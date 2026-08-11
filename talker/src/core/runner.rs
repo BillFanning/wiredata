@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use crate::core::{
-    channel::{ChannelId, Interface, InterfaceConfig},
+    channel::{ChannelId, Interface, InterfaceConfig, MissingRetryConfiguration},
     internal_fault::InternalFaultTally,
     run_summary::{RunEndReason, RunId, RunSummary},
     scheduler::{Schedule, Tick},
@@ -182,8 +182,9 @@ pub enum TalkerStatus {
     /// Sending resumed after a failing episode. Carries the episode's cost so
     /// the observer can state what was lost: `failures` sends were attempted
     /// and failed (the first was reported as `ConnectionError`), `suppressed`
-    /// due fires were skipped by the bounded-backoff retry policy without
-    /// being attempted at all.
+    /// due fires were skipped by the bounded-backoff retry policy without an
+    /// interface write; some may have found that the handle could not yet be
+    /// reopened.
     SendRecovered {
         channel: ChannelId,
         failures: u64,
@@ -195,14 +196,16 @@ pub enum TalkerStatus {
 
 /// First retry delay after a send failure (the **bounded-backoff** retry
 /// policy): while an interface is failing, due fires are suppressed — counted,
-/// not attempted — until the next retry instant; each failed retry doubles the
-/// wait up to [`RETRY_BACKOFF_MAX`], and the first success closes the episode.
+/// with no interface write — until the next retry instant. At that instant a
+/// transport may first prepare or replace its failed handle; an unavailable
+/// replacement withholds that fire too. Each unsuccessful retry doubles the wait up to
+/// [`RETRY_BACKOFF_MAX`], and the first successful send closes the episode.
 /// Without this, a 100 Hz schedule against a dead TCP/serial target retries
 /// (and used to log) 100 times a second, burying the original failure.
 const RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 /// Retry delay cap: a persistently dead interface is probed at most once per
-/// this interval. Recovery stays automatic — no manual Retry state (pinned by
-/// `send_failure_reports_connection_error_and_keeps_running`).
+/// this interval. Retrying stays automatic — there is no manual Retry state —
+/// and transports that require a new OS handle can prepare it at that probe.
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// How a runner reports to its observer (ADR-018): the named policy the owner
@@ -251,10 +254,17 @@ impl Default for ObserverPolicy {
 struct FailureEpisode {
     /// Sends attempted and failed, ≥ 1 (the reported first one).
     failures: u64,
-    /// Due fires suppressed by the backoff gate without an attempt.
+    /// Due fires suppressed by the backoff gate without an interface write.
     suppressed: u64,
     backoff: Duration,
     next_attempt: Instant,
+    /// The last attempted handle failed and must be prepared before it is used
+    /// again. A successful interface update clears this for its first send.
+    handle_needs_recovery: bool,
+    /// At least one preparation call replaced the OS handle during this
+    /// episode. Retained across later failures so the one recovery edge can
+    /// distinguish replacement from a transient write recovery.
+    handle_replaced: bool,
 }
 
 /// How long a channel must go without skipping a scheduled send before its
@@ -434,6 +444,10 @@ pub fn open_and_run(
 ///
 /// Log text names the channel by `who.label`; the structured `channel` field
 /// carries the stable id (ADR-020).
+///
+/// `current_config` is required when a built-in transport may need to replace
+/// its failed handle or apply a live configuration update. Purpose-built
+/// interfaces that can recover their existing handle may pass `None`.
 pub fn run(
     who: RunnerIdentity,
     interface: Box<dyn Interface>,
@@ -727,6 +741,10 @@ fn run_loop(
                         // reports what was lost).
                         if let Some(ep) = episode.as_mut() {
                             ep.next_attempt = Instant::now();
+                            ep.handle_needs_recovery = false;
+                            // The explicit update supersedes any automatic
+                            // replacement earlier in this episode.
+                            ep.handle_replaced = false;
                         }
                         tracing::info!(
                             channel = who.id.as_u64(),
@@ -800,6 +818,10 @@ fn run_loop(
     // Renders that returned nothing for an index the schedule handed out. Per
     // run rather than per slot, because a runner outlives no run but its own.
     let mut render_faults = InternalFaultTally::default();
+    // Missing confirmed configuration during handle replacement is a separate
+    // invariant from rendering, so its first occurrence must not suppress the
+    // render invariant's first report (ADR-054).
+    let mut retry_config_faults = InternalFaultTally::default();
 
     let end_reason = 'run: loop {
         // Drain anything already queued so back-to-back sends can't starve
@@ -880,16 +902,64 @@ fn run_loop(
                     ),
                     MissReport::Silent => {}
                 }
-                let suppressed = episode
+                let backoff_withheld = episode
                     .as_ref()
                     .is_some_and(|ep| due_handled_at < ep.next_attempt);
-                if suppressed {
-                    // Backoff gate: this due fire is suppressed — counted,
-                    // not rendered or attempted. The scheduler has already
-                    // advanced, consistent with the stall policy (cadence
-                    // over count).
-                    if let Some(ep) = episode.as_mut() {
-                        ep.suppressed += 1;
+                let needs_recovery = episode.as_ref().is_some_and(|ep| ep.handle_needs_recovery);
+                let mut reopen_withheld = false;
+                if !backoff_withheld && needs_recovery {
+                    match interface.prepare_retry(current_config.as_ref()) {
+                        Ok(handle_replaced) => {
+                            // If the following send fails it sets this back to
+                            // true in the ordinary failure branch below.
+                            if let Some(ep) = episode.as_mut() {
+                                ep.handle_needs_recovery = false;
+                                ep.handle_replaced |= handle_replaced;
+                            }
+                        }
+                        Err(e) => {
+                            // No interface write was attempted, so this due fire
+                            // is withheld rather than failed. It has no render or
+                            // send-call timing either; reopen work is outside
+                            // both measurement boundaries.
+                            if let Some(ep) = episode.as_mut() {
+                                ep.suppressed += 1;
+                                ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
+                                ep.next_attempt = Instant::now() + ep.backoff;
+                                if e.downcast_ref::<MissingRetryConfiguration>().is_some() {
+                                    if let Some(line) = retry_config_faults.report(
+                                        &who.label,
+                                        "serial recovery had no confirmed interface settings",
+                                        "That send was withheld; automatic reopen cannot proceed \
+                                         until the interface is updated or the channel is restarted",
+                                    ) {
+                                        tracing::error!("{line}");
+                                    }
+                                } else {
+                                    tracing::debug!(
+                                        channel = who.id.as_u64(),
+                                        "channel {} interface still unavailable ({} failed sends, \
+                                         {} withheld while retrying): {e:#}",
+                                        who.label,
+                                        ep.failures,
+                                        ep.suppressed
+                                    );
+                                }
+                            }
+                            reopen_withheld = true;
+                        }
+                    }
+                }
+                if backoff_withheld || reopen_withheld {
+                    // Backoff gate: this due fire is suppressed — counted, but
+                    // not rendered or written. A retry-edge fire may have tried
+                    // to reopen the handle first. The scheduler has already
+                    // advanced, consistent with the stall policy (cadence over
+                    // count).
+                    if backoff_withheld {
+                        if let Some(ep) = episode.as_mut() {
+                            ep.suppressed += 1;
+                        }
                     }
                     suppressed_sends += 1;
                 } else {
@@ -939,14 +1009,43 @@ fn run_loop(
                                 // "Suppressed" is defined on the send-outcomes
                                 // line and nowhere the log reader can see, so
                                 // this states what happened to those sends.
-                                tracing::info!(
-                                    channel = who.id.as_u64(),
-                                    "channel {} sending recovered after {} failed sends and {} \
-                                     withheld while retrying",
-                                    who.label,
-                                    ep.failures,
-                                    ep.suppressed
-                                );
+                                let failed_noun = if ep.failures == 1 { "send" } else { "sends" };
+                                if ep.handle_replaced {
+                                    if let Some(InterfaceConfig::Serial(config)) =
+                                        current_config.as_ref()
+                                    {
+                                        tracing::info!(
+                                            channel = who.id.as_u64(),
+                                            "channel {} reopened serial port {}; sending recovered \
+                                             after {} failed {} and {} withheld while retrying",
+                                            who.label,
+                                            config.port,
+                                            ep.failures,
+                                            failed_noun,
+                                            ep.suppressed
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            channel = who.id.as_u64(),
+                                            "channel {} sending recovered after {} failed {} and {} \
+                                             withheld while retrying",
+                                            who.label,
+                                            ep.failures,
+                                            failed_noun,
+                                            ep.suppressed
+                                        );
+                                    }
+                                } else {
+                                    tracing::info!(
+                                        channel = who.id.as_u64(),
+                                        "channel {} sending recovered after {} failed {} and {} \
+                                         withheld while retrying",
+                                        who.label,
+                                        ep.failures,
+                                        failed_noun,
+                                        ep.suppressed
+                                    );
+                                }
                                 timer.emit(TalkerStatus::SendRecovered {
                                     channel: who.id,
                                     failures: ep.failures,
@@ -1001,6 +1100,8 @@ fn run_loop(
                                         suppressed: 0,
                                         backoff: RETRY_BACKOFF_INITIAL,
                                         next_attempt: Instant::now() + RETRY_BACKOFF_INITIAL,
+                                        handle_needs_recovery: true,
+                                        handle_replaced: false,
                                     });
                                     timer.emit(TalkerStatus::ConnectionError {
                                         channel: who.id,
@@ -1010,6 +1111,7 @@ fn run_loop(
                                 // A failed retry deepens the backoff; no re-report.
                                 Some(ep) => {
                                     ep.failures += 1;
+                                    ep.handle_needs_recovery = true;
                                     ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
                                     ep.next_attempt = Instant::now() + ep.backoff;
                                     tracing::debug!(
@@ -1226,7 +1328,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::core::channel::TcpClientConfig;
+    use crate::core::channel::{SerialConfig, TcpClientConfig};
     use crate::core::message::{CodePage, MessageConfig, PayloadConfig};
 
     /// Sustained overload must log twice, not once per skipped send. This is
@@ -1399,12 +1501,7 @@ mod tests {
             // lines: no global to install, nothing shared with another test,
             // and no window between spawning and subscribing.
             match log_tx {
-                Some(tx) => {
-                    use tracing_subscriber::layer::SubscriberExt as _;
-                    let subscriber = tracing_subscriber::registry()
-                        .with(crate::core::logging::GuiLogLayer::new(tx));
-                    tracing::subscriber::with_default(subscriber, go)
-                }
+                Some(tx) => crate::core::logging::with_gui_test_subscriber(tx, go),
                 None => go(),
             }
         });
@@ -2352,14 +2449,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn recovery_reports_send_recovered_with_episode_counts() {
-        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let interface = Box::new(FlakyInterface {
-            sent: Arc::clone(&sent),
-            fail: Arc::clone(&fail),
-        });
+    /// Start the real runner loop around a purpose-built interface. Recovery
+    /// tests use this instead of `MockInterface` because the distinction being
+    /// tested lives in the handle, not in the schedule.
+    fn spawn_interface_runner(
+        interface: Box<dyn Interface>,
+        current_config: Option<InterfaceConfig>,
+    ) -> TalkerHandle {
+        spawn_interface_runner_observed(interface, current_config, None)
+    }
+
+    fn spawn_logging_interface_runner(
+        interface: Box<dyn Interface>,
+        current_config: Option<InterfaceConfig>,
+    ) -> (
+        TalkerHandle,
+        crossbeam_channel::Receiver<crate::core::logging::LogEvent>,
+    ) {
+        let (log_tx, log_rx) = crossbeam_channel::unbounded();
+        (
+            spawn_interface_runner_observed(interface, current_config, Some(log_tx)),
+            log_rx,
+        )
+    }
+
+    fn spawn_interface_runner_observed(
+        interface: Box<dyn Interface>,
+        current_config: Option<InterfaceConfig>,
+        log_tx: Option<crossbeam_channel::Sender<crate::core::logging::LogEvent>>,
+    ) -> TalkerHandle {
         let schedule = Schedule::compile(&[msg("AB", 5)], Instant::now()).unwrap();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
         let (control_tx, control_rx) = crossbeam_channel::bounded(16);
@@ -2370,22 +2488,39 @@ mod tests {
             run_id: RunId::mint(),
         };
         let thread = std::thread::spawn(move || {
-            run(
-                who,
-                interface,
-                None,
-                schedule,
-                cmd_rx,
-                RunnerObserver::new(status_tx, ObserverPolicy::every_send())
-                    .with_control(control_tx),
-            )
+            let go = move || {
+                run(
+                    who,
+                    interface,
+                    current_config,
+                    schedule,
+                    cmd_rx,
+                    RunnerObserver::new(status_tx, ObserverPolicy::every_send())
+                        .with_control(control_tx),
+                )
+            };
+            match log_tx {
+                Some(tx) => crate::core::logging::with_gui_test_subscriber(tx, go),
+                None => go(),
+            }
         });
-        let handle = TalkerHandle {
+        TalkerHandle {
             cmd_tx,
             control_rx,
             status_rx,
             thread,
-        };
+        }
+    }
+
+    #[test]
+    fn recovery_reports_send_recovered_with_episode_counts() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let interface = Box::new(FlakyInterface {
+            sent: Arc::clone(&sent),
+            fail: Arc::clone(&fail),
+        });
+        let handle = spawn_interface_runner(interface, None);
 
         // Let the episode open (first failure) and some fires get suppressed,
         // then heal the interface: the next backoff retry closes the episode.
@@ -2415,7 +2550,7 @@ mod tests {
         assert!(failures >= 1, "the reported first failure is counted");
         assert!(
             suppressed >= 1,
-            "5 ms fires during the 250 ms backoff are suppressed, not attempted"
+            "5 ms fires during the 250 ms backoff make no interface write"
         );
         assert!(
             !sent.lock().unwrap().is_empty(),
@@ -2435,6 +2570,213 @@ mod tests {
         let (failed_total, suppressed_total) = final_outcomes.expect("final cumulative counters");
         assert!(failed_total >= failures);
         assert!(suppressed_total >= suppressed);
+    }
+
+    /// Model the serial failure mode where a removed device's old handle stays
+    /// unusable after a replacement appears under the same port name. Recovery
+    /// must prepare a replacement handle rather than assuming every transport
+    /// can heal its existing one in place.
+    #[test]
+    fn a_replaced_device_reopens_before_the_backoff_retry() {
+        struct ReplacementOnlyInterface {
+            stale_handle: bool,
+            reopen_attempts: Arc<std::sync::atomic::AtomicU64>,
+            sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+
+        impl Interface for ReplacementOnlyInterface {
+            fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
+                anyhow::ensure!(!self.stale_handle, "removed device handle");
+                self.sent.lock().unwrap().push(data.to_vec());
+                Ok(())
+            }
+
+            fn prepare_retry(&mut self, current: Option<&InterfaceConfig>) -> anyhow::Result<bool> {
+                anyhow::ensure!(
+                    matches!(current, Some(InterfaceConfig::Serial(_))),
+                    "serial configuration missing"
+                );
+                let attempt = self
+                    .reopen_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                anyhow::ensure!(attempt > 1, "replacement device is absent");
+                self.stale_handle = false;
+                Ok(true)
+            }
+        }
+
+        let reopen_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let interface = Box::new(ReplacementOnlyInterface {
+            stale_handle: true,
+            reopen_attempts: Arc::clone(&reopen_attempts),
+            sent: Arc::clone(&sent),
+        });
+        let (handle, log_rx) = spawn_logging_interface_runner(
+            interface,
+            Some(InterfaceConfig::Serial(SerialConfig::new("COM4"))),
+        );
+
+        // No command is sent to the runner. The fake makes the first open find
+        // the device absent and the second find its replacement. Sequencing by
+        // attempt keeps the backoff contract without racing the test thread's
+        // scheduling against a two-second deadline.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut errors = 0;
+        let mut recovered = None;
+        while recovered.is_none() && Instant::now() < deadline {
+            match handle.status_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(TalkerStatus::ConnectionError { .. }) => errors += 1,
+                Ok(TalkerStatus::SendRecovered {
+                    failures,
+                    suppressed,
+                    ..
+                }) => recovered = Some((failures, suppressed)),
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        let (failures, suppressed) = recovered.expect("replacement should resume the same run");
+        assert_eq!(errors, 1, "one failure episode has one error edge");
+        assert_eq!(
+            failures, 1,
+            "failed reopen attempts are withheld, not reported as failed writes"
+        );
+        assert!(
+            suppressed >= 1,
+            "backoff remains active while the port is absent"
+        );
+        assert_eq!(
+            reopen_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one failed reopen is followed by one successful replacement open"
+        );
+        assert!(!sent.lock().unwrap().is_empty(), "sending resumed");
+
+        let final_statuses = handle.status_rx.clone();
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(2));
+        let (
+            sent_total,
+            failed_total,
+            suppressed_total,
+            render_samples,
+            send_samples,
+            message_render_samples,
+            message_send_samples,
+        ) = final_statuses
+            .try_iter()
+            .find_map(|status| match status {
+                TalkerStatus::Counters {
+                    total_count,
+                    failed_sends,
+                    suppressed_sends,
+                    timing,
+                    per_message_timing,
+                    final_snapshot: true,
+                    ..
+                } => Some((
+                    total_count,
+                    failed_sends,
+                    suppressed_sends,
+                    timing.cumulative.render_duration.sample_count(),
+                    timing.cumulative.send_duration.sample_count(),
+                    per_message_timing
+                        .first()
+                        .map_or(0, |message| message.render_duration.sample_count()),
+                    per_message_timing
+                        .first()
+                        .map_or(0, |message| message.send_duration.sample_count()),
+                )),
+                _ => None,
+            })
+            .expect("final cumulative counters");
+        assert_eq!(failed_total, 1);
+        assert!(suppressed_total >= suppressed);
+        assert_eq!(
+            render_samples,
+            sent_total + failed_total,
+            "reopen attempts are outside the render timing boundary"
+        );
+        assert_eq!(
+            message_render_samples, render_samples,
+            "failed reopens do not create per-message render samples"
+        );
+        assert_eq!(
+            send_samples,
+            sent_total + failed_total,
+            "reopen attempts are outside the send-call timing boundary"
+        );
+        assert_eq!(
+            message_send_samples, send_samples,
+            "failed reopens do not create per-message send windows"
+        );
+
+        let recovery_lines = log_rx
+            .try_iter()
+            .filter(|event| {
+                event.level == tracing::Level::INFO && event.message.contains("sending recovered")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovery_lines.len(),
+            1,
+            "one failure episode has one recovery log edge"
+        );
+        assert!(
+            recovery_lines[0]
+                .message
+                .contains("reopened serial port COM4"),
+            "the recovery edge distinguishes handle replacement: {recovery_lines:#?}"
+        );
+    }
+
+    #[test]
+    fn missing_serial_retry_configuration_is_an_internal_fault() {
+        struct MissingConfigInterface;
+
+        impl Interface for MissingConfigInterface {
+            fn send(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+                anyhow::bail!("failed serial handle")
+            }
+
+            fn prepare_retry(
+                &mut self,
+                _current: Option<&InterfaceConfig>,
+            ) -> anyhow::Result<bool> {
+                Err(MissingRetryConfiguration.into())
+            }
+        }
+
+        let (handle, log_rx) =
+            spawn_logging_interface_runner(Box::new(MissingConfigInterface), None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let internal = loop {
+            assert!(
+                Instant::now() < deadline,
+                "missing retry configuration was not reported"
+            );
+            if let Ok(event) = log_rx.recv_timeout(Duration::from_millis(20)) {
+                if event
+                    .message
+                    .contains("serial recovery had no confirmed interface settings")
+                {
+                    break event;
+                }
+            }
+        };
+
+        assert_eq!(internal.level, tracing::Level::ERROR);
+        assert_eq!(
+            internal.channel, None,
+            "an internal state disagreement is not blamed on the channel"
+        );
+        assert!(internal.message.contains("Please report this"));
+
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(2));
     }
 
     #[test]

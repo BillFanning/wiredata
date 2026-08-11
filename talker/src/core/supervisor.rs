@@ -911,7 +911,7 @@ fn drain_control_statuses(
                     CommandExecution::Failed(message) => {
                         let message = match target {
                             CommandTarget::Interface => format!(
-                                "interface update failed; the existing interface handle was retained: {message}"
+                                "interface update failed; the previous interface settings remain in use: {message}"
                             ),
                             CommandTarget::MessageInterval(index) => {
                                 format!("message {index} interval update failed: {message}")
@@ -1252,16 +1252,12 @@ mod tests {
     /// prevents a future edit from re-adding the field.
     #[test]
     fn an_internal_fault_does_not_claim_to_be_about_the_channel() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let (tx, rx) = crossbeam_channel::bounded(8);
-        let subscriber =
-            tracing_subscriber::registry().with(crate::core::logging::GuiLogLayer::new(tx));
         let slot = ChannelId::mint();
         let mut retained = None;
         let mut misrouted = InternalFaultTally::default();
 
-        tracing::subscriber::with_default(subscriber, || {
+        crate::core::logging::with_gui_test_subscriber(tx, || {
             retain_run_summary(
                 slot,
                 ChannelId::mint(),

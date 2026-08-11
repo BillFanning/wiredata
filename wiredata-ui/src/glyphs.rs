@@ -11,10 +11,11 @@
 //! Serial control lines reuse the same pair of circles, filled for high and
 //! hollow for low, so the distinction survives without colour.
 //!
-//! What each *state* maps to stays app-specific (talker has
-//! running-with-error, and only listener reconnects); only the symbols, their
-//! optical sizing, and the fixed-cell painter live here. Colors come from
-//! [`crate::palette`] at the call site.
+//! What each *state* maps to stays app-specific. Talker represents its internal
+//! retry/reopen work as running-with-error; only listener exposes Reconnecting
+//! as a lifecycle state. Only the symbols, their optical sizing, and the
+//! fixed-cell painter live here. Colors come from [`crate::palette`] at the call
+//! site.
 
 /// Running / active: `●`.
 pub const RUNNING: &str = "\u{25CF}";

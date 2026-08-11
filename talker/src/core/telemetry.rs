@@ -137,12 +137,11 @@ pub struct MessageTiming {
     /// occurred, so this grows with the problem instead (ADR-051).
     ///
     /// Summing this across every message gives the share of the channel's
-    /// `missed_sends` that some send is answerable for. The remainder is
-    /// **unattributed**: points the retained send history cannot place. It is
-    /// reported as exactly that and never as idle time — the reach is sized so
-    /// that a point skipped behind a send should always find it, but a readout
-    /// that assumed so would be asserting the absence of a cause from the
-    /// absence of a record.
+    /// `missed_sends` that some send is answerable for. The remainder has no
+    /// matching retained send window. A real schedule retains enough windows
+    /// that a point skipped behind a send can always find it; defensive,
+    /// out-of-model calls still under-attribute rather than guess. Either way,
+    /// no match is never presented as proof that the channel was idle.
     pub missed_others: u64,
 }
 
@@ -217,14 +216,13 @@ struct SendWindow {
 /// readout began describing the shortfall — misreported a busy thread as an
 /// idle one.
 ///
-/// **How deep the ring has to be**, and why that is not a guess. Between two
-/// deadlines of the same message, every *other* message can send at most once.
-/// A message is only serviced ahead of an overdue one if its own deadline is
-/// earlier, and once it fires, the stall policy advances it to the first grid
-/// point in the future — past the overdue deadline still waiting. So the sends
-/// separating a deadline from its handling number at most one per other
-/// message, and a ring the size of the schedule can always answer. It is sized
-/// from the message count for exactly that reason, not from a round number.
+/// **How deep the ring has to be**, and why that is not a guess. Once a
+/// message's deadline is overdue, each *other* message can be serviced at most
+/// once ahead of it: only an earlier deadline goes first, and firing advances
+/// that message to the first grid point in the future. No more than one send
+/// per message can therefore separate an overdue deadline from its handling,
+/// so a ring the size of the schedule can always answer. It is sized from the
+/// message count for exactly that reason, not from a round number.
 #[derive(Debug, Default)]
 pub(crate) struct MessageTimingRecorder {
     messages: Vec<MessageTiming>,

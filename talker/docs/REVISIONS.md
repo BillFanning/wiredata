@@ -13,6 +13,57 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-08-10) — diagnostic guidance now speaks from the
+technician's side of the screen:
+
+- **§3.2 current timing (ADR-042/046)** — “recent snapshot” is replaced by the
+  period it describes: `last ~10 s`, with update age when useful, an unavailable
+  state when stale, and `final ~10 s before stop` at a clean run end. Cadence
+  keeps that period on its main line and moves its sample count into the tooltip,
+  paired with the current, final, or run-wide period that supplied the figure.
+- **§3.2 stable timing figures (ADR-046)** — Cadence, render, and send-call
+  readouts lead with their longest observation; a distinct percentile follows
+  in the same qualifier. Its appearance can no longer move the main figure under
+  the reader.
+- **§3.2 missed-send result (ADR-051)** — the amount-stating branch describes
+  the observed overlap directly: Talker was waiting for another message's serial
+  or network send to finish when the misses occurred. The screen no longer asks
+  a technician to translate “charged” before following the result.
+- **§3.2 evidence limits (ADR-051)** — four labelled points distinguish a
+  measured missed-send count from a message offered only as a delay-based lead,
+  explain what an unmatched miss does and does not mean, and separate direct
+  findings from earlier failures and estimated application headroom. The
+  history-sizing proof remains in ADR-051 rather than appearing in operational
+  guidance.
+- **§3.2 / §5.7 live updates (ADR-052)** — the live-update queue moves beside
+  its dropped-update warning above Output. Its tooltip states that drops can
+  also affect diagnostic readouts. The queue and sampling lines share the same
+  quiet treatment; only the active drop warning carries urgency.
+- **§4.2 absent serial devices** — Windows' known filesystem-oriented file/path
+  not-found messages now read `no device is present at <port>`. The broader
+  serial error category also covers busy and access-denied ports, so every other
+  operating-system message remains unchanged.
+
+Revision note (2026-08-09) — three readouts stop claiming more than they measure:
+
+- **§3.2 uncharged misses (ADR-051, corrected)** — the remainder no longer offers
+  "the send that held it has aged out of the retained record" as an explanation.
+  The retained history is sized from the schedule, so a write that could have
+  spanned a point has not been forgotten. What the record supports is one
+  negative fact — no measured interface write spanned those points — which a late
+  deadline wake, work outside the send call, and a genuinely free thread all
+  produce alike.
+- **§5.7 completeness notices (ADR-052)** — while the dropped-update warning is
+  unacknowledged, the **Output** section header reads `Output ⚠ <n> dropped`.
+  The pane is collapsed by default and the warning no longer raises the
+  diagnostics card's badge, so without the marked header the condition could be
+  on screen and unseeable.
+- **§9.2 edge-triggered channel conditions (ADR-053)** — the five-second settle
+  is a **minimum, not a deadline**: it is judged on a cadence point the channel
+  reaches, so a slow schedule reports at its next send. The table no longer
+  claims all three conditions close — discarded updates are a run total with no
+  recovery edge to report, which is now stated rather than left as a dash.
+
 Revision note (2026-08-09) — a warning may be acknowledged, and is raised where
 it lands:
 
@@ -297,6 +348,45 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-08-10) — four existing decisions carry their evidence in
+the reader's vocabulary:
+
+- **ADR-042** keeps freshness provenance internal while presentation names the
+  period it supports: last ~10 seconds, its useful update age, unavailable recent
+  timing, or the final period before stop.
+- **ADR-046** keeps the sample count but pairs Cadence's count with the current,
+  final, or run-wide period that supplied its figure. Longest timing stays in one
+  position and any distinct percentile follows it.
+- **ADR-051** keeps a measured missed-send count distinct from a delay-based
+  lead. The screen describes observed overlap instead of “charging”; the
+  retained-history proof stays in the decision rather than operational help.
+- **ADR-052** places the shared live-update queue gauge with its warning above
+  Output while stating that drops can also affect diagnostic readouts. The gauge
+  and standing sampling note are quiet context; the warning alone carries
+  attention.
+
+Revision note (2026-08-09) — three decisions state their boundaries, and stop
+telling their own story:
+
+- **ADR-052 (boundary added)** — placement by consequence has to reach the
+  reader. Moving the dropped-update warning into the Output pane while removing
+  the card badge put it inside a section that is collapsed by default, so the
+  warning could be on screen and unseeable. A warning inside a collapsed section
+  now marks that section's header.
+- **ADR-053 (boundary added)** — the settle window is a **minimum, not a
+  deadline**: recovery is judged where the skip count arrives, on a cadence
+  point the channel reaches, so a slow schedule reports at its next send rather
+  than at five seconds, and nothing is woken to announce its own recovery. The
+  line is scoped to cadence alone — sends can be failing while every point is
+  reached.
+- **ADR-054 (corrected)** — the decade rate limit was applied by convention to
+  five of the six internal faults, and the sixth, on the send path, was the one
+  best placed to flood. The tally and the sentence shape now live in one module
+  every caller reaches for.
+- **All three, compressed.** They carried the debugging story, superseded
+  wording, and test mechanics. AGENTS.md gives those to the commit message; an
+  ADR states the decision, the boundary it does not cross, and what follows.
 
 Revision note (2026-08-09) — a warning may be acknowledged, and is raised where
 it lands:

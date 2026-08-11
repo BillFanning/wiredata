@@ -10,6 +10,28 @@ use tracing_subscriber::{
 
 pub use gui_layer::{GuiLogLayer, LogEvent};
 
+/// Run a test closure with GUI log capture on its current thread.
+///
+/// `tracing` caches callsite interest process-wide. A callsite first reached
+/// concurrently on another test thread can otherwise be registered against
+/// that thread's empty default and remain invisible to this scoped subscriber.
+/// Keeping a second live dispatch makes the registrar consult its active
+/// dispatch list; the mutex keeps two capture tests from routing into one
+/// another while that cache is rebuilt.
+#[cfg(test)]
+pub(crate) fn with_gui_test_subscriber<T>(
+    sender: crossbeam_channel::Sender<LogEvent>,
+    run: impl FnOnce() -> T,
+) -> T {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    let _capture_guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _registration_sentinel = tracing::Dispatch::new(tracing_subscriber::registry());
+    let capture =
+        tracing::Dispatch::new(tracing_subscriber::registry().with(GuiLogLayer::new(sender)));
+    tracing::dispatcher::with_default(&capture, run)
+}
+
 // ── Config types ──────────────────────────────────────────────────────────────
 
 #[non_exhaustive]

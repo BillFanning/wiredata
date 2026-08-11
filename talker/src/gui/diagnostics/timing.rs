@@ -6,19 +6,20 @@
 
 use super::*;
 
-pub(in crate::gui) const TIMING_TOOLTIP: &str = "Each recent snapshot merges up to approximately ten seconds of \
-fixed one-second segments ending when the runner captured its latest counter update. A slow or \
-dormant schedule can therefore leave the displayed snapshot unchanged; its “as of” age is the \
-snapshot compute time, not necessarily the newest sample time. While running, a snapshot is no \
-longer used as recent evidence once that age reaches ten seconds. After a normal run end, the \
-channel retains its exact final snapshot; an abnormal exit can leave the last non-final snapshot \
-instead. Deadline lateness runs from a message's monotonic cadence deadline \
+pub(in crate::gui) const TIMING_TOOLTIP: &str = "Recent timing merges up to approximately ten seconds of \
+fixed one-second segments ending at the latest counter update. A slow or dormant schedule can \
+therefore leave the displayed figures unchanged; “updated” states when the figures were computed, \
+not necessarily when their newest send occurred. While running, recent figures are no longer used \
+once their update age reaches ten seconds. After a normal run end, the channel retains exact final \
+timing for the period before stop; an abnormal exit can leave older, non-final timing instead. \
+Deadline lateness runs from a message's monotonic cadence deadline \
 until the runner handles that send; handled retry-suppressed sends are included, while \
 cadence points counted as Missed are not sampled. Render covers payload and timestamp construction. \
 Send call ends when the configured-interface write returns and includes failed attempts; it does \
-not prove physical-wire or peer delivery. Each boundary reports its own worst value and its own \
-sample count; a percentile is added only where it differs from that worst value, which below a \
-hundred samples it never does. Percentiles are histogram-bucket upper bounds.";
+not prove physical-wire or peer delivery. The line gives its send count once; a boundary adds a \
+separate count only if its population differs. Render and send call lead with their longest \
+observation, followed by a percentile only when it is different; below a hundred samples it never \
+is. Percentiles are histogram-bucket upper bounds.";
 
 pub(in crate::gui) const TIMER_TOOLTIP: &str =
     "The shortest active interval selects the deadline-wait policy. On \
@@ -60,9 +61,10 @@ pub(in crate::gui) fn timing_detail_text(
             "Work per send: {} · run max late {run_max}",
             recent_snapshot_label(snapshot_state)
         ),
-        RecentSnapshotState::Pending => {
-            format!("Work per send: recent snapshot pending · run max late {run_max}")
-        }
+        RecentSnapshotState::Pending => format!(
+            "Work per send: {} · run max late {run_max}",
+            recent_snapshot_label(snapshot_state)
+        ),
         // Deadline lateness is deliberately absent: the Cadence row renders the
         // same recent histogram with the schedule context that makes it
         // readable, so repeating it here was one fact in two places. What is
@@ -78,8 +80,8 @@ pub(in crate::gui) fn timing_detail_text(
                 "Work per send ({}, {} sends): {} · {} · run max late {run_max}",
                 recent_snapshot_label(snapshot_state),
                 thousands(samples),
-                timing_metric("render", recent.render_duration, samples),
-                timing_metric("send call", recent.send_duration, samples),
+                longest_metric("render", recent.render_duration, samples),
+                longest_metric("send call", recent.send_duration, samples),
             )
         }
     }

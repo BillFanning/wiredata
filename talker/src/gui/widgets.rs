@@ -17,8 +17,19 @@ use crate::core::message::{
     CodePage, Segment,
 };
 
-use super::diagnostics::DISPLAY_QUEUE_TOOLTIP;
+use super::diagnostics::LIVE_UPDATE_QUEUE_TOOLTIP;
 use super::display::{ChannelDisplay, ControlStyle, DisplayMode};
+
+/// The runner→UI live-update queue as reported beside its drop warning.
+///
+/// Grouped rather than passed as three loose numbers: depth is only readable
+/// against its capacity, and a peak means nothing without both.
+pub(super) struct LiveUpdateQueueGauge {
+    pub len: usize,
+    pub peak: usize,
+    pub capacity: usize,
+}
+
 use super::draft::{ConnDraft, ConnKind, PayloadKind, PortHold, ScheduleDraft, UdpModeDraft};
 use super::notice::DismissedNotice;
 use super::{MessageAnalysisCache, MessageDraftAnalysis};
@@ -1867,12 +1878,13 @@ fn output_layout_job(
 
 /// Render a channel's real-time outbound display pane (spec §5.7).
 ///
-/// Both notices at the top of the pane qualify the same thing — how complete
-/// what follows is — so they are stated where that matters rather than in the
-/// diagnostics card, which holds readouts about the wire. The dropped-update
-/// warning is dismissible because it is a run total that keeps its last value
-/// long after the pressure that caused it passed; `dismissed` carries the count
-/// the reader has already acknowledged (see `super::notice`).
+/// Three lines can head the pane. The warning and gauge describe the shared
+/// live-update queue, which can affect Output and diagnostic readouts; the
+/// sampling note qualifies Output alone. The shared queue has one visible home
+/// here rather than being repeated in the diagnostics card. Its warning is
+/// dismissible because it is a run total that keeps its last value long after
+/// the pressure that caused it passed; `dismissed` carries the count the reader
+/// has already acknowledged (see `super::notice`).
 ///
 /// An unacknowledged warning also marks the section's own header. The pane is
 /// collapsed by default, and moving this warning here took away the diagnostics
@@ -1886,6 +1898,7 @@ pub(super) fn show_display_pane(
     dismissed: &mut DismissedNotice,
     accepted_total: u64,
     dropped_updates: u64,
+    queue: LiveUpdateQueueGauge,
 ) {
     let unacknowledged = dropped_updates > 0 && dismissed.showing(dropped_updates);
     let heading = if unacknowledged {
@@ -1905,10 +1918,13 @@ pub(super) fn show_display_pane(
             if unacknowledged {
                 let acknowledged = dismissible_attention_callout(
                     ui,
-                    "display_drop_attention",
-                    format!("{dropped_updates} diagnostic updates dropped; live readouts may lag"),
+                    "live_update_drop_attention",
+                    format!(
+                        "{dropped_updates} live updates dropped; Output may omit lines and live \
+                         readouts may lag"
+                    ),
                     SignalTone::Warning,
-                    DISPLAY_QUEUE_TOOLTIP,
+                    LIVE_UPDATE_QUEUE_TOOLTIP,
                 );
                 if acknowledged {
                     dismissed.dismiss(dropped_updates);
@@ -1922,26 +1938,39 @@ pub(super) fn show_display_pane(
                 / crate::core::runner::ObserverPolicy::sampled()
                     .sample_interval
                     .as_secs_f32();
+            // The gauge sits with the warning it explains. This shared queue
+            // also feeds live diagnostic readouts (as the tooltip says); its
+            // placement does not make it an Output-only measurement.
+            ui.label(
+                egui::RichText::new(format!(
+                    "live update queue at last screen check: {}/{} · peak {} · {} dropped",
+                    queue.len, queue.capacity, queue.peak, dropped_updates
+                ))
+                .small()
+                .color(ui.visuals().weak_text_color()),
+            )
+            .on_hover_text(LIVE_UPDATE_QUEUE_TOOLTIP);
             if display.payload_samples_omitted(accepted_total) {
-                // Weighted, not accented: this is still a standing note about how
-                // the pane works rather than a state to act on, so it takes no
-                // accent and no ⚠ and does not compete with the callout above. But
-                // it qualifies every line beneath it, and at small-and-weak it read
-                // as a footnote to skip. The bundled bold face carries that as
-                // stroke — `RichText::strong` only shifts the colour, which is the
-                // one channel a state may never depend on (ADR-050).
-                ui.label(wiredata_ui::fonts::bold(format!(
-                    "sampled output · not every sent payload is shown · limit ~{sample_hz:.0}/s"
-                )))
+                // A standing note about how the pane works, not a state to act
+                // on, so it recedes with the theme: no accent, no ⚠, and the
+                // same quiet weight as the queue gauge above it. The callout is
+                // what carries urgency when there is any.
+                ui.label(
+                    egui::RichText::new(format!(
+                        "sampled output · not every sent payload is shown · limit ~{sample_hz:.0}/s"
+                    ))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                )
                 .on_hover_text(format!(
                     "Above ~{sample_hz:.0} messages/s the Output pane shows a \
                  rate-limited live sample, not every message, so its \
-                 render cost stays constant at any send rate. This badge appears \
+                 render cost stays constant at any send rate. This line appears \
                  only after the locally accepted total proves that one or more \
-                 payload updates were omitted; display-queue pressure can also omit \
+                 payload updates were omitted; live-update queue pressure can also omit \
                  an update. The fact remains visible for the rest of this run. \
                  Runner-owned cumulative totals remain exact; live readouts can lag \
-                 until a later update, and the final run snapshot is exact. None of \
+                 until a later update, and the final run totals are exact. None of \
                  these values proves physical-wire or peer delivery."
                 ));
                 ui.separator();

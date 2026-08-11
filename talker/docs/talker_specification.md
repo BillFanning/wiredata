@@ -1,27 +1,27 @@
 # Talker — Program Specification
-**Version:** 2.4.11
+**Version:** 2.4.13
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-08-09) — three readouts stop claiming more than they measure:
+Revision note (2026-08-10) — a replaced serial device can recover in the same
+run without broadening network recovery:
 
-- **§3.2 uncharged misses (ADR-051, corrected)** — the remainder no longer offers
-  "the send that held it has aged out of the retained record" as an explanation.
-  The retained history is sized from the schedule, so a write that could have
-  spanned a point has not been forgotten. What the record supports is one
-  negative fact — no measured interface write spanned those points — which a late
-  deadline wake, work outside the send call, and a genuinely free thread all
-  produce alike.
-- **§5.7 completeness notices (ADR-052)** — while the dropped-update warning is
-  unacknowledged, the **Output** section header reads `Output ⚠ <n> dropped`.
-  The pane is collapsed by default and the warning no longer raises the
-  diagnostics card's badge, so without the marked header the condition could be
-  on screen and unseeable.
-- **§9.2 edge-triggered channel conditions (ADR-053)** — the five-second settle
-  is a **minimum, not a deadline**: it is judged on a cadence point the channel
-  reaches, so a slow schedule reports at its next send. The table no longer
-  claims all three conditions close — discarded updates are a run total with no
-  recovery edge to report, which is now stated rather than left as a dash.
+- **§4.2 running serial recovery (ADR-055)** — after a running serial write
+  reports an unusable handle, Talker closes it before reopening the same
+  configured port. Known transient flow-control results retry the existing
+  handle; device, permission, operation-aborted, and unclassified errors replace
+  it. Initial-open failure, a replacement that returns under another port name,
+  and uncertainty after a partial write remain explicit boundaries.
+- **§9.2 retry accounting (ADR-055)** — reopening is attempted at the next due
+  send allowed by bounded backoff. An unavailable replacement withholds that
+  send without rendering or entering failed-write and send-call timing totals.
+  The single recovery log edge names the port when sending recovers on an
+  automatically reopened handle. The five-second backoff cap limits retry
+  frequency; it is not a recovery-time promise.
+- **§12.1 deferred TCP reconnect** — an established TCP stream that fails still
+  uses bounded retries without creating a new connection. Automatic reconnect
+  remains open until its partial-write, replay, and retry-accounting boundaries
+  receive a separate decision.
 
 Earlier revisions are in [REVISIONS.md](REVISIONS.md). They live there rather
 than here for two reasons: a document's version number belongs only in its own
@@ -270,49 +270,62 @@ The **detail pane** (right) shows the selected channel:
     Unapplied edits therefore no longer make this row describe a schedule that is
     not running; for Serial it reports UART line utilization and headroom against
     that configuration. A second line shows measured application
-    headroom after warm-up from an eligible recent or cumulative run-wide
-    render/send timing snapshot. An expired recent snapshot cannot supply this
-    estimate; a warmed run-wide fallback is labelled explicitly. Low margin and
-    physical serial oversubscription are amber.
+    headroom after warm-up from eligible timing covering the last ~10 seconds or
+    from cumulative run-wide timing. Recent timing whose update is ten seconds
+    old cannot supply this estimate; a warmed run-wide fallback is labelled
+    explicitly. Low margin and physical serial oversubscription are amber.
   - *Cadence:* leads with the schedule — how many messages are sending and at
     which intervals, grouped by distinct interval (`3 messages: 2 at 50 ms, 1 at
     15 s`) and summarized past three groups. A lateness figure never appears
-    without that count beside it, because the measurement pools every active
-    message's deadlines and reads as one message's behaviour otherwise. The
-    measurement itself is stated in plain terms — the worst delay with the number
-    of sends behind it (`worst send started 1.4 ms late … of 4,300 sends`), plus
-    `99% of sends started ≤ X late` where that is a different figure, keeping the
-    `≤` glyph that marks a histogram-bucket bound. There is **no warm-up state**
-    (ADR-046): one measured form serves every sample count. Any percentage scales
-    against the shortest interval without restating it, since the schedule phrase
-    already names it on the same line. Interval detail comes from the running
-    schedule's own per-message intervals once the channel has reported any, and
-    from the on-screen draft otherwise — never both in one render.
+    without that schedule beside it, because the measurement pools every active
+    message's deadlines and reads as one message's behaviour otherwise. The main
+    figure is `worst <duration> behind schedule`; its percentage of the shortest
+    interval and a distinct `99% within <duration>` follow together in one
+    parenthesis, separated as distinct statistics, so the worst figure does not
+    move as a percentile appears or disappears. `last ~10 s` states that the
+    figure describes current behaviour; update age says when that period ended.
+    The tooltip pairs its sample count with whichever period supplied the
+    displayed figure: current, final-before-stop, or the whole run for a labelled
+    fallback. There is **no warm-up state** (ADR-046): one measured form serves
+    every sample count. Interval detail comes from the running schedule's own
+    per-message intervals once the channel has reported any, and from the
+    on-screen draft otherwise — never both in one render.
   - *Missed-send routing (ADR-045, amended by ADR-051):* when any scheduled send
     has been skipped, one callout says where to look rather than restating the
-    count — a **live** interface fault first (retry backoff withholds sends),
-    then a serial line that cannot carry the schedule, then the message the
-    misses were **charged to**, then the message whose sends delayed the others,
-    then application headroom, and otherwise the render and send-call timing.
-    Exactly one of those branches may convict: misses charged at the moment they
-    were skipped are evidence about the misses themselves, so that branch states
-    an amount and names a message for it. Every other branch keeps the hedged
-    verbs, and for the same reasons as before — its counts are run totals, so a
-    fault that has since recovered is described in the past tense; a capacity
-    finding is a projection; and delay-based blocking evidence is qualified
-    because it comes from deadlines the channel reached rather than the ones it
-    skipped. The amount-stating branch must close its own arithmetic: the
-    charged total, the largest single share, and the remainder, so that a reader
-    is never left to infer where the rest went. That remainder is described as
-    **not charged to any send** and never as an idle channel. The record
-    supports one negative fact — no measured interface write spanned those
-    points — and a late deadline wake, work outside the send call, and a
-    genuinely free thread all produce it. The retained history is sized from
-    the schedule, so a write that could have spanned a point has not been
-    forgotten; the gap is in what is measured, not in what is kept. The callout carries a **Dismiss** button, on the rule in §3.2
-    *Dismissible warnings* below. It is advice rather than a count: the misses
-    stay on the send-outcomes line and keep the card's badge raised, so
-    dismissing hides where to look and never what happened.
+    count — a **live** interface fault to fix first, then a serial line that
+    cannot carry the schedule, then a message whose send was in progress when
+    misses occurred, then a message whose sends delayed the others, then
+    estimated application headroom. With only one active message, it instead
+    directs the technician to compare that message's longest send call with its
+    interval or consider a late channel wake-up. An earlier failed-send total is
+    only an uncorrelated historical clue and follows those stronger findings.
+    Other unmatched cases direct them to the render and send-call timing. Only
+    the observed-overlap branch states an
+    amount: it is recorded when each miss happens and does not depend on the
+    delayed send later starting. A message offered with “check message #…” is a
+    weaker, delay-based lead rather than proof of those misses. A live failure is
+    an action priority, not proof that it caused the misses; an impossible serial
+    schedule and an observed send overlap are direct findings. Earlier failure
+    counts may describe a problem that has cleared, and application headroom
+    remains guidance rather than proof.
+
+    The amount-stating branch closes its arithmetic with the total for which
+    Talker was waiting for another message's serial or network send to finish,
+    the largest single share, and the remainder. For the remainder, the callout
+    says no serial or network send was recorded as being in progress. It never
+    calls the channel idle: a late wake, other work, and a genuinely free thread
+    all leave the same gap in this measurement. A message is not counted against
+    its own missed points; a send lasting longer than that message's interval is
+    compared through **Send call** instead.
+
+    **Timing & runtime details** presents those limits as four labelled points,
+    using the same message, interval, send-call, failure, and capacity vocabulary
+    as the screen. The retained-history sizing that proves an eligible send was
+    not merely forgotten remains in ADR-051, not in the technician-facing help.
+    The callout carries a **Dismiss** button, on the rule in §3.2 *Dismissible
+    warnings* below. It is advice rather than a count: the misses stay on the
+    send-outcomes line and keep the card's badge raised, so dismissing hides
+    where to look and never what happened.
   - *Per-message timing (ADR-045, amended by ADR-051):* a collapsed table, one
     row per message numbered as in the Messages editor, with seven columns —
     **Msg**, **Interval**, **Sends**, **Late**, **Send call**, **Longest
@@ -324,12 +337,9 @@ The **detail pane** (right) shows the selected channel:
     message displaced — which can exceed the send that caused it and must never
     be presented as a duration the channel was held — and the cadence points
     others lost outright while it was sending. Neither converts into the other.
-    All three come from charging each deadline, and each skipped point, to
-    whichever send in the retained history was holding the channel when it
-    passed. That history is sized from the schedule — a deadline is separated
-    from its handling by at most one send per other message — so a longer
-    message list widens the reach rather than exhausting it. Because a channel
-    handles its messages one at a time, the message
+    All three are attributed by matching each deadline and skipped point to the
+    send that was holding the channel when it passed. Because a channel handles
+    its messages one at a time, the message
     recording the lateness and the message causing it are routinely different
     rows; the table exists so that comparison is a single read across a row. An
     interval that changed mid-run is marked, because the timing beside it is
@@ -341,10 +351,10 @@ The **detail pane** (right) shows the selected channel:
     forever. A **victim-side** miss count is still not offered at any
     granularity: skips accrue as `late / interval + 1`, so they concentrate on
     the shortest interval and would name the message that suffered. The count
-    that is offered is the culprit's, charged at the moment each point was
-    skipped, which is why it stays attributable under the heavy overload that
-    starves the delay figures beside it (ADR-051). Per-message histograms are
-    cumulative-only; the rolling window stays channel-wide.
+    that is offered belongs to the message whose send was in progress when each
+    point was skipped, which is why it stays attributable under the heavy
+    overload that starves the delay figures beside it (ADR-051). Per-message
+    histograms are cumulative-only; the rolling window stays channel-wide.
   - *Work per send:* the two stages of the work itself — render and the
     synchronous send call — over the approximate last ten seconds, beside the
     cumulative run maximum lateness. Deadline lateness is deliberately **absent**:
@@ -352,25 +362,23 @@ The **detail pane** (right) shows the selected channel:
     that makes it readable, so repeating it here was one fact in two places. This
     line is the only channel-wide view of the two stages *as they are now*, since
     the per-message table is cumulative — which makes it the "is it Talker or the
-    link" check. Each pushed timing snapshot is classified as pending, current
-    (with capture age), expired, or final-at-run-end from runner-supplied
-    provenance; Capacity, Cadence, and this line use the same classification. The
-    timer readout names the configured timing mode, active policy, shortest active
+    link" check. The boundaries read `longest render` and `longest send call`;
+    where a percentile differs it follows the longest observation rather than
+    moving it. Timing with no capture reads `awaiting timing data`; usable timing
+    names `last ~10 s` and adds update age after one second; stale timing reads
+    `recent timing unavailable`; and a clean run end retains `final ~10 s before
+    stop`. Capacity, Cadence, and this line use the same classification. The timer
+    readout names the configured timing mode, active policy, shortest active
     interval, cadence alignment, wall-clock re-alignment count, and any Windows
     1 ms request failure (ADR-032 through ADR-042).
-  - *Sample counts are stated once per line.* A readout that already names a
-    count — the per-message table's Sends column, or the work line's own total —
-    does not repeat it beside every figure. A boundary states its own count only
-    where its population differs, which is exactly where it carries information:
-    lateness is sampled for sends that retry backoff then withheld, and the send
-    call is timed for writes that failed, so a gap is evidence rather than noise.
-  - *Observer health:* `Display backlog: <len>/<cap> (peak <p>, <d> dropped)` —
-    the runner→UI status-queue gauge (ADR-018/ADR-019); amber when the peak
-    nears the cap or anything was dropped. Pressure here never delays a send;
-    counters are cumulative, so tallies stay exact across drops. The gauge is
-    the card's only account of dropped updates: what those drops cost is the
-    **Output** pane's completeness, so the warning about them is raised there
-    (§5.7) and the card's badge does not rise for them (ADR-052).
+  - *Sample counts are stated once with their context.* The Cadence line puts its
+    count in the tooltip beside the current, final, or run-wide period it
+    qualifies. A readout that already names a count — the per-message table's
+    Sends column, or the work line's own total — does not repeat it beside every
+    figure. A boundary states its own count only where its population differs,
+    which is exactly where it carries information: lateness is sampled before
+    retry backoff can withhold a scheduled send, and the send call is timed for
+    writes that failed, so a gap is evidence rather than noise.
 - **Dismissible warnings** (ADR-052) — the missed-send routing callout and the
   Output pane's dropped-update warning each carry a **Dismiss** button. Both
   stand on a per-run counter that only grows, so dismissal records that counter
@@ -397,8 +405,8 @@ The **detail pane** (right) shows the selected channel:
   column *N* of every line describes the same message and one fact can be diffed
   across runs without re-assembling a block per message.
 - **Configure interface** / **Configure messages** sections (the editors), and
-  the **Output** display pane, headed by the two notices that qualify how
-  complete its lines are — dropped diagnostic updates and sampling (§5.7).
+  the **Output** display pane, headed by the three live-update and sampling lines
+  described in §5.7.
 
 The deadline-wait policy is derived from the shortest active interval —
 continuous below 32 ms, a bounded window at or above it — and is **not
@@ -453,6 +461,31 @@ All standard RS-232 parameters are user-configurable:
 - Stop bits (1, 2)
 - Hardware flow control (RTS/CTS, None)
 
+If Windows describes an absent port with its known filesystem-oriented file- or
+path-not-found wording, the error instead reads `no device is present at
+<port>`. The dependency's broader unavailable-device category also covers busy
+and access-denied ports, so those and all unfamiliar or localized
+operating-system messages retain their original detail.
+
+After a run has successfully opened a serial port, timeout, would-block,
+interrupted, and zero-write results can describe transient flow control and are
+retried on the existing handle. Every other write error, including one the
+operating system cannot classify more narrowly, makes that handle unusable.
+Talker closes it before attempting to reopen the same configured port. If the
+device returns under that name and no other process owns it, the same GUI or CLI
+run resumes without user action. On Windows, an operation-aborted result still
+replaces the handle even when the operating system categorizes it as a timeout.
+
+Automatic replacement begins only after the run opened successfully. An initial
+open failure still ends that run; the GUI uses its existing **Retry Channel**
+action, while CLI mode must start a new run. Recovery does not search for a
+renamed port: if the replacement appears under a different name, the configured
+port must be changed. A failed write may have transferred a prefix before the
+operating system reported the error, so serial recovery cannot promise
+exactly-once delivery. Disconnecting only the far-end RS-232 cable or device may
+produce no operating-system write error at all; automatic recovery starts only
+when the owned port handle reports a failure.
+
 ### 4.3 Real-Time Parameter Changes
 
 Interface parameters (port, baud rate, UDP port, host address, etc.) are adjustable while the program is running in GUI mode. When a change requires closing and reopening the interface:
@@ -461,6 +494,11 @@ Interface parameters (port, baud rate, UDP port, host address, etc.) are adjusta
 - The user is notified visibly in the GUI (status indicator)
 - The interface is automatically closed, reconfigured, and reopened
 - Output resumes without user action
+
+If a serial channel is already recovering from an unusable handle, a successful
+live update opens the new settings and clears the pending replacement. If that
+update fails, the previous settings remain confirmed and automatic reopen
+attempts continue with them.
 
 The transport kind itself is selected when the channel is created and is not an
 in-place interface parameter. A different transport is represented by a newly added
@@ -577,23 +615,30 @@ The display mode is a GUI-only setting and is not saved in the profile.
 
 #### Completeness notices
 
-Two notices head the pane, above the view controls, because both qualify how
-complete the lines below them are — which is a fact about this pane, not about
-the wire, and so is stated here rather than in the diagnostics card (ADR-052):
+Three lines head the pane above the view controls. The first two explain the
+shared live-update queue and its warning; the third qualifies Output sampling.
+The queue can also affect live diagnostic readouts, as its tooltip states. It is
+shown here because the warning needs one visible home and discarded payload
+updates land in Output, not because the queue is Output-only (ADR-052):
 
-1. **Dropped diagnostic updates** — `<n> diagnostic updates dropped; live
-   readouts may lag`, an attention callout shown when the runner has discarded
-   any update because the UI queue was full. It can cost a payload line, a
-   counter snapshot, a timer change, or an interface error notice; sends are
-   never delayed by it, counters remain self-correcting, and the final run
-   snapshot stays exact. Dismissible, per §3.2.
-2. **Sampled output** — `sampled output · not every sent payload is shown ·
+1. **Dropped live updates** — `<n> live updates dropped; Output may omit lines
+   and live readouts may lag`, an attention callout shown when the runner has
+   discarded any update because the UI queue was full. It can cost a payload
+   line, a counter update, a timer change, or an interface error notice; sends
+   are never delayed by it, counters remain self-correcting, and the final run
+   totals stay exact. Dismissible, per §3.2.
+2. **Live-update queue** — `live update queue at last screen check:
+   <len>/<capacity> · peak <peak> · <drops> dropped`, shown in small, quiet text.
+   It is the gauge behind the warning above and lives beside it rather than under
+   Timing & runtime details. Queue pressure never delays a send; later cumulative
+   updates correct the live totals and the final run totals remain exact.
+3. **Sampled output** — `sampled output · not every sent payload is shown ·
    limit ~<n>/s`, shown once the cumulative accepted total proves an omitted
    payload update, and then for the rest of the run. A standing statement about
    how the pane works rather than a state to act on, so it takes no accent and
-   no ⚠ — but it qualifies every line beneath it, so it is set in a strong
-   weight rather than a small, weak one. It is not dismissible: it describes a
-   condition that stays true.
+   no ⚠. It uses the same small, quiet treatment as the queue gauge; the active
+   dropped-update callout alone carries urgency. It is not dismissible because
+   it describes a condition that stays true.
 
 While the dropped-update warning is unacknowledged, the **Output** section
 header itself reads `Output ⚠ <n> dropped` in the warning accent. The pane is
@@ -1041,6 +1086,19 @@ competing with.
 | Off schedule (ADR-053) | the first skipped send, at WARN | the first cadence point reached at least five seconds after the last skip, at INFO, carrying the episode's total |
 | Display updates discarded | the first discarded update, at WARN | nothing — see below |
 
+After a failed write, additional due sends are gated by a bounded retry delay
+that starts at 250 ms and doubles to at most five seconds. A retry is considered
+only when the schedule next reaches a due send after that delay, so five seconds
+caps retry frequency rather than recovery latency; a slower schedule waits for
+its next due point. For an unusable serial handle, that point first attempts the
+replacement described in §4.2. If reopening fails, the due send is counted as
+withheld: no payload is rendered, no interface write is attempted, and no render
+or send-call timing or send-overlap attribution is recorded. The original write
+failure remains a failed send, and the first later successful write closes the
+same failure episode. That single INFO recovery edge names the configured serial
+port when sending recovers on the automatically reopened handle; opening the
+handle does not add a separate log event.
+
 Two of the three close; the third cannot. Discarded updates are a run total
 that never returns to zero, so there is no recovery edge to report. The standing
 count is on the Output pane (§5.7), which is where it can be acted on.
@@ -1132,6 +1190,10 @@ Coverage requirements:
 ### 12.1 Open Items
 
 - Additional interface types beyond TCP/UDP/serial (WebSocket, raw socket, etc.)
+- Automatic TCP client reconnect after an established stream fails. Current
+  bounded retries retain that stream rather than creating a new connection; a
+  future decision must preserve failed-write versus withheld-send accounting and
+  must not assume that an errored write transferred no bytes.
 - Additional CRC/checksum algorithms beyond the initial set
 - Additional named proprietary NMEA sentences beyond `$PRDID` and `$PASHR`
 - Installer/packaging requirements for broader distribution

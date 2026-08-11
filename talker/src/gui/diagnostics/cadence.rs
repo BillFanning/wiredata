@@ -16,11 +16,25 @@ pub(in crate::gui) fn relative_to_shortest(
     duration: std::time::Duration,
     shortest: std::time::Duration,
 ) -> String {
+    share_of_shortest(duration, shortest)
+        .map(|share| format!(" ({share})"))
+        .unwrap_or_default()
+}
+
+/// The bare phrase, for a caller assembling its own bracket.
+///
+/// `None` when there is no interval to scale against, which is not the same as
+/// an empty string: a caller joining qualifiers has to leave the separator out
+/// too, and a blank entry would have left a stray separator behind.
+fn share_of_shortest(
+    duration: std::time::Duration,
+    shortest: std::time::Duration,
+) -> Option<String> {
     if shortest.is_zero() {
-        return String::new();
+        return None;
     }
     let percentage = duration.as_secs_f64() / shortest.as_secs_f64() * 100.0;
-    format!(" ({} of the shortest interval)", percent(percentage))
+    Some(format!("{} of the shortest interval", percent(percentage)))
 }
 
 /// The most interval groups the schedule phrase will name before summarizing.
@@ -169,45 +183,59 @@ pub(in crate::gui) fn cadence_decision(
             format!("{schedule} · awaiting the first scheduled send")
         }
     } else if recent_samples == 0 {
+        let recent_state = if matches!(snapshot_state, RecentSnapshotState::Pending) {
+            snapshot_label
+        } else {
+            format!("no scheduled deadlines in {snapshot_label}")
+        };
         format!(
-            "{schedule} · nothing sent in {snapshot_label} · {}",
+            "{schedule} · {recent_state} · {}",
             lateness_phrase("worst this run", run_max, shortest)
         )
     } else {
-        // One measured state at every sample count. The percentage is anchored
-        // to whichever figure the sentence ends on, so it always qualifies the
-        // number immediately before it.
+        // One measured state at every sample count. The optional percentage
+        // scales the worst value; the percentile is separate distribution
+        // context and follows it only when the two figures differ.
         let recent_max = recent.deadline_lateness.max().unwrap_or_default();
         let recent_p99 = recent
             .deadline_lateness
             .percentile_upper_bound(99)
             .unwrap_or_default();
         // "Sends" would be wrong here. Lateness is sampled when the channel
-        // reaches a scheduled point, which happens before retry backoff decides
-        // whether to attempt anything — so this population includes sends that
-        // were withheld and never transmitted, and excludes skipped points the
-        // channel never reached at all. "Reached" is exactly that set.
-        let measured = if recent_p99 < recent_max {
-            format!(
-                "99% within {} of schedule, worst {} behind{}",
-                compact_duration(recent_p99),
-                compact_duration(recent_max),
-                shortest
-                    .map(|interval| relative_to_shortest(recent_max, interval))
-                    .unwrap_or_default(),
-            )
+        // reaches a scheduled deadline, before retry backoff decides whether to
+        // attempt anything. This population therefore includes work later
+        // withheld and excludes skipped points the channel never reached.
+        // One skeleton, whatever the figures do. The percentile used to lead
+        // the clause when it differed from the maximum and vanish when it did
+        // not, which moved every word after it — on a live readout that
+        // crosses back and forth as samples arrive, the line re-lays itself
+        // under the reader. The worst figure now always holds the same
+        // position. Two compact pieces of context follow in one bracket: the
+        // share normalizes the worst figure to the schedule, while the
+        // percentile contrasts the broader distribution with that outlier.
+        // A semicolon keeps those distinct statistics from reading as two
+        // names for the same number.
+        let mut qualifiers = Vec::new();
+        if let Some(share) = shortest.and_then(|interval| share_of_shortest(recent_max, interval)) {
+            qualifiers.push(share);
+        }
+        if recent_p99 < recent_max {
+            qualifiers.push(format!("99% within {}", compact_duration(recent_p99)));
+        }
+        let qualifiers = if qualifiers.is_empty() {
+            String::new()
         } else {
-            format!(
-                "worst was {} behind schedule{}",
-                compact_duration(recent_max),
-                shortest
-                    .map(|interval| relative_to_shortest(recent_max, interval))
-                    .unwrap_or_default(),
-            )
+            format!(" ({})", qualifiers.join("; "))
         };
+        // The sample count is not on the line. A bare "201" invited the reader
+        // to weigh a denominator nothing on screen explained; the tooltip now
+        // states it with the window it was measured over, which is what makes
+        // it mean anything. What the line keeps is the window itself, because
+        // that is what says the figure describes current behaviour rather than
+        // the whole run.
         format!(
-            "{schedule} · {measured} · {} scheduled sends reached · {snapshot_label}",
-            thousands(recent_samples)
+            "{schedule} · worst {} behind schedule{qualifiers} · {snapshot_label}",
+            compact_duration(recent_max)
         )
     };
 
@@ -227,6 +255,9 @@ pub(in crate::gui) fn cadence_decision(
 pub(in crate::gui) fn cadence_tooltip(
     cadence: Option<ActiveCadence>,
     groups: &[(std::time::Duration, usize)],
+    recent_samples: u64,
+    run_samples: u64,
+    snapshot_state: RecentSnapshotState,
 ) -> String {
     // Same source rule as the row itself: per-message detail when the channel
     // has reported any, the timer status' own count otherwise.
@@ -235,30 +266,71 @@ pub(in crate::gui) fn cadence_tooltip(
     } else {
         groups.iter().map(|(_, count)| count).sum()
     };
-    let pooling = if active > 1 {
-        format!(
+    let pooling = match active {
+        0 => "No message is currently scheduled to send. When messages are active, each follows \
+              its own repeating interval."
+            .to_owned(),
+        1 => "A channel sends each of its messages on its own repeating interval; this one \
+              currently has a single message sending, so its cadence timing describes that \
+              message."
+            .to_owned(),
+        _ => format!(
             "This channel is sending {active} messages, each on its own repeating interval, and \
-             all of them go out through one interface, one at a time. The figure above pools \
-             every active message's sends together — it is the channel's behaviour, not any \
-             single message's. Because a \
+             all of them go out through one interface, one at a time. When timing is available, \
+             it pools every active message's sends together — it is the channel's behaviour, \
+             not any single message's. Because a \
              message that repeats more often contributes more sends, the fastest messages weigh \
              most heavily in it."
+        ),
+    };
+
+    // The sample count lives here rather than on the line, and never alone. It
+    // follows the same source choice as the line: current/final timing when it
+    // has samples, otherwise the labelled run-wide fallback.
+    let using_run = matches!(snapshot_state, RecentSnapshotState::Expired(_))
+        || (recent_samples == 0 && run_samples > 0);
+    let (samples, period) = if using_run {
+        (run_samples, "since this run started")
+    } else if matches!(snapshot_state, RecentSnapshotState::Final) {
+        (recent_samples, "in the final ~10-second period before stop")
+    } else {
+        (
+            recent_samples,
+            "in the ~10-second period ending at the latest timing update",
+        )
+    };
+    let basis = if samples == 0 {
+        "No scheduled deadlines have been measured yet.".to_owned()
+    } else if using_run {
+        format!(
+            "The run-wide figure is based on {} scheduled {} {period}.",
+            thousands(samples),
+            if samples == 1 {
+                "deadline"
+            } else {
+                "deadlines"
+            },
         )
     } else {
-        "A channel sends each of its messages on its own repeating interval; this one currently \
-         has a single message sending, so the figure above describes that message."
-            .to_owned()
+        format!(
+            "Based on {} scheduled {} {period}.",
+            thousands(samples),
+            if samples == 1 {
+                "deadline"
+            } else {
+                "deadlines"
+            },
+        )
     };
 
     format!(
-        "{pooling} This measures one thing: the gap between the moment a send was scheduled for \
-         and the moment the channel actually got to it. It does not include how long the send \
-         itself took, and it never means the data arrived late at the far end. \"Reached\" is the \
-         exact population behind it — every scheduled send the channel got to, which includes any \
+        "{basis} {pooling} This measures one thing: the gap between the moment a send was \
+         scheduled for and the moment the channel actually got to it. It does not include how \
+         long the send itself took, and it never means the data arrived late at the far end. The \
+         timing covers every scheduled send the channel got to, including any \
          that were then withheld by retry backoff without being transmitted, and excludes points \
          skipped entirely, which are counted as Missed on the Send outcomes line and never appear \
-         here. The worst delay is always shown with that count beside it, so a figure from four \
-         cannot be mistaken for one from four thousand. \"99% within X of schedule\" appears \
+         here. \"99% within X\" appears \
          alongside only when that is a different figure from the worst — below a hundred it never \
          is — and means at most one in a hundred waited longer than X, rounded up to a histogram \
          bucket edge, which is what ≤ marks elsewhere. Any percentage compares the delay with the \
@@ -297,8 +369,8 @@ mod tests {
         );
         assert_eq!(
             few.text,
-            "3 messages: 2 at 50 ms, 1 at 1,000 ms · worst was 1.00 ms behind schedule \
-             (2% of the shortest interval) · 4 scheduled sends reached · recent snapshot"
+            "3 messages: 2 at 50 ms, 1 at 1,000 ms · worst 1.00 ms behind schedule \
+             (2% of the shortest interval) · last ~10 s"
         );
         assert_eq!(few.tone, SignalTone::Neutral);
 
@@ -316,7 +388,7 @@ mod tests {
             RecentSnapshotState::Current(Duration::ZERO),
         );
         assert!(
-            more.text.contains("worst was 1.00 ms behind schedule") && !more.text.contains("99%"),
+            more.text.contains("worst 1.00 ms behind schedule") && !more.text.contains("99%"),
             "twenty samples must not promote the same figure to a percentile: {}",
             more.text
         );
@@ -337,8 +409,46 @@ mod tests {
         );
         assert_eq!(
             spread.text,
-            "3 messages: 2 at 50 ms, 1 at 1,000 ms · 99% within 1.00 ms of schedule, worst 40 ms \
-             behind (80% of the shortest interval) · 201 scheduled sends reached · recent snapshot"
+            "3 messages: 2 at 50 ms, 1 at 1,000 ms · worst 40 ms behind schedule \
+             (80% of the shortest interval; 99% within 1.00 ms) · last ~10 s"
+        );
+
+        // The normalization and percentile are distinct facts in one compact
+        // bracket; the semicolon must preserve that distinction.
+        assert_eq!(
+            spread.text.matches('(').count(),
+            1,
+            "the worst figure takes one bracket, not one per qualifier: {}",
+            spread.text
+        );
+
+        // The sample count is gone from the line: it is a denominator nothing
+        // on the row explained, and it now appears in the tooltip beside the
+        // window that gives it meaning.
+        for line in [&few.text, &more.text, &spread.text] {
+            assert!(
+                !line.contains("reached"),
+                "the sample count belongs in the tooltip, with its window: {line}"
+            );
+        }
+
+        // The point of the shape, not just its wording: a percentile appears
+        // and disappears as the samples spread, and nothing before it may move.
+        // It used to lead the clause, so gaining one shifted every word after
+        // it and the live line re-laid itself under the reader.
+        let leading = "3 messages: 2 at 50 ms, 1 at 1,000 ms · worst ";
+        for line in [&more.text, &spread.text] {
+            assert!(
+                line.starts_with(leading),
+                "the worst figure holds its position with and without a percentile: {line}"
+            );
+        }
+        assert!(
+            spread
+                .text
+                .contains("behind schedule (80% of the shortest interval; 99% within"),
+            "the percentile trails the primary figure as a distinct statistic: {}",
+            spread.text
         );
     }
 
@@ -468,7 +578,8 @@ mod tests {
     /// technician reading the row has no other source for it.
     #[test]
     fn cadence_tooltip_explains_pooling_only_when_several_messages_send() {
-        let many = cadence_tooltip(mixed_cadence(), &mixed_groups());
+        let current = RecentSnapshotState::Current(Duration::ZERO);
+        let many = cadence_tooltip(mixed_cadence(), &mixed_groups(), 201, 2_001, current);
         assert!(many.contains("sending 3 messages, each on its own repeating interval"));
         assert!(many.contains("pools every active message's sends together"));
 
@@ -478,6 +589,9 @@ mod tests {
                 shortest: Duration::from_millis(250),
             }),
             &cadence_groups([Duration::from_millis(250)]),
+            201,
+            2_001,
+            current,
         );
         assert!(
             !one.contains("pools every active message's sends together"),
@@ -486,9 +600,77 @@ mod tests {
         assert!(one.contains("describes that message"));
 
         // Both forms must define what "late" measures and rule out delivery.
-        for tooltip in [many, one] {
+        for tooltip in [&many, &one] {
             assert!(tooltip.contains("scheduled for"));
             assert!(tooltip.contains("never means the data arrived late at the far end"));
+            // The sample count left the row for here, and may never appear
+            // without the window it was gathered over — a bare denominator is
+            // the thing that move was meant to stop showing.
+            assert!(
+                tooltip.starts_with(
+                    "Based on 201 scheduled deadlines in the ~10-second period ending at the latest timing update"
+                ),
+                "the count must lead, paired with its window: {tooltip}"
+            );
         }
+
+        // Nothing measured yet says so, rather than offering a zero to weigh.
+        let none = cadence_tooltip(
+            mixed_cadence(),
+            &mixed_groups(),
+            0,
+            0,
+            RecentSnapshotState::Pending,
+        );
+        assert!(
+            none.starts_with("No scheduled deadlines have been measured"),
+            "{none}"
+        );
+        let dormant = cadence_tooltip(None, &[], 0, 0, RecentSnapshotState::Pending);
+        assert!(
+            dormant.contains("No message is currently scheduled to send"),
+            "a dormant channel must not be described as having one message: {dormant}"
+        );
+        assert!(!dormant.contains("single message sending"), "{dormant}");
+
+        // Once recent timing expires (or contains no sends), the line falls
+        // back to its run-wide maximum. The tooltip's count must follow that
+        // source rather than describing a stale recent population.
+        let run_wide = cadence_tooltip(
+            mixed_cadence(),
+            &mixed_groups(),
+            17,
+            2_001,
+            RecentSnapshotState::Expired(Duration::from_secs(11)),
+        );
+        assert!(
+            run_wide.starts_with(
+                "The run-wide figure is based on 2,001 scheduled deadlines since this run started"
+            ),
+            "{run_wide}"
+        );
+
+        // Defensive but grammatical: cumulative timing can exist before a
+        // recent capture has arrived, and Pending is not a phrase that can
+        // follow "in".
+        let mut cumulative = SendTimingTelemetry::default();
+        cumulative
+            .deadline_lateness
+            .record(Duration::from_millis(1));
+        let pending = cadence_decision(
+            SendTimingTelemetry::default(),
+            cumulative,
+            mixed_cadence(),
+            &mixed_groups(),
+            false,
+            RecentSnapshotState::Pending,
+        );
+        assert!(
+            pending
+                .text
+                .contains("awaiting timing data · worst this run"),
+            "{pending:?}"
+        );
+        assert!(!pending.text.contains("in awaiting"), "{pending:?}");
     }
 }

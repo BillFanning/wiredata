@@ -4,7 +4,7 @@ use anyhow::Context;
 use clap::{Args as ClapArgs, ValueEnum};
 
 use crate::core::{
-    channel::{ChannelId, Interface},
+    channel::{ChannelId, Interface, InterfaceConfig},
     logging::{self, FileLogConfig, Rotation},
     message::decode_utf8_lossy_latin1,
     profile::{self, Profile},
@@ -211,10 +211,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 .with_context(|| format!("compiling channel {i} schedule"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut prepared: Vec<(runner::RunnerIdentity, Box<dyn Interface>, Schedule)> = Vec::new();
+    let mut prepared: Vec<(
+        runner::RunnerIdentity,
+        Box<dyn Interface>,
+        InterfaceConfig,
+        Schedule,
+    )> = Vec::new();
     for ((i, channel), schedule) in channels.into_iter().enumerate().zip(schedules) {
-        let interface = channel
-            .interface
+        let config = channel.interface;
+        let interface = config
             .open()
             .with_context(|| format!("opening channel {i}"))?;
         let label = if channel.name.is_empty() {
@@ -227,7 +232,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             label,
             run_id: crate::core::run_summary::RunId::mint(),
         };
-        prepared.push((who, interface, schedule));
+        prepared.push((who, interface, config, schedule));
     }
 
     // One runner thread per channel, each driven by the same core send loop
@@ -254,7 +259,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // to the channel's position in the profile.
     let mut echo_index: std::collections::HashMap<ChannelId, usize> =
         std::collections::HashMap::new();
-    for (i, (who, interface, schedule)) in prepared.into_iter().enumerate() {
+    for (i, (who, interface, config, schedule)) in prepared.into_iter().enumerate() {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
         cmd_txs.push(cmd_tx);
         echo_index.insert(who.id, i);
@@ -265,7 +270,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             runner::run(
                 who,
                 interface,
-                None,
+                Some(config),
                 schedule,
                 cmd_rx,
                 runner::RunnerObserver::new(status_tx, policy),

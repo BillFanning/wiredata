@@ -129,8 +129,8 @@ bad enough that few deadlines are reached at all. Suffering and causing usually 
 rows, and that is the normal shape of a cadence problem: a channel handles its messages one at a \
 time, so a slow infrequent message can delay a fast one badly while recording almost no lateness \
 itself. Read across a row, not down a column. Sends counts writes that succeeded; a timing figure \
-repeats a count only where its own differs — lateness is also sampled for sends that retry \
-backoff then withheld, and the send call is timed for writes that failed. Figures cover the whole \
+repeats a count only where its own differs — lateness is sampled before retry backoff can withhold \
+a scheduled send, and the send call is timed for writes that failed. Figures cover the whole \
 run, and a percentile appears only where it differs from the worst value; the rolling ten-second \
 view is channel-wide and appears in the Cadence row instead.";
 

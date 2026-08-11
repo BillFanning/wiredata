@@ -34,15 +34,22 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 ## Robustness & performance (external review, 2026-07-11)
 
-- [x] **Send-failure storms: edge-trigger + backoff** — DONE (`6d4da3b`). A
-  send failure opens a `FailureEpisode` (runner.rs): first failure reported
-  (`ConnectionError`), further due fires suppressed under the bounded-backoff
-  policy (`RETRY_BACKOFF_INITIAL` 250 ms doubling to `RETRY_BACKOFF_MAX` 5 s),
-  first success closes it with `SendRecovered { failures, suppressed }`.
-  Keeps-running contract retained (no manual Retry state); a successful
-  interface update pulls the next retry forward. Pinned by
-  `repeated_send_failures_report_one_connection_error` +
-  `recovery_reports_send_recovered_with_episode_counts`.
+- [ ] **Hardware-check serial recovery on Windows.** With a running schedule,
+  unplug and replace a USB serial adapter that returns under the same COM name;
+  confirm that the same run resumes after the port becomes available. Separately
+  hold CTS low through a write timeout and confirm that transient flow control
+  does not cause port reopen or DTR-reset churn. The automated coverage fixes the
+  state and accounting contract; this check validates real driver mappings and
+  hardware behavior.
+- [ ] **Define automatic TCP reconnect after an established stream fails.** The
+  current bounded failure episode retries the existing stream, which cannot heal
+  after a reset or broken connection. Decide whether and how to establish a fresh
+  connection from the confirmed address at an eligible retry. A failed reconnect
+  must withhold that due send without render, interface-write, or send-call timing;
+  it must not count as a failed write or replay a write that may already have
+  transferred a prefix. UDP retains its existing socket because replacing it can
+  change source-port semantics. Amend the current-behaviour spec and record the
+  transport decision before implementation.
 - [x] **Telemetry split (ADR-018, accepted + implemented 2026-07-11).**
   `TalkerStatus::Sent` replaced by the three lanes: `Counters` (≤5 Hz +
   final-at-stop, cumulative, self-correcting), `SendSample` (payload-bearing,

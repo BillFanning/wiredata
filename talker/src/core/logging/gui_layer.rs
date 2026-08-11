@@ -135,11 +135,9 @@ mod tests {
         // A real tracing event dispatched through the layer: the structured
         // `channel` field (a stable id's raw value, ADR-020) lands in
         // LogEvent::channel, and an event without one yields None.
-        use tracing_subscriber::layer::SubscriberExt as _;
         let (tx, rx) = crossbeam_channel::bounded(8);
-        let subscriber = tracing_subscriber::registry().with(GuiLogLayer::new(tx));
         let id = ChannelId::mint();
-        tracing::subscriber::with_default(subscriber, || {
+        super::super::with_gui_test_subscriber(tx, || {
             tracing::info!(channel = id.as_u64(), "channel 3 running");
             tracing::warn!("app-level warning");
         });

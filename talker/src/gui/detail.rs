@@ -35,7 +35,7 @@ use super::widgets::{
     marker_aware_text_edit, message_editor_max_height, plain_text_edit_with_cursor,
     preview_ascii_layout_job, red_bordered, show_display_pane, show_insert_byte_button,
     show_insert_unit_button, show_interface_summary, show_serial_fields, show_tcp_fields,
-    show_udp_fields, start_button, UppercaseHex,
+    show_udp_fields, start_button, LiveUpdateQueueGauge, UppercaseHex,
 };
 use super::{MessageAnalysisCache, MessageDraftAnalysis, MessagePreview, TalkerApp};
 use wiredata_ui::palette::active as theme_palette;
@@ -158,8 +158,8 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
                         "Timing (run, {} sends): {} · {} · {}",
                         thousands(samples),
                         timing_metric("late", timing.deadline_lateness, samples),
-                        timing_metric("render", timing.render_duration, samples),
-                        timing_metric("send call", timing.send_duration, samples),
+                        longest_metric("render", timing.render_duration, samples),
+                        longest_metric("send call", timing.send_duration, samples),
                     )
                 }
             };
@@ -192,11 +192,29 @@ impl TalkerApp {
                 // were omitted; retained Output history is a separate concern.
                 // Dropped updates are the pane's other completeness limit and
                 // are read from the same snapshot.
-                let (sent_total, dropped_updates) = self
+                let (sent_total, dropped_updates, queue) = self
                     .sup
                     .telemetry_ref(i)
-                    .map(|telemetry| (telemetry.total_count, telemetry.dropped_statuses))
-                    .unwrap_or_default();
+                    .map(|telemetry| {
+                        (
+                            telemetry.total_count,
+                            telemetry.dropped_statuses,
+                            LiveUpdateQueueGauge {
+                                len: telemetry.queue_len,
+                                peak: telemetry.queue_peak,
+                                capacity: super::STATUS_QUEUE_CAP,
+                            },
+                        )
+                    })
+                    .unwrap_or((
+                        0,
+                        0,
+                        LiveUpdateQueueGauge {
+                            len: 0,
+                            peak: 0,
+                            capacity: super::STATUS_QUEUE_CAP,
+                        },
+                    ));
                 let view = &mut self.views[i];
                 show_display_pane(
                     ui,
@@ -204,6 +222,7 @@ impl TalkerApp {
                     &mut view.notices.dropped_updates,
                     sent_total,
                     dropped_updates,
+                    queue,
                 );
             });
         });
@@ -363,7 +382,7 @@ impl TalkerApp {
             if service_source == ServiceTimingSource::Run
                 && matches!(recent_snapshot_state, RecentSnapshotState::Expired(_))
             {
-                text.push_str(" · run-wide timing (recent expired)");
+                text.push_str(" · run-wide timing · recent timing unavailable");
             }
             text
         } else if service_samples == 0 {
@@ -481,9 +500,6 @@ impl TalkerApp {
                 telemetry.timer.clock_realignments
             ),
         };
-        let qlen = telemetry.queue_len;
-        let qpeak = telemetry.queue_peak;
-        let drops = telemetry.dropped_statuses;
         // The send-outcome tone still escalates the card badge even though the
         // counts themselves now live above the card: a failing interface must
         // read as ISSUE there, and the adjacent line carries the reason.
@@ -554,14 +570,20 @@ impl TalkerApp {
                     "Cadence",
                     &cadence_decision.text,
                     cadence_decision.tone,
-                    cadence_tooltip(active_cadence, &cadence_groups),
+                    cadence_tooltip(
+                        active_cadence,
+                        &cadence_groups,
+                        timing.deadline_lateness.sample_count(),
+                        cumulative_timing.deadline_lateness.sample_count(),
+                        recent_snapshot_state,
+                    ),
                 );
                 signal_row(
                         ui,
                         "Capacity",
                         &capacity.text,
                         capacity.tone,
-                        "Requested load comes from the running schedule: each message's wire size and interval as the channel is actually sending them. A channel that is not running has none, so it is projected from the settings shown and labelled as such. Sent rate is the rolling five-second average of configured-interface writes that returned success. Serial utilization is a theoretical UART line estimate. Application headroom compares that same requested load with separate render and interface-write p99 bounds. A warmed recent snapshot is preferred while it is current; an expired snapshot is discarded and a clearly labelled run-wide fallback is used when available. This is an advisory projection, not a hard capacity promise.",
+                        "Requested load comes from the running schedule: each message's wire size and interval as the channel is actually sending them. A channel that is not running has none, so it is projected from the settings shown and labelled as such. Sent rate is the rolling five-second average of configured-interface writes that returned success. Serial utilization is a theoretical UART line estimate. Application headroom compares that same requested load with separate render and interface-write p99 bounds. Timing from the last ~10 seconds is preferred after enough observations; timing whose update is ten seconds old is discarded, and a clearly labelled run-wide fallback is used when available. This is an advisory projection, not a hard capacity promise.",
                     );
             });
 
@@ -578,10 +600,12 @@ impl TalkerApp {
                 if let Some(routing) = missed_send_routing(
                     &MissedSendEvidence {
                         missed,
-                        // The banner error is the only *current* interface
-                        // signal here; `failed` is a run total that may have
+                        // A command failure also appears in the banner, but it
+                        // says nothing about the interface or retry backoff.
+                        // Only the interface-specific state can support this
+                        // branch; `failed` remains a run total that may have
                         // recovered.
-                        interface_erroring: error.is_some(),
+                        interface_erroring: telemetry.last_error.is_some(),
                         failed,
                         serial_oversubscribed: serial.is_some_and(|line| line.is_oversubscribed()),
                         service: service_estimate,
@@ -629,10 +653,10 @@ impl TalkerApp {
                         "The channel continues with ordinary deadline waits. The failed request does not prove that any send was late; inspect measured deadline lateness and Missed cadence points for the observed effect.",
                     );
             }
-            // No dropped-update callout: what those drops cost is the Output
-            // pane's completeness, so the warning is raised there, beside the
-            // sampling note that qualifies the same lines. Only the queue gauge
-            // stays here, under Timing & runtime details.
+            // The dropped-update callout and its one queue gauge are shown
+            // together above the Output pane. Do not repeat either here; the
+            // tooltip there states that the shared queue can also delay these
+            // live readouts.
 
             ui.add_space(5.0);
             egui::CollapsingHeader::new("Timing & runtime details")
@@ -738,7 +762,7 @@ impl TalkerApp {
                                             compact_rate(estimate.capacity_messages_per_second, "msg/s"),
                                         ),
                                         estimate.utilization >= 0.8,
-                                        "Advisory projection: the separate render and configured-interface write p99 histogram upper bounds are added, then compared with the aggregate message rate the running schedule is asking for. A current recent snapshot is preferred after 20 paired observations. Otherwise the run-wide histogram is used after it warms up; a running recent snapshot is always discarded once its capture age reaches ten seconds. A channel that is not running is projected from the settings shown, using timing retained from its previous run. It is not a joint p99 or hard capacity promise. A write may return after driver/kernel buffering, and coincident due messages still serialize.",
+                                        "Advisory projection: the separate render and configured-interface write p99 histogram upper bounds are added, then compared with the aggregate message rate the running schedule is asking for. Timing from the last ~10 seconds is preferred after 20 paired observations. Otherwise run-wide timing is used after it has enough observations; recent timing is discarded once its update is ten seconds old. A channel that is not running is projected from the settings shown, using timing retained from its previous run. It is not a joint p99 or hard capacity promise. A write may return after driver/kernel buffering, and coincident due messages still serialize.",
                                     );
                                 } else {
                                     let text = if service_samples == 0 {
@@ -778,15 +802,9 @@ impl TalkerApp {
                             false,
                             ALIGNMENT_TOOLTIP,
                         );
-                        detail_line(
-                            ui,
-                            format!(
-                                "Display update queue before last drain: {qlen}/{} (sampled peak {qpeak}, {drops} dropped)",
-                                super::STATUS_QUEUE_CAP
-                            ),
-                            qpeak * 2 >= super::STATUS_QUEUE_CAP || drops > 0,
-                            DISPLAY_QUEUE_TOOLTIP,
-                        );
+                        // No queue gauge here: its one copy sits beside the
+                        // live-update warning above Output. That shared queue
+                        // also feeds these readouts, as its tooltip explains.
                     });
 
             // Per-message breakdown (ADR-045). Collapsed by default: it answers

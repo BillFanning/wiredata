@@ -58,6 +58,18 @@ impl std::fmt::Display for ChannelId {
 pub trait Interface: Send {
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()>;
 
+    /// Prepare the live handle for a scheduled retry after a send failure.
+    ///
+    /// Most transient send errors can be retried on the existing handle, so
+    /// the default does nothing. A transport whose failed OS handle cannot
+    /// become usable again may reopen it from `current`; the runner calls this
+    /// only when retry backoff permits another attempt. Returns `true` only
+    /// when this call replaced the operating-system handle. An error withholds
+    /// that due fire without calling [`send`](Self::send).
+    fn prepare_retry(&mut self, _current: Option<&InterfaceConfig>) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Apply `next` to the existing handle when reopening would conflict with
     /// the resource it already owns. Returns `true` when applied in place;
     /// `false` asks the runner to open a replacement and swap on success.
@@ -69,6 +81,20 @@ pub trait Interface: Send {
         Ok(false)
     }
 }
+
+/// A built-in interface needed its confirmed configuration to replace a failed
+/// handle, but the runner did not have one. This is talker's state disagreeing
+/// with itself, not an error reported by the configured link (ADR-054).
+#[derive(Debug)]
+pub(crate) struct MissingRetryConfiguration;
+
+impl std::fmt::Display for MissingRetryConfiguration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("serial retry has no current serial configuration")
+    }
+}
+
+impl std::error::Error for MissingRetryConfiguration {}
 
 impl InterfaceConfig {
     /// Open the live interface described by this config.

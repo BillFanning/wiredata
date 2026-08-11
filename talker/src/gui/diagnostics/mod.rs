@@ -28,7 +28,7 @@ use crate::core::capacity::{
     service_sample_count, ChannelDemand, MessageDemand, ServiceEstimate, MIN_SERVICE_SAMPLES,
 };
 use crate::core::telemetry::{
-    DurationHistogram, MessageTiming, RecentSnapshotState, SendTimingTelemetry,
+    DurationHistogram, MessageTiming, RecentSnapshotState, SendTimingTelemetry, RECENT_WINDOW,
 };
 use crate::core::timing::{ActiveCadence, TimerMode, TimerReason, TimerStatus};
 use wiredata_ui::diagnostics::SignalTone;
@@ -73,21 +73,31 @@ pub(in crate::gui) fn compact_factor(factor: f64) -> String {
 }
 
 pub(in crate::gui) fn recent_snapshot_label(state: RecentSnapshotState) -> String {
+    // "Snapshot" said how the figure travels, not what it covers, and it reads
+    // as an instant — which is the one thing this is not. Every one of these
+    // summarizes up to a whole window, so each state names that window and then
+    // says what is wrong with it, if anything.
+    let window = RECENT_WINDOW.as_secs();
     match state {
-        RecentSnapshotState::Pending => "recent snapshot pending".to_owned(),
+        RecentSnapshotState::Pending => "awaiting timing data".to_owned(),
+        // Under a second old, the age is noise the reader would have to read
+        // past on every frame to learn nothing.
         RecentSnapshotState::Current(age) if age < std::time::Duration::from_secs(1) => {
-            "recent snapshot".to_owned()
+            format!("last ~{window} s")
         }
         RecentSnapshotState::Current(age) => {
-            format!("recent snapshot · as of {} ago", compact_duration(age))
+            format!("last ~{window} s · updated {} ago", compact_duration(age))
         }
+        // Past the window there is no "last ~10 s" left to describe: the figures
+        // are older than the span they claim, so the state leads with that
+        // rather than qualifying a window it can no longer stand behind.
         RecentSnapshotState::Expired(age) => {
             format!(
-                "recent snapshot expired · as of {} ago",
+                "recent timing unavailable · last update {} ago",
                 compact_duration(age)
             )
         }
-        RecentSnapshotState::Final => "final recent snapshot · at run end".to_owned(),
+        RecentSnapshotState::Final => format!("final ~{window} s before stop"),
     }
 }
 
@@ -125,8 +135,8 @@ pub(in crate::gui) fn timing_figures(histogram: DurationHistogram) -> Option<Str
 /// `line_samples` is that count, so this appends its own only when the two
 /// populations differ — the same rule the per-message cells use. Render and the
 /// send call are recorded in lockstep, so on a line carrying both, one shared
-/// count is exact; lateness is sampled for sends that retry backoff then
-/// withheld, so it states its own whenever that gap opens.
+/// count is exact; lateness is sampled before retry backoff can withhold a
+/// scheduled send, so it states its own whenever that gap opens.
 pub(in crate::gui) fn timing_metric(
     label: &str,
     histogram: DurationHistogram,
@@ -143,6 +153,42 @@ pub(in crate::gui) fn timing_metric(
     }
 }
 
+/// A work boundary named by its longest observation.
+///
+/// "Worst" is the right superlative for lateness, where the reader wants the
+/// biggest miss. A render or a send call is not *bad* for taking a long time,
+/// it is just long, so these read "longest render" and "longest send call" —
+/// which also puts the name of the figure before the figure rather than after
+/// the boundary it belongs to.
+///
+/// The percentile trails in parentheses when it differs, so the leading figure
+/// keeps its position as the two converge and the line does not re-lay itself
+/// out around a clause that appears and disappears.
+pub(in crate::gui) fn longest_metric(
+    label: &str,
+    histogram: DurationHistogram,
+    line_samples: u64,
+) -> String {
+    let Some(max) = histogram.max() else {
+        return format!("longest {label} no samples");
+    };
+    let samples = histogram.sample_count();
+    let percentile = histogram
+        .percentile_upper_bound(99)
+        .filter(|p99| *p99 < max)
+        .map(|p99| format!(" (99% ≤ {})", compact_duration(p99)))
+        .unwrap_or_default();
+    let population = if samples == line_samples {
+        String::new()
+    } else {
+        format!(" of {}", thousands(samples))
+    };
+    format!(
+        "longest {label} {}{percentile}{population}",
+        compact_duration(max)
+    )
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::gui) struct DecisionSignal {
     pub(in crate::gui) text: String,
@@ -152,10 +198,10 @@ pub(in crate::gui) struct DecisionSignal {
 /// The badge on the diagnostics card.
 ///
 /// Every input is something the card itself shows or is shown immediately above
-/// it. Discarded diagnostic updates used to raise this badge too, and no longer
-/// do: that warning now belongs to the Output pane, and a badge reading
-/// ATTENTION over rows that are all calm sends the reader hunting inside a card
-/// for a cause that was never in it.
+/// it. Discarded live updates used to raise this badge too, and no longer do:
+/// that shared-queue warning now has one home above Output. A badge reading
+/// ATTENTION over otherwise calm diagnostic rows would make queue pressure look
+/// like a channel problem found by those measurements.
 pub(in crate::gui) fn diagnostic_card_tone(
     delivery: SignalTone,
     capacity: SignalTone,
@@ -309,14 +355,71 @@ mod tests {
             false,
             state,
         );
+        // Past the window there is no "last ~10 s" to claim, so the state says
+        // the recent figure is unavailable and dates the last one instead. A
+        // reader must never take a run-wide number for current behaviour.
         assert_eq!(
             cadence.text,
-            "3 messages: 2 at 50 ms, 1 at 1,000 ms · recent snapshot expired · as \
-             of 11.0 s ago · worst this run 1.00 ms (2% of the shortest interval)"
+            "3 messages: 2 at 50 ms, 1 at 1,000 ms · recent timing unavailable · last \
+             update 11.0 s ago · worst this run 1.00 ms (2% of the shortest interval)"
         );
         assert_eq!(
             timing_detail_text(timing, timing, state),
-            "Work per send: recent snapshot expired · as of 11.0 s ago · run max late 1.00 ms"
+            "Work per send: recent timing unavailable · last update 11.0 s ago · run max late 1.00 ms"
+        );
+    }
+
+    /// Each state names the window it covers, because none of these is an
+    /// instant — every one summarizes up to a whole window of samples, which is
+    /// what "snapshot" hid.
+    #[test]
+    fn a_recent_window_label_states_its_span_and_what_is_wrong_with_it() {
+        assert_eq!(
+            recent_snapshot_label(RecentSnapshotState::Current(Duration::ZERO)),
+            "last ~10 s"
+        );
+        assert_eq!(
+            recent_snapshot_label(RecentSnapshotState::Current(Duration::from_millis(2_300))),
+            "last ~10 s · updated 2.30 s ago"
+        );
+        assert_eq!(
+            recent_snapshot_label(RecentSnapshotState::Final),
+            "final ~10 s before stop"
+        );
+        assert_eq!(
+            recent_snapshot_label(RecentSnapshotState::Expired(Duration::from_secs(11))),
+            "recent timing unavailable · last update 11.0 s ago"
+        );
+        assert_eq!(
+            recent_snapshot_label(RecentSnapshotState::Pending),
+            "awaiting timing data"
+        );
+
+        // Every consumer must use that vocabulary; the work line previously
+        // bypassed the helper and kept the retired "snapshot pending" phrase.
+        let mut cumulative = SendTimingTelemetry::default();
+        cumulative
+            .deadline_lateness
+            .record(Duration::from_millis(1));
+        assert_eq!(
+            timing_detail_text(
+                SendTimingTelemetry::default(),
+                cumulative,
+                RecentSnapshotState::Pending,
+            ),
+            "Work per send: awaiting timing data · run max late 1.00 ms"
+        );
+        assert!(
+            !TIMING_TOOLTIP.contains("snapshot"),
+            "technician-facing timing help names the period, not its transport shape"
+        );
+
+        // The span comes from the window constant, so a change to the engine's
+        // retention cannot leave five labels quoting a number it stopped using.
+        assert!(
+            recent_snapshot_label(RecentSnapshotState::Current(Duration::ZERO))
+                .contains(&RECENT_WINDOW.as_secs().to_string()),
+            "the label states the real window"
         );
     }
 
@@ -349,6 +452,35 @@ mod tests {
         assert_eq!(
             timing_metric("render", DurationHistogram::default(), line_samples),
             "render no samples"
+        );
+    }
+
+    /// The work boundaries name their figure before stating it, and the
+    /// percentile trails rather than leads — so gaining or losing one leaves
+    /// every word before it where the reader last saw it.
+    #[test]
+    fn a_work_boundary_reads_as_its_longest_observation() {
+        let mut single = DurationHistogram::default();
+        single.record(Duration::from_micros(100));
+        assert_eq!(longest_metric("render", single, 1), "longest render 100 us");
+
+        let mut spread = DurationHistogram::default();
+        for _ in 0..200 {
+            spread.record(Duration::from_micros(100));
+        }
+        spread.record(Duration::from_millis(4));
+        let line = longest_metric("send call", spread, spread.sample_count());
+        assert!(
+            line.starts_with("longest send call 4 ms (99% ≤ "),
+            "the longest figure leads and the percentile follows it: {line}"
+        );
+
+        // A boundary sampled less often than the line says so, after both
+        // figures rather than between them.
+        assert!(longest_metric("render", single, 9).ends_with(" of 1"));
+        assert_eq!(
+            longest_metric("render", DurationHistogram::default(), 1),
+            "longest render no samples"
         );
     }
 }

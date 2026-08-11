@@ -18,14 +18,13 @@ startup and decay to zero after traffic stops, while the total stands still; the
 instantaneous line rate. Sent means the interface write returned success, not that any peer \
 received the data.";
 
-pub(in crate::gui) const DISPLAY_QUEUE_TOOLTIP: &str =
-    "The current value was sampled immediately before the UI's \
-last drain of the runner-to-UI diagnostic queue; it is not the post-drain depth. Peak is the \
-largest such UI sample, not an exact queue high-water mark. A dropped update may be a payload \
-sample, counter snapshot, timer change, or interface error/recovery notice. The runner never waits \
-for this queue, so display pressure cannot delay sending. Live readouts can lag until a later \
-cumulative update; the final run snapshot remains exact. Reliable command results use a separate \
-queue.";
+pub(in crate::gui) const LIVE_UPDATE_QUEUE_TOOLTIP: &str =
+    "Current is how many live updates were waiting the last time the screen checked. The screen \
+then removes them, so it is not the number waiting now. Peak is the largest value seen at one of \
+those checks; a brief higher peak may be missed. A dropped update may affect an Output sample, a \
+counter readout, timer status, or interface error notice. Sending never waits for this queue. \
+Later cumulative updates correct the live totals, and final run totals remain exact. Command \
+results use a separate path.";
 
 /// The run's counted send outcomes as one always-visible line.
 ///

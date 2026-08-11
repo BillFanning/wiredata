@@ -1,30 +1,19 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.16
-**Date:** 2026-08-09
+**Version:** 1.18
+**Date:** 2026-08-10
 **Status:** Accepted
 
-Revision note (2026-08-09) — three decisions state their boundaries, and stop
-telling their own story:
+Revision note (2026-08-10) — serial device replacement gets a transport-specific
+recovery boundary:
 
-- **ADR-052 (boundary added)** — placement by consequence has to reach the
-  reader. Moving the dropped-update warning into the Output pane while removing
-  the card badge put it inside a section that is collapsed by default, so the
-  warning could be on screen and unseeable. A warning inside a collapsed section
-  now marks that section's header.
-- **ADR-053 (boundary added)** — the settle window is a **minimum, not a
-  deadline**: recovery is judged where the skip count arrives, on a cadence
-  point the channel reaches, so a slow schedule reports at its next send rather
-  than at five seconds, and nothing is woken to announce its own recovery. The
-  line is scoped to cadence alone — sends can be failing while every point is
-  reached.
-- **ADR-054 (corrected)** — the decade rate limit was applied by convention to
-  five of the six internal faults, and the sixth, on the send path, was the one
-  best placed to flood. The tally and the sentence shape now live in one module
-  every caller reaches for.
-- **All three, compressed.** They carried the debugging story, superseded
-  wording, and test mechanics. AGENTS.md gives those to the commit message; an
-  ADR states the decision, the boundary it does not cross, and what follows.
+- **ADR-055** replaces an unusable running serial handle before the next eligible
+  write, while preserving the existing edge-triggered failure episode and bounded
+  backoff. It defines why known flow-control-shaped errors retain the handle while
+  unknown operating-system errors replace it, why reopening stays outside render
+  and send-call timing, and the limits around initial open, port renaming, retry
+  latency, partial writes, the single enriched recovery log edge, and the
+  separately deferred TCP reconnect policy.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -410,7 +399,7 @@ owner picks the payload policy via a named `ObserverPolicy` passed to the runner
    payload (default 100 ms ≈ 10 Hz). The Output pane shows a live, bounded sample
    instead of every wire message.
 3. **Immediate errors** — `ConnectionError` / `SendRecovered` / `OpenFailed`
-   (edge-triggered per ADR-017's sibling backoff work) are never rate-limited.
+   (edge-triggered per ADR-055) are never rate-limited.
 
 `Sent` is **removed**, replaced by lanes 1+2. CLI `--echo` passes
 `ObserverPolicy::every_send()` (every send emits a `SendSample`) — the one consumer
@@ -596,6 +585,10 @@ exclusive resources. These contradicted both ADR-021's runtime-truth rule and sp
   settings on error. UDP changes retaining the same local bind update socket options
   and destination in place, also with rollback. Different serial ports, different UDP
   local ports, and TCP continue to open a replacement first and swap only on success.
+  ADR-055 amends the serial case once a write has classified its handle as unusable:
+  there is no working handle to roll back, so the stale handle is dropped before the
+  next settings are opened; a failed update retains the previous settings and their
+  automatic recovery path.
 - Successful live interface and interval commands update `AppliedRunConfig` inside the
   supervisor. They do not mutate persisted profile state.
 
@@ -1279,6 +1272,13 @@ Talker classifies the retained pushed snapshot once for all GUI consumers:
 - an explicitly provenance-marked snapshot is **Final**, regardless of later
   display age.
 
+Presentation names what that provenance lets the reader trust, not how the data
+travels internally. Pending reads `awaiting timing data`; Current reads `last
+~10 s` and adds its update age once that age is useful; Expired reads `recent
+timing unavailable` with the last update age; and Final reads `final ~10 s before
+stop`. “Snapshot” remains the internal transport shape, not technician-facing
+vocabulary for a window of observations.
+
 Capacity, Cadence, and detailed Timing consume that same classification. Expired
 recent histograms are neither presented as current nor used for measured application
 headroom. Capacity may fall back to sufficiently warmed cumulative run-wide timing
@@ -1521,19 +1521,27 @@ A gate that switches labels on a threshold also forces a state into every
 readout, every tooltip, and the shared vocabulary — one more thing a technician
 must learn that describes the tool rather than the channel.
 
-**Decision:** State the maximum with its sample count, and add the percentile
-only when it is a different figure. The maximum is exact (`max_nanos`, not
-bucketed), meaningful at one sample, and needs no disclaimer; the count carries
-the weight the label used to imply, so `worst 3.1 ms of 4 sends` is honest
-without a warm-up state.
+**Decision:** State the maximum and add the percentile only when it is a
+different figure. The maximum is exact (`max_nanos`, not bucketed), meaningful
+at one sample, and needs no warm-up disclaimer.
 
-The count belongs to the **line**, not to every figure on it. Where a readout
-already names one — a table's own Sends column, or a line covering boundaries
-that are recorded in lockstep — repeating it beside each figure states the same
-number three or four times and crowds out what varies. A boundary states its own
-count only where its population differs from the line's, which is exactly where
-it carries information: lateness is sampled for sends that retry backoff then
-withheld, and the send call is timed for writes that failed.
+State a sample count once with the context that makes it useful, not beside every
+figure. Cadence's main line already states the running schedule and the last
+~10-second period; a bare count there invited the reader to weigh a denominator
+without saying what period produced it. Its tooltip therefore pairs the count
+with the period that supplied the displayed figure: the timing period ending at
+the latest update, the final period before stop, or the whole run for a labelled
+fallback. A table's own Sends column and the work line's own total keep their
+counts on screen, while individual boundaries repeat a count only where their
+populations differ. Lateness is sampled before retry backoff can withhold a
+scheduled send, and the send call is timed for writes that failed, so such a
+difference is evidence rather than noise.
+
+Keep the maximum in one syntactic position. For Cadence it leads as `worst X
+behind schedule`; its share of the shortest interval and a distinct percentile
+follow together in one parenthesis. Render and send-call boundaries likewise
+lead with `longest`. A percentile appearing or disappearing must not move the
+primary figure under the reader.
 
 `p99 < max` is exactly the test for "the percentile says something new": within
 one bucket the bound is `>=` the maximum, so the comparison is false; it becomes
@@ -1546,10 +1554,11 @@ This retires `TIMING_WARMUP_SAMPLES` in Talker. `MIN_SERVICE_SAMPLES` is
 (ADR-035), which divides by summed p99 bounds and genuinely needs samples before
 it can project. It merely shares the value 20.
 
-**Consequences:** Cadence has one measured state instead of two, at every sample
-count, and long runs gain a figure they lacked — with real spread the row now
-shows the percentile *and* the outlier, where before the percentile alone hid a
-one-off stall. Listener still carries its own warm-up gate and `p99 ≤ X`
+**Consequences:** Cadence has one measured state instead of two at every sample
+count, and long runs gain a figure they lacked — with real spread the row shows
+the percentile *and* the outlier, where before the percentile alone hid a one-off
+stall. Its main line stays compact while the tooltip retains the denominator with
+its time basis. Listener still carries its own warm-up gate and `p99 ≤ X`
 phrasing; the shared vocabulary module records that divergence as deliberate and
 tracked rather than leaving it to drift. No measurement, wire output, profile
 schema, or cadence behavior changes — this is presentation only.
@@ -1829,7 +1838,7 @@ pretending otherwise is how the removed tests came to exist.
 
 ---
 
-## ADR-051 — A missed send is charged where it was missed
+## ADR-051 — A missed send is attributed where it was missed
 
 **Status:** Accepted 2026-08-06. Amends the scope limit in ADR-045.
 
@@ -1861,10 +1870,10 @@ channel-wide `missed_sends` total. The skipped points lie at
 one of them on the timeline.
 
 `MessageTiming::missed_others` counts, for each message, the cadence points
-**other** messages lost while its own sends held the channel. A point is charged
-to whichever send spanned the moment it passed, and a message is never charged
-for its own points, which are already visible as a send call longer than its
-interval.
+**other** messages lost while its own sends held the channel. A point is
+attributed to whichever send spanned the moment it passed. Points from a
+message's own schedule are not attributed back to that message; an overrun there
+is already visible by comparing its longest send call with its interval.
 
 A skipped run is **partitioned** across every retained send window it overlaps.
 A stall long enough to skip points is usually long enough to contain several
@@ -1876,20 +1885,19 @@ points inside its own brief window, which is almost never any, so it cannot
 inherit a burst it is clearing.
 
 **Correction (2026-08-06, before release).** This entry first specified the
-charge against a single retained send window and described the shortfall as
+attribution against a single retained send window and described the shortfall as
 points that "passed with the thread free". Both were wrong. The recorder kept
 one completed window, so a deadline or a skip behind an *earlier* write in the
 same busy stretch matched nothing — the startup case above went entirely
-uncharged — and ADR-045's `blocked_others` had carried the same hole silently
+unattributed — and ADR-045's `blocked_others` had carried the same hole silently
 since it shipped. Calling the shortfall idle time then converted a gap in the
 record into an affirmative claim about the machine. The record now retains
 one send window per message and both paths search them, which closes the
-delay hole as well; and an uncharged point is reported as **unattributed**, never as
-idle, because reaching the end of the retained history produces exactly the same
-silence as a genuinely free thread and nothing here can tell them apart. (The
-history was first capped at a constant, which the same review then pointed out
-was a number with no matching limit anywhere in the scheduler; it is now derived
-as above.)
+delay hole as well; and an unmatched point is reported as **unattributed**, never
+as idle, because a late wake, work outside an interface write, and a genuinely
+free thread all leave the same gap. (The history was first capped at a constant,
+which the same review then pointed out was a number with no matching limit
+anywhere in the scheduler; it is now derived as below.)
 
 Two details the arithmetic forced:
 
@@ -1905,27 +1913,28 @@ Two details the arithmetic forced:
   `blocker_for` is therefore a pure query and only the deadline being handled
   advances the cursor.
 
-**What this does and does not claim.** The charged share is measured, not
-inferred, so the missed-send callout may now state an amount and name a message
-for it. Its own limits are narrower than the old ones but real: a point is
-charged to whichever message was inside its *interface write* when the point
-passed, so a message that holds the channel some other way is not charged
-(render is 1–3 µs and below the histogram's first bucket, which is why the send
-call is the only window measured).
+**What this does and does not claim.** The attributed share is measured, not
+inferred, so the missed-send callout may state an amount and name a message for
+it. Its own limits are narrower than the old ones but real: a point is attributed
+to whichever message was inside its *interface write* when the point passed. A
+message that holds the channel some other way is not matched (render is 1–3 µs
+and below the histogram's first bucket, which is why the send call is the only
+window measured).
 
 The retained history is sized from the message count rather than capped at a
-constant, and the size is a consequence rather than a budget: between two
-deadlines of the same message, every *other* message can send at most once,
-because a message is only serviced ahead of an overdue one if its own deadline
-is earlier, and firing advances it past that deadline under the stall policy.
-One window per message is therefore always enough to answer, and a schedule
-that grows widens its own reach.
+constant, and the size is a consequence rather than a budget. Once a message's
+deadline is overdue, each *other* message can be serviced at most once ahead of
+it: only an earlier deadline goes first, and firing advances that message to the
+first grid point in the future. No more than one send per message can therefore
+separate an overdue deadline from its handling. One retained window per message
+is always enough to answer, and a schedule that grows widens its own reach.
 
-The callout must therefore state three quantities: the charged total, the
-largest single share, and the remainder — and must describe the remainder as
-**not charged to any send**, not as idle time. Naming only the largest culprit
-and the shortfall drops every other charged message out of a sentence whose
-numbers are supposed to add up.
+The callout must therefore state three quantities: the total observed during
+other messages' sends, the largest single share, and the remainder. For the
+remainder it says no serial or network send was recorded as being in progress;
+it does not call that idle time. Naming only the largest contributor and the
+shortfall drops every other matched message out of a sentence whose numbers are
+supposed to add up.
 
 **Consequences:** `MessageTiming` gains one `u64`; the recorder gains a ring of
 send windows one deep per message (tens of bytes each, alongside the ~0.5 kB of
@@ -1956,15 +1965,17 @@ occasion it means something.
 
 **Decision:** Three rules.
 
-*A warning is placed where its consequence lands.* Discarded diagnostic updates
-cost the **Output** pane's completeness, not anything about the wire, so the
-warning about them belongs there rather than in the diagnostics card, above the
-sampling note that qualifies the same lines. `diagnostic_card_tone` therefore
-does not read drops: a badge reading ATTENTION over rows that are all calm sends
-the reader hunting inside the card for a cause that was never in it. The queue
-gauge stays under Timing & runtime details, where depth and occupancy belong. A
-warning inside a collapsed section also marks that section's header, or placement
-by consequence would put it somewhere the reader can sit in front of and not see.
+*A warning has one visible home beside its evidence.* The bounded live-update
+queue carries payload samples and diagnostic state alike, so a drop can omit an
+Output line or make a live readout lag. It does not affect the wire. The warning
+needs one home rather than copies in two sections; it sits above **Output** because
+discarded payload updates land there and the section header can keep the count
+visible while collapsed. Its tooltip states the broader diagnostic effect.
+`diagnostic_card_tone` therefore does not read drops: a badge reading ATTENTION
+over otherwise calm rows would imply that one of their underlying measurements
+had found a channel problem. The live-update queue gauge belongs beside its
+warning, not in a second collapsed section. A warning inside a collapsed section
+also marks that section's header, or its chosen home could remain invisible.
 
 *Dismissal is acknowledgement, not deletion.* Dismissal records the counter, and
 the warning returns when that counter is **exceeded** — told once per occurrence,
@@ -1985,13 +1996,14 @@ live interface fault, a serial line that cannot carry the schedule, and a failed
 Windows timer request each describe a condition still true while it is on
 screen: there is nothing to acknowledge and nothing that would bring them back.
 The sampling note is not dismissible for the same reason, but it is set in a
-strong weight — it qualifies every line beneath it, and weight rather than
-colour carries that (ADR-050).
+small, quiet weight shared with the queue gauge. It describes standing context,
+not a condition to act on; the dropped-update callout alone carries urgency.
 
 **Consequences:** Dismissal is process-local view state, per channel, never
 written to a profile, and changes nothing counted, logged, or sent. The shared
 chrome gains `dismissible_attention_callout` beside the plain one, sharing its
 frame so this is not a second visual language for the same kind of statement.
+Timing & runtime details no longer repeats the live-update queue.
 
 ---
 
@@ -2098,6 +2110,82 @@ of the counter rather than of any run, and one that dispatches a real fault at a
 real call site through the GUI log layer and asserts the badge never rises —
 because a rule the type system cannot carry needs something other than reading to
 enforce it.
+
+---
+
+## ADR-055 — A serial retry replaces an unusable operating-system handle
+
+**Status:** Accepted 2026-08-10.
+
+**Context:** A running serial port owns an operating-system handle to one device
+instance. Unplugging a USB serial adapter can leave that handle permanently
+unusable even when a replacement later appears under the same COM name. Windows
+may report the stale write as access denied or operation aborted. Retrying the
+write on that same handle cannot reach the replacement, and opening the name
+before releasing the stale handle can fail because serial ports are exclusive.
+
+**Decision:** Serial recovery stays inside the existing edge-triggered send
+failure episode. Timeout, would-block, interrupted, and zero-write results keep
+the handle because they can describe transient flow control rather than device
+replacement. Windows operation-aborted code 995 takes precedence over its
+broader timeout category and replaces the handle.
+
+Every other error, including one the standard library cannot classify more
+narrowly than *uncategorized*, marks the handle for replacement. That bias is
+deliberate: Windows invalid-handle, general-failure, and device-not-connected
+results and POSIX I/O, no-device, and no-such-device errors do not share one
+portable error category, even though each can describe a removed adapter. A
+narrow fatal-error allowlist would therefore restore the permanent stale-handle
+loop for real drivers. A new keep-handle exemption requires observed evidence
+that the error is transient; an unfamiliar error is not assumed recoverable on
+the handle that just returned it.
+
+At the next due send admitted by bounded backoff, the runner gives the transport
+a preparation step before it renders the payload or starts send-call timing.
+Serial uses that step to drop the stale handle first and then open the same
+current port configuration. Other transports do nothing there: UDP socket
+replacement would change source-port semantics, and TCP reconnect policy is a
+separate decision.
+
+If the serial open fails, no interface write is attempted. That due send counts
+as withheld, the backoff deepens, and the failure episode remains open. The open
+attempt is outside render and send-call timing and outside per-message send
+overlap attribution; those measurements describe payload work and interface
+writes, not port discovery. A successful open proceeds through the ordinary
+render and write path, and the first successful write closes the episode with
+its failed and withheld totals. A successful live serial update during recovery
+supplies a fresh handle and clears pending replacement; a failed update keeps the
+previous settings and recovery path.
+
+Handle replacement does not create another log edge. The existing INFO line that
+closes the failure episode names the configured serial port when sending recovers
+on an automatically replaced handle; ordinary transient recovery keeps the
+generic wording. A later successful live interface update supersedes the
+automatic-replacement marker. This distinguishes the support cases without
+logging every open attempt or reporting recovery before a write has proved the
+new handle usable.
+
+**Boundary:** This is recovery for a run that opened successfully. An initial
+open failure still ends the run; the GUI uses **Retry Channel**, and CLI mode
+must start another run. Automatic recovery reopens only the configured port name
+and does not search for a replacement that enumerated elsewhere. Backoff grows
+from 250 ms to five seconds, but an open is attempted only at the next due send
+after the gate, so the cap limits attempt frequency rather than recovery latency.
+A failed write may have transferred a prefix before reporting its error; recovery
+therefore makes no exactly-once delivery guarantee. Talker remains
+running-with-error during the episode rather than adding Listener's reconnecting
+lifecycle state. Disconnecting only the remote RS-232 cable or device may leave
+writes successful at the operating-system boundary and therefore does not
+necessarily trigger this recovery.
+
+**Consequences:** A removed and replaced serial device can resume within the same
+GUI or CLI run without a command, while access denied from another process during
+recovery keeps retrying at bounded frequency. Failed opens do not masquerade as
+failed writes or pollute send-call timing. The transport-specific preparation seam
+avoids generic runner reconstruction and leaves UDP and TCP behavior unchanged.
+If a built-in transport reaches replacement without confirmed settings, that is
+reported as talker's own rate-limited internal fault rather than blamed on the
+channel.
 
 ---
 
