@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     thread::JoinHandle,
 };
@@ -104,16 +104,27 @@ pub(super) fn spawn() -> anyhow::Result<RuntimeFileSink> {
 }
 
 fn spawn_with(open: OpenFileFn) -> anyhow::Result<RuntimeFileSink> {
-    let (event_tx, event_rx) = crossbeam_channel::bounded(FILE_EVENT_QUEUE_CAP);
+    spawn_with_capacity(open, FILE_EVENT_QUEUE_CAP)
+}
+
+fn spawn_with_capacity(
+    open: OpenFileFn,
+    event_queue_cap: usize,
+) -> anyhow::Result<RuntimeFileSink> {
+    let (event_tx, event_rx) = crossbeam_channel::bounded(event_queue_cap);
     let (command_tx, command_rx) = crossbeam_channel::unbounded();
     let state = Arc::new(Mutex::new(FileLogState::Disabled));
     let accepting = Arc::new(AtomicBool::new(false));
     let generation = Arc::new(AtomicU64::new(0));
+    let generation_drops = Arc::new(RwLock::new(Arc::new(GenerationDrops::new(0))));
     let dropped_events = Arc::new(AtomicU64::new(0));
     let notify = Arc::new(Mutex::new(None));
     let worker_state = Arc::clone(&state);
     let worker_accepting = Arc::clone(&accepting);
-    let worker_generation = Arc::clone(&generation);
+    let worker_generations = WorkerGenerations {
+        current: Arc::clone(&generation),
+        drops: Arc::clone(&generation_drops),
+    };
     let worker_notify = Arc::clone(&notify);
     let thread = std::thread::Builder::new()
         .name("talker-file-log".into())
@@ -123,7 +134,7 @@ fn spawn_with(open: OpenFileFn) -> anyhow::Result<RuntimeFileSink> {
                 command_rx,
                 worker_state,
                 worker_accepting,
-                worker_generation,
+                worker_generations,
                 worker_notify,
                 open,
             )
@@ -135,7 +146,9 @@ fn spawn_with(open: OpenFileFn) -> anyhow::Result<RuntimeFileSink> {
             events: event_tx,
             accepting: Arc::clone(&accepting),
             generation: Arc::clone(&generation),
+            generation_drops,
             dropped_events: Arc::clone(&dropped_events),
+            commands: command_tx.clone(),
         },
         toggle: FileLogToggle {
             commands: command_tx.clone(),
@@ -154,7 +167,13 @@ fn spawn_with(open: OpenFileFn) -> anyhow::Result<RuntimeFileSink> {
 enum FileCommand {
     Enable(FileLogConfig),
     Disable,
+    CheckGap(Arc<GenerationDrops>),
     Shutdown,
+}
+
+struct WorkerGenerations {
+    current: Arc<AtomicU64>,
+    drops: Arc<RwLock<Arc<GenerationDrops>>>,
 }
 
 fn run_worker(
@@ -162,7 +181,7 @@ fn run_worker(
     commands: crossbeam_channel::Receiver<FileCommand>,
     state: Arc<Mutex<FileLogState>>,
     accepting: Arc<AtomicBool>,
-    generation: Arc<AtomicU64>,
+    generations: WorkerGenerations,
     notify: Arc<Mutex<Option<Notify>>>,
     open: OpenFileFn,
 ) {
@@ -187,10 +206,15 @@ fn run_worker(
                             // The worker owns generation allocation as well as
                             // file replacement. Concurrent control clones cannot
                             // reorder a caller-side id and its command.
-                            let generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
+                            let generation =
+                                generations.current.fetch_add(1, Ordering::AcqRel) + 1;
+                            let drops = Arc::new(GenerationDrops::new(generation));
+                            *write_generation_drops(&generations.drops) = Arc::clone(&drops);
                             file = Some(ActiveFile {
                                 generation,
                                 writer: opened,
+                                marker_baseline: 0,
+                                drops,
                             });
                             accepting.store(true, Ordering::Release);
                             publish_state(
@@ -225,6 +249,34 @@ fn run_worker(
                         },
                     );
                 }
+                Ok(FileCommand::CheckGap(drops)) => {
+                    let result = file.as_mut().map_or(Ok(()), |active| {
+                        if Arc::ptr_eq(&active.drops, &drops) {
+                            write_ready_gap_markers(&events, active)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    if file
+                        .as_ref()
+                        .is_none_or(|active| !Arc::ptr_eq(&active.drops, &drops))
+                    {
+                        // A stale notification can outlive its file generation.
+                        // Close it so no late producer can leave bookkeeping
+                        // pending on a tracker the worker no longer owns.
+                        drops.close();
+                    }
+                    if let Err(error) = result {
+                        accepting.store(false, Ordering::Release);
+                        close_active_file(&mut file);
+                        file = None;
+                        publish_state(
+                            &state,
+                            &notify,
+                            FileLogState::Failed(format!("writing the file log: {error}")),
+                        );
+                    }
+                }
                 Ok(FileCommand::Shutdown) | Err(_) => {
                     accepting.store(false, Ordering::Release);
                     let _ = finish_file(&events, &mut file);
@@ -236,11 +288,16 @@ fn run_worker(
                     let Some(active) = file.as_mut() else {
                         continue;
                     };
-                    if event.generation != active.generation {
-                        continue;
-                    }
-                    if let Err(error) = active.writer.write_all(&event.bytes) {
+                    let result: io::Result<()> = (|| {
+                        if event.generation == active.generation {
+                            active.writer.write_all(&event.bytes)?;
+                        }
+                        write_ready_gap_markers(&events, active)?;
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
                         accepting.store(false, Ordering::Release);
+                        close_active_file(&mut file);
                         file = None;
                         publish_state(
                             &state,
@@ -258,6 +315,72 @@ fn run_worker(
 struct ActiveFile {
     generation: u64,
     writer: FileWriter,
+    drops: Arc<GenerationDrops>,
+    marker_baseline: u64,
+}
+
+struct GenerationDrops {
+    generation: u64,
+    /// Queue-full producers touch this mutex only on the loss path. The worker
+    /// holds it for bookkeeping only, never while draining the queue or writing
+    /// the file, so a saturated producer cannot wait for disk I/O.
+    state: Mutex<GenerationDropState>,
+}
+
+struct GenerationDropState {
+    total: u64,
+    /// Losses coalesce here until the worker claims their cumulative boundary.
+    pending_target: Option<u64>,
+    /// Fixed cumulative boundary claimed before the worker checks queue
+    /// emptiness. Later losses go to `pending_target`, so their marker cannot
+    /// move ahead of the records that were queued before them.
+    claimed_target: Option<u64>,
+    closed: bool,
+}
+
+impl GenerationDrops {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            state: Mutex::new(GenerationDropState {
+                total: 0,
+                pending_target: None,
+                claimed_target: None,
+                closed: false,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn dropped(&self) -> u64 {
+        lock_generation_drop_state(&self.state).total
+    }
+
+    fn claim_marker_target(&self) -> Option<u64> {
+        let mut state = lock_generation_drop_state(&self.state);
+        if state.claimed_target.is_none() {
+            state.claimed_target = state.pending_target.take();
+        }
+        state.claimed_target
+    }
+
+    /// Close this generation and return the complete, now-stable drop count.
+    fn close(&self) -> u64 {
+        let mut state = lock_generation_drop_state(&self.state);
+        state.closed = true;
+        state.pending_target = None;
+        state.claimed_target = None;
+        state.total
+    }
+
+    /// Release one fixed marker batch and report whether loss arrived while it
+    /// was being written.
+    fn marker_written(&self, target: u64) -> bool {
+        let mut state = lock_generation_drop_state(&self.state);
+        debug_assert_eq!(state.claimed_target, Some(target));
+        state.claimed_target = None;
+        !state.closed && state.pending_target.is_some()
+    }
 }
 
 struct FileEvent {
@@ -274,11 +397,13 @@ fn finish_file(
 ) -> io::Result<()> {
     let result = match file.as_mut() {
         Some(active) => (|| {
+            let final_drop_target = active.drops.close();
             for event in events.try_iter() {
                 if event.generation == active.generation {
                     active.writer.write_all(&event.bytes)?;
                 }
             }
+            write_gap_marker(active, final_drop_target)?;
             active.writer.flush()
         })(),
         None => {
@@ -290,6 +415,56 @@ fn finish_file(
     result
 }
 
+/// Write every marker batch whose causal queue records have already drained.
+///
+/// The target is copied before checking queue emptiness. A later loss therefore
+/// belongs to a later target and cannot place its marker before the accepted
+/// record that filled the queue ahead of it.
+fn write_ready_gap_markers(
+    events: &crossbeam_channel::Receiver<FileEvent>,
+    active: &mut ActiveFile,
+) -> io::Result<()> {
+    loop {
+        let Some(target) = active.drops.claim_marker_target() else {
+            return Ok(());
+        };
+        if !events.is_empty() {
+            return Ok(());
+        }
+
+        write_gap_marker(active, target)?;
+        if !active.drops.marker_written(target) {
+            return Ok(());
+        }
+    }
+}
+
+fn write_gap_marker(active: &mut ActiveFile, target: u64) -> io::Result<()> {
+    let delta = target.saturating_sub(active.marker_baseline);
+    if delta == 0 {
+        return Ok(());
+    }
+
+    let marker = gap_marker_line(delta);
+    active.writer.write_all(marker.as_bytes())?;
+    active.marker_baseline = target;
+    Ok(())
+}
+
+fn close_active_file(file: &mut Option<ActiveFile>) {
+    if let Some(active) = file.as_ref() {
+        active.drops.close();
+    }
+}
+
+fn gap_marker_line(dropped: u64) -> String {
+    if dropped == 1 {
+        "--- Talker file log gap: 1 earlier log entry was not saved. ---\n".to_owned()
+    } else {
+        format!("--- Talker file log gap: {dropped} earlier log entries were not saved. ---\n")
+    }
+}
+
 fn lock_state(state: &Mutex<FileLogState>) -> std::sync::MutexGuard<'_, FileLogState> {
     state
         .lock()
@@ -299,6 +474,30 @@ fn lock_state(state: &Mutex<FileLogState>) -> std::sync::MutexGuard<'_, FileLogS
 fn lock_notify(notify: &Mutex<Option<Notify>>) -> std::sync::MutexGuard<'_, Option<Notify>> {
     notify
         .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_generation_drop_state(
+    state: &Mutex<GenerationDropState>,
+) -> std::sync::MutexGuard<'_, GenerationDropState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn read_generation_drops(
+    drops: &RwLock<Arc<GenerationDrops>>,
+) -> std::sync::RwLockReadGuard<'_, Arc<GenerationDrops>> {
+    drops
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_generation_drops(
+    drops: &RwLock<Arc<GenerationDrops>>,
+) -> std::sync::RwLockWriteGuard<'_, Arc<GenerationDrops>> {
+    drops
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -315,36 +514,48 @@ pub(super) struct RuntimeFileMakeWriter {
     events: crossbeam_channel::Sender<FileEvent>,
     accepting: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
+    generation_drops: Arc<RwLock<Arc<GenerationDrops>>>,
     dropped_events: Arc<AtomicU64>,
+    commands: crossbeam_channel::Sender<FileCommand>,
 }
 
 impl<'a> MakeWriter<'a> for RuntimeFileMakeWriter {
-    type Writer = RuntimeEventWriter;
+    type Writer = RuntimeEventWriter<'a>;
 
     fn make_writer(&'a self) -> Self::Writer {
+        let accepting = self.accepting.load(Ordering::Acquire);
+        let generation = if accepting {
+            self.generation.load(Ordering::Acquire)
+        } else {
+            0
+        };
         RuntimeEventWriter {
-            events: self.events.clone(),
+            events: &self.events,
             bytes: Vec::new(),
-            accepted_at_start: self.accepting.load(Ordering::Acquire),
-            accepting: Arc::clone(&self.accepting),
-            generation: self.generation.load(Ordering::Acquire),
-            current_generation: Arc::clone(&self.generation),
-            dropped_events: Arc::clone(&self.dropped_events),
+            accepted_at_start: accepting,
+            accepting: &self.accepting,
+            generation,
+            current_generation: &self.generation,
+            generation_drops: &self.generation_drops,
+            dropped_events: &self.dropped_events,
+            commands: &self.commands,
         }
     }
 }
 
-pub(super) struct RuntimeEventWriter {
-    events: crossbeam_channel::Sender<FileEvent>,
+pub(super) struct RuntimeEventWriter<'a> {
+    events: &'a crossbeam_channel::Sender<FileEvent>,
     bytes: Vec<u8>,
     accepted_at_start: bool,
-    accepting: Arc<AtomicBool>,
+    accepting: &'a AtomicBool,
     generation: u64,
-    current_generation: Arc<AtomicU64>,
-    dropped_events: Arc<AtomicU64>,
+    current_generation: &'a AtomicU64,
+    generation_drops: &'a RwLock<Arc<GenerationDrops>>,
+    dropped_events: &'a AtomicU64,
+    commands: &'a crossbeam_channel::Sender<FileCommand>,
 }
 
-impl Write for RuntimeEventWriter {
+impl Write for RuntimeEventWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.accepted_at_start {
             self.bytes.extend_from_slice(buf);
@@ -357,7 +568,7 @@ impl Write for RuntimeEventWriter {
     }
 }
 
-impl Drop for RuntimeEventWriter {
+impl Drop for RuntimeEventWriter<'_> {
     fn drop(&mut self) {
         if !self.accepted_at_start
             || !self.accepting.load(Ordering::Acquire)
@@ -366,16 +577,79 @@ impl Drop for RuntimeEventWriter {
         {
             return;
         }
-        if self
-            .events
-            .try_send(FileEvent {
-                generation: self.generation,
-                bytes: std::mem::take(&mut self.bytes),
-            })
-            .is_err()
-        {
-            self.dropped_events.fetch_add(1, Ordering::Relaxed);
+        match self.events.try_send(FileEvent {
+            generation: self.generation,
+            bytes: std::mem::take(&mut self.bytes),
+        }) {
+            Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                record_current_generation_full_queue_drop(
+                    self.accepting,
+                    self.current_generation,
+                    self.generation,
+                    self.generation_drops,
+                    self.dropped_events,
+                    self.commands,
+                );
+            }
         }
+    }
+}
+
+fn record_current_generation_full_queue_drop(
+    accepting: &AtomicBool,
+    current_generation: &AtomicU64,
+    writer_generation: u64,
+    current_drops: &RwLock<Arc<GenerationDrops>>,
+    dropped_events: &AtomicU64,
+    commands: &crossbeam_channel::Sender<FileCommand>,
+) {
+    // Tracker lookup and cloning belong only to the already-Full path. Normal
+    // accepted events neither wait for a generation replacement nor retain
+    // loss-only command/tracker handles while they are being formatted.
+    let generation_drops = Arc::clone(&read_generation_drops(current_drops));
+    record_full_queue_drop(
+        accepting,
+        current_generation,
+        writer_generation,
+        &generation_drops,
+        dropped_events,
+        commands,
+    );
+}
+
+fn record_full_queue_drop(
+    accepting: &AtomicBool,
+    current_generation: &AtomicU64,
+    writer_generation: u64,
+    generation_drops: &Arc<GenerationDrops>,
+    dropped_events: &AtomicU64,
+    commands: &crossbeam_channel::Sender<FileCommand>,
+) {
+    // The queue is already full before this lock is reached. Serialize this
+    // rare loss path with generation close so the worker's final snapshot
+    // either includes the loss or definitively rejects it. The worker never
+    // holds this mutex during file I/O.
+    let should_notify = {
+        let mut state = lock_generation_drop_state(&generation_drops.state);
+        if state.closed
+            || generation_drops.generation != writer_generation
+            || !accepting.load(Ordering::Acquire)
+            || current_generation.load(Ordering::Acquire) != writer_generation
+            || state.total == u64::MAX
+        {
+            return;
+        }
+
+        state.total += 1;
+        dropped_events.fetch_add(1, Ordering::Relaxed);
+        let should_notify = state.pending_target.is_none() && state.claimed_target.is_none();
+        state.pending_target = Some(state.total);
+        should_notify
+    };
+
+    if should_notify {
+        let _ = commands.try_send(FileCommand::CheckGap(Arc::clone(generation_drops)));
     }
 }
 
@@ -417,6 +691,26 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "file-log state stayed at {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn emit(writer: &RuntimeFileMakeWriter, bytes: &[u8]) {
+        let mut event = writer.make_writer();
+        event.write_all(bytes).unwrap();
+    }
+
+    fn wait_for_text(written: &Mutex<Vec<u8>>, wanted: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let text = String::from_utf8_lossy(&written.lock().unwrap()).into_owned();
+            if text.contains(wanted) {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "file worker did not write {wanted:?}: {text}"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -689,21 +983,580 @@ mod tests {
     }
 
     #[test]
-    fn a_full_file_queue_increments_the_exposed_drop_count() {
-        let (events, _receiver) = crossbeam_channel::bounded(0);
-        let dropped_events = Arc::new(AtomicU64::new(0));
+    fn an_ordinary_accepted_event_does_not_read_the_loss_tracker() {
+        let (events, receiver) = crossbeam_channel::bounded(1);
         let generation = Arc::new(AtomicU64::new(1));
+        let drops = Arc::new(GenerationDrops::new(1));
+        let generation_drops = Arc::new(RwLock::new(Arc::clone(&drops)));
+        let (commands, _command_receiver) = crossbeam_channel::unbounded();
         let writer = RuntimeFileMakeWriter {
             events,
             accepting: Arc::new(AtomicBool::new(true)),
             generation,
+            generation_drops: Arc::clone(&generation_drops),
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            commands,
+        };
+
+        // A normal accepted event has no loss bookkeeping to perform. Holding
+        // the tracker exclusively must therefore not delay formatting or queue
+        // admission; only the already-Full branch may consult this tracker.
+        let tracker_guard = write_generation_drops(&generation_drops);
+        let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
+        let producer = std::thread::spawn(move || {
+            emit(&writer, b"ordinary event");
+            completed_tx.send(()).unwrap();
+        });
+        let completed_without_tracker = completed_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_ok();
+        drop(tracker_guard);
+        producer.join().unwrap();
+
+        assert!(
+            completed_without_tracker,
+            "an accepted event waited for the loss tracker"
+        );
+        assert_eq!(receiver.recv().unwrap().bytes, b"ordinary event");
+    }
+
+    #[test]
+    fn a_full_file_queue_increments_the_exposed_drop_count() {
+        let (events, _receiver) = crossbeam_channel::bounded(0);
+        let dropped_events = Arc::new(AtomicU64::new(0));
+        let generation = Arc::new(AtomicU64::new(1));
+        let drops = Arc::new(GenerationDrops::new(1));
+        let generation_drops = Arc::new(RwLock::new(Arc::clone(&drops)));
+        let (commands, command_receiver) = crossbeam_channel::unbounded();
+        let writer = RuntimeFileMakeWriter {
+            events,
+            accepting: Arc::new(AtomicBool::new(true)),
+            generation,
+            generation_drops,
             dropped_events: Arc::clone(&dropped_events),
+            commands,
         };
         {
             let mut event = writer.make_writer();
             event.write_all(b"cannot be queued").unwrap();
         }
         assert_eq!(dropped_events.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.dropped(), 1);
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Ok(FileCommand::CheckGap(notified)) if Arc::ptr_eq(&notified, &drops)
+        ));
+    }
+
+    #[test]
+    fn a_disconnected_file_queue_is_not_counted_as_overload_loss() {
+        let (events, receiver) = crossbeam_channel::bounded(1);
+        drop(receiver);
+        let dropped_events = Arc::new(AtomicU64::new(0));
+        let generation = Arc::new(AtomicU64::new(1));
+        let drops = Arc::new(GenerationDrops::new(1));
+        let generation_drops = Arc::new(RwLock::new(Arc::clone(&drops)));
+        let (commands, command_receiver) = crossbeam_channel::unbounded();
+        let writer = RuntimeFileMakeWriter {
+            events,
+            accepting: Arc::new(AtomicBool::new(true)),
+            generation,
+            generation_drops,
+            dropped_events: Arc::clone(&dropped_events),
+            commands,
+        };
+
+        emit(&writer, b"receiver has stopped");
+
+        assert_eq!(dropped_events.load(Ordering::Relaxed), 0);
+        assert_eq!(drops.dropped(), 0);
+        assert!(command_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_stale_writer_cannot_charge_the_current_generation() {
+        let (events, receiver) = crossbeam_channel::bounded(1);
+        events
+            .send(FileEvent {
+                generation: 2,
+                bytes: b"fills the queue".to_vec(),
+            })
+            .unwrap();
+        let dropped_events = Arc::new(AtomicU64::new(0));
+        let generation = Arc::new(AtomicU64::new(1));
+        let old_drops = Arc::new(GenerationDrops::new(1));
+        let generation_drops = Arc::new(RwLock::new(Arc::clone(&old_drops)));
+        let (commands, command_receiver) = crossbeam_channel::unbounded();
+        let writer = RuntimeFileMakeWriter {
+            events,
+            accepting: Arc::new(AtomicBool::new(true)),
+            generation: Arc::clone(&generation),
+            generation_drops: Arc::clone(&generation_drops),
+            dropped_events: Arc::clone(&dropped_events),
+            commands,
+        };
+        let mut stale = writer.make_writer();
+        stale.write_all(b"formatted for generation one").unwrap();
+
+        let current_drops = Arc::new(GenerationDrops::new(2));
+        *write_generation_drops(&generation_drops) = Arc::clone(&current_drops);
+        generation.store(2, Ordering::Release);
+        drop(stale);
+
+        assert_eq!(dropped_events.load(Ordering::Relaxed), 0);
+        assert_eq!(old_drops.dropped(), 0);
+        assert_eq!(current_drops.dropped(), 0);
+        assert!(command_receiver.try_recv().is_err());
+        drop(receiver);
+    }
+
+    #[test]
+    fn a_full_result_crossing_disable_or_reenable_is_not_counted() {
+        let accepting = AtomicBool::new(true);
+        let current_generation = AtomicU64::new(2);
+        let old_drops = Arc::new(GenerationDrops::new(1));
+        let dropped_events = AtomicU64::new(0);
+        let (commands, command_receiver) = crossbeam_channel::unbounded();
+
+        // Model the seam after try_send returned Full: the writer had already
+        // passed Drop's first check, but a new generation is active now.
+        record_full_queue_drop(
+            &accepting,
+            &current_generation,
+            1,
+            &old_drops,
+            &dropped_events,
+            &commands,
+        );
+        assert_eq!(dropped_events.load(Ordering::Relaxed), 0);
+        assert_eq!(old_drops.dropped(), 0);
+        assert!(command_receiver.try_recv().is_err());
+
+        // The disable boundary is likewise normal shutdown, not overload.
+        accepting.store(false, Ordering::Release);
+        current_generation.store(1, Ordering::Release);
+        record_full_queue_drop(
+            &accepting,
+            &current_generation,
+            1,
+            &old_drops,
+            &dropped_events,
+            &commands,
+        );
+        assert_eq!(dropped_events.load(Ordering::Relaxed), 0);
+        assert_eq!(old_drops.dropped(), 0);
+        assert!(command_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn closing_a_generation_linearizes_with_queue_full_accounting() {
+        let accepting = AtomicBool::new(true);
+        let current_generation = AtomicU64::new(1);
+        let dropped_events = AtomicU64::new(0);
+        let (commands, command_receiver) = crossbeam_channel::unbounded();
+
+        let before_close = Arc::new(GenerationDrops::new(1));
+        record_full_queue_drop(
+            &accepting,
+            &current_generation,
+            1,
+            &before_close,
+            &dropped_events,
+            &commands,
+        );
+        assert_eq!(before_close.close(), 1);
+        assert_eq!(dropped_events.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Ok(FileCommand::CheckGap(notified)) if Arc::ptr_eq(&notified, &before_close)
+        ));
+
+        let after_close = Arc::new(GenerationDrops::new(1));
+        assert_eq!(after_close.close(), 0);
+        record_full_queue_drop(
+            &accepting,
+            &current_generation,
+            1,
+            &after_close,
+            &dropped_events,
+            &commands,
+        );
+        assert_eq!(after_close.dropped(), 0);
+        assert_eq!(dropped_events.load(Ordering::Relaxed), 1);
+        assert!(command_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_fixed_marker_target_keeps_later_loss_for_a_followup_batch() {
+        let accepting = AtomicBool::new(true);
+        let current_generation = AtomicU64::new(1);
+        let drops = Arc::new(GenerationDrops::new(1));
+        let dropped_events = AtomicU64::new(0);
+        let (commands, command_receiver) = crossbeam_channel::unbounded();
+
+        record_full_queue_drop(
+            &accepting,
+            &current_generation,
+            1,
+            &drops,
+            &dropped_events,
+            &commands,
+        );
+        let first_target = drops.claim_marker_target().unwrap();
+        assert_eq!(first_target, 1);
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Ok(FileCommand::CheckGap(notified)) if Arc::ptr_eq(&notified, &drops)
+        ));
+
+        // Model another loss while the worker is writing the first marker. It
+        // must not move that marker's boundary or require a later normal event
+        // to make its own follow-up batch visible.
+        record_full_queue_drop(
+            &accepting,
+            &current_generation,
+            1,
+            &drops,
+            &dropped_events,
+            &commands,
+        );
+        assert_eq!(drops.dropped(), 2);
+        assert_eq!(drops.claim_marker_target(), Some(first_target));
+        assert_eq!(
+            lock_generation_drop_state(&drops.state).pending_target,
+            Some(2)
+        );
+        assert!(command_receiver.try_recv().is_err());
+
+        assert!(drops.marker_written(first_target));
+        assert_eq!(drops.claim_marker_target(), Some(2));
+        assert!(!drops.marker_written(2));
+        assert_eq!(drops.claim_marker_target(), None);
+    }
+
+    #[test]
+    fn a_file_gap_marker_follows_the_accepted_records_that_preceded_it() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let worker_written = Arc::clone(&written);
+        let sink = spawn_with_capacity(
+            Box::new(move |_| {
+                Ok(Box::new(GatedWriter {
+                    bytes: Arc::clone(&worker_written),
+                    started: started_tx.clone(),
+                    releases: release_rx.clone(),
+                }))
+            }),
+            1,
+        )
+        .unwrap();
+        sink.toggle.enable(config()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+
+        emit(&sink.writer, b"block first record\n");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("file worker did not enter the gated write");
+        emit(&sink.writer, b"accepted queued record\n");
+        emit(&sink.writer, b"lost record\n");
+        assert_eq!(sink.toggle.dropped_events(), 1);
+        release_tx.send(()).unwrap();
+
+        let marker = gap_marker_line(1);
+        let text = wait_for_text(&written, &marker);
+        assert_eq!(
+            text,
+            format!("block first record\naccepted queued record\n{marker}")
+        );
+    }
+
+    #[test]
+    fn loss_during_a_marker_waits_behind_its_record_and_writes_without_another_event() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (record_started_tx, record_started_rx) = crossbeam_channel::bounded(1);
+        let (record_release_tx, record_release_rx) = crossbeam_channel::bounded(1);
+        let (marker_started_tx, marker_started_rx) = crossbeam_channel::bounded(1);
+        let (marker_release_tx, marker_release_rx) = crossbeam_channel::bounded(1);
+        let worker_written = Arc::clone(&written);
+        let sink = spawn_with_capacity(
+            Box::new(move |_| {
+                Ok(Box::new(MarkerRaceWriter {
+                    bytes: Arc::clone(&worker_written),
+                    record_started: record_started_tx.clone(),
+                    record_release: record_release_rx.clone(),
+                    marker_started: marker_started_tx.clone(),
+                    marker_release: marker_release_rx.clone(),
+                    first_marker: true,
+                }))
+            }),
+            1,
+        )
+        .unwrap();
+        sink.toggle.enable(config()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+
+        emit(&sink.writer, b"block initial record\n");
+        record_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("file worker did not enter the gated record write");
+        emit(&sink.writer, b"accepted before first loss\n");
+        emit(&sink.writer, b"lost before first marker\n");
+        record_release_tx.send(()).unwrap();
+        marker_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("file worker did not enter the gated marker write");
+
+        // The first marker is in progress. Fill the queue with a record, then
+        // lose the next one. No later event is emitted to rescue the wakeup.
+        emit(&sink.writer, b"accepted between markers\n");
+        emit(&sink.writer, b"lost during first marker\n");
+        assert_eq!(sink.toggle.dropped_events(), 2);
+        marker_release_tx.send(()).unwrap();
+
+        let marker = gap_marker_line(1);
+        let expected = format!(
+            "block initial record\naccepted before first loss\n{marker}accepted between markers\n{marker}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let text = String::from_utf8_lossy(&written.lock().unwrap()).into_owned();
+            if text == expected {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "file worker did not preserve marker ordering: {text:?}"
+            );
+            std::thread::yield_now();
+        }
+
+        sink.toggle.disable().unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Disabled)
+        });
+    }
+
+    #[test]
+    fn disabling_writes_a_gap_marker_for_loss_at_the_queued_tail() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let worker_written = Arc::clone(&written);
+        let sink = spawn_with_capacity(
+            Box::new(move |_| {
+                Ok(Box::new(GatedWriter {
+                    bytes: Arc::clone(&worker_written),
+                    started: started_tx.clone(),
+                    releases: release_rx.clone(),
+                }))
+            }),
+            1,
+        )
+        .unwrap();
+        sink.toggle.enable(config()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+
+        emit(&sink.writer, b"block before disable\n");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("file worker did not enter the gated write");
+        emit(&sink.writer, b"accepted tail\n");
+        emit(&sink.writer, b"lost at tail\n");
+        sink.toggle.disable().unwrap();
+        release_tx.send(()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Disabled)
+        });
+
+        let marker = gap_marker_line(1);
+        let text = String::from_utf8_lossy(&written.lock().unwrap()).into_owned();
+        assert_eq!(
+            text,
+            format!("block before disable\naccepted tail\n{marker}")
+        );
+    }
+
+    #[test]
+    fn shutdown_writes_a_gap_marker_for_loss_at_the_queued_tail() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let worker_written = Arc::clone(&written);
+        let sink = spawn_with_capacity(
+            Box::new(move |_| {
+                Ok(Box::new(GatedWriter {
+                    bytes: Arc::clone(&worker_written),
+                    started: started_tx.clone(),
+                    releases: release_rx.clone(),
+                }))
+            }),
+            1,
+        )
+        .unwrap();
+        sink.toggle.enable(config()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+
+        emit(&sink.writer, b"block before shutdown\n");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("file worker did not enter the gated write");
+        emit(&sink.writer, b"accepted shutdown tail\n");
+        emit(&sink.writer, b"lost at shutdown\n");
+        let shutdown = std::thread::spawn(move || drop(sink.guard));
+        release_tx.send(()).unwrap();
+        shutdown.join().unwrap();
+
+        let marker = gap_marker_line(1);
+        let text = String::from_utf8_lossy(&written.lock().unwrap()).into_owned();
+        assert_eq!(
+            text,
+            format!("block before shutdown\naccepted shutdown tail\n{marker}")
+        );
+    }
+
+    #[test]
+    fn a_gap_marker_write_failure_disables_the_file_sink() {
+        let (started_tx, started_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let sink = spawn_with_capacity(
+            Box::new(move |_| {
+                Ok(Box::new(MarkerFailingGatedWriter {
+                    started: started_tx.clone(),
+                    releases: release_rx.clone(),
+                }))
+            }),
+            1,
+        )
+        .unwrap();
+        sink.toggle.enable(config()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+
+        emit(&sink.writer, b"block before marker failure\n");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("file worker did not enter the gated write");
+        emit(&sink.writer, b"accepted before marker failure\n");
+        emit(&sink.writer, b"lost before marker failure\n");
+        release_tx.send(()).unwrap();
+
+        let state = wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Failed(_))
+        });
+        assert!(
+            matches!(state, FileLogState::Failed(message) if message.contains("marker denied"))
+        );
+        assert!(!sink.writer.accepting.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn separate_loss_batches_write_delta_markers_without_recounting() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let worker_written = Arc::clone(&written);
+        let sink = spawn_with_capacity(
+            Box::new(move |_| {
+                Ok(Box::new(GatedWriter {
+                    bytes: Arc::clone(&worker_written),
+                    started: started_tx.clone(),
+                    releases: release_rx.clone(),
+                }))
+            }),
+            1,
+        )
+        .unwrap();
+        sink.toggle.enable(config()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+
+        emit(&sink.writer, b"block batch one\n");
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        emit(&sink.writer, b"accepted batch one\n");
+        emit(&sink.writer, b"lost batch one\n");
+        release_tx.send(()).unwrap();
+        wait_for_text(&written, &gap_marker_line(1));
+
+        emit(&sink.writer, b"block batch two\n");
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        emit(&sink.writer, b"accepted batch two\n");
+        emit(&sink.writer, b"lost batch two a\n");
+        emit(&sink.writer, b"lost batch two b\n");
+        release_tx.send(()).unwrap();
+        wait_for_text(&written, &gap_marker_line(2));
+        sink.toggle.disable().unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Disabled)
+        });
+
+        assert_eq!(sink.toggle.dropped_events(), 3);
+        let text = String::from_utf8_lossy(&written.lock().unwrap()).into_owned();
+        assert_eq!(text.matches(&gap_marker_line(1)).count(), 1, "{text}");
+        assert_eq!(text.matches(&gap_marker_line(2)).count(), 1, "{text}");
+    }
+
+    #[test]
+    fn reenable_starts_a_fresh_gap_baseline() {
+        let first_file = Arc::new(Mutex::new(Vec::new()));
+        let second_file = Arc::new(Mutex::new(Vec::new()));
+        let opens = Arc::new(AtomicU64::new(0));
+        let (started_tx, started_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let worker_first = Arc::clone(&first_file);
+        let worker_second = Arc::clone(&second_file);
+        let worker_opens = Arc::clone(&opens);
+        let sink = spawn_with_capacity(
+            Box::new(move |_| {
+                if worker_opens.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Box::new(GatedWriter {
+                        bytes: Arc::clone(&worker_first),
+                        started: started_tx.clone(),
+                        releases: release_rx.clone(),
+                    }))
+                } else {
+                    Ok(Box::new(SharedWriter(Arc::clone(&worker_second))))
+                }
+            }),
+            1,
+        )
+        .unwrap();
+        sink.toggle.enable(config()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+
+        emit(&sink.writer, b"block old file\n");
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        emit(&sink.writer, b"accepted old tail\n");
+        emit(&sink.writer, b"lost from old file\n");
+        sink.toggle.disable().unwrap();
+        sink.toggle.enable(config()).unwrap();
+        release_tx.send(()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. }) && opens.load(Ordering::SeqCst) == 2
+        });
+        emit(&sink.writer, b"fresh file record\n");
+        sink.toggle.disable().unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Disabled)
+        });
+
+        let first = String::from_utf8_lossy(&first_file.lock().unwrap()).into_owned();
+        let second = String::from_utf8_lossy(&second_file.lock().unwrap()).into_owned();
+        assert!(first.contains(&gap_marker_line(1)), "{first}");
+        assert_eq!(second, "fresh file record\n");
+        assert_eq!(sink.toggle.dropped_events(), 1);
     }
 
     #[test]
@@ -966,6 +1819,78 @@ mod tests {
             let _ = self.started.send(());
             if let Some(release) = self.release.take() {
                 let _ = release.recv();
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct GatedWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        started: crossbeam_channel::Sender<()>,
+        releases: crossbeam_channel::Receiver<()>,
+    }
+
+    impl Write for GatedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.starts_with(b"block ") {
+                let _ = self.started.send(());
+                let _ = self.releases.recv();
+            }
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MarkerRaceWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        record_started: crossbeam_channel::Sender<()>,
+        record_release: crossbeam_channel::Receiver<()>,
+        marker_started: crossbeam_channel::Sender<()>,
+        marker_release: crossbeam_channel::Receiver<()>,
+        first_marker: bool,
+    }
+
+    impl Write for MarkerRaceWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.starts_with(b"block ") {
+                let _ = self.record_started.send(());
+                let _ = self.record_release.recv();
+            }
+            if self.first_marker && buf.starts_with(b"--- Talker file log gap:") {
+                self.first_marker = false;
+                let _ = self.marker_started.send(());
+                let _ = self.marker_release.recv();
+            }
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MarkerFailingGatedWriter {
+        started: crossbeam_channel::Sender<()>,
+        releases: crossbeam_channel::Receiver<()>,
+    }
+
+    impl Write for MarkerFailingGatedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.starts_with(b"block ") {
+                let _ = self.started.send(());
+                let _ = self.releases.recv();
+            }
+            if buf.starts_with(b"--- Talker file log gap:") {
+                return Err(io::Error::other("marker denied"));
             }
             Ok(buf.len())
         }

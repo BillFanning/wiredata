@@ -13,13 +13,14 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 use egui::{Align, Layout, ScrollArea};
+use wiredata_ui::diagnostics::{attention_callout, SignalTone};
 use wiredata_ui::selection;
 
 use crate::core::{
     channel::{ChannelConfig, ChannelId, InterfaceConfig},
     logging::{
-        FileLogConfig, FileLogState, FileLogToggle, LogEvent, LogLevel, LogLevelHandle,
-        LoggingConfig,
+        FileLogConfig, FileLogState, FileLogToggle, GuiLogHealth, LogEvent, LogFolderOpener,
+        LogFolderState, LogLevel, LogLevelHandle, LoggingConfig,
     },
     message::{code_page_replacements, CodePage, CodePageReplacementSummary, MessageConfig},
     profile::Profile,
@@ -63,7 +64,7 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
     // Windows 11 would otherwise ignore the high-rate timer request while
     // the window is minimized — the usual state of a long soak (ADR-017).
     crate::core::timing::keep_timer_resolution_when_minimized();
-    let (log_tx, log_rx) = crossbeam_channel::bounded::<LogEvent>(512);
+    let (log_tx, log_rx) = crossbeam_channel::bounded::<LogEvent>(GUI_LOG_QUEUE_CAP);
     // `logging` stays in scope until `run_native` returns so the
     // file-appender worker guards aren't dropped early. The reload
     // handle is cloned out for the GUI's log-level ComboBox.
@@ -73,6 +74,9 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
     let file_log = logging
         .file_log_toggle()
         .context("GUI file-log control was not installed")?;
+    let gui_log_health = logging
+        .gui_log_health()
+        .context("GUI pane-log health was not installed")?;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -98,6 +102,7 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
                 cc.storage,
                 level_handle,
                 file_log,
+                gui_log_health,
             )))
         }),
     )
@@ -114,6 +119,16 @@ pub(crate) use crate::core::supervisor::STATUS_QUEUE_CAP;
 const RECENT_PROFILES_KEY: &str = "recent_profiles";
 /// How many entries the Profile menu's Recent section keeps.
 const MAX_RECENT_PROFILES: usize = 8;
+/// Bounded handoff from tracing call sites to the on-screen Log pane. A full
+/// queue never blocks application work and is reported through `GuiLogHealth`.
+const GUI_LOG_QUEUE_CAP: usize = 512;
+/// Maximum log entries formatted into pane rows in one frame. Producers can
+/// refill the bounded queue while it is being drained, so the queue bound alone
+/// would not bound UI-thread work.
+const GUI_LOG_DRAIN_PER_FRAME: usize = GUI_LOG_QUEUE_CAP;
+/// One chronological, all-severity history backs the GUI Log pane. Visibility
+/// switches filter this retained set; they do not reserve per-level capacity.
+const LOG_HISTORY_CAP: usize = 2_000;
 
 /// All-or-none draft → profile conversion, **index-preserving**: any channel
 /// or message that cannot convert aborts the whole flush with human-readable
@@ -423,10 +438,10 @@ fn replace_channel_run(
 }
 
 struct TalkerApp {
-    /// Repaint-on-status coalescer shared with every runner thread: a status
-    /// wakes the UI instantly, but N statuses between frames cost **one**
-    /// winit wake (see `wiredata_ui::repaint`). Re-armed at the top of each
-    /// frame, before the status drain.
+    /// Cross-thread repaint coalescer shared with channel runners and the pane,
+    /// file, and folder logging observers. N notifications between frames cost
+    /// **one** winit wake (see `wiredata_ui::repaint`). Re-armed at the top of
+    /// each frame, before the inbox drains.
     repaint: std::sync::Arc<wiredata_ui::repaint::RepaintCoalescer>,
     profile: Profile,
     profile_path: Option<PathBuf>,
@@ -470,11 +485,17 @@ struct TalkerApp {
     /// Per-severity display filters for the retained log panel. These never
     /// change what the recording threshold admits to the pane or file.
     log_visibility: LogVisibility,
+    /// Session-cumulative loss at the independent bounded GUI-pane transport.
+    gui_log_health: GuiLogHealth,
     /// Runtime GUI file destination. The worker behind this handle owns every
     /// open/write/flush/close operation.
     file_log: FileLogToggle,
     file_log_state: FileLogState,
     file_log_config: Option<FileLogConfig>,
+    /// Independent helper for creating/opening the fixed GUI log directory.
+    /// It never shares the UI or file-writer thread.
+    log_folder: LogFolderOpener,
+    log_folder_state: LogFolderState,
     /// Recently loaded/saved profile paths, most recent first (max
     /// [`MAX_RECENT_PROFILES`]); persisted via eframe storage.
     recent_profiles: Vec<PathBuf>,
@@ -559,6 +580,12 @@ impl LogVisibility {
             tracing::Level::WARN => self.warn,
             tracing::Level::ERROR => self.error,
         }
+    }
+}
+
+fn trim_log_history(lines: &mut Vec<(String, tracing::Level)>) {
+    if lines.len() > LOG_HISTORY_CAP {
+        lines.drain(..lines.len() - LOG_HISTORY_CAP);
     }
 }
 
@@ -681,6 +708,7 @@ impl TalkerApp {
         storage: Option<&dyn eframe::Storage>,
         log_level_handle: LogLevelHandle,
         file_log: FileLogToggle,
+        gui_log_health: GuiLogHealth,
     ) -> Self {
         // Default to dark; persisted across runs. Stored as the string
         // "false" only when the user has switched to light.
@@ -698,6 +726,15 @@ impl TalkerApp {
         {
             let repaint = std::sync::Arc::clone(&repaint);
             file_log.set_notify(std::sync::Arc::new(move || repaint.notify()));
+        }
+        {
+            let repaint = std::sync::Arc::clone(&repaint);
+            gui_log_health.set_notify(std::sync::Arc::new(move || repaint.notify()));
+        }
+        let log_folder = LogFolderOpener::default();
+        {
+            let repaint = std::sync::Arc::clone(&repaint);
+            log_folder.set_notify(std::sync::Arc::new(move || repaint.notify()));
         }
         // Sampled lanes (ADR-018): the GUI's display cost stays constant
         // regardless of send rate; statuses wake the UI via the coalescer.
@@ -728,9 +765,12 @@ impl TalkerApp {
             channels_collapsed: false,
             log_counts: HashMap::new(),
             log_visibility: LogVisibility::default(),
+            gui_log_health,
             file_log,
             file_log_state,
             file_log_config: crate::core::logging::default_log_dir().map(FileLogConfig::new),
+            log_folder_state: log_folder.state(),
+            log_folder,
             recent_profiles: storage
                 .and_then(|s| s.get_string(RECENT_PROFILES_KEY))
                 .map(|joined| {
@@ -1225,7 +1265,7 @@ impl TalkerApp {
             self.save_profile_as();
         }
 
-        for event in self.log_rx.try_iter() {
+        for event in self.log_rx.try_iter().take(GUI_LOG_DRAIN_PER_FRAME) {
             // Tally channel-attributed events (structured `channel` field — a
             // stable ChannelId, ADR-020) for the channel-list rows. Keyed by
             // id, so a runner below a removed channel keeps counting into its
@@ -1238,9 +1278,12 @@ impl TalkerApp {
             let line = format!("[{ts}] [{:<5}] {}", event.level, event.message);
             self.log_lines.push((line, event.level));
         }
-        const LOG_CAP: usize = 2000;
-        if self.log_lines.len() > LOG_CAP {
-            self.log_lines.drain(..self.log_lines.len() - LOG_CAP);
+        trim_log_history(&mut self.log_lines);
+        if !self.log_rx.is_empty() {
+            // Entries already waiting before `frame_started` have no pending
+            // wake of their own. Keep this frame bounded, then immediately
+            // schedule another until the backlog is gone.
+            self.repaint.notify();
         }
 
         // Drain runner telemetry (ADR-019: the supervisor owns the statuses;
@@ -1271,10 +1314,9 @@ impl TalkerApp {
         }
 
         if self.sup.any_running() || self.sup.any_draining() {
-            // Sends wake the UI instantly via the runners' notify callbacks
-            // (ADR-016); this slower heartbeat only covers what has no
-            // callback — log lines arriving over `log_rx`, the window title,
-            // and reaping drained threads.
+            // Runner and logging callbacks wake the UI for new observations.
+            // This slower heartbeat advances quiet-period rate displays,
+            // refreshes the window title, and reaps drained threads.
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
 
@@ -1297,6 +1339,7 @@ impl eframe::App for TalkerApp {
         self.repaint.frame_started();
         self.debug_assert_channel_state_aligned();
         self.sync_file_log_state(ui.ctx());
+        self.sync_log_folder_state();
         self.poll_channels(ui.ctx());
         self.refresh_message_analysis();
         self.handle_tab_keys(ui.ctx());
@@ -1490,11 +1533,33 @@ impl TalkerApp {
         }
     }
 
+    fn sync_log_folder_state(&mut self) {
+        let next = self.log_folder.state();
+        if next == self.log_folder_state {
+            return;
+        }
+        self.log_folder_state = next.clone();
+        if let LogFolderState::Failed(error) = next {
+            tracing::error!("the log folder could not be opened: {error}");
+        }
+    }
+
     fn show_log_panel(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("log_panel")
             .resizable(true)
             .default_size(190.0)
             .show_inside(ui, |ui| {
+                let file_failure = match &self.file_log_state {
+                    FileLogState::Failed(error) => Some(error.clone()),
+                    _ => None,
+                };
+                let folder_failure = match &self.log_folder_state {
+                    LogFolderState::Failed(error) => Some(error.clone()),
+                    LogFolderState::Idle | LogFolderState::Opening => None,
+                };
+                let file_dropped = self.file_log.dropped_events();
+                let pane_dropped = self.gui_log_health.dropped_events();
+
                 ui.horizontal(|ui| {
                     ui.strong("Log");
                     ui.separator();
@@ -1542,23 +1607,32 @@ impl TalkerApp {
                     );
                     let mut file_hint = match &self.file_log_state {
                         FileLogState::Enabled { directory, prefix } => format!(
-                            "Saving logs in {}. Files begin with {prefix}; a new file is started \
-                             each day. Show in pane does not change file content. File logging \
-                             stays on only until Talker closes.",
+                            "Saving logs in {}. Files begin with {prefix}. Talker uses this log \
+                             folder; it cannot be changed in this window. A new file starts each \
+                             day. Old log files are not deleted automatically. Show in pane does \
+                             not change file content. File logging stays on only until Talker \
+                             closes.",
                             directory.display()
                         ),
                         FileLogState::Enabling => "Starting file logging…".to_owned(),
                         FileLogState::Disabling => {
                             "Finishing the current log file…".to_owned()
                         }
-                        FileLogState::Failed(error) => {
-                            format!("File logging is off: {error}. Select Log file to retry.")
-                        }
+                        FileLogState::Failed(error) => match &self.file_log_config {
+                            Some(config) => format!(
+                                "File logging is off: {error}. Select Log file to retry. Talker \
+                                 uses {}; that folder cannot be changed in this window, and old \
+                                 log files are not deleted automatically.",
+                                config.directory.display()
+                            ),
+                            None => format!("File logging is off: {error}."),
+                        },
                         FileLogState::Disabled => match &self.file_log_config {
                             Some(config) => format!(
-                                "Save logs in {}. Files begin with {}; a new file is started each \
-                                 day. This starts off each time Talker opens, and profiles do not \
-                                 turn it on.",
+                                "Save logs in {}. Files begin with {}. Talker uses this log folder; \
+                                 it cannot be changed in this window. A new file starts each day. \
+                                 Old log files are not deleted automatically. File logging starts \
+                                 off each time Talker opens, and profiles do not turn it on.",
                                 config.directory.display(),
                                 config.prefix
                             ),
@@ -1567,34 +1641,15 @@ impl TalkerApp {
                                 .to_owned(),
                         },
                     };
-                    let dropped = self.file_log.dropped_events();
-                    if dropped > 0 {
+                    if file_dropped > 0 {
                         file_hint.push_str(&format!(
-                            " {dropped} log entries were not written to a file this session because \
-                             the file writer could not keep up."
+                            " {file_dropped} log entries were not written to a file this session \
+                             because saving could not keep up. While file logging remains \
+                             available, the saved logs mark the gap after saving catches up or \
+                             file logging stops."
                         ));
                     }
                     response.clone().on_hover_text(file_hint);
-                    if let FileLogState::Failed(error) = &self.file_log_state {
-                        ui.colored_label(
-                            wiredata_ui::palette::active(ui).fault,
-                            "File unavailable",
-                        )
-                        .on_hover_text(format!(
-                            "The log file is off: {error}. Select Log file to retry."
-                        ));
-                    }
-                    if dropped > 0 {
-                        ui.colored_label(
-                            wiredata_ui::palette::active(ui).warning,
-                            format!("{dropped} log entries not saved"),
-                        )
-                        .on_hover_text(
-                            "Log entries not written to a file this session because the file writer \
-                             could not keep up. Sending does not wait for file logging; the Log pane \
-                             is handled separately.",
-                        );
-                    }
                     if response.changed() {
                         let result = if file_enabled {
                             self.file_log_config
@@ -1608,13 +1663,44 @@ impl TalkerApp {
                             tracing::error!("file log change failed: {error:#}");
                         }
                     }
+                    ui.separator();
+
+                    let opening_folder = matches!(self.log_folder_state, LogFolderState::Opening);
+                    let folder_button = ui
+                        .add_enabled(
+                            file_available && !opening_folder,
+                            egui::Button::new(if opening_folder {
+                                "Opening folder…"
+                            } else {
+                                "Open folder"
+                            }),
+                        )
+                        .on_hover_text(match &self.file_log_config {
+                            Some(config) => format!(
+                                "Create {} if needed, then open it. This does not turn on file \
+                                 logging.",
+                                config.directory.display()
+                            ),
+                            None => "No local log folder is available on this computer.".to_owned(),
+                        });
+                    if folder_button.clicked() {
+                        if let Some(config) = &self.file_log_config {
+                            if self.log_folder.open(config.directory.clone()) {
+                                // Preserve the accepted edge locally. A fast
+                                // retry can otherwise go Failed -> Opening ->
+                                // the same Failed value between two frames,
+                                // making the click appear to do nothing.
+                                self.log_folder_state = LogFolderState::Opening;
+                            }
+                        }
+                    }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .small_button("Clear")
                             .on_hover_text(
-                                "Clear the on-screen log. Channel counts and saved log files are \
-                                 unchanged.",
+                                "Clear the on-screen log. Channel counts, saved log files, and \
+                                 log-loss notices are unchanged.",
                             )
                             .clicked()
                         {
@@ -1622,11 +1708,13 @@ impl TalkerApp {
                         }
                     });
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Show in pane:").on_hover_text(
-                        "Display only. These boxes hide or show entries already in this pane; they \
-                         do not change which new entries Detail collects or what the file contains. \
-                         These choices last until Talker closes.",
+                        "Display only. The pane keeps the newest 2,000 entries that meet the Detail \
+                         setting, with one shared limit for all five levels. Hidden entries still \
+                         use that space and can push older visible entries out. These boxes do not \
+                         change what Detail collects or what the file contains, and last until \
+                         Talker closes.",
                     );
                     ui.checkbox(&mut self.log_visibility.trace, "Trace");
                     ui.checkbox(&mut self.log_visibility.debug, "Debug");
@@ -1634,6 +1722,54 @@ impl TalkerApp {
                     ui.checkbox(&mut self.log_visibility.warn, "Warn");
                     ui.checkbox(&mut self.log_visibility.error, "Error");
                 });
+                ui.weak("keeps newest 2,000 entries").on_hover_text(
+                    "Trace, Debug, Info, Warn, and Error share one chronological history. Hidden \
+                     entries count toward the same 2,000-entry limit.",
+                );
+                if let Some(error) = file_failure {
+                    attention_callout(
+                        ui,
+                        "file_log_unavailable",
+                        "File unavailable",
+                        SignalTone::Fault,
+                        format!("The log file is off: {error}. Select Log file to retry."),
+                    );
+                }
+                if file_dropped > 0 {
+                    attention_callout(
+                        ui,
+                        "file_log_entries_not_saved",
+                        format!("{file_dropped} log entries not saved this session"),
+                        SignalTone::Fault,
+                        "Talker produced log entries faster than they could be saved. While file \
+                         logging remains available, the saved logs mark the missing count after \
+                         saving catches up or file logging stops. Sending continued without \
+                         waiting; the on-screen Log is collected separately.",
+                    );
+                }
+                if pane_dropped > 0 {
+                    attention_callout(
+                        ui,
+                        "pane_log_entries_not_shown",
+                        format!("{pane_dropped} log entries not shown this session"),
+                        SignalTone::Fault,
+                        "The on-screen Log could not keep up. These entries are missing, and channel \
+                         Info/Warn/Error counts may be lower than what occurred. Sending continued \
+                         without waiting; saved log files are collected separately.",
+                    );
+                }
+                if let Some(error) = folder_failure {
+                    attention_callout(
+                        ui,
+                        "log_folder_unavailable",
+                        "Log folder did not open",
+                        SignalTone::Fault,
+                        format!(
+                            "The log folder could not be created or opened: {error}. Select Open \
+                             folder to retry."
+                        ),
+                    );
+                }
                 ui.separator();
                 // Filter first, then virtualize: `show_rows` lays out only the
                 // visible rows instead of all (up to 2,000) lines every
@@ -1926,6 +2062,35 @@ mod tests {
         assert_eq!(counts.info, 1);
         assert_eq!(counts.warn, 1);
         assert_eq!(counts.error, 1);
+    }
+
+    #[test]
+    fn log_history_cap_is_shared_by_hidden_and_visible_levels() {
+        let mut lines = vec![("old error".to_owned(), tracing::Level::ERROR)];
+        lines.extend(
+            (0..LOG_HISTORY_CAP).map(|index| (format!("trace {index}"), tracing::Level::TRACE)),
+        );
+
+        trim_log_history(&mut lines);
+
+        assert_eq!(lines.len(), LOG_HISTORY_CAP);
+        assert!(
+            lines
+                .iter()
+                .all(|(_, level)| *level == tracing::Level::TRACE),
+            "hidden low-detail entries still use the chronological history and can evict an error"
+        );
+        let error_only = LogVisibility {
+            trace: false,
+            debug: false,
+            info: false,
+            warn: false,
+            error: true,
+        };
+        assert!(
+            lines.iter().all(|(_, level)| !error_only.includes(*level)),
+            "display filtering happens after retention"
+        );
     }
 
     /// Log severities come from the shared palette, in both themes.

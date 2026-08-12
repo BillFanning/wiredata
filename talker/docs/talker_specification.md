@@ -1,24 +1,26 @@
 # Talker — Program Specification
-**Version:** 2.4.14
+**Version:** 2.4.15
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-08-11) — logging controls and channel fault state now say
-exactly what is current, what is retained, and what is saved:
+Revision note (2026-08-12) — both GUI log destinations now disclose when they
+cannot keep up:
 
-- **§3.1 / §9.2 logging (ADR-006, corrected)** — the GUI exposes all five
-  severities, separates collection from pane visibility, and offers a
-  session-local file toggle backed by non-blocking file work and visible failure
-  reporting. CLI logging remains launch policy from the profile; neither mode
-  reads `RUST_LOG`.
-- **§3.2 / §4.4 current fault versus run history (ADR-056)** — a channel row
-  shows the unresolved command or interface problem now. Successful sending
-  clears the current interface fault without erasing this run's Send outcomes
-  or log counts; command faults clear only through their own success path.
-- **§5.7 / §8.1 repair after a dropped live update (ADR-018/056)** — periodic
-  and final counters repeat the active send/reopen fault and the cumulative
-  failure-episode count, so a dropped failure or recovery edge is repaired
-  without a heartbeat or a reliable send-path observer queue.
+- **§4.4 / §9.2 pane completeness** — a persistent,
+  session-cumulative notice reports entries that did not reach the Log pane.
+  Those entries are absent from its retained history and its per-channel
+  INFO/WARN/ERROR tallies, while saved files remain an independent destination.
+- **§9.2 retained history and saved gaps** — all five levels share one
+  newest-2,000-entry history before pane visibility is applied. File loss
+  remains non-blocking and session-counted; after entries accepted ahead of a
+  loss drain, or when the enabled destination closes, the worker attempts a
+  plain gap line for the omitted batch. The visible queue-loss count remains
+  available if the destination can no longer be written.
+- **§9.2 file access and limits** — GUI logging uses a fixed local-data
+  directory when the platform provides one, rotates daily, deletes no old
+  files, and adds a
+  non-blocking **Open folder** action that neither enables logging nor shares
+  the file worker. Folder failures remain visible in the Log pane.
 
 Earlier revisions are in [REVISIONS.md](REVISIONS.md). They live there rather
 than here for two reasons: a document's version number belongs only in its own
@@ -520,10 +522,11 @@ Each channel maintains and displays:
 
 - **Send outcomes** — cumulative scheduled, failed, suppressed, missed, and sent
   totals for the current run; they remain visible after recovery and after Stop
-- **Log counts** — collected, channel-attributed INFO, WARN, and ERROR entries
-  since Start;
-  DEBUG and TRACE remain available in the global Log pane when Detail admits
-  them, but do not inflate INFO
+- **Log counts** — channel-attributed INFO, WARN, and ERROR entries delivered
+  to the global Log pane since Start; DEBUG and TRACE remain available there
+  when Detail admits them, but do not inflate INFO. While **log entries not
+  shown this session** is present, those three tallies may be lower than what
+  occurred
 - **Status indicator** — the channel's current lifecycle state
 - **Current fault** — the unresolved command or interface problem shown inline;
   a command failure takes precedence, retry attempts refresh the current
@@ -1203,29 +1206,52 @@ non-blocking logger thread rather than the channel's send thread.
 The GUI includes a global **Log** pane for TRACE, DEBUG, INFO, WARN, and ERROR
 events. Its controls are deliberately separate:
 
-- **Detail** is the process-wide threshold for new events reaching the pane,
-  console, and enabled file destination. It defaults to Info each launch. Debug
-  includes DEBUG and higher events; Trace includes all five levels.
+- **Detail** is the process-wide threshold for new events eligible for the
+  pane, console, and enabled file destination. It defaults to Info each launch.
+  Debug includes DEBUG and higher events; Trace includes all five levels. The
+  two bounded GUI destinations can independently omit an eligible event if
+  they cannot keep up.
 - Five independent **Show in pane** switches hide or show retained pane rows
-  only. All default on. They do not alter collection, channel INFO/WARN/ERROR
-  counts, or file contents; a hidden retained row can reappear until the pane's
-  2,000-row cap evicts it.
+  only. All default on. All five levels share one chronological history of the
+  newest 2,000 entries delivered to the pane after Detail is applied; retention
+  happens before visibility, so hidden rows use the same capacity and can evict
+  older visible rows. The switches do not alter collection, channel
+  INFO/WARN/ERROR counts, or file contents; a hidden retained row can reappear
+  only while it remains in that shared history.
 - **Clear** removes only the on-screen pane rows. Channel counts and saved files
-  are unchanged.
+  are unchanged, as are the session's pane-loss and file-loss notices.
 - **Log file** is off at every launch and lasts only for the GUI session. Loading
   a profile cannot enable it or change Detail or Show in pane. When enabled, it
   writes under the platform's local-data `talker/logs` directory with the
-  `talker.log` prefix and starts a new file each day.
+  `talker.log` prefix and starts a new file each day. That GUI destination is
+  fixed. **Open folder** creates it if needed and asks the desktop to open it on
+  a separate helper thread; the action neither turns file logging on nor uses
+  its file worker. A launch failure remains visible and may be retried. If the
+  platform cannot provide a local-data directory, file logging and Open folder
+  are unavailable.
+
+Events offered to the on-screen Log cross a bounded, non-blocking handoff. If it
+fills, Talker keeps sending and shows a persistent, session-cumulative **log
+entries not shown** count. Those entries never enter the pane's retained history
+or its derived per-channel INFO/WARN/ERROR tallies, so the latter may be low.
+The saved-file destination is independent: loss in one does not establish loss
+in the other. Pane processing is bounded per frame, so accepted backlog is
+carried across frames.
 
 Opening, writing, flushing, and closing GUI log files belong to a dedicated file
 worker; neither the UI nor a channel's send thread waits for disk I/O. New file
 entries cross a bounded queue. If that queue fills, Talker keeps sending and
-shows a session-cumulative **log entries not saved** count. An open, write, or
-flush failure turns file logging off and remains visible beside the control so
-it does not depend on the pane being open or ERROR rows being shown. Disabling
-or shutting down drains entries already queued for the current file before
-flushing it; generation boundaries prevent a late entry from an earlier file
-session entering a later one.
+shows a persistent, session-cumulative **log entries not saved** count. After
+entries accepted before a known queue loss have drained, the worker attempts to
+write a plain gap line for that loss directly in the saved output. A marker is
+best-effort: the same destination failure that loses entries can also prevent it
+from being written. Disabling or shutting down first drains accepted entries,
+then attempts a final gap line and flush.
+While the GUI remains open, failure to write either an entry or its gap line
+turns file logging off and leaves a Fault callout in the Log pane; the visible
+session count remains even when the file cannot record its gap. File-session
+boundaries prevent a late entry or loss from an earlier destination being
+assigned to a later one.
 
 GUI rotation is time-based only. It starts a new file daily but deletes no old
 files and places no bound on total disk use. CLI profiles may instead select no

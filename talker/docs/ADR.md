@@ -1,21 +1,20 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.19
-**Date:** 2026-08-11
+**Version:** 1.20
+**Date:** 2026-08-12
 **Status:** Accepted
 
-Revision note (2026-08-11) — logging and channel health separate control,
-history, and current state:
+Revision note (2026-08-12) — both GUI log routes now disclose observer loss:
 
-- **ADR-006 (corrected)** records five logging levels, the shared collection
-  threshold, pane-only visibility switches, and the GUI's session-local
-  bounded-queue file destination with visible loss/failure reporting and no
-  retention promise.
-- **ADR-010 (corrected)** keeps profiles and GUI state separate while naming
-  only the state actually retained; runtime logging controls reset each launch.
-- **ADR-018 / ADR-056** add current send/reopen state and a cumulative failure-
-  episode count to counter snapshots. Immediate edges remain responsive; repeated
-  counters repair dropped edges without erasing run outcomes or log history.
+- **ADR-006 (corrected)** gives the pane and file independent bounded,
+  non-blocking loss accounts. Pane loss qualifies retained history and channel
+  tallies; the file worker attempts a direct gap marker after earlier accepted
+  entries, with enabled-session boundaries preventing reassignment.
+- **ADR-006 (boundary added)** keeps one chronological pane history, a fixed GUI
+  directory when platform local data is available, and time-only rotation.
+  **Open folder** runs independently of the UI and file worker and never enables
+  logging; directory choice, retention, and disk-use bounds remain outside this
+  change.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -133,18 +132,28 @@ An ADR captures *why* a significant decision was made, not just *what* was decid
 
 ## ADR-006 — Logging: `tracing` + `tracing-subscriber`
 
-**Context:** `talker` needs structured logging to both a rotating file and stdout (CLI), and to a GUI status pane plus optional file (GUI).
+**Context:** `talker` needs structured logging to both a rotating file and
+stdout (CLI), and to a GUI Log pane plus optional file (GUI).
 
 **Correction (2026-08-11):** The original decision named only three severities
 and assigned CLI filtering to `RUST_LOG`; neither describes the implemented
 contract. The decision below replaces those two statements.
 
+**Correction (2026-08-12):** The pane's bounded handoff previously discarded
+entries silently, and the file's loss count did not leave evidence inside saved
+output. The decision now treats pane and file delivery as two independent lossy
+observers, makes each loss visible, and attempts file-gap evidence without
+sending a log event through the route that is already overloaded. It also fixes
+the GUI log directory and separates opening that folder from both the UI and
+file worker.
+
 **Decision:** Use the `tracing` facade with `tracing-subscriber` for TRACE,
 DEBUG, INFO, WARN, and ERROR dispatch. One reloadable threshold wraps the complete
-sink stack, so an admitted event is consistently available to every installed
-destination. CLI takes that threshold from the profile's `[logging].level`; it
-does not read `RUST_LOG`, and its stdout and file destinations are fixed at
-launch.
+sink stack, so an admitted event is offered consistently to every installed
+destination. Each bounded destination may still omit that event independently
+if its receiver cannot keep up. CLI takes the threshold from the profile's
+`[logging].level`; it does not read `RUST_LOG`, and its stdout and file
+destinations are fixed at launch.
 
 The GUI installs a permanent pane destination and a runtime-controlled file
 destination at subscriber initialization. **Detail** changes the shared
@@ -153,13 +162,35 @@ filter retained pane rows only; they neither reconfigure capture nor affect the
 file. These controls are session-local, begin at Info/all shown/file off, and are
 not applied from profiles.
 
+The pane uses its own bounded, non-blocking handoff. A full handoff increments a
+persistent, session-cumulative loss count and wakes the GUI; normal receiver
+teardown during shutdown is not overload and is not counted. Only entries that
+arrive through this path enter pane history or its derived per-channel
+INFO/WARN/ERROR tallies, so the visible loss count explicitly qualifies both.
+All five levels share one chronological newest-2,000-entry history, and the
+Show switches apply after retention. Hidden rows therefore consume the same
+capacity as visible rows. Pane processing is bounded per frame and carries any
+accepted backlog into later frames.
+
 The GUI file destination is switched by control messages, not by rebuilding the
 subscriber. One dedicated worker owns file open, write, flush, and close. Event
-producers use a bounded non-blocking queue; saturation is counted and shown, and
-file failures become a persistent inline state until retried. Disable and shutdown
-drain entries already queued for the current file before flushing. File-session
-generation tags quarantine late entries so they cannot enter a later destination.
-GUI files rotate daily by time and have no retention or disk-use bound.
+producers use a separate bounded non-blocking queue. Saturation increments a
+session-cumulative visible count. Within each enabled file session, the worker
+attempts a direct plain gap marker only after writing entries accepted before
+the known loss. The marker never re-enters `tracing`, and no producer waits for
+it. Disable and shutdown drain accepted entries, attempt the final marker, then
+flush. File-session generation boundaries keep late entries and losses out of a
+later destination. A marker remains best-effort because a destination write
+failure can prevent the evidence itself; while the GUI remains open, that uses
+the ordinary visible file-failure path and the session loss count remains.
+
+When the platform supplies a local-data directory, the GUI file destination is
+its fixed `talker/logs` location. Otherwise file logging and **Open folder** are
+unavailable. Open folder creates the directory if needed and invokes the
+platform folder opener on a separate, single-in-flight helper thread. It waits
+there for the opener's result so a non-zero exit remains visible and retryable.
+The action never enables file logging and never occupies the UI or file-worker
+thread. GUI files rotate daily by time and have no retention or disk-use bound.
 
 **Alternatives considered:**
 - **`log` + `env_logger`:** The classic Rust logging pair. Simpler but less flexible — `tracing` supports structured fields and spans, which will be useful for correlating log events with specific connections or send operations.
@@ -171,15 +202,38 @@ GUI files rotate daily by time and have no retention or disk-use bound.
   can stall cadence or repaint; an unbounded queue trades that for uncontrolled
   memory growth. A bounded lossy observer preserves application work and makes
   the loss visible.
+- **Make either observer reliable or block producers until space exists:** This
+  would let diagnostic work delay the send path it is meant to observe. The
+  decision instead makes incomplete evidence explicit at each destination.
+- **Emit file-gap markers as tracing events:** Such a marker would traverse the
+  same bounded file route whose loss it reports, could itself be dropped, and
+  would also create an unrelated pane row. The file worker writes it directly.
+- **Keep separate pane histories per severity:** Reserved capacity would change
+  chronological retention and add policy without measured need. One shared
+  history keeps visibility reversible for every row that is still retained.
+- **Open or choose the directory on the UI or file-worker thread:** Folder
+  creation and desktop launch can block or fail independently of file writes.
+  The separate helper preserves both boundaries. Directory choice, retention,
+  and size-based rotation remain separate product decisions.
 
 **Consequences:**
-- The GUI status pane is implemented as a `tracing_subscriber::Layer` that captures log events and pushes them to the UI thread via a `crossbeam-channel`.
+- The GUI Log pane is implemented as a `tracing_subscriber::Layer` that captures
+  log events and pushes them to the UI through a bounded `crossbeam-channel`.
 - GUI file control can change at runtime without file I/O on the UI or channel
   threads. The same Detail threshold governs the pane, console, and file; Show in
   pane cannot be used as an accidental recording filter.
-- File logging is intentionally best-effort under sustained disk pressure. The
-  visible dropped-entry count is cumulative for the process session. Time
-  rotation does not delete old files; retention remains separate work.
+- Pane and file delivery are independently best-effort. Each has its own visible,
+  session-cumulative loss count; loss in one does not establish loss in the
+  other. Neither waits for queue capacity or file I/O; queue-full bookkeeping
+  uses only short-lived in-memory synchronization.
+- When its marker write succeeds, saved output identifies known file-delivery
+  gaps after the earlier accepted backlog. The visible session count remains
+  the persistent in-process disclosure when it does not; enabled-session
+  boundaries prevent a stale entry or loss from being reassigned after disable
+  and re-enable.
+- The fixed folder can be created and opened without enabling logging or doing
+  I/O on the UI thread. Time rotation deletes no old files; directory choice,
+  retention, size rotation, and a disk-use bound remain separate work.
 
 ---
 

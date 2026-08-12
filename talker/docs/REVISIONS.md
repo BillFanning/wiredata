@@ -13,6 +13,23 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-08-11) — logging controls and channel fault state now say
+exactly what is current, what is retained, and what is saved:
+
+- **§3.1 / §9.2 logging (ADR-006, corrected)** — the GUI exposes all five
+  severities, separates collection from pane visibility, and offers a
+  session-local file toggle backed by non-blocking file work and visible failure
+  reporting. CLI logging remains launch policy from the profile; neither mode
+  reads `RUST_LOG`.
+- **§3.2 / §4.4 current fault versus run history (ADR-056)** — a channel row
+  shows the unresolved command or interface problem now. Successful sending
+  clears the current interface fault without erasing this run's Send outcomes
+  or log counts; command faults clear only through their own success path.
+- **§5.7 / §8.1 repair after a dropped live update (ADR-018/056)** — periodic
+  and final counters repeat the active send/reopen fault and the cumulative
+  failure-episode count, so a dropped failure or recovery edge is repaired
+  without a heartbeat or a reliable send-path observer queue.
+
 Revision note (2026-08-10) — a replaced serial device can recover in the same
 run without broadening network recovery:
 
@@ -368,6 +385,19 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-08-11) — logging and channel health separate control,
+history, and current state:
+
+- **ADR-006 (corrected)** records five logging levels, the shared collection
+  threshold, pane-only visibility switches, and the GUI's session-local
+  bounded-queue file destination with visible loss/failure reporting and no
+  retention promise.
+- **ADR-010 (corrected)** keeps profiles and GUI state separate while naming
+  only the state actually retained; runtime logging controls reset each launch.
+- **ADR-018 / ADR-056** add current send/reopen state and a cumulative failure-
+  episode count to counter snapshots. Immediate edges remain responsive; repeated
+  counters repair dropped edges without erasing run outcomes or log history.
 
 Revision note (2026-08-10) — serial device replacement gets a transport-specific
 recovery boundary:

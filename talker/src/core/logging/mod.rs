@@ -1,3 +1,4 @@
+mod folder;
 mod gui_layer;
 mod runtime_file;
 
@@ -9,7 +10,8 @@ use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, reload, util::SubscriberInitExt, Layer, Registry,
 };
 
-pub use gui_layer::{GuiLogLayer, LogEvent};
+pub(crate) use folder::{LogFolderOpener, LogFolderState};
+pub use gui_layer::{GuiLogHealth, GuiLogLayer, LogEvent};
 pub use runtime_file::{FileLogState, FileLogToggle};
 
 /// Run a test closure with GUI log capture on its current thread.
@@ -155,6 +157,7 @@ pub struct LoggingHandle {
     _runtime_file_guard: Option<runtime_file::RuntimeFileGuard>,
     level: LogLevelHandle,
     file_log: Option<FileLogToggle>,
+    gui_log_health: Option<GuiLogHealth>,
 }
 
 impl LoggingHandle {
@@ -170,6 +173,13 @@ impl LoggingHandle {
     /// `None` in CLI mode, whose file destination is fixed at launch.
     pub fn file_log_toggle(&self) -> Option<FileLogToggle> {
         self.file_log.clone()
+    }
+
+    /// Health of the bounded GUI-pane event transport.
+    ///
+    /// `None` in CLI mode. Pane loss is independent of file-log loss.
+    pub fn gui_log_health(&self) -> Option<GuiLogHealth> {
+        self.gui_log_health.clone()
     }
 }
 
@@ -187,7 +197,17 @@ pub fn init(
     gui_sender: Option<crossbeam_channel::Sender<LogEvent>>,
 ) -> anyhow::Result<LoggingHandle> {
     let mut guards: Vec<tracing_appender::non_blocking::WorkerGuard> = vec![];
-    let gui_mode = gui_sender.is_some();
+    let (gui_layer, gui_log_health) = match gui_sender {
+        Some(sender) => {
+            let health = GuiLogHealth::new();
+            (
+                Some(GuiLogLayer::with_health(sender, health.clone())),
+                Some(health),
+            )
+        }
+        None => (None, None),
+    };
+    let gui_mode = gui_layer.is_some();
     let mut runtime_file_guard = None;
     let mut file_log = None;
 
@@ -231,8 +251,8 @@ pub fn init(
         runtime_file_guard = Some(sink.guard);
     }
 
-    if let Some(sender) = gui_sender {
-        layers.push(GuiLogLayer::new(sender).boxed());
+    if let Some(layer) = gui_layer {
+        layers.push(layer.boxed());
     }
 
     // The reloadable level filter must wrap the complete sink stack. Putting a
@@ -256,6 +276,7 @@ pub fn init(
         _runtime_file_guard: runtime_file_guard,
         level: level_handle,
         file_log,
+        gui_log_health,
     })
 }
 

@@ -14,6 +14,9 @@ fn production_level_control_gates_the_gui_and_runtime_file_together() {
     let mut config = LoggingConfig::new(LogLevel::Info);
     config.stdout = false;
     let logging = logging::init(&config, Some(gui_tx)).unwrap();
+    let pane_health = logging
+        .gui_log_health()
+        .expect("GUI pane health is installed with GUI capture");
     let file = logging.file_log_toggle().expect("GUI runtime file layer");
     let mut file_config = FileLogConfig::new(directory.clone());
     file_config.prefix = "integration.log".into();
@@ -42,6 +45,7 @@ fn production_level_control_gates_the_gui_and_runtime_file_together() {
         .collect::<Vec<_>>()
         .join("\n");
     assert_threshold_results(&pane);
+    assert_eq!(pane_health.dropped_events(), 0);
 
     let saved = read_log_files(&directory);
     assert_threshold_results(&saved);

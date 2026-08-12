@@ -1,10 +1,15 @@
-use crossbeam_channel::Sender;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
+
+use crossbeam_channel::{Sender, TrySendError};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::{layer::Context, Layer};
 
 use crate::core::channel::ChannelId;
 
-/// A log event forwarded to the GUI status pane.
+/// A log event forwarded to the GUI Log pane.
 #[derive(Debug, Clone)]
 pub struct LogEvent {
     pub level: tracing::Level,
@@ -24,18 +29,80 @@ pub struct LogEvent {
 ///
 /// Construct with [`GuiLogLayer::new`] and install alongside the other layers
 /// in [`super::init`]. The matching [`Receiver`][crossbeam_channel::Receiver]
-/// is read by the GUI status pane to display live log output.
+/// is read by the GUI Log pane to display live log output.
 ///
-/// Sends are best-effort (`try_send`): if the channel is full or the receiver
-/// has been dropped the event is silently discarded rather than blocking the
-/// calling thread.
+/// Sends are best-effort (`try_send`): a full channel increments the matching
+/// [`GuiLogHealth`] counter rather than blocking the calling thread. A dropped
+/// receiver is normal during shutdown and is ignored.
 pub struct GuiLogLayer {
     sender: Sender<LogEvent>,
+    health: GuiLogHealth,
 }
 
 impl GuiLogLayer {
     pub fn new(sender: Sender<LogEvent>) -> Self {
-        Self { sender }
+        Self::with_health(sender, GuiLogHealth::new())
+    }
+
+    pub(super) fn with_health(sender: Sender<LogEvent>, health: GuiLogHealth) -> Self {
+        Self { sender, health }
+    }
+
+    fn forward(&self, event: LogEvent) {
+        match self.sender.try_send(event) {
+            Ok(()) => self.health.notify(),
+            Err(TrySendError::Full(_)) => {
+                self.health.dropped_events.fetch_add(1, Ordering::Relaxed);
+                self.health.notify();
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // The GUI receiver is dropped during normal shutdown. There
+                // is nobody left to show either the event or a loss notice.
+            }
+        }
+    }
+}
+
+type Notify = Arc<dyn Fn() + Send + Sync>;
+
+/// Session-wide health of the bounded GUI-pane log transport.
+///
+/// This is separate from file-log health: pane loss does not imply file loss,
+/// and a full file queue does not imply pane loss.
+#[derive(Clone)]
+pub struct GuiLogHealth {
+    dropped_events: Arc<AtomicU64>,
+    notify: Arc<OnceLock<Notify>>,
+}
+
+impl GuiLogHealth {
+    pub(super) fn new() -> Self {
+        Self {
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            notify: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Number of entries not delivered to the GUI pane because its queue was
+    /// full. The count is cumulative for this application session.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Install the lightweight callback used to wake the GUI after an accepted
+    /// or queue-full event.
+    ///
+    /// Installation may happen after this health handle is constructed. The
+    /// first callback wins; a duplicate installation is ignored so active log
+    /// producers never see their wake target replaced.
+    pub fn set_notify(&self, notify: Notify) {
+        let _ = self.notify.set(notify);
+    }
+
+    fn notify(&self) {
+        if let Some(callback) = self.notify.get() {
+            callback();
+        }
     }
 }
 
@@ -53,7 +120,7 @@ impl<S: Subscriber> Layer<S> for GuiLogLayer {
             channel: visitor.channel,
         };
 
-        let _ = self.sender.try_send(log_event);
+        self.forward(log_event);
     }
 }
 
@@ -93,13 +160,23 @@ impl tracing::field::Visit for EventVisitor {
 
 #[cfg(test)]
 mod tests {
-    use crossbeam_channel::unbounded;
+    use crossbeam_channel::{bounded, unbounded};
 
     use super::*;
 
     fn make_layer() -> (GuiLogLayer, crossbeam_channel::Receiver<LogEvent>) {
         let (tx, rx) = unbounded();
         (GuiLogLayer::new(tx), rx)
+    }
+
+    fn event(message: &str) -> LogEvent {
+        LogEvent {
+            level: tracing::Level::INFO,
+            target: "test".to_owned(),
+            message: message.to_owned(),
+            timestamp: chrono::Local::now(),
+            channel: None,
+        }
     }
 
     #[test]
@@ -157,11 +234,81 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_receiver_does_not_panic() {
-        let (tx, rx) = unbounded::<LogEvent>();
-        let layer = GuiLogLayer::new(tx);
-        drop(rx); // disconnect receiver
-                  // Sending to a disconnected channel must not panic — try_send discards.
-        drop(layer);
+    fn accepted_and_full_events_notify_while_only_full_events_count_as_dropped() {
+        let (tx, rx) = bounded(1);
+        let health = GuiLogHealth::new();
+        let notifications = Arc::new(AtomicU64::new(0));
+        let callback_count = Arc::clone(&notifications);
+        health.set_notify(Arc::new(move || {
+            callback_count.fetch_add(1, Ordering::Relaxed);
+        }));
+        let layer = GuiLogLayer::with_health(tx, health.clone());
+
+        layer.forward(event("accepted"));
+        layer.forward(event("full one"));
+        layer.forward(event("full two"));
+
+        assert_eq!(health.dropped_events(), 2);
+        assert_eq!(notifications.load(Ordering::Relaxed), 3);
+        assert_eq!(rx.try_recv().unwrap().message, "accepted");
+    }
+
+    #[test]
+    fn notify_callback_installs_late_once_and_duplicate_install_is_ignored() {
+        let (tx, rx) = bounded(1);
+        let health = GuiLogHealth::new();
+        let layer = GuiLogLayer::with_health(tx, health.clone());
+
+        // Construction precedes GUI setup. Events before callback installation
+        // remain valid; they simply have nobody to wake yet.
+        layer.forward(event("before callback"));
+        assert_eq!(rx.try_recv().unwrap().message, "before callback");
+
+        let first_notifications = Arc::new(AtomicU64::new(0));
+        let first_callback_count = Arc::clone(&first_notifications);
+        health.set_notify(Arc::new(move || {
+            first_callback_count.fetch_add(1, Ordering::Relaxed);
+        }));
+        let duplicate_notifications = Arc::new(AtomicU64::new(0));
+        let duplicate_callback_count = Arc::clone(&duplicate_notifications);
+        health.set_notify(Arc::new(move || {
+            duplicate_callback_count.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        layer.forward(event("after callback"));
+
+        assert_eq!(first_notifications.load(Ordering::Relaxed), 1);
+        assert_eq!(duplicate_notifications.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn disconnected_receiver_counts_nothing_and_does_not_notify() {
+        let (tx, rx) = bounded::<LogEvent>(1);
+        let health = GuiLogHealth::new();
+        let notifications = Arc::new(AtomicU64::new(0));
+        let callback_count = Arc::clone(&notifications);
+        health.set_notify(Arc::new(move || {
+            callback_count.fetch_add(1, Ordering::Relaxed);
+        }));
+        let layer = GuiLogLayer::with_health(tx, health.clone());
+        drop(rx);
+
+        layer.forward(event("after shutdown"));
+
+        assert_eq!(health.dropped_events(), 0);
+        assert_eq!(notifications.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rendezvous_queue_without_receiver_reports_full_instead_of_blocking() {
+        let (tx, _rx) = bounded::<LogEvent>(0);
+        let health = GuiLogHealth::new();
+        let layer = GuiLogLayer::with_health(tx, health.clone());
+
+        for index in 0..1_000 {
+            layer.forward(event(&format!("full {index}")));
+        }
+
+        assert_eq!(health.dropped_events(), 1_000);
     }
 }
