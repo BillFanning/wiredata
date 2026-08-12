@@ -104,7 +104,11 @@ pub struct ChannelTelemetry {
     /// Errors observed since the channel started: connection/open errors
     /// plus undeliverable commands.
     pub errors_total: u64,
-    /// The latest **interface** error (connection/open failure). Cleared by a
+    /// Send-failure episodes already folded into `errors_total`. Counter
+    /// snapshots advance this even when an immediate edge was dropped.
+    send_failure_episodes: u64,
+    /// The current unresolved **interface** error (send/reopen/open failure).
+    /// Retry snapshots refresh it as the obstacle changes. Cleared by a
     /// delivered payload sample or a `SendRecovered` — live proof the
     /// interface works again — and on start.
     pub last_error: Option<String>,
@@ -1033,7 +1037,9 @@ fn drain_statuses(
                 dropped_statuses,
                 missed_sends,
                 failed_sends,
+                send_failure_episodes,
                 suppressed_sends,
+                active_send_error,
                 timing,
                 captured_at,
                 final_snapshot,
@@ -1048,6 +1054,18 @@ fn drain_statuses(
                 telemetry.missed_sends = missed_sends;
                 telemetry.failed_sends = failed_sends;
                 telemetry.suppressed_sends = suppressed_sends;
+                // Immediate failure/recovery edges paint quickly, but share the
+                // bounded observer queue. The cumulative count repairs every
+                // dropped opening edge, including two failures separated by a
+                // recovery whose own edge and snapshot were both dropped.
+                if send_failure_episodes > telemetry.send_failure_episodes {
+                    telemetry.errors_total +=
+                        send_failure_episodes - telemetry.send_failure_episodes;
+                    telemetry.send_failure_episodes = send_failure_episodes;
+                }
+                // The repeated Option is independently authoritative for the
+                // current state, so either dropped edge repairs the live banner.
+                telemetry.last_error = active_send_error;
                 telemetry.timing = timing.cumulative;
                 telemetry.recent_timing = timing.recent;
                 telemetry.recent_timing_captured_at = Some(captured_at);
@@ -1070,8 +1088,12 @@ fn drain_statuses(
                     replacement_wire_offsets,
                 });
             }
-            TalkerStatus::ConnectionError { message, .. }
-            | TalkerStatus::OpenFailed { message, .. } => {
+            TalkerStatus::ConnectionError { message, .. } => {
+                telemetry.errors_total += 1;
+                telemetry.send_failure_episodes += 1;
+                telemetry.last_error = Some(message);
+            }
+            TalkerStatus::OpenFailed { message, .. } => {
                 telemetry.errors_total += 1;
                 telemetry.last_error = Some(message);
             }
@@ -1155,6 +1177,32 @@ mod tests {
 
     fn schedule(messages: &[MessageConfig]) -> Schedule {
         Schedule::compile(messages, Instant::now()).unwrap()
+    }
+
+    /// A counter-lane snapshot with only the failure state populated. Tests
+    /// omit the immediate edge on purpose to model a full observer queue.
+    fn failure_counter(active_send_error: Option<&str>) -> TalkerStatus {
+        failure_counter_at(active_send_error, 1)
+    }
+
+    fn failure_counter_at(active_send_error: Option<&str>, episodes: u64) -> TalkerStatus {
+        TalkerStatus::Counters {
+            channel: ChannelId::mint(),
+            total_count: 0,
+            total_bytes: 0,
+            per_message_counts: Vec::new(),
+            per_message_timing: Vec::new(),
+            dropped_statuses: 1,
+            missed_sends: 0,
+            failed_sends: episodes,
+            send_failure_episodes: episodes,
+            suppressed_sends: 0,
+            active_send_error: active_send_error.map(str::to_owned),
+            timing: Box::default(),
+            captured_at: Instant::now(),
+            final_snapshot: false,
+            timer: TimerStatus::default(),
+        }
     }
 
     fn poll_until(
@@ -1689,6 +1737,80 @@ mod tests {
         let _ = sup.stop(0);
         let mut samples = Vec::new();
         poll_until(&mut sup, &mut samples, |s| !s.any_draining());
+    }
+
+    #[test]
+    fn counters_repair_a_dropped_failure_edge() {
+        let mut telemetry = ChannelTelemetry::default();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        // No `ConnectionError` is delivered: only the later, self-describing
+        // counter snapshot survives observer pressure.
+        tx.send(failure_counter(Some(
+            "writing to serial port: device removed",
+        )))
+        .unwrap();
+        drop(tx);
+
+        let mut samples = Vec::new();
+        drain_statuses(0, &rx, &mut telemetry, &mut samples);
+
+        assert_eq!(telemetry.failed_sends, 1, "run history is repaired too");
+        assert_eq!(
+            telemetry.errors_total, 1,
+            "the app-wide error tally is repaired with the missing edge"
+        );
+        assert_eq!(
+            telemetry.last_error.as_deref(),
+            Some("writing to serial port: device removed"),
+            "the still-open failure episode must reach the live banner"
+        );
+    }
+
+    #[test]
+    fn counters_repair_a_dropped_recovery_edge_without_clearing_command_errors() {
+        let mut telemetry = ChannelTelemetry {
+            failed_sends: 1,
+            send_failure_episodes: 1,
+            last_error: Some("writing to serial port: device removed".into()),
+            command_error: Some("the interval change was not carried out".into()),
+            ..ChannelTelemetry::default()
+        };
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        // No `SendRecovered` is delivered. `None` in the next counter snapshot
+        // is live proof that the runner's failure episode has closed.
+        tx.send(failure_counter(None)).unwrap();
+        drop(tx);
+
+        let mut samples = Vec::new();
+        drain_statuses(0, &rx, &mut telemetry, &mut samples);
+
+        assert!(telemetry.last_error.is_none(), "interface error cleared");
+        assert_eq!(telemetry.failed_sends, 1, "failure history is retained");
+        assert!(
+            telemetry.command_error.is_some(),
+            "send recovery says nothing about a failed command"
+        );
+    }
+
+    #[test]
+    fn counters_repair_two_dropped_failure_edges_without_an_observed_recovery() {
+        let mut telemetry = ChannelTelemetry::default();
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        // The first active snapshot is followed by a later episode. The
+        // intervening recovery edge/snapshot and both ConnectionError edges
+        // are intentionally absent.
+        tx.send(failure_counter_at(Some("first failure"), 1))
+            .unwrap();
+        tx.send(failure_counter_at(Some("second failure"), 2))
+            .unwrap();
+        drop(tx);
+
+        let mut samples = Vec::new();
+        drain_statuses(0, &rx, &mut telemetry, &mut samples);
+
+        assert_eq!(telemetry.errors_total, 2);
+        assert_eq!(telemetry.send_failure_episodes, 2);
+        assert_eq!(telemetry.last_error.as_deref(), Some("second failure"));
     }
 
     /// Error-class separation: a healthy payload sample clears an *interface*

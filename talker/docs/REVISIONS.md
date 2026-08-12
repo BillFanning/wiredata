@@ -13,6 +13,26 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-08-10) — a replaced serial device can recover in the same
+run without broadening network recovery:
+
+- **§4.2 running serial recovery (ADR-055)** — after a running serial write
+  reports an unusable handle, Talker closes it before reopening the same
+  configured port. Known transient flow-control results retry the existing
+  handle; device, permission, operation-aborted, and unclassified errors replace
+  it. Initial-open failure, a replacement that returns under another port name,
+  and uncertainty after a partial write remain explicit boundaries.
+- **§9.2 retry accounting (ADR-055)** — reopening is attempted at the next due
+  send allowed by bounded backoff. An unavailable replacement withholds that
+  send without rendering or entering failed-write and send-call timing totals.
+  The single recovery log edge names the port when sending recovers on an
+  automatically reopened handle. The five-second backoff cap limits retry
+  frequency; it is not a recovery-time promise.
+- **§12.1 deferred TCP reconnect** — an established TCP stream that fails still
+  uses bounded retries without creating a new connection. Automatic reconnect
+  remains open until its partial-write, replay, and retry-accounting boundaries
+  receive a separate decision.
+
 Revision note (2026-08-10) — diagnostic guidance now speaks from the
 technician's side of the screen:
 
@@ -348,6 +368,17 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-08-10) — serial device replacement gets a transport-specific
+recovery boundary:
+
+- **ADR-055** replaces an unusable running serial handle before the next eligible
+  write, while preserving the existing edge-triggered failure episode and bounded
+  backoff. It defines why known flow-control-shaped errors retain the handle while
+  unknown operating-system errors replace it, why reopening stays outside render
+  and send-call timing, and the limits around initial open, port renaming, retry
+  latency, partial writes, the single enriched recovery log edge, and the
+  separately deferred TCP reconnect policy.
 
 Revision note (2026-08-10) — four existing decisions carry their evidence in
 the reader's vocabulary:

@@ -1,19 +1,21 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.18
-**Date:** 2026-08-10
+**Version:** 1.19
+**Date:** 2026-08-11
 **Status:** Accepted
 
-Revision note (2026-08-10) — serial device replacement gets a transport-specific
-recovery boundary:
+Revision note (2026-08-11) — logging and channel health separate control,
+history, and current state:
 
-- **ADR-055** replaces an unusable running serial handle before the next eligible
-  write, while preserving the existing edge-triggered failure episode and bounded
-  backoff. It defines why known flow-control-shaped errors retain the handle while
-  unknown operating-system errors replace it, why reopening stays outside render
-  and send-call timing, and the limits around initial open, port renaming, retry
-  latency, partial writes, the single enriched recovery log edge, and the
-  separately deferred TCP reconnect policy.
+- **ADR-006 (corrected)** records five logging levels, the shared collection
+  threshold, pane-only visibility switches, and the GUI's session-local
+  bounded-queue file destination with visible loss/failure reporting and no
+  retention promise.
+- **ADR-010 (corrected)** keeps profiles and GUI state separate while naming
+  only the state actually retained; runtime logging controls reset each launch.
+- **ADR-018 / ADR-056** add current send/reopen state and a cumulative failure-
+  episode count to counter snapshots. Immediate edges remain responsive; repeated
+  counters repair dropped edges without erasing run outcomes or log history.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -133,15 +135,51 @@ An ADR captures *why* a significant decision was made, not just *what* was decid
 
 **Context:** `talker` needs structured logging to both a rotating file and stdout (CLI), and to a GUI status pane plus optional file (GUI).
 
-**Decision:** Use the `tracing` facade with `tracing-subscriber` for log dispatch. A custom subscriber layer will route `ERROR`/`WARN`/`INFO` events to the appropriate sinks depending on interface mode.
+**Correction (2026-08-11):** The original decision named only three severities
+and assigned CLI filtering to `RUST_LOG`; neither describes the implemented
+contract. The decision below replaces those two statements.
+
+**Decision:** Use the `tracing` facade with `tracing-subscriber` for TRACE,
+DEBUG, INFO, WARN, and ERROR dispatch. One reloadable threshold wraps the complete
+sink stack, so an admitted event is consistently available to every installed
+destination. CLI takes that threshold from the profile's `[logging].level`; it
+does not read `RUST_LOG`, and its stdout and file destinations are fixed at
+launch.
+
+The GUI installs a permanent pane destination and a runtime-controlled file
+destination at subscriber initialization. **Detail** changes the shared
+collection threshold, including file contents. The five **Show in pane** switches
+filter retained pane rows only; they neither reconfigure capture nor affect the
+file. These controls are session-local, begin at Info/all shown/file off, and are
+not applied from profiles.
+
+The GUI file destination is switched by control messages, not by rebuilding the
+subscriber. One dedicated worker owns file open, write, flush, and close. Event
+producers use a bounded non-blocking queue; saturation is counted and shown, and
+file failures become a persistent inline state until retried. Disable and shutdown
+drain entries already queued for the current file before flushing. File-session
+generation tags quarantine late entries so they cannot enter a later destination.
+GUI files rotate daily by time and have no retention or disk-use bound.
 
 **Alternatives considered:**
 - **`log` + `env_logger`:** The classic Rust logging pair. Simpler but less flexible — `tracing` supports structured fields and spans, which will be useful for correlating log events with specific connections or send operations.
 - **`slog`:** Structured logging with explicit loggers passed through the call stack. More explicit but significantly more verbose.
+- **Rebuild or reinitialize the subscriber when the GUI file box changes:** A
+  process can have only one global subscriber, and replacing it would race active
+  channels. A permanently installed gated destination keeps the control local.
+- **Write files on the UI/send threads, or use an unbounded queue:** Direct I/O
+  can stall cadence or repaint; an unbounded queue trades that for uncontrolled
+  memory growth. A bounded lossy observer preserves application work and makes
+  the loss visible.
 
 **Consequences:**
 - The GUI status pane is implemented as a `tracing_subscriber::Layer` that captures log events and pushes them to the UI thread via a `crossbeam-channel`.
-- Log level filtering is controlled by the `RUST_LOG` environment variable in CLI mode, and by a settings toggle in GUI mode.
+- GUI file control can change at runtime without file I/O on the UI or channel
+  threads. The same Detail threshold governs the pane, console, and file; Show in
+  pane cannot be used as an accidental recording filter.
+- File logging is intentionally best-effort under sustained disk pressure. The
+  visible dropped-entry count is cumulative for the process session. Time
+  rotation does not delete old files; retention remains separate work.
 
 ---
 
@@ -192,18 +230,34 @@ Moved to [`nmea0183/docs/ADR.md`](../../nmea0183/docs/ADR.md) — it is a decisi
 
 **Context:** Profiles need to be compatible between CLI and GUI. GUI also needs to save window geometry and layout. The question was whether these should share a format and file, or be kept separate.
 
+**Correction (2026-08-11):** Window geometry was later excluded because restoring
+it after first paint caused a visible second frame and could resurrect unusable
+dimensions. The GUI does not persist the runtime logging controls added under
+ADR-006. The separation decision remains; the exact contents below replace the
+original illustrative list.
+
 **Decision:** Profile data and GUI state are strictly separated into two different files with two different purposes:
 
-- **Profiles** — TOML files containing connection configuration, data configuration, schedule, and checksum settings. Fully compatible between CLI and GUI. Stored in a documented profile directory. Schema is public and documented so users can create and edit profiles by hand.
-- **GUI state** — `eframe`'s built-in persistence mechanism (ron format, platform config directory). Contains window geometry, panel layout, display column toggles, and the name of the last active profile. Never loaded by the CLI. Never contains connection or data configuration.
+- **Profiles** — TOML files containing channel, message, schedule, checksum, and
+  CLI launch-logging configuration. Channel and message configuration is fully
+  compatible between CLI and GUI. Profiles live in a documented directory and
+  have a public schema so users can edit them by hand.
+- **GUI state** — `eframe`'s built-in persistence mechanism in the platform
+  config directory. Talker explicitly stores theme and current/recent profile
+  paths; egui retains presentation memory such as zoom. It never contains channel
+  or message configuration and is never loaded by the CLI. Window geometry and
+  the GUI's Detail, Show in pane, and Log file controls are not retained.
 
 **Alternatives considered:**
 - Single file for everything: Simpler on the surface, but means the CLI must parse and ignore GUI-only fields, and GUI-only concepts leak into the profile schema. Rejected.
 - TOML for GUI state as well: Would require reimplementing what `eframe` already provides for free. Not justified.
 
 **Consequences:**
-- Profile structs must not contain any GUI-only fields. GUI preferences that relate to a connection (e.g., which display columns are visible for that connection) are GUI state, not profile data.
-- CLI loading a GUI-created profile silently ignores unrecognized fields via `#[serde(deny_unknown_fields = false)]` (the `toml` crate default). This ensures forward compatibility as GUI-adjacent fields are never written into profiles in the first place.
+- Profile structs must not contain GUI-only fields. Runtime logging controls start
+  from their GUI defaults on every launch and profile loading cannot change them.
+- Serde's default unknown-field handling lets the CLI ignore unrecognized fields
+  in a hand-edited profile. GUI-only state is never written there in the first
+  place.
 
 ---
 
@@ -390,16 +444,21 @@ thousand payload Vecs a second that the GUI mostly discarded.
 **Decision:** The status protocol has three lanes with different cadences, and the
 owner picks the payload policy via a named `ObserverPolicy` passed to the runner:
 
-1. **Periodic counters** — `TalkerStatus::Counters` (total/per-message counts, bytes,
-   missed sends, dropped statuses; **no payload**), emitted at most once per
-   `counter_interval` (default 200 ms ≈ 5 Hz), checked on the send path. A final
-   `Counters` is emitted when the runner stops, so totals are exact at rest.
+1. **Periodic counters** — `TalkerStatus::Counters` (total/per-message counts,
+   bytes, missed sends, dropped statuses, cumulative send-failure episodes, and
+   the current optional send/reopen error; **no payload**), emitted at most once
+   per `counter_interval` (default 200 ms ≈ 5 Hz), checked on the send path. A
+   final `Counters` is emitted when the runner stops, so totals and final failure
+   state are exact at rest. ADR-056 defines the current-state repair boundary.
 2. **Sampled display payloads** — `TalkerStatus::SendSample` (payload-bearing),
    newest-per-interval: the first send after `sample_interval` elapses carries its
    payload (default 100 ms ≈ 10 Hz). The Output pane shows a live, bounded sample
    instead of every wire message.
 3. **Immediate errors** — `ConnectionError` / `SendRecovered` / `OpenFailed`
-   (edge-triggered per ADR-055) are never rate-limited.
+   (edge-triggered per ADR-055) are never rate-limited. The running failure and
+   recovery edges remain best-effort for low latency; periodic state repairs
+   either one if the observer queue discarded it. Initial-open failure occurs
+   before an armed run and therefore has no counter repair.
 
 `Sent` is **removed**, replaced by lanes 1+2. CLI `--echo` passes
 `ObserverPolicy::every_send()` (every send emits a `SendSample`) — the one consumer
@@ -409,8 +468,10 @@ that genuinely wants every payload keeps it, explicitly.
 - Per-send cost at any rate is a counter bump; allocations for observers happen at
   the sample cadence, not the send cadence. The 200-item display Vec fills at ≤10
   items/s regardless of send rate.
-- The self-correcting counter scheme survives: totals ride in every `Counters`, so a
-  dropped status is corrected by the next one; drop-and-count is unchanged.
+- The self-correcting counter scheme survives: totals, the failure-episode count,
+  and current send/reopen state ride in every `Counters`, so a dropped failure or
+  recovery edge is corrected by the next one; drop-and-count is unchanged. This
+  repairs observer state, not a missing GUI log line or its severity tally.
 - Status-queue pressure drops by construction (≤ ~15 statuses/s/channel steady-state
   vs. one per send), making `dropped_statuses` a true anomaly signal.
 - The GUI's per-send "Output" completeness is gone by design at high rates — the pane
@@ -2186,6 +2247,69 @@ avoids generic runner reconstruction and leaves UDP and TCP behavior unchanged.
 If a built-in transport reaches replacement without confirmed settings, that is
 reported as talker's own rate-limited internal fault rather than blamed on the
 channel.
+
+---
+
+## ADR-056 — Current channel faults are snapshotted separately from run history
+
+**Status:** Accepted 2026-08-11.
+
+**Context:** Send outcomes and channel-attributed log counts deliberately remain
+for the whole run. A failed serial write must still be visible after the adapter
+returns, but keeping the channel row faulted after a successful send would turn
+history into a false claim about current health. The opposite failure also existed:
+the immediate failure and recovery statuses use the best-effort observer lane. A
+full queue could discard either edge, leaving a still-broken channel looking clean
+or a recovered one looking broken. A cumulative failed-send count repairs history
+but cannot distinguish those two current states, and an optional error alone cannot
+count two complete episodes that occur between delivered observations.
+
+**Decision:** Current fault state and run history remain separate:
+
+- A healthy-to-failing transition opens one send-failure episode. The runner keeps
+  cumulative failed, suppressed, and episode counts while retaining a separate
+  current send/reopen explanation. Later failed writes or reopen attempts refresh
+  that explanation as the obstacle changes without opening another episode or
+  recategorizing a withheld reopen as a failed interface write.
+- Immediate `ConnectionError` and `SendRecovered` statuses remain the low-latency
+  edge notifications. Every periodic and final `Counters` status repeats both the
+  cumulative episode count and the optional current explanation. The supervisor
+  treats those snapshot fields as authoritative, repairing the running
+  send-failure contribution to the application-wide error tally and either
+  current-state edge if an immediate status was dropped.
+- A successful send closes the episode and clears the current interface fault. It
+  does not reset Send outcomes, channel log counts, or completed-run history. The
+  selected diagnostics card also retains ADR-044/052's existing escalation from
+  cumulative failed or missed outcomes.
+- Command failures remain independent because a working interface does not prove a
+  requested edit was applied. The current row banner prefers an unresolved command
+  failure over an interface failure and clears each only through its own success
+  path.
+
+**Boundary:** Counter snapshots repair observer state; they do not recreate a
+dropped GUI log event or its per-severity row tally. They remain send-path updates
+plus the final at-rest update, not a heartbeat. An all-dormant schedule therefore
+does not wake merely to refresh the row, and an initial interface-open failure
+occurs before an armed run has counters available to repair its immediate status.
+
+**Alternatives considered:**
+
+- **Keep a channel faulted whenever the run has any failed send:** Rejected because
+  it makes a recovered channel claim a current problem. Run totals already preserve
+  that history.
+- **Reset failed outcomes on recovery:** Rejected because it destroys the run's
+  accounting and hides an intermittent device fault.
+- **Make failure edges blocking/reliable:** Rejected because observer backpressure
+  must not delay the send cadence. Repeated compact state supplies eventual repair.
+- **Add an idle heartbeat:** Rejected because it adds wakes and traffic only to
+  restate unchanged state; repair at the next send-path or final counter is enough.
+
+**Consequences:** A channel row answers what is wrong now while Send outcomes and
+the global log answer what happened during the run. One later counter corrects a
+dropped failure or recovery edge, and the cumulative episode count keeps the
+running send-failure contribution to the application-wide error tally exact even
+when several complete episodes pass between observations. No second per-channel
+error-history view is needed.
 
 ---
 

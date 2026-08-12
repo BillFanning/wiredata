@@ -18,6 +18,14 @@ Cross off items as they are completed. Add new ones inline as they come up.
   a GUI setting), which also enables a portable "profiles next to the .exe" layout
   without making it the default. Sample profiles ship in `talker/profiles/`.
 
+## Logging
+
+- [ ] **Define file-log retention before promising bounded disk use.** GUI rotation
+  starts a new file daily; CLI profiles may select never, hourly, or daily rotation.
+  None deletes old files or bounds disk use. Choose an age, file-count, or byte limit,
+  including how cleanup failure is reported, before describing file logging as
+  disk-bounded.
+
 ## Docs
 
 - [x] **Spec §8.1 wording tighten** — folded into spec v2.1.1 (2026-07-16): the
@@ -52,8 +60,9 @@ Cross off items as they are completed. Add new ones inline as they come up.
   transport decision before implementation.
 - [x] **Telemetry split (ADR-018, accepted + implemented 2026-07-11).**
   `TalkerStatus::Sent` replaced by the three lanes: `Counters` (≤5 Hz +
-  final-at-stop, cumulative, self-correcting), `SendSample` (payload-bearing,
-  ≤10 Hz newest-per-interval), immediate errors. The owner picks the policy
+  final-at-stop, cumulative totals plus current send-failure state,
+  self-correcting), `SendSample` (payload-bearing, ≤10 Hz newest-per-interval),
+  immediate errors. The owner picks the policy
   via `ObserverPolicy` (`sampled()` for the GUI, `every_send()` for CLI
   `--echo`). Pinned by `sampled_policy_bounds_payload_traffic` + the reworked
   `sends_on_schedule_and_reports_self_describing_counts`. Spec "status"
@@ -164,11 +173,12 @@ One item survives as work:
   (`ConnectionError`/`SendRecovered`) now route through `emit_status`, so a
   dropped one is at least counted in `dropped_statuses`.
 - [x] **Error-class separation for `last_error`** — `ChannelTelemetry` splits
-  `last_error` (interface class; cleared by a live `SendSample`/
-  `SendRecovered`) from `command_error` (control-plane class; cleared only by
-  a later successfully executed command for the same target, or start), and the UI banner prefers the
-  command error (`banner_error()`). Pinned by
-  `samples_clear_interface_errors_but_not_command_errors`.
+  `last_error` (current interface class; refreshed by retry snapshots and cleared
+  by a live `SendSample`/`SendRecovered`) from `command_error` (control-plane
+  class; cleared only by a later successfully executed command for the same
+  target, or start), and the UI banner prefers the command error. Repeated
+  counters repair a dropped failure or recovery edge and the cumulative episode
+  count repairs the app-wide error tally.
 - [x] **Correlated command execution (ADR-021)** — enqueue success is no
   longer presented as application. Live interface/interval commands carry
   ids; the runner reports `Applied`/`Failed` on a reliable control lane; the
@@ -566,5 +576,8 @@ preceded it. The first two are cross-crate consistency debts, not local cleanups
 
 The sections below were open in TODO v1.0 and are now done; kept here so the history is not lost.
 
-- **`core::logging`** — `tracing-appender` added to workspace dependencies for rotating file output; dual-mode subscriber implemented (CLI writes to stdout/file; the GUI captures events into a `tracing_subscriber::Layer` that forwards to the UI thread via `crossbeam-channel`).
+- **`core::logging`** — dual-mode logging is implemented: CLI destinations are
+  fixed at launch; the GUI has five independent pane filters and can start or stop
+  its rotating file destination during the session without doing file I/O on the
+  UI or send threads.
 - **`core::profile`** — schema v2 with `CURRENT_VERSION` checked on every load; `#[serde(default)]` on all fields; `#[non_exhaustive]` on profile enums. OQ-2 (`toml = "1"` is sufficient) and OQ-3 (profiles use a `talker`-side NMEA representation, so the `nmea0183` `serde` feature stays off) are resolved — see the Open questions section of the ADR.

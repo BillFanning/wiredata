@@ -23,8 +23,8 @@ pub(in crate::gui) const LIVE_UPDATE_QUEUE_TOOLTIP: &str =
 then removes them, so it is not the number waiting now. Peak is the largest value seen at one of \
 those checks; a brief higher peak may be missed. A dropped update may affect an Output sample, a \
 counter readout, timer status, or interface error notice. Sending never waits for this queue. \
-Later cumulative updates correct the live totals, and final run totals remain exact. Command \
-results use a separate path.";
+Later updates correct the live totals and whether a send failure is still active; final run totals \
+remain exact. Command results use a separate path.";
 
 /// The run's counted send outcomes as one always-visible line.
 ///
@@ -88,7 +88,8 @@ pub(in crate::gui) fn send_outcomes_tooltip(
          cannot occur without one. {} missed: the runner fell more than one interval \
          behind, so the cadence point was skipped before any send existed. The remaining \
          {} sent means the interface write returned success; it does not confirm that \
-         bytes reached the wire or that any peer received them.",
+         bytes reached the wire or that any peer received them. These totals cover this run \
+         and remain after sending recovers; the channel fault line says what is wrong now.",
         thousands(scheduled),
         thousands(failed),
         thousands(suppressed),
@@ -166,5 +167,7 @@ mod tests {
         // The remainder is defined by the equation, but its limit still needs
         // stating: a successful write is not proof of delivery.
         assert!(tip.contains("does not confirm that bytes reached the wire"));
+        assert!(tip.contains("totals cover this run and remain after sending recovers"));
+        assert!(tip.contains("fault line says what is wrong now"));
     }
 }

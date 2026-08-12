@@ -110,11 +110,13 @@ pub enum TalkerCommand {
 /// supervisor keeps one receiver per slot and routes by slot. A slot index
 /// would go stale the moment a channel above is removed; the id never does.
 pub enum TalkerStatus {
-    /// Periodic counters (ADR-018 lane 1): cumulative totals, **no payload**.
+    /// Periodic counters (ADR-018 lane 1): cumulative totals, **no message
+    /// payload**.
     /// Emitted at most once per [`ObserverPolicy::counter_interval`] on the
     /// send path, plus once when the runner stops (so totals are exact at
-    /// rest). Every field is cumulative, so the reader self-corrects even
-    /// when some updates were dropped by a full queue.
+    /// rest). Cumulative totals and the current failure-episode state repeat,
+    /// so the reader self-corrects even when some updates were dropped by a
+    /// full queue.
     Counters {
         channel: ChannelId,
         /// Running send count across all messages in this channel.
@@ -136,8 +138,19 @@ pub enum TalkerStatus {
         missed_sends: u64,
         /// Cumulative send calls that reached the interface and failed.
         failed_sends: u64,
+        /// Cumulative send-failure episodes. Repeated attempts inside one
+        /// bounded-backoff episode do not increase this count.
+        send_failure_episodes: u64,
         /// Cumulative due fires suppressed by the bounded-backoff gate.
         suppressed_sends: u64,
+        /// The current write or reopen error from the open failure episode.
+        ///
+        /// This repeats the immediate [`ConnectionError`](Self::ConnectionError)
+        /// edge so a later counter snapshot repairs observer state if that edge
+        /// was dropped. Later retry errors refresh the live explanation without
+        /// opening another counted episode. `None` likewise repairs a dropped
+        /// [`SendRecovered`](Self::SendRecovered) edge.
+        active_send_error: Option<String>,
         /// Cumulative bounded measurements of deadline handling, payload
         /// rendering, and the application-level interface send call.
         timing: Box<SendTimingReport>,
@@ -252,6 +265,11 @@ impl Default for ObserverPolicy {
 /// One failing episode: from the first failed send (reported) to the first
 /// successful one (reported with these counts). See [`RETRY_BACKOFF_INITIAL`].
 struct FailureEpisode {
+    /// The obstacle currently preventing a successful write, repeated in
+    /// counter snapshots until a successful write closes the episode. The
+    /// episode's first failure remains in its edge-triggered log/status event;
+    /// later retries update this live description without creating new edges.
+    active_error: String,
     /// Sends attempted and failed, ≥ 1 (the reported first one).
     failures: u64,
     /// Due fires suppressed by the backoff gate without an interface write.
@@ -683,6 +701,7 @@ fn run_loop(
     let mut total_count = 0u64;
     let mut total_bytes = 0u64;
     let mut failed_sends = 0u64;
+    let mut send_failure_episodes = 0u64;
     let mut suppressed_sends = 0u64;
     let mut send_timing = SendTimingRecorder::default();
     // Lane rate limits (ADR-018): `None` = nothing emitted yet, so the first
@@ -923,6 +942,7 @@ fn run_loop(
                             // send-call timing either; reopen work is outside
                             // both measurement boundaries.
                             if let Some(ep) = episode.as_mut() {
+                                ep.active_error = format!("{e:#}");
                                 ep.suppressed += 1;
                                 ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
                                 ep.next_attempt = Instant::now() + ep.backoff;
@@ -1089,13 +1109,16 @@ fn run_loop(
                                 // Edge-triggered: only the episode's first failure is
                                 // reported (warn + `ConnectionError`); it opens the episode.
                                 None => {
+                                    send_failure_episodes += 1;
                                     tracing::warn!(
                                         channel = who.id.as_u64(),
                                         "channel {} send failed (retrying, with a growing delay \
                                          between attempts): {e:#}",
                                         who.label
                                     );
+                                    let message = format!("{e:#}");
                                     episode = Some(FailureEpisode {
+                                        active_error: message.clone(),
                                         failures: 1,
                                         suppressed: 0,
                                         backoff: RETRY_BACKOFF_INITIAL,
@@ -1105,11 +1128,12 @@ fn run_loop(
                                     });
                                     timer.emit(TalkerStatus::ConnectionError {
                                         channel: who.id,
-                                        message: format!("{e:#}"),
+                                        message,
                                     });
                                 }
                                 // A failed retry deepens the backoff; no re-report.
                                 Some(ep) => {
+                                    ep.active_error = format!("{e:#}");
                                     ep.failures += 1;
                                     ep.handle_needs_recovery = true;
                                     ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
@@ -1142,7 +1166,9 @@ fn run_loop(
                         dropped_statuses: drops_so_far,
                         missed_sends: schedule.missed_sends(),
                         failed_sends,
+                        send_failure_episodes,
                         suppressed_sends,
+                        active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
                         timing: Box::new(send_timing.snapshot_at(now)),
                         captured_at: now,
                         final_snapshot: false,
@@ -1232,7 +1258,9 @@ fn run_loop(
         dropped_statuses,
         missed_sends,
         failed_sends,
+        send_failure_episodes,
         suppressed_sends,
+        active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
         timing: Box::new(final_timing),
         captured_at: finished_mono,
         final_snapshot: true,
@@ -2394,15 +2422,29 @@ mod tests {
                 total_count,
                 failed_sends,
                 suppressed_sends,
+                active_send_error,
                 timing,
                 ..
-            } => Some((*total_count, *failed_sends, *suppressed_sends, **timing)),
+            } => Some((
+                *total_count,
+                *failed_sends,
+                *suppressed_sends,
+                active_send_error.clone(),
+                **timing,
+            )),
             _ => None,
         });
-        let (sent, failed, suppressed, timing) = outcomes.expect("live cumulative counters");
+        let (sent, failed, suppressed, active_send_error, timing) =
+            outcomes.expect("live cumulative counters");
         let cumulative = timing.cumulative;
         assert_eq!(sent, 0);
         assert!(failed >= 1, "the failed attempt is visible before stop");
+        assert!(
+            active_send_error
+                .as_deref()
+                .is_some_and(|message| message.contains("mock send failure")),
+            "counter snapshots repeat the open failure episode"
+        );
         assert!(
             suppressed >= 1,
             "backoff-suppressed sends are visible before stop"
@@ -2563,13 +2605,20 @@ mod tests {
             TalkerStatus::Counters {
                 failed_sends,
                 suppressed_sends,
+                active_send_error,
+                final_snapshot: true,
                 ..
-            } => Some((failed_sends, suppressed_sends)),
+            } => Some((failed_sends, suppressed_sends, active_send_error)),
             _ => None,
         });
-        let (failed_total, suppressed_total) = final_outcomes.expect("final cumulative counters");
+        let (failed_total, suppressed_total, active_send_error) =
+            final_outcomes.expect("final cumulative counters");
         assert!(failed_total >= failures);
         assert!(suppressed_total >= suppressed);
+        assert!(
+            active_send_error.is_none(),
+            "the final counter snapshot repairs a dropped recovery edge"
+        );
     }
 
     /// Model the serial failure mode where a removed device's old handle stays
@@ -2624,10 +2673,15 @@ mod tests {
         // scheduling against a two-second deadline.
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut errors = 0;
+        let mut active_errors = Vec::new();
         let mut recovered = None;
         while recovered.is_none() && Instant::now() < deadline {
             match handle.status_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(TalkerStatus::ConnectionError { .. }) => errors += 1,
+                Ok(TalkerStatus::Counters {
+                    active_send_error: Some(error),
+                    ..
+                }) => active_errors.push(error),
                 Ok(TalkerStatus::SendRecovered {
                     failures,
                     suppressed,
@@ -2640,6 +2694,12 @@ mod tests {
 
         let (failures, suppressed) = recovered.expect("replacement should resume the same run");
         assert_eq!(errors, 1, "one failure episode has one error edge");
+        assert!(
+            active_errors
+                .iter()
+                .any(|error| error.contains("replacement device is absent")),
+            "counter snapshots should show the current reopen obstacle: {active_errors:#?}"
+        );
         assert_eq!(
             failures, 1,
             "failed reopen attempts are withheld, not reported as failed writes"

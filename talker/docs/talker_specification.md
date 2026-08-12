@@ -1,27 +1,24 @@
 # Talker — Program Specification
-**Version:** 2.4.13
+**Version:** 2.4.14
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-08-10) — a replaced serial device can recover in the same
-run without broadening network recovery:
+Revision note (2026-08-11) — logging controls and channel fault state now say
+exactly what is current, what is retained, and what is saved:
 
-- **§4.2 running serial recovery (ADR-055)** — after a running serial write
-  reports an unusable handle, Talker closes it before reopening the same
-  configured port. Known transient flow-control results retry the existing
-  handle; device, permission, operation-aborted, and unclassified errors replace
-  it. Initial-open failure, a replacement that returns under another port name,
-  and uncertainty after a partial write remain explicit boundaries.
-- **§9.2 retry accounting (ADR-055)** — reopening is attempted at the next due
-  send allowed by bounded backoff. An unavailable replacement withholds that
-  send without rendering or entering failed-write and send-call timing totals.
-  The single recovery log edge names the port when sending recovers on an
-  automatically reopened handle. The five-second backoff cap limits retry
-  frequency; it is not a recovery-time promise.
-- **§12.1 deferred TCP reconnect** — an established TCP stream that fails still
-  uses bounded retries without creating a new connection. Automatic reconnect
-  remains open until its partial-write, replay, and retry-accounting boundaries
-  receive a separate decision.
+- **§3.1 / §9.2 logging (ADR-006, corrected)** — the GUI exposes all five
+  severities, separates collection from pane visibility, and offers a
+  session-local file toggle backed by non-blocking file work and visible failure
+  reporting. CLI logging remains launch policy from the profile; neither mode
+  reads `RUST_LOG`.
+- **§3.2 / §4.4 current fault versus run history (ADR-056)** — a channel row
+  shows the unresolved command or interface problem now. Successful sending
+  clears the current interface fault without erasing this run's Send outcomes
+  or log counts; command faults clear only through their own success path.
+- **§5.7 / §8.1 repair after a dropped live update (ADR-018/056)** — periodic
+  and final counters repeat the active send/reopen fault and the cumulative
+  failure-episode count, so a dropped failure or recovery edge is repaired
+  without a heartbeat or a reliable send-path observer queue.
 
 Earlier revisions are in [REVISIONS.md](REVISIONS.md). They live there rather
 than here for two reasons: a document's version number belongs only in its own
@@ -207,9 +204,15 @@ This loads the profile, spawns a talker thread for each channel defined in it, a
 
 #### Profile Compatibility
 
-Profiles are fully compatible between CLI and GUI. A profile saved from the GUI loads correctly in the CLI and vice versa. A profile written by hand in a text editor (valid TOML matching the profile schema) works in both.
+Channel and message configuration is fully compatible between CLI and GUI. A
+profile saved from the GUI loads correctly in the CLI and vice versa. A profile
+written by hand in a text editor (valid TOML matching the profile schema) works
+in both.
 
-GUI-only settings (window geometry, panel layout, display column toggles, last active profile name) are stored in a separate GUI state file and are not part of a profile.
+The profile's `[logging]` table is CLI launch policy. GUI **Detail**, **Show in
+pane**, and **Log file** controls are session-local: loading a profile neither
+changes GUI collection or display nor enables file logging. Persisted GUI state
+is described below and remains separate from the profile.
 
 **Example invocation sketch** (illustrative, not final):
 ```
@@ -233,8 +236,9 @@ The GUI is built with egui/eframe and supports:
 One channel is on screen at a time. The collapsible **channel list** (left) shows
 per-row: status glyph + name, the one-line interface summary (unfilled fields as
 red `?` pills), `Sent: N · msg/s` while running, per-severity log counts
-(info · warn · err, since the channel's last start), and the last error. Rows carry
-a ✕ remove overlay; `+ Add` (per transport kind), Start all / Stop all, and the
+(info · warn · err, since the channel's last start), and any current unresolved
+fault. DEBUG and TRACE entries never inflate the INFO count. Rows carry a ✕
+remove overlay; `+ Add` (per transport kind), Start all / Stop all, and the
 **Profile menu** (Recent / Save / Save As… / Load… / New; renaming = Save As…) live
 in the list header. Collapsed, the list becomes a mini-strip of status glyphs.
 
@@ -249,9 +253,10 @@ The **detail pane** (right) shows the selected channel:
     schedule's own cadence points, so the successful remainder is defined by the
     equation rather than by a noun asserting something the application cannot
     observe. One tooltip defines each term and where in the send path its
-    deduction happened (§8.1). The outcomes are rendered in exactly one place:
-    the diagnostics card neither repeats them nor raises a separate unsent
-    callout, though their tone still escalates its badge.
+    deduction happened (§8.1). These are totals for the current run and remain
+    after sending recovers and after Stop. The outcomes are rendered in exactly
+    one place: the diagnostics card neither repeats them nor raises a separate
+    unsent callout, though their tone still escalates its badge.
   - *Sent:* `Sent: <total> total · <byte rate> · <msg/s> (~5 s)` — the cumulative
     byte total, retained after Stop, beside the rolling five-second rates, which
     decay to `0.0` at rest while the total stands still. Byte values scale by SI
@@ -426,7 +431,12 @@ replacement.
 GUI state and profile data are stored separately and serve different purposes:
 
 - **Profiles** (channel config, message config, checksum settings) are TOML files shared between CLI and GUI. They live in the profile directory and are the primary unit of saved work.
-- **GUI state** (window size, position, which panels are open, display column toggles, name of the last active profile) is stored in a separate file using `eframe`'s built-in persistence mechanism. It is never loaded by the CLI and never conflicts with profile data.
+- **GUI state** explicitly stores theme and the current/recent profile paths;
+  egui's own presentation memory restores zoom. It uses `eframe`'s persistence
+  mechanism, is never loaded by the CLI, and never conflicts with profile data.
+- **Logging controls** are neither profile data nor persisted GUI state. Detail
+  returns to INFO, all five pane visibility switches return on, and Log file
+  returns off whenever Talker starts.
 
 On exit, the GUI saves its state automatically. On next launch, the GUI reopens the last active profile and restores zoom and theme. Window geometry is deliberately **not** persisted: eframe restores it only after the window is first shown, which produced a visible double frame/title-bar flash on every launch (and could resurrect a broken tiny geometry) — the window always opens at its default size instead.
 
@@ -508,10 +518,21 @@ channel, as in listener.
 
 Each channel maintains and displays:
 
-- **Send count** — total messages successfully sent since the channel was started
-- **Error count** — total send errors since the channel was started
-- **Status indicator** — current state: idle, running, error
-- **Error log** — the most recent error is always visible inline; clicking it opens a scrolling list of all errors for that channel session
+- **Send outcomes** — cumulative scheduled, failed, suppressed, missed, and sent
+  totals for the current run; they remain visible after recovery and after Stop
+- **Log counts** — collected, channel-attributed INFO, WARN, and ERROR entries
+  since Start;
+  DEBUG and TRACE remain available in the global Log pane when Detail admits
+  them, but do not inflate INFO
+- **Status indicator** — the channel's current lifecycle state
+- **Current fault** — the unresolved command or interface problem shown inline;
+  a command failure takes precedence, retry attempts refresh the current
+  interface explanation, and a successful send clears the interface fault;
+  command faults clear only through their own successful command path
+
+Event history lives in the global Log pane. There is no separate clickable
+per-channel error log. A recovered channel can therefore have no current fault
+while its current-run Send outcomes and log counts still show earlier failures.
 
 ---
 
@@ -625,13 +646,15 @@ updates land in Output, not because the queue is Output-only (ADR-052):
    and live readouts may lag`, an attention callout shown when the runner has
    discarded any update because the UI queue was full. It can cost a payload
    line, a counter update, a timer change, or an interface error notice; sends
-   are never delayed by it, counters remain self-correcting, and the final run
-   totals stay exact. Dismissible, per §3.2.
+   are never delayed by it. Later counters repair cumulative totals, the
+   send-failure episode count, and whether a send/reopen fault is currently
+   active; the final run totals stay exact. Dismissible, per §3.2.
 2. **Live-update queue** — `live update queue at last screen check:
    <len>/<capacity> · peak <peak> · <drops> dropped`, shown in small, quiet text.
    It is the gauge behind the warning above and lives beside it rather than under
    Timing & runtime details. Queue pressure never delays a send; later cumulative
-   updates correct the live totals and the final run totals remain exact.
+   updates correct the live totals and current send-failure state, and the final
+   run totals remain exact.
 3. **Sampled output** — `sampled output · not every sent payload is shown ·
    limit ~<n>/s`, shown once the cumulative accepted total proves an omitted
    payload update, and then for the rest of the run. A standing statement about
@@ -869,6 +892,18 @@ now + new-interval in Immediate mode, or at the new interval's strict next UTC p
 in UTC-phase mode. All other messages continue unaffected. The channel is never
 stopped by an interval change.
 
+**Observer-state repair (ADR-018/056):** Periodic and final counter updates carry
+the cumulative send totals, a cumulative send-failure episode count, and the
+current optional send/reopen error. Immediate failure and recovery updates keep
+the screen responsive but are best-effort; a later counter therefore repairs
+either edge if the live-update queue discarded it, including multiple complete
+episodes between observations. A failed reopen refreshes the current obstacle and
+withholds that due send without adding a failed write; a later failed write does
+increment the failed-send total. Neither opens another episode. These counters do
+not reconstruct a dropped log entry or its per-channel severity tally. No telemetry
+heartbeat is added: a dormant schedule still waits indefinitely, and repair occurs
+at the next delivered send-path or final counter update.
+
 After startup, both modes advance from monotonic deadlines so ordinary wall-clock
 slew cannot accumulate cadence drift. A UTC-phase schedule compares its paired
 monotonic/wall anchor with the wall clock at most once per second. A displacement of
@@ -1071,6 +1106,8 @@ Logging uses the `tracing` facade with `tracing-subscriber` for dispatch. Log le
 | ERROR | Connection failure, file not found, encoding error |
 | WARN | Parameter change caused reconnect, malformed record skipped, a channel falling off its send schedule |
 | INFO | Channel opened/closed, profile loaded, send started/stopped, a channel returning to schedule |
+| DEBUG | Repeated retry detail useful while diagnosing a persistent fault |
+| TRACE | Finest-grained application and dependency diagnostics |
 
 #### Edge-triggered channel conditions
 
@@ -1097,7 +1134,11 @@ or send-call timing or send-overlap attribution is recorded. The original write
 failure remains a failed send, and the first later successful write closes the
 same failure episode. That single INFO recovery edge names the configured serial
 port when sending recovers on the automatically reopened handle; opening the
-handle does not add a separate log event.
+handle does not add a separate log event. While the episode remains open, the
+channel row can refresh its current fault from later write or reopen attempts;
+that live explanation does not create additional WARN edges or failed-send
+episodes. Periodic counters repeat it so a dropped opening or recovery edge is
+eventually repaired.
 
 Two of the three close; the third cannot. Discarded updates are a run total
 that never returns to zero, so there is no recovery edge to report. The standing
@@ -1145,18 +1186,50 @@ the log.
 
 #### CLI Logging
 
-In CLI mode, log output destinations are independently selectable at launch:
+In CLI mode, the profile's `[logging].level` selects the process-wide threshold.
+INFO is the default; DEBUG is admitted at Debug or Trace, and TRACE only at
+Trace. Talker does not read `RUST_LOG`. Log output destinations are independently
+selectable at launch:
 
 - **stdout** — enabled or disabled via flag
-- **log file** — enabled or disabled via flag; path is configurable or defaults to a platform-appropriate location
+- **log file** — enabled or disabled via flag; path is configurable or defaults
+  to a platform-appropriate location
+
+The threshold and destinations are fixed for that CLI launch. File writes use a
+non-blocking logger thread rather than the channel's send thread.
 
 #### GUI Logging
 
-The GUI includes a **status pane** that displays errors, warnings, and info messages in real time. The status pane is always present and cannot be disabled.
+The GUI includes a global **Log** pane for TRACE, DEBUG, INFO, WARN, and ERROR
+events. Its controls are deliberately separate:
 
-Per-channel errors also appear in the channel's own error log (Section 4.4) in addition to the global status pane.
+- **Detail** is the process-wide threshold for new events reaching the pane,
+  console, and enabled file destination. It defaults to Info each launch. Debug
+  includes DEBUG and higher events; Trace includes all five levels.
+- Five independent **Show in pane** switches hide or show retained pane rows
+  only. All default on. They do not alter collection, channel INFO/WARN/ERROR
+  counts, or file contents; a hidden retained row can reappear until the pane's
+  2,000-row cap evicts it.
+- **Clear** removes only the on-screen pane rows. Channel counts and saved files
+  are unchanged.
+- **Log file** is off at every launch and lasts only for the GUI session. Loading
+  a profile cannot enable it or change Detail or Show in pane. When enabled, it
+  writes under the platform's local-data `talker/logs` directory with the
+  `talker.log` prefix and starts a new file each day.
 
-File logging in the GUI is optional and toggled by the user. Log file rotation limits total disk usage.
+Opening, writing, flushing, and closing GUI log files belong to a dedicated file
+worker; neither the UI nor a channel's send thread waits for disk I/O. New file
+entries cross a bounded queue. If that queue fills, Talker keeps sending and
+shows a session-cumulative **log entries not saved** count. An open, write, or
+flush failure turns file logging off and remains visible beside the control so
+it does not depend on the pane being open or ERROR rows being shown. Disabling
+or shutting down drains entries already queued for the current file before
+flushing it; generation boundaries prevent a late entry from an earlier file
+session entering a later one.
+
+GUI rotation is time-based only. It starts a new file daily but deletes no old
+files and places no bound on total disk use. CLI profiles may instead select no
+rotation, hourly rotation, or daily rotation; none supplies retention.
 
 ---
 

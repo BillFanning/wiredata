@@ -17,7 +17,10 @@ use wiredata_ui::selection;
 
 use crate::core::{
     channel::{ChannelConfig, ChannelId, InterfaceConfig},
-    logging::{LogEvent, LogLevel, LogLevelHandle, LoggingConfig},
+    logging::{
+        FileLogConfig, FileLogState, FileLogToggle, LogEvent, LogLevel, LogLevelHandle,
+        LoggingConfig,
+    },
     message::{code_page_replacements, CodePage, CodePageReplacementSummary, MessageConfig},
     profile::Profile,
     runner,
@@ -67,6 +70,9 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
     let logging = crate::core::logging::init(&LoggingConfig::default(), Some(log_tx))
         .context("initializing logging")?;
     let level_handle = logging.level_handle();
+    let file_log = logging
+        .file_log_toggle()
+        .context("GUI file-log control was not installed")?;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -91,6 +97,7 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
                 &cc.egui_ctx,
                 cc.storage,
                 level_handle,
+                file_log,
             )))
         }),
     )
@@ -460,11 +467,14 @@ struct TalkerApp {
     /// slot's stable [`ChannelId`] (ADR-020) — a positional Vec misrouted a
     /// running runner's events after a channel above it was removed.
     log_counts: HashMap<ChannelId, LogCounts>,
-    /// Per-severity display filters for the log panel (capture level is a
-    /// separate concern — the Level ComboBox).
-    show_info: bool,
-    show_warn: bool,
-    show_error: bool,
+    /// Per-severity display filters for the retained log panel. These never
+    /// change what the recording threshold admits to the pane or file.
+    log_visibility: LogVisibility,
+    /// Runtime GUI file destination. The worker behind this handle owns every
+    /// open/write/flush/close operation.
+    file_log: FileLogToggle,
+    file_log_state: FileLogState,
+    file_log_config: Option<FileLogConfig>,
     /// Recently loaded/saved profile paths, most recent first (max
     /// [`MAX_RECENT_PROFILES`]); persisted via eframe storage.
     recent_profiles: Vec<PathBuf>,
@@ -502,6 +512,54 @@ struct LogCounts {
     info: u32,
     warn: u32,
     error: u32,
+}
+
+impl LogCounts {
+    fn record(&mut self, level: tracing::Level) {
+        match level {
+            tracing::Level::ERROR => self.error = self.error.saturating_add(1),
+            tracing::Level::WARN => self.warn = self.warn.saturating_add(1),
+            tracing::Level::INFO => self.info = self.info.saturating_add(1),
+            // Channel cards report technician-facing signal. Diagnostic detail
+            // remains in the global log and must not inflate the INFO badge.
+            tracing::Level::DEBUG | tracing::Level::TRACE => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LogVisibility {
+    trace: bool,
+    debug: bool,
+    info: bool,
+    warn: bool,
+    error: bool,
+}
+
+impl Default for LogVisibility {
+    fn default() -> Self {
+        // This preserves the old panel behavior: every admitted event was
+        // visible until the reader hid its severity group.
+        Self {
+            trace: true,
+            debug: true,
+            info: true,
+            warn: true,
+            error: true,
+        }
+    }
+}
+
+impl LogVisibility {
+    fn includes(self, level: tracing::Level) -> bool {
+        match level {
+            tracing::Level::TRACE => self.trace,
+            tracing::Level::DEBUG => self.debug,
+            tracing::Level::INFO => self.info,
+            tracing::Level::WARN => self.warn,
+            tracing::Level::ERROR => self.error,
+        }
+    }
 }
 
 /// Rolling-throughput window, matching Listener's technician-facing rate.
@@ -622,6 +680,7 @@ impl TalkerApp {
         ctx: &egui::Context,
         storage: Option<&dyn eframe::Storage>,
         log_level_handle: LogLevelHandle,
+        file_log: FileLogToggle,
     ) -> Self {
         // Default to dark; persisted across runs. Stored as the string
         // "false" only when the user has switched to light.
@@ -636,6 +695,10 @@ impl TalkerApp {
         wiredata_ui::install_chrome(ctx);
         apply_theme(ctx, dark_mode);
         let repaint = wiredata_ui::repaint::RepaintCoalescer::for_ctx(ctx.clone());
+        {
+            let repaint = std::sync::Arc::clone(&repaint);
+            file_log.set_notify(std::sync::Arc::new(move || repaint.notify()));
+        }
         // Sampled lanes (ADR-018): the GUI's display cost stays constant
         // regardless of send rate; statuses wake the UI via the coalescer.
         let mut sup = TalkerSupervisor::new(runner::ObserverPolicy::sampled());
@@ -643,6 +706,7 @@ impl TalkerApp {
             let r = std::sync::Arc::clone(&repaint);
             sup.set_notify(std::sync::Arc::new(move || r.notify()));
         }
+        let file_log_state = file_log.state();
         let mut app = Self {
             repaint,
             profile: Profile::default(),
@@ -663,9 +727,10 @@ impl TalkerApp {
             selected: None,
             channels_collapsed: false,
             log_counts: HashMap::new(),
-            show_info: true,
-            show_warn: true,
-            show_error: true,
+            log_visibility: LogVisibility::default(),
+            file_log,
+            file_log_state,
+            file_log_config: crate::core::logging::default_log_dir().map(FileLogConfig::new),
             recent_profiles: storage
                 .and_then(|s| s.get_string(RECENT_PROFILES_KEY))
                 .map(|joined| {
@@ -1167,11 +1232,7 @@ impl TalkerApp {
             // own row instead of the one that slid into its old position.
             if let Some(id) = event.channel {
                 let c = self.log_counts.entry(id).or_default();
-                match event.level {
-                    tracing::Level::ERROR => c.error += 1,
-                    tracing::Level::WARN => c.warn += 1,
-                    _ => c.info += 1,
-                }
+                c.record(event.level);
             }
             let ts = event.timestamp.format("%H:%M:%S%.3f");
             let line = format!("[{ts}] [{:<5}] {}", event.level, event.message);
@@ -1235,6 +1296,7 @@ impl eframe::App for TalkerApp {
         // fresh wake — never lost.
         self.repaint.frame_started();
         self.debug_assert_channel_state_aligned();
+        self.sync_file_log_state(ui.ctx());
         self.poll_channels(ui.ctx());
         self.refresh_message_analysis();
         self.handle_tab_keys(ui.ctx());
@@ -1396,6 +1458,38 @@ impl TalkerApp {
         });
     }
 
+    fn sync_file_log_state(&mut self, ctx: &egui::Context) {
+        let next = self.file_log.state();
+        if next != self.file_log_state {
+            let previous = std::mem::replace(&mut self.file_log_state, next.clone());
+            match &next {
+                FileLogState::Enabled { directory, prefix } => tracing::info!(
+                    "file logging enabled for files beginning with {:?} in {:?}",
+                    prefix,
+                    directory
+                ),
+                FileLogState::Disabled
+                    if matches!(
+                        previous,
+                        FileLogState::Disabling | FileLogState::Enabled { .. }
+                    ) =>
+                {
+                    tracing::info!("file logging disabled");
+                }
+                FileLogState::Failed(error) => {
+                    tracing::error!("file logging is unavailable: {error}");
+                }
+                FileLogState::Disabled | FileLogState::Enabling | FileLogState::Disabling => {}
+            }
+        }
+        if matches!(
+            self.file_log_state,
+            FileLogState::Enabling | FileLogState::Disabling
+        ) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
     fn show_log_panel(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("log_panel")
             .resizable(true)
@@ -1404,10 +1498,14 @@ impl TalkerApp {
                 ui.horizontal(|ui| {
                     ui.strong("Log");
                     ui.separator();
-                    ui.label("Level:");
+                    ui.label("Detail:").on_hover_text(
+                        "Choose how much new logging to collect. Debug is collected at Debug or \
+                         Trace and is saved when Log file is on. Trace is collected only at Trace. \
+                         This setting lasts until Talker closes; profiles do not change it.",
+                    );
                     let before = self.log_level;
                     egui::ComboBox::from_id_salt("log_level")
-                        .selected_text(self.log_level.as_str())
+                        .selected_text(log_level_label(self.log_level))
                         .show_ui(ui, |ui| {
                             for lvl in [
                                 LogLevel::Trace,
@@ -1416,7 +1514,7 @@ impl TalkerApp {
                                 LogLevel::Warn,
                                 LogLevel::Error,
                             ] {
-                                ui.selectable_value(&mut self.log_level, lvl, lvl.as_str());
+                                ui.selectable_value(&mut self.log_level, lvl, log_level_label(lvl));
                             }
                         });
                     if self.log_level != before {
@@ -1428,16 +1526,113 @@ impl TalkerApp {
                         }
                     }
                     ui.separator();
-                    // Display filters — what's *shown*, independent of the
-                    // capture level above. Info covers DEBUG/TRACE too.
-                    ui.checkbox(&mut self.show_info, "Info");
-                    ui.checkbox(&mut self.show_warn, "Warn");
-                    ui.checkbox(&mut self.show_error, "Error");
+
+                    let pending = matches!(
+                        self.file_log_state,
+                        FileLogState::Enabling | FileLogState::Disabling
+                    );
+                    let mut file_enabled = matches!(
+                        self.file_log_state,
+                        FileLogState::Enabling | FileLogState::Enabled { .. }
+                    );
+                    let file_available = self.file_log_config.is_some();
+                    let response = ui.add_enabled(
+                        file_available && !pending,
+                        egui::Checkbox::new(&mut file_enabled, "Log file"),
+                    );
+                    let mut file_hint = match &self.file_log_state {
+                        FileLogState::Enabled { directory, prefix } => format!(
+                            "Saving logs in {}. Files begin with {prefix}; a new file is started \
+                             each day. Show in pane does not change file content. File logging \
+                             stays on only until Talker closes.",
+                            directory.display()
+                        ),
+                        FileLogState::Enabling => "Starting file logging…".to_owned(),
+                        FileLogState::Disabling => {
+                            "Finishing the current log file…".to_owned()
+                        }
+                        FileLogState::Failed(error) => {
+                            format!("File logging is off: {error}. Select Log file to retry.")
+                        }
+                        FileLogState::Disabled => match &self.file_log_config {
+                            Some(config) => format!(
+                                "Save logs in {}. Files begin with {}; a new file is started each \
+                                 day. This starts off each time Talker opens, and profiles do not \
+                                 turn it on.",
+                                config.directory.display(),
+                                config.prefix
+                            ),
+                            None => "File logging is unavailable because no local data directory \
+                                     was found."
+                                .to_owned(),
+                        },
+                    };
+                    let dropped = self.file_log.dropped_events();
+                    if dropped > 0 {
+                        file_hint.push_str(&format!(
+                            " {dropped} log entries were not written to a file this session because \
+                             the file writer could not keep up."
+                        ));
+                    }
+                    response.clone().on_hover_text(file_hint);
+                    if let FileLogState::Failed(error) = &self.file_log_state {
+                        ui.colored_label(
+                            wiredata_ui::palette::active(ui).fault,
+                            "File unavailable",
+                        )
+                        .on_hover_text(format!(
+                            "The log file is off: {error}. Select Log file to retry."
+                        ));
+                    }
+                    if dropped > 0 {
+                        ui.colored_label(
+                            wiredata_ui::palette::active(ui).warning,
+                            format!("{dropped} log entries not saved"),
+                        )
+                        .on_hover_text(
+                            "Log entries not written to a file this session because the file writer \
+                             could not keep up. Sending does not wait for file logging; the Log pane \
+                             is handled separately.",
+                        );
+                    }
+                    if response.changed() {
+                        let result = if file_enabled {
+                            self.file_log_config
+                                .clone()
+                                .context("no default file-log directory is available")
+                                .and_then(|config| self.file_log.enable(config))
+                        } else {
+                            self.file_log.disable()
+                        };
+                        if let Err(error) = result {
+                            tracing::error!("file log change failed: {error:#}");
+                        }
+                    }
+
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("Clear").clicked() {
+                        if ui
+                            .small_button("Clear")
+                            .on_hover_text(
+                                "Clear the on-screen log. Channel counts and saved log files are \
+                                 unchanged.",
+                            )
+                            .clicked()
+                        {
                             self.log_lines.clear();
                         }
                     });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Show in pane:").on_hover_text(
+                        "Display only. These boxes hide or show entries already in this pane; they \
+                         do not change which new entries Detail collects or what the file contains. \
+                         These choices last until Talker closes.",
+                    );
+                    ui.checkbox(&mut self.log_visibility.trace, "Trace");
+                    ui.checkbox(&mut self.log_visibility.debug, "Debug");
+                    ui.checkbox(&mut self.log_visibility.info, "Info");
+                    ui.checkbox(&mut self.log_visibility.warn, "Warn");
+                    ui.checkbox(&mut self.log_visibility.error, "Error");
                 });
                 ui.separator();
                 // Filter first, then virtualize: `show_rows` lays out only the
@@ -1448,11 +1643,7 @@ impl TalkerApp {
                 let visible: Vec<(&str, tracing::Level)> = self
                     .log_lines
                     .iter()
-                    .filter(|(_, level)| match *level {
-                        tracing::Level::ERROR => self.show_error,
-                        tracing::Level::WARN => self.show_warn,
-                        _ => self.show_info,
-                    })
+                    .filter(|(_, level)| self.log_visibility.includes(*level))
                     .map(|(line, level)| (line.as_str(), *level))
                     .collect();
                 let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
@@ -1606,6 +1797,17 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     });
 }
 
+/// Stable title-case names for the GUI's logging-detail control.
+fn log_level_label(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Trace => "Trace",
+        LogLevel::Debug => "Debug",
+        LogLevel::Info => "Info",
+        LogLevel::Warn => "Warn",
+        LogLevel::Error => "Error",
+    }
+}
+
 /// Log-line colour for `level`, adapted to the active theme.
 ///
 /// ERROR / WARN keep saturated reds/ambers that read on either
@@ -1634,6 +1836,97 @@ fn level_color(ui: &egui::Ui, level: tracing::Level) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_detail_choices_use_technician_facing_title_case() {
+        assert_eq!(log_level_label(LogLevel::Trace), "Trace");
+        assert_eq!(log_level_label(LogLevel::Debug), "Debug");
+        assert_eq!(log_level_label(LogLevel::Info), "Info");
+        assert_eq!(log_level_label(LogLevel::Warn), "Warn");
+        assert_eq!(log_level_label(LogLevel::Error), "Error");
+    }
+
+    #[test]
+    fn each_log_level_has_an_independent_display_switch() {
+        let levels = [
+            tracing::Level::TRACE,
+            tracing::Level::DEBUG,
+            tracing::Level::INFO,
+            tracing::Level::WARN,
+            tracing::Level::ERROR,
+        ];
+        let cases = [
+            LogVisibility {
+                trace: true,
+                debug: false,
+                info: false,
+                warn: false,
+                error: false,
+            },
+            LogVisibility {
+                trace: false,
+                debug: true,
+                info: false,
+                warn: false,
+                error: false,
+            },
+            LogVisibility {
+                trace: false,
+                debug: false,
+                info: true,
+                warn: false,
+                error: false,
+            },
+            LogVisibility {
+                trace: false,
+                debug: false,
+                info: false,
+                warn: true,
+                error: false,
+            },
+            LogVisibility {
+                trace: false,
+                debug: false,
+                info: false,
+                warn: false,
+                error: true,
+            },
+        ];
+
+        for (wanted, visibility) in levels.into_iter().zip(cases) {
+            for level in levels {
+                assert_eq!(
+                    visibility.includes(level),
+                    level == wanted,
+                    "{wanted} must not share a display switch with {level}"
+                );
+            }
+        }
+        for level in levels {
+            assert!(
+                LogVisibility::default().includes(level),
+                "defaults preserve the old all-admitted-lines-visible behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_card_info_excludes_debug_and_trace_detail() {
+        let mut counts = LogCounts::default();
+        for level in [
+            tracing::Level::TRACE,
+            tracing::Level::DEBUG,
+            tracing::Level::INFO,
+            tracing::Level::WARN,
+            tracing::Level::ERROR,
+        ] {
+            counts.record(level);
+        }
+
+        assert_eq!(counts.info, 1);
+        assert_eq!(counts.warn, 1);
+        assert_eq!(counts.error, 1);
+    }
 
     /// Log severities come from the shared palette, in both themes.
     ///

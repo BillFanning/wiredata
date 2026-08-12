@@ -1,6 +1,7 @@
 mod gui_layer;
+mod runtime_file;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ use tracing_subscriber::{
 };
 
 pub use gui_layer::{GuiLogLayer, LogEvent};
+pub use runtime_file::{FileLogState, FileLogToggle};
 
 /// Run a test closure with GUI log capture on its current thread.
 ///
@@ -134,15 +136,13 @@ pub enum Rotation {
 /// Cloneable handle for changing the minimum log level at runtime. The
 /// new level takes effect on the next emitted event.
 #[derive(Clone)]
-pub struct LogLevelHandle(reload::Handle<LevelFilter, Registry>);
+pub struct LogLevelHandle(Arc<dyn Fn(LogLevel) -> anyhow::Result<()> + Send + Sync>);
 
 impl LogLevelHandle {
     /// Set the global filter to `level`. Errors only if the
     /// subscriber has been torn down.
     pub fn set(&self, level: LogLevel) -> anyhow::Result<()> {
-        self.0
-            .modify(|f| *f = to_level_filter(level))
-            .map_err(|e| anyhow::anyhow!("updating log level: {e}"))
+        (self.0)(level)
     }
 }
 
@@ -152,7 +152,9 @@ impl LogLevelHandle {
 /// will stop file log flushing.
 pub struct LoggingHandle {
     _guards: Vec<tracing_appender::non_blocking::WorkerGuard>,
+    _runtime_file_guard: Option<runtime_file::RuntimeFileGuard>,
     level: LogLevelHandle,
+    file_log: Option<FileLogToggle>,
 }
 
 impl LoggingHandle {
@@ -161,6 +163,13 @@ impl LoggingHandle {
     /// `LoggingHandle` away from `run()`'s scope.
     pub fn level_handle(&self) -> LogLevelHandle {
         self.level.clone()
+    }
+
+    /// Runtime control for the GUI's optional file destination.
+    ///
+    /// `None` in CLI mode, whose file destination is fixed at launch.
+    pub fn file_log_toggle(&self) -> Option<FileLogToggle> {
+        self.file_log.clone()
     }
 }
 
@@ -178,44 +187,75 @@ pub fn init(
     gui_sender: Option<crossbeam_channel::Sender<LogEvent>>,
 ) -> anyhow::Result<LoggingHandle> {
     let mut guards: Vec<tracing_appender::non_blocking::WorkerGuard> = vec![];
-
-    // Wrap the level filter in a reload layer so the GUI can change
-    // the level at runtime via [`LogLevelHandle::set`].
-    let (filter_layer, level_handle) = reload::Layer::new(to_level_filter(config.level));
+    let gui_mode = gui_sender.is_some();
+    let mut runtime_file_guard = None;
+    let mut file_log = None;
 
     // Build all layers into a single vec so the subscriber type stays
     // `Registry` throughout and dynamic dispatch compiles cleanly.
-    let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync + 'static>> =
-        vec![filter_layer.boxed()];
+    let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync + 'static>> = vec![];
 
     if config.stdout {
         layers.push(tracing_subscriber::fmt::layer().with_target(false).boxed());
     }
 
-    if let Some(fc) = &config.file {
-        let appender = make_rolling_appender(fc);
-        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-        guards.push(guard);
+    if !gui_mode {
+        if let Some(fc) = &config.file {
+            let appender = make_rolling_appender(fc)?;
+            let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+            guards.push(guard);
+            layers.push(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(non_blocking)
+                    .boxed(),
+            );
+        }
+    }
+
+    // The GUI may turn its file destination on and off after the subscriber is
+    // installed. Its layer is permanent, while the worker owns the optional
+    // file handle; no open, write, flush, or close runs on the UI/talker thread.
+    if gui_mode {
+        let sink = runtime_file::spawn()?;
+        if let Some(config) = config.file.clone() {
+            sink.toggle.enable(config)?;
+        }
         layers.push(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(non_blocking)
+                .with_writer(sink.writer)
                 .boxed(),
         );
+        file_log = Some(sink.toggle);
+        runtime_file_guard = Some(sink.guard);
     }
 
     if let Some(sender) = gui_sender {
         layers.push(GuiLogLayer::new(sender).boxed());
     }
 
-    tracing_subscriber::registry()
-        .with(layers)
+    // The reloadable level filter must wrap the complete sink stack. Putting a
+    // filtering layer inside the `Vec` is ineffective: another layer's
+    // callsite interest can make the vector permanently interested before its
+    // runtime `enabled` checks run.
+    let sinks = tracing_subscriber::registry().with(layers);
+    let (filter_layer, raw_level_handle) = reload::Layer::new(to_level_filter(config.level));
+    sinks
+        .with(filter_layer)
         .try_init()
         .context("installing global tracing subscriber (already initialized?)")?;
+    let level_handle = LogLevelHandle(Arc::new(move |level| {
+        raw_level_handle
+            .modify(|filter| *filter = to_level_filter(level))
+            .map_err(|error| anyhow::anyhow!("updating log level: {error}"))
+    }));
 
     Ok(LoggingHandle {
         _guards: guards,
-        level: LogLevelHandle(level_handle),
+        _runtime_file_guard: runtime_file_guard,
+        level: level_handle,
+        file_log,
     })
 }
 
@@ -236,12 +276,24 @@ fn to_level_filter(level: LogLevel) -> LevelFilter {
     }
 }
 
-fn make_rolling_appender(config: &FileLogConfig) -> tracing_appender::rolling::RollingFileAppender {
-    match config.rotation {
-        Rotation::Never => tracing_appender::rolling::never(&config.directory, &config.prefix),
-        Rotation::Hourly => tracing_appender::rolling::hourly(&config.directory, &config.prefix),
-        Rotation::Daily => tracing_appender::rolling::daily(&config.directory, &config.prefix),
-    }
+fn make_rolling_appender(
+    config: &FileLogConfig,
+) -> anyhow::Result<tracing_appender::rolling::RollingFileAppender> {
+    let rotation = match config.rotation {
+        Rotation::Never => tracing_appender::rolling::Rotation::NEVER,
+        Rotation::Hourly => tracing_appender::rolling::Rotation::HOURLY,
+        Rotation::Daily => tracing_appender::rolling::Rotation::DAILY,
+    };
+    tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(rotation)
+        .filename_prefix(config.prefix.clone())
+        .build(&config.directory)
+        .with_context(|| {
+            format!(
+                "opening file log {:?} in {:?}",
+                config.prefix, config.directory
+            )
+        })
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
