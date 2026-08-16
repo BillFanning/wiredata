@@ -98,7 +98,8 @@ in the paragraph you are reading.
 - **Test-first** for core logic: write the unit/integration tests before or alongside
   the code, not after.
 - Keep changes minimal and on-task; don't refactor unrelated code in passing.
-- Before finishing, run the checks in §4 (build, test, clippy, fmt).
+- Before finishing, run the §4 checks that the change reaches — always clippy and fmt
+  across the workspace, plus the tests for what you touched.
 - Commits: imperative subject, explain *why* in the body; group related changes.
 - Never commit secrets; profiles and logs may contain real device data.
 
@@ -107,10 +108,11 @@ in the paragraph you are reading.
 ## 4. Build and development commands
 
 ```powershell
-# Build / test the entire workspace
-cargo build
+# Build / test the entire workspace (the --workspace/--all-targets forms are
+# what CI runs; the bare forms miss test targets and sibling crates)
+cargo build --workspace --all-targets
 cargo build --release
-cargo test
+cargo test --workspace
 
 # Run a crate binary
 cargo run -p talker -- --gui
@@ -123,17 +125,27 @@ cargo test -p talker
 cargo test -p nmea0183 checksum::tests::xor_basic
 
 # Lint and format (run before finishing)
-cargo clippy -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt
-cargo fmt -- --check
+cargo fmt --all -- --check
 
 # Verify nmea0183 optional serde feature compiles cleanly
 cargo build -p nmea0183
 cargo build -p nmea0183 --features serde
+
+# Dependency policy — licenses, advisories, banned/duplicate crates (deny.toml).
+# CI runs this as its own job, so a change that passes everything above can
+# still fail the push.
+cargo deny check
 ```
 
-MSRV is **1.95** (current stable). Run `rustup update stable` if the build rejects your
-toolchain.
+This is a menu, not a per-commit checklist: scope the gate to the crates a change
+actually touches. A single-crate change needs that crate's tests plus the workspace
+clippy and fmt checks; the `nmea0183` serde build only guards what `nmea0183` can
+break; `cargo deny check` matters when dependencies change.
+
+MSRV is **1.95**. Stable moves ahead of it — run `rustup update stable` if the build
+rejects your toolchain.
 
 ---
 

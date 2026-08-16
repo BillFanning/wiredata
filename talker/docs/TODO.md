@@ -67,6 +67,12 @@ Cross off items as they are completed. Add new ones inline as they come up.
   `--echo`). Pinned by `sampled_policy_bounds_payload_traffic` + the reworked
   `sends_on_schedule_and_reports_self_describing_counts`. Spec "status"
   wording: fold into the next spec pass (no bump alone).
+- [ ] **Confirm the sampled Output pane reads correctly in a live run** (ADR-018).
+  Above ~10 Hz the pane shows the newest-per-interval `SendSample`, not every
+  send — the one user-visible consequence of the telemetry split, shipped
+  2026-07-11 and never confirmed against a real high-rate run. If the sampling
+  reads as lost data rather than a sample, the fix is presentation (how the pane
+  labels what it is showing), not the lane.
 - [x] **Observer-path allocations — MEASURED 2026-07-12, three of four killed
   by the baselines** (`cargo bench -p talker`, criterion baseline `main`).
   Decision rule: proceed only above ~1% of a core at 100 Hz–1 kHz. Verdicts:

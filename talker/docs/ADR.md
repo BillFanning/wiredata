@@ -2379,4 +2379,6 @@ The following decisions are deferred until the relevant module is written. They 
 
 **OQ-4 — `nmea0183` library MSRV policy.** Moved to [`nmea0183/docs/ADR.md`](../../nmea0183/docs/ADR.md) — it concerns the library's publication policy. See ADR-008 above for the workspace MSRV context it builds on.
 
+**OQ-5 — Theme preference: per-app or shared?** ADR-016 gave both apps the same dark/light toggle, but each persists its own choice through its own `eframe` storage, so putting talker in dark leaves listener light. Whether the two should follow one preference is unresolved, and so is where a shared value would live: `wiredata-ui` is chrome-only and depends on nothing at runtime, so it cannot own persisted state. Raised during the 2026-07-09 GUI merge; no decision has been taken.
+
 New open questions should be added here as they arise during implementation.
