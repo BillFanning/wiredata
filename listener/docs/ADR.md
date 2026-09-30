@@ -225,7 +225,9 @@ reporting contract for each.
    the affected recording rather than stalling the reader or writing a gapped
    file. The recorder emits `RecordingFaulted(ChannelId)` and records the
    truncation point; the artifact is contiguous and byte-exact up to a known end.
-   *Status: implemented and tested* (`recording_overflow_faults_emits_event_and_reception_continues`).
+   *Status: implemented, then superseded by ADR-043 (2026-09-30):* an overflow
+   now opens a recorded gap and the recording continues in a new segment,
+   rather than faulting the recording.
 
 2. **Detectable as an event, not quantifiable — a sustained reader stall on the
    Transport→Extractor edge (§97.1, §99).** This is the only edge permitted to

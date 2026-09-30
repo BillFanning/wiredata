@@ -40,8 +40,8 @@ const TRANSPORT_TOOLTIP: &str = concat!(
 const PRESSURE_TOOLTIP: &str = concat!(
     "Ingest is received data moving through Listener's in-memory processing queue; ",
     "its summary shows the highest sampled in-flight count this run, not a live ",
-    "current depth. Raw is the background recorder's in-memory queue; while recording, ",
-    "its ",
+    "current depth. Raw is the background recorder's in-memory queue, measured in bytes; ",
+    "while recording, its ",
     "latest status sample and highest observed occupancy are shown, and afterward ",
     "the highest observed occupancy is retained for the channel run. The writer may ",
     "be handling one block concurrently. These are application queues, not device or ",
@@ -164,11 +164,19 @@ const INGEST_QUEUE_TOOLTIP: &str = concat!(
     "transport stalls."
 );
 const RAW_QUEUE_ACTIVE_TOOLTIP: &str = concat!(
-    "Received blocks queued for the background Raw recorder. Latest sample is the queue ",
-    "occupancy in the most recent status snapshot, highest observed is the largest ",
-    "sample this run, and capacity is the queue limit. The writer may be handling one ",
-    "block concurrently. A brief burst can set the observed high. If an enqueue is ",
-    "attempted while the queue is full, Raw recording faults while reception continues."
+    "Bytes of received blocks queued for the background Raw recorder, each block ",
+    "counted with a small fixed allowance. Latest sample is the queue occupancy in the ",
+    "most recent status snapshot, highest observed is the largest sample this run, and ",
+    "capacity is the queue limit. The writer may be handling one block concurrently. A ",
+    "brief burst can set the observed high. If a block would not fit, Raw recording ",
+    "enters a gap: those bytes are not recorded, the gap is logged, and recording ",
+    "resumes in a new file while reception continues."
+);
+const RAW_QUEUE_GAP_TOOLTIP: &str = concat!(
+    "Raw recording is in a gap: received bytes are not being recorded until the next ",
+    "file opens. The gap's start, end and reason are logged in the diagnostics and the ",
+    "event log. Reception continues. The highest observed queue occupancy remains ",
+    "visible for this channel run."
 );
 const RAW_QUEUE_RETAINED_TOOLTIP: &str = concat!(
     "Raw recording is no longer active. This preserves the highest observed queue ",
@@ -176,10 +184,11 @@ const RAW_QUEUE_RETAINED_TOOLTIP: &str = concat!(
     "visible. It does not describe current storage load."
 );
 const RAW_QUEUE_FAULTED_TOOLTIP: &str = concat!(
-    "Raw recording is faulted. The highest observed queue occupancy remains visible ",
-    "for this channel run. An enqueue attempted while the queue is full is terminal ",
-    "for Raw recording, as are some recorder I/O failures; reception continues. Check ",
-    "the recording fault and diagnostics for the specific cause."
+    "Raw recording could not begin — for example, the file exists and on-exists is ",
+    "Refuse, or another recording holds the destination — and retrying on its own ",
+    "cannot fix it. Reception continues. Check the diagnostics for the specific cause, ",
+    "then press Record again. The highest observed queue occupancy remains visible for ",
+    "this channel run."
 );
 const RAW_QUEUE_INACTIVE_TOOLTIP: &str =
     "Raw recording is not active, so there is no Raw recorder queue to measure.";
@@ -254,24 +263,38 @@ fn pressure_signal(
     } else {
         format!("Ingest highest sampled {}/{}", ingest.peak, ingest.capacity)
     };
+    // The Raw queue is measured in bytes (ADR-043).
+    let bytes = |n: usize| human_bytes(n as u64);
     let raw_text = match (raw, raw_recording) {
+        (Some(queue), Some(RecordingState::Gap(reason))) => format!(
+            "Raw gap, {} · highest observed {} of {}",
+            reason.describe(),
+            bytes(queue.peak),
+            bytes(queue.capacity)
+        ),
+        (None, Some(RecordingState::Gap(reason))) => format!("Raw gap, {}", reason.describe()),
         (Some(queue), Some(RecordingState::Faulted)) => format!(
-            "Raw faulted · highest observed {}/{}",
-            queue.peak, queue.capacity
+            "Raw faulted · highest observed {} of {}",
+            bytes(queue.peak),
+            bytes(queue.capacity)
         ),
         (None, Some(RecordingState::Faulted)) => "Raw faulted".to_owned(),
         (Some(queue), Some(RecordingState::Enabled)) => format!(
-            "Raw latest sample {} · highest observed {}/{}",
-            queue.current, queue.peak, queue.capacity
+            "Raw latest sample {} · highest observed {} of {}",
+            bytes(queue.current),
+            bytes(queue.peak),
+            bytes(queue.capacity)
         ),
         (Some(queue), _) => format!(
-            "Raw retained highest observed {}/{}",
-            queue.peak, queue.capacity
+            "Raw retained highest observed {} of {}",
+            bytes(queue.peak),
+            bytes(queue.capacity)
         ),
         (None, _) => "Raw not recording".to_owned(),
     };
     let tone = match (raw, raw_recording) {
-        (_, Some(RecordingState::Faulted)) => SignalTone::Fault,
+        // A gap is bytes going unrecorded now.
+        (_, Some(RecordingState::Faulted | RecordingState::Gap(_))) => SignalTone::Fault,
         (Some(queue), Some(RecordingState::Enabled))
             if queue_level_reaches_half(queue.current, queue.capacity) =>
         {
@@ -713,12 +736,29 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
     ui.label(egui::RichText::new(ingest_text).weak())
         .on_hover_text(INGEST_QUEUE_TOOLTIP);
 
+    let bytes = |n: usize| human_bytes(n as u64);
     match view.raw_recording_queue {
+        Some(queue) if matches!(view.recording, Some(RecordingState::Gap(_))) => {
+            let reason = match view.recording {
+                Some(RecordingState::Gap(reason)) => reason.describe(),
+                _ => "",
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    "Raw record queue (gap — {reason}): highest observed {} of {}",
+                    bytes(queue.peak),
+                    bytes(queue.capacity)
+                ))
+                .color(palette(ui).fault),
+            )
+            .on_hover_text(RAW_QUEUE_GAP_TOOLTIP);
+        }
         Some(queue) if view.recording == Some(RecordingState::Faulted) => {
             ui.label(
                 egui::RichText::new(format!(
-                    "Raw record queue (faulted): highest observed {}/{}",
-                    queue.peak, queue.capacity
+                    "Raw record queue (faulted): highest observed {} of {}",
+                    bytes(queue.peak),
+                    bytes(queue.capacity)
                 ))
                 .color(palette(ui).fault),
             )
@@ -730,11 +770,11 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
             // conclusion the app had drawn and was stating in amber alone.
             let pressured = queue_level_reaches_half(queue.current, queue.capacity);
             let text = egui::RichText::new(format!(
-                "Raw record queue: latest sample {}/{}{} · highest observed {}",
-                queue.current,
-                queue.capacity,
+                "Raw record queue: latest sample {} of {}{} · highest observed {}",
+                bytes(queue.current),
+                bytes(queue.capacity),
                 if pressured { ", at half capacity" } else { "" },
-                queue.peak
+                bytes(queue.peak)
             ))
             .weak();
             ui.label(if pressured {
@@ -747,8 +787,9 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
         Some(queue) => {
             ui.label(
                 egui::RichText::new(format!(
-                    "Raw record queue (retained): highest observed {}/{}",
-                    queue.peak, queue.capacity
+                    "Raw record queue (retained): highest observed {} of {}",
+                    bytes(queue.peak),
+                    bytes(queue.capacity)
                 ))
                 .weak(),
             )
@@ -771,8 +812,8 @@ mod tests {
         ChannelStatus, ARRIVAL_TIMESTAMP_TOOLTIP, CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP,
         IDLE_RULE_TIMING_TOOLTIP, IDLE_TIMER_TOOLTIP, PIPELINE_TOOLTIP, PRESSURE_TOOLTIP,
         PROCESSING_TOOLTIP, RAW_QUEUE_ACTIVE_TOOLTIP, RAW_QUEUE_FAULTED_TOOLTIP,
-        RECEIVE_DETAILS_TOOLTIP, SERIAL_BACKPRESSURE_TOOLTIP, TRANSPORT_TOOLTIP,
-        UDP_AVAILABLE_TOOLTIP, UDP_UNAVAILABLE_TOOLTIP,
+        RAW_QUEUE_GAP_TOOLTIP, RECEIVE_DETAILS_TOOLTIP, SERIAL_BACKPRESSURE_TOOLTIP,
+        TRANSPORT_TOOLTIP, UDP_AVAILABLE_TOOLTIP, UDP_UNAVAILABLE_TOOLTIP,
     };
     use crate::core::RecordingState;
     use crate::runtime::{
@@ -870,7 +911,7 @@ mod tests {
         assert_eq!(quiet.tone, SignalTone::Neutral);
         assert_eq!(
             quiet.value,
-            "Ingest highest sampled 9/10 · Raw latest sample 2 · highest observed 7/8"
+            "Ingest highest sampled 9/10 · Raw latest sample 2 B · highest observed 7 B of 8 B"
         );
 
         let pressured = pressure_signal(
@@ -884,12 +925,26 @@ mod tests {
         assert_eq!(retained.tone, SignalTone::Neutral);
         assert_eq!(
             retained.value,
-            "Ingest highest sampled 9/10 · Raw retained highest observed 7/8"
+            "Ingest highest sampled 9/10 · Raw retained highest observed 7 B of 8 B"
         );
 
         let faulted = pressure_signal(ingest, Some(raw), Some(RecordingState::Faulted));
         assert_eq!(faulted.tone, SignalTone::Fault);
         assert!(faulted.value.contains("Raw faulted"));
+
+        // A gap names itself and its reason in words, not only by tone.
+        let gap = pressure_signal(
+            ingest,
+            Some(raw),
+            Some(RecordingState::Gap(crate::core::GapReason::QueueOverflow)),
+        );
+        assert_eq!(gap.tone, SignalTone::Fault);
+        assert!(
+            gap.value
+                .contains("Raw gap, the recording queue overflowed"),
+            "{}",
+            gap.value
+        );
 
         let awaiting = pressure_signal(QueueDepth::default(), None, None);
         assert_eq!(awaiting.value, "Ingest awaiting data · Raw not recording");
@@ -932,7 +987,9 @@ mod tests {
         assert!(ARRIVAL_TIMESTAMP_TOOLTIP.contains("Handoff and Read gap always use post-read"));
         assert!(RAW_QUEUE_ACTIVE_TOOLTIP.contains("most recent status snapshot"));
         assert!(RAW_QUEUE_ACTIVE_TOOLTIP.contains("reception continues"));
-        assert!(RAW_QUEUE_FAULTED_TOOLTIP.contains("terminal for Raw recording"));
+        assert!(RAW_QUEUE_FAULTED_TOOLTIP.contains("could not begin"));
+        assert!(RAW_QUEUE_GAP_TOOLTIP.contains("not being recorded"));
+        assert!(RAW_QUEUE_GAP_TOOLTIP.contains("Reception continues"));
     }
 
     #[test]

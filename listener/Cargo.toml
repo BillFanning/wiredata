@@ -25,6 +25,7 @@ path = "src/bin/listener-gui.rs"
 wiredata-ui = { path = "../wiredata-ui" }
 wiredata-timing = { path = "../wiredata-timing" }
 wiredata-telemetry = { path = "../wiredata-telemetry" }
+wiredata-log = { path = "../wiredata-log" }         # persistent event log worker (ADR-044)
 
 # Presentation-only construction of inline NMEA ZDA Mark annotations (ADR-025).
 # Listener remains stream-only: received bytes are never decoded as NMEA.
@@ -77,6 +78,7 @@ rfd = { workspace = true }
 # Diagnostic logging (§114) — tracing facade + env-filtered subscriber
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+dirs = { workspace = true }                           # event log folder (§118)
 
 # Windows console handling for the GUI (§3): the binary stays a console-subsystem
 # app so the headless CLI works when run from a terminal, and the GUI path detaches

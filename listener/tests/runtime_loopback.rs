@@ -279,12 +279,14 @@ async fn talker_input_gets_zda_in_live_mark_and_disp_but_never_raw() {
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
         disk_guard: None,
+        size_cap: None,
     };
     config.display_recording = DisplayRecordingConfig {
         enabled: true,
         destination: Some(disp_path.clone()),
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
+        size_cap: None,
     };
 
     let mut listener = Listener::with_default_capacities();
@@ -498,6 +500,7 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::Hourly,
         disk_guard: None,
+        size_cap: None,
     };
 
     let mut listener = Listener::with_default_capacities();
@@ -560,6 +563,7 @@ async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
         disk_guard: None,
+        size_cap: None,
     };
 
     let mut listener = Listener::with_default_capacities();
@@ -627,6 +631,7 @@ async fn set_display_recording_toggles_display_recording_live_through_the_orches
         destination: Some(path.clone()),
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
+        size_cap: None,
     };
 
     let mut listener = Listener::with_default_capacities();
@@ -716,12 +721,14 @@ async fn raw_and_display_recording_run_to_independent_destinations() {
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
         disk_guard: None,
+        size_cap: None,
     };
     config.display_recording = DisplayRecordingConfig {
         enabled: true,
         destination: Some(disp_path.clone()),
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
+        size_cap: None,
     };
 
     let mut listener = Listener::with_default_capacities();

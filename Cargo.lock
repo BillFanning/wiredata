@@ -2037,6 +2037,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "dirs",
  "eframe",
  "egui",
  "fs4",
@@ -2055,6 +2056,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows-sys 0.59.0",
+ "wiredata-log",
  "wiredata-telemetry",
  "wiredata-timing",
  "wiredata-ui",
@@ -4594,6 +4596,7 @@ name = "wiredata-log"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crossbeam-channel",
  "tracing",
  "tracing-appender",

@@ -57,9 +57,15 @@ pub(crate) struct MatchSetup {
     /// "Record on start" (§53): the pipeline begins recording at startup. Set when the
     /// channel's `raw_recording.enabled` is true and a destination is configured.
     pub(crate) auto_begin_recording: bool,
+    /// "Record on start" for the Display recording (§54): set from the
+    /// channel's `display_recording.enabled`.
+    pub(crate) auto_begin_display_recording: bool,
     /// The previous run's diagnostics, so a restarted Channel keeps its log across a
     /// stop/start within a session (§88). Empty for a first start.
     pub(crate) prior_diagnostics: Vec<crate::diagnostics::Diagnostic>,
+    /// The configured Channel name, for diagnostics and the event log (§118).
+    /// `None` names the Channel by its UUID (a TCP connection has no name).
+    pub(crate) channel_name: Option<String>,
 }
 
 impl MatchSetup {
@@ -70,7 +76,9 @@ impl MatchSetup {
             recording_settings: None,
             display_recording_settings: None,
             auto_begin_recording: false,
+            auto_begin_display_recording: false,
             prior_diagnostics: Vec::new(),
+            channel_name: None,
         }
     }
 }
@@ -142,6 +150,9 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     let (ingest_tx, ingest_rx) = mpsc::channel(caps.ingest);
 
     let mut pipeline = ChannelPipeline::new(channel_id, caps).with_event_sender(events);
+    if let Some(name) = match_setup.channel_name {
+        pipeline = pipeline.with_channel_name(name);
+    }
     if let Some(state) = serial_stall_state {
         pipeline = pipeline.with_serial_stall_state(state);
     }
@@ -163,6 +174,9 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     // as the live toggle), so it never pre-builds the recorder for this case.
     if match_setup.auto_begin_recording {
         pipeline = pipeline.with_auto_begin_recording();
+    }
+    if match_setup.auto_begin_display_recording {
+        pipeline = pipeline.with_auto_begin_display_recording();
     }
     if let Some(r) = raw_recorder {
         pipeline = pipeline.with_raw_recorder(r);

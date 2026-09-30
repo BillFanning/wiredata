@@ -64,9 +64,13 @@ impl LogFileConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Rotation {
     Never,
+    /// At each UTC hour.
     Hourly,
+    /// At each UTC midnight.
     #[default]
     Daily,
+    /// At each local midnight, so a file holds the operator's calendar day.
+    DailyLocal,
 }
 
 /// Open a rotating log file, first deleting files older than `max_age`.
@@ -75,11 +79,6 @@ pub enum Rotation {
 /// written to. Deletion is best-effort: a file that cannot be deleted is left
 /// and tried again at the next check.
 pub fn open_rolling_file(config: &LogFileConfig) -> anyhow::Result<RollingLogFile> {
-    let rotation = match config.rotation {
-        Rotation::Never => tracing_appender::rolling::Rotation::NEVER,
-        Rotation::Hourly => tracing_appender::rolling::Rotation::HOURLY,
-        Rotation::Daily => tracing_appender::rolling::Rotation::DAILY,
-    };
     if let Some(max_age) = config.max_age {
         prune_old_files(
             &config.directory,
@@ -88,16 +87,31 @@ pub fn open_rolling_file(config: &LogFileConfig) -> anyhow::Result<RollingLogFil
             SystemTime::now(),
         );
     }
-    let inner = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(rotation)
-        .filename_prefix(config.prefix.clone())
-        .build(&config.directory)
-        .with_context(|| {
-            format!(
-                "opening file log {:?} in {:?}",
-                config.prefix, config.directory
-            )
-        })?;
+    let context = || {
+        format!(
+            "opening file log {:?} in {:?}",
+            config.prefix, config.directory
+        )
+    };
+    let utc_rotation = match config.rotation {
+        Rotation::Never => Some(tracing_appender::rolling::Rotation::NEVER),
+        Rotation::Hourly => Some(tracing_appender::rolling::Rotation::HOURLY),
+        Rotation::Daily => Some(tracing_appender::rolling::Rotation::DAILY),
+        Rotation::DailyLocal => None,
+    };
+    let inner = match utc_rotation {
+        Some(rotation) => RollingInner::Utc(
+            tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(rotation)
+                .filename_prefix(config.prefix.clone())
+                .build(&config.directory)
+                .with_context(context)?,
+        ),
+        None => RollingInner::Local(
+            LocalDailyFile::open(&config.directory, &config.prefix, chrono::Local::now())
+                .with_context(context)?,
+        ),
+    };
     Ok(RollingLogFile {
         inner,
         directory: config.directory.clone(),
@@ -109,11 +123,16 @@ pub fn open_rolling_file(config: &LogFileConfig) -> anyhow::Result<RollingLogFil
 
 /// A rotating log file that also deletes its own old files.
 pub struct RollingLogFile {
-    inner: tracing_appender::rolling::RollingFileAppender,
+    inner: RollingInner,
     directory: PathBuf,
     prefix: String,
     max_age: Option<Duration>,
     next_prune: Instant,
+}
+
+enum RollingInner {
+    Utc(tracing_appender::rolling::RollingFileAppender),
+    Local(LocalDailyFile),
 }
 
 impl Write for RollingLogFile {
@@ -125,12 +144,83 @@ impl Write for RollingLogFile {
                 prune_old_files(&self.directory, &self.prefix, max_age, SystemTime::now());
             }
         }
-        self.inner.write(buf)
+        match &mut self.inner {
+            RollingInner::Utc(appender) => appender.write(buf),
+            RollingInner::Local(file) => file.write(buf),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        match &mut self.inner {
+            RollingInner::Utc(appender) => appender.flush(),
+            RollingInner::Local(file) => file.flush(),
+        }
     }
+}
+
+/// A log file named for the local calendar day, `<prefix>.<YYYY-MM-DD>`, that
+/// moves to the next day's file at local midnight. Appends when the day's file
+/// already exists, so a restart continues the same day's log.
+struct LocalDailyFile {
+    directory: PathBuf,
+    prefix: String,
+    file: std::fs::File,
+    /// When the next day's file takes over.
+    rollover_at: SystemTime,
+}
+
+impl LocalDailyFile {
+    fn open(
+        directory: &Path,
+        prefix: &str,
+        now: chrono::DateTime<chrono::Local>,
+    ) -> io::Result<Self> {
+        std::fs::create_dir_all(directory)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join(local_day_file_name(prefix, now.date_naive())))?;
+        Ok(Self {
+            directory: directory.to_path_buf(),
+            prefix: prefix.to_owned(),
+            file,
+            rollover_at: next_local_midnight(now).into(),
+        })
+    }
+}
+
+impl Write for LocalDailyFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if SystemTime::now() >= self.rollover_at {
+            let next = Self::open(&self.directory, &self.prefix, chrono::Local::now())?;
+            self.file.flush()?;
+            *self = next;
+        }
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn local_day_file_name(prefix: &str, day: chrono::NaiveDate) -> String {
+    format!("{prefix}.{}", day.format("%Y-%m-%d"))
+}
+
+/// The first instant of the local day after `now`. Where a time-zone change
+/// skips local midnight, the day starts at the first local time that exists;
+/// failing that, an hour from now, so rotation is late rather than never.
+fn next_local_midnight(now: chrono::DateTime<chrono::Local>) -> chrono::DateTime<chrono::Local> {
+    use chrono::TimeZone as _;
+    let fallback = now + chrono::Duration::hours(1);
+    let Some(tomorrow) = now.date_naive().succ_opt() else {
+        return fallback;
+    };
+    (0..3)
+        .filter_map(|hour| tomorrow.and_hms_opt(hour, 0, 0))
+        .find_map(|start| chrono::Local.from_local_datetime(&start).earliest())
+        .unwrap_or(fallback)
 }
 
 /// Delete the log files in `directory` with this prefix that were last written
@@ -914,6 +1004,47 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_local_day_file_is_named_for_the_local_date_and_rolls_at_local_midnight() {
+        use chrono::{Datelike as _, TimeZone as _, Timelike as _};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        assert_eq!(
+            local_day_file_name("listener.log", day),
+            "listener.log.2026-09-30"
+        );
+
+        let late = chrono::Local
+            .from_local_datetime(&day.and_hms_opt(23, 59, 0).unwrap())
+            .earliest()
+            .unwrap();
+        let next = next_local_midnight(late);
+        assert!(next > late);
+        assert_eq!(next.date_naive(), day.succ_opt().unwrap());
+        assert!(
+            next.hour() < 3,
+            "the next day starts at its first local hour"
+        );
+        assert_eq!(next.day(), 1);
+    }
+
+    #[test]
+    fn a_restart_on_the_same_local_day_appends_to_that_day_s_file() {
+        let dir = temp_folder("local_daily");
+        let config = LogFileConfig {
+            rotation: Rotation::DailyLocal,
+            ..LogFileConfig::new(&dir, "app.log")
+        };
+        for line in [b"first run\n".as_slice(), b"second run\n"] {
+            let mut file = open_rolling_file(&config).unwrap();
+            file.write_all(line).unwrap();
+            file.flush().unwrap();
+        }
+        let today = local_day_file_name("app.log", chrono::Local::now().date_naive());
+        let text = std::fs::read_to_string(dir.join(today)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(text, "first run\nsecond run\n");
     }
 
     #[test]

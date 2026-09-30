@@ -542,11 +542,15 @@ impl ListenerApp {
         // button on the same line (no expander — the setup follows below).
         ui.horizontal(|ui| {
             ui.label("Record Raw Data");
-            // Status glyph only (same symbol set/colors as channel status) — the word
-            // ("recording"/"off"/"faulted") is dropped to keep the row compact; the glyph
-            // ■/●/⚠ carries the state.
-            let (glyph, color, _text) = recording_indicator(recording, palette(ui));
+            // Status glyph (same symbol set/colors as channel status). The common
+            // words ("recording"/"off"/"faulted") are dropped to keep the row
+            // compact — the glyph ■/●/⚠ carries them — but a gap says what it is
+            // waiting for.
+            let (glyph, color, text) = recording_indicator(recording, palette(ui));
             paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
+            if matches!(recording, Some(RecordingState::Gap(_))) {
+                ui.label(egui::RichText::new(text).weak());
+            }
             self.record_button(ui, id, status, recording, RecTap::Raw);
         });
         if self.edit_draft.as_ref().map(|(eid, _)| *eid) != Some(id) {
@@ -570,8 +574,11 @@ impl ListenerApp {
         let display_recording = self.state.channel(id).and_then(|v| v.display_recording);
         ui.horizontal(|ui| {
             ui.label("Record Display");
-            let (glyph, color, _text) = recording_indicator(display_recording, palette(ui));
+            let (glyph, color, text) = recording_indicator(display_recording, palette(ui));
             paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
+            if matches!(display_recording, Some(RecordingState::Gap(_))) {
+                ui.label(egui::RichText::new(text).weak());
+            }
             self.record_button(ui, id, status, display_recording, RecTap::Display);
         });
         if let Some((_, config)) = &mut self.edit_draft {
@@ -627,7 +634,9 @@ impl ListenerApp {
             RecTap::Raw => cfg.raw_recording.destination.is_some(),
             RecTap::Display => cfg.display_recording.destination.is_some(),
         });
-        let recording_now = matches!(recording, Some(RecordingState::Enabled));
+        // A recording in a gap is still on — it resumes by itself — so it
+        // offers Stop, not Record.
+        let recording_now = recording.is_some_and(RecordingState::is_on);
         let label = if recording_now { "Stop" } else { "Record" };
         // Match the start-channel button's *width* (96) but keep the default height —
         // a full CONTROL_BUTTON_SIZE min_size plus a long label made it both too wide

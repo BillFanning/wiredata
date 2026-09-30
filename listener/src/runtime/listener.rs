@@ -26,11 +26,7 @@ use tokio::sync::mpsc;
 use crate::config::schema::InterfaceConfig;
 use crate::config::ChannelConfig;
 use crate::core::{lock_recover, ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
-use crate::display::{DisplayView, RenderedOutput};
-use crate::record::{
-    start_display_recording, DisplayFileRecorder, FileRotationPolicy, Recording,
-    RotatingDisplayRecorder,
-};
+use crate::display::DisplayView;
 use crate::transport::{
     DataTransportRunner, SerialControlCommand, SerialControlHooks, SerialControlLines,
     SerialStallState, TransportNotice,
@@ -148,10 +144,6 @@ struct SerialControl {
 /// Resources assembled while opening a stream transport and consumed together
 /// when its monitored pipeline is spawned.
 struct DataSpawnContext {
-    display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
-    /// A setup failure retained in the new pipeline so Display recording faults
-    /// surface through the same diagnostic path as Raw recording faults.
-    display_diagnostic: Option<crate::diagnostics::Diagnostic>,
     faulted: Arc<AtomicBool>,
     serial_stall_state: Option<SerialStallState>,
     notices: (
@@ -631,7 +623,8 @@ impl Listener {
                     display.file_rotation,
                 ),
                 file_rotation: display.file_rotation,
-                capacity: self.caps.raw_recording,
+                queue_budget: self.caps.recording_queue_budget,
+                size_cap: display.size_cap(),
                 renderer,
             })
     }
@@ -803,10 +796,13 @@ impl Listener {
                     .error_retention
                     .unwrap_or(crate::retention::DEFAULT_BACKSTOP);
                 if let Some(channel) = self.channels.get_mut(&id) {
-                    let name = channel.config.name.as_str();
-                    let message = format!("{name}: {err}");
-                    channel
-                        .retain_diagnostic(crate::diagnostics::Diagnostic::error(message), limit);
+                    let name = channel.config.name.as_str().to_owned();
+                    let diagnostic =
+                        crate::diagnostics::Diagnostic::error(format!("{name}: {err}"));
+                    // Every failed attempt reaches the event log (§118), even when the
+                    // retained list merges it into one counted entry.
+                    crate::diagnostics::emit_to_event_log(&name, id, &diagnostic);
+                    channel.retain_diagnostic(diagnostic, limit);
                 }
                 let _ = self.events_tx.try_send(RuntimeEvent::ChannelFaulted(id));
                 Err(err)
@@ -1238,16 +1234,11 @@ impl Listener {
                     .with_notice_sender(notice_tx.clone())
                     .with_control(hooks);
                 let serial_stall_state = opened.stall_state();
-                // "Record on start" is begun by the pipeline (auto_begin_recording), not
-                // pre-built here — so its failure surfaces like the live toggle.
-                let (display, display_diag) = self.build_display_recorder(id, config).await;
                 let handle = ChannelHandle::Data(self.spawn_data(
                     id,
                     opened,
                     config,
                     DataSpawnContext {
-                        display_recorder: display,
-                        display_diagnostic: display_diag,
                         faulted,
                         serial_stall_state: Some(serial_stall_state),
                         notices: (notice_tx, notice_rx),
@@ -1268,9 +1259,6 @@ impl Listener {
                     .await
                     .map_err(OrchestratorError::Bind)?
                     .with_notice_sender(notice_tx.clone());
-                // "Record on start" is begun by the pipeline (auto_begin_recording), not
-                // pre-built here — so its failure surfaces like the live toggle.
-                let (display, display_diag) = self.build_display_recorder(id, config).await;
                 // UDP is async and never stalls the reader. On Linux the transport
                 // also publishes its cumulative SO_RXQ_OVFL socket-drop counter;
                 // other platforms explicitly report that counter unsupported.
@@ -1279,8 +1267,6 @@ impl Listener {
                     bound,
                     config,
                     DataSpawnContext {
-                        display_recorder: display,
-                        display_diagnostic: display_diag,
                         faulted,
                         serial_stall_state: None,
                         notices: (notice_tx, notice_rx),
@@ -1319,8 +1305,6 @@ impl Listener {
         context: DataSpawnContext,
     ) -> MonitoredChannel {
         let DataSpawnContext {
-            display_recorder,
-            display_diagnostic,
             faulted,
             serial_stall_state,
             notices,
@@ -1328,11 +1312,11 @@ impl Listener {
         spawn_monitored_channel(
             id,
             runner,
-            // No pre-built Raw recorder: recording begins lazily in the pipeline
-            // (auto-begin / the live toggle), so its failure surfaces as a
-            // recording fault (§55) rather than a start fault.
+            // No pre-built recorders: both taps begin in the pipeline (auto-begin
+            // or the live toggle), so a failure surfaces as a recording fault
+            // (§55) rather than a start fault.
             None,
-            display_recorder,
+            None,
             // One runtime Display View per configured view (§48); at least one.
             view_count(config),
             // Disk-space guard (§56.2, §168): only when both a guard and a Raw
@@ -1358,14 +1342,11 @@ impl Listener {
                 // like the live toggle (diagnostic + RecordingFaulted), not silently —
                 // including the no-destination case, which `begin_recording` faults.
                 auto_begin_recording: config.raw_recording.enabled,
-                // Carry the previous run's diagnostics forward so a restart keeps its log
-                // (§88, within session), plus any display-recording setup failure just
-                // recorded, so it lands in this run's log.
-                prior_diagnostics: {
-                    let mut prior = self.prior_diagnostics(id);
-                    prior.extend(display_diagnostic);
-                    prior
-                },
+                auto_begin_display_recording: config.display_recording.enabled,
+                // Carry the previous run's diagnostics forward so a restart keeps its
+                // log (§88, within session).
+                prior_diagnostics: self.prior_diagnostics(id),
+                channel_name: Some(config.name.as_str().to_owned()),
             },
             self.channel_caps(config),
             self.events_tx.clone(),
@@ -1377,9 +1358,9 @@ impl Listener {
 
     /// The Raw recording settings for a `Record` action (§50.2): present whenever a
     /// Raw destination is configured — **independent of `raw_recording.enabled`**, so
-    /// a match-triggered `Record` works even when auto-start recording is off. Mirrors
-    /// `build_raw_recorder`'s destination/overwrite/timestamp/rotation choices so a
-    /// match-triggered recording matches what auto-start recording would produce.
+    /// a match-triggered `Record` works even when auto-start recording is off. The
+    /// auto-start, live-toggle and match-triggered begins all use these settings, so
+    /// the three produce the same recording.
     fn recording_settings(&self, config: &ChannelConfig) -> Option<RawRecordingSettings> {
         self.settings_from(&config.raw_recording, config.name.as_str())
     }
@@ -1419,83 +1400,9 @@ impl Listener {
                 ),
                 timestamps: raw.timestamp_enabled,
                 file_rotation: raw.file_rotation,
-                capacity: self.caps.raw_recording,
+                queue_budget: self.caps.recording_queue_budget,
+                size_cap: raw.size_cap(),
             })
-    }
-
-    /// Create the Display Recording for a Channel if enabled (§54). v1 records the
-    /// primary (first) Display View. An enable failure does **not** fault the Channel
-    /// (§55) — reception continues — but, like raw recording, it records a **concrete
-    /// diagnostic** (returned as the second tuple element so the caller can seed the
-    /// pipeline log with it) and emits `RecordingFaulted`, instead of a bare reason-less
-    /// warning. `None` recorder + `None` diagnostic when display recording is disabled.
-    async fn build_display_recorder(
-        &self,
-        id: ChannelId,
-        config: &ChannelConfig,
-    ) -> (
-        Option<(DisplayView, Recording<RenderedOutput>)>,
-        Option<crate::diagnostics::Diagnostic>,
-    ) {
-        use crate::diagnostics::Diagnostic;
-        let recording = &config.display_recording;
-        if !recording.enabled {
-            return (None, None);
-        }
-        let name = config.name.as_str();
-        let Some(destination) = &recording.destination else {
-            let _ = self.events_tx.try_send(RuntimeEvent::RecordingFaulted(
-                id,
-                crate::core::RecordingTap::Display,
-            ));
-            return (
-                None,
-                Some(Diagnostic::error(format!(
-                    "{name}: can't start Display recording — no destination is set \
-                     (set one in Display record, then restart)"
-                ))),
-            );
-        };
-        let renderer = config
-            .display
-            .views
-            .first()
-            .map(build_display_view)
-            .unwrap_or_default();
-        let policy = recording.overwrite_policy;
-        let cap = self.caps.raw_recording;
-        let created = if recording.file_rotation == FileRotationPolicy::None {
-            DisplayFileRecorder::create(destination, policy)
-                .await
-                .map(|r| start_display_recording(r, cap))
-        } else {
-            RotatingDisplayRecorder::create(
-                destination,
-                name,
-                ".disp",
-                policy,
-                recording.file_rotation,
-            )
-            .await
-            .map(|r| start_display_recording(r, cap))
-        };
-        match created {
-            Ok(recording) => (Some((renderer, recording)), None),
-            Err(err) => {
-                let _ = self.events_tx.try_send(RuntimeEvent::RecordingFaulted(
-                    id,
-                    crate::core::RecordingTap::Display,
-                ));
-                (
-                    None,
-                    Some(Diagnostic::error(format!(
-                        "{name}: could not start Display recording to {} (on-exists: {:?}): {err}",
-                        destination.display(),
-                        policy,
-                    ))),
-                )
-            }
-        }
     }
 }
 
@@ -1538,6 +1445,7 @@ async fn drain_handle(handle: Option<ChannelHandle>) -> Option<ChannelSnapshot> 
 mod tests {
     use super::*;
     use crate::config::{schema::InterfaceConfig, templates};
+    use crate::record::FileRotationPolicy;
 
     fn udp_channel() -> ChannelConfig {
         // Template binds 0.0.0.0:0 (ephemeral) — binds cleanly in tests.
@@ -1559,6 +1467,7 @@ mod tests {
             overwrite_policy: OverwritePolicy::Refuse,
             file_rotation: FileRotationPolicy::Hourly,
             disk_guard: None,
+            size_cap: None,
         };
         let settings = listener.settings_from(&raw, "GPS").unwrap();
         assert_eq!(settings.overwrite, OverwritePolicy::AppendIfExists);
@@ -1589,6 +1498,7 @@ mod tests {
             overwrite_policy: OverwritePolicy::Overwrite,
             file_rotation: FileRotationPolicy::None,
             disk_guard: None,
+            size_cap: None,
         };
         assert!(!listener.settings_from(&off, "GPS").unwrap().timestamps);
 
@@ -2188,6 +2098,7 @@ mod tests {
             overwrite_policy: OverwritePolicy::Refuse,
             file_rotation: FileRotationPolicy::None,
             disk_guard: None,
+            size_cap: None,
         };
         let id = listener.add_channel(config);
 
@@ -2342,6 +2253,7 @@ mod tests {
             overwrite_policy: OverwritePolicy::Overwrite,
             file_rotation: FileRotationPolicy::None,
             disk_guard: None,
+            size_cap: None,
         };
 
         let mut listener = Listener::with_default_capacities();
@@ -2357,8 +2269,23 @@ mod tests {
         let second_id = listener.add_channel(second);
 
         // Both channels start fine (reception runs); the second's recording faults on the
-        // lock. Allow time for the pipeline auto-begin to attempt and fault.
+        // lock. The first file opens in its recorder's task, so wait for it to start
+        // before starting the second — otherwise either could win the lock.
         listener.start(first_id).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first recording never started"
+            );
+            if let Ok(Some(RuntimeEvent::RecordingStarted(id, _))) =
+                tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+            {
+                if id == first_id {
+                    break;
+                }
+            }
+        }
         listener.start(second_id).await.unwrap();
         assert_eq!(listener.state(second_id), Some(ChannelState::Running));
 

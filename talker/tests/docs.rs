@@ -19,11 +19,22 @@ use std::path::{Path, PathBuf};
 ///
 /// Each entry claims the surrounding prose reads correctly with the identifier
 /// absent. Checked for still being needed, below.
-const REMOVED_ON_PURPOSE: &[(&str, &str)] = &[(
-    "min_active_interval",
-    "talker TODO names the old symbol beside the one that replaced it \
-     (`active_cadence`); the sentence is about the rename",
-)];
+const REMOVED_ON_PURPOSE: &[(&str, &str)] = &[
+    (
+        "min_active_interval",
+        "talker TODO names the old symbol beside the one that replaced it \
+         (`active_cadence`); the sentence is about the rename",
+    ),
+    (
+        "build_raw_recorder",
+        "listener ADR-013 records what the Raw/Display split changed at the time; \
+         both taps now begin in the pipeline (ADR-043)",
+    ),
+    (
+        "build_display_recorder",
+        "listener ADR-013 history, as for `build_raw_recorder`",
+    ),
+];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

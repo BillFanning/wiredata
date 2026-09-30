@@ -15,7 +15,7 @@ pub mod timing;
 pub use command::{RecordingTap, RuntimeEvent};
 pub use error::RecordError;
 pub use ids::{ChannelId, ChannelName, DisplayViewId, MatchRuleId, StableConfigId};
-pub use state::{ChannelKind, ChannelState, DisplayState, RecordingState};
+pub use state::{ChannelKind, ChannelState, DisplayState, GapReason, RecordingState};
 pub use sync::lock_recover;
 pub use timing::{
     validate_zda_talker_id, zda_sentence, ArrivalTimestampSource, ArrivalTimestampStatus,

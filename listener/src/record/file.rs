@@ -64,6 +64,13 @@ fn lock_path(path: &Path) -> PathBuf {
 /// asynchronously, so its lock would linger past drop. Returns
 /// [`RecordError::DestinationInUse`] if the destination is already locked.
 fn lock_recording_destination(path: &Path) -> Result<std::fs::File, RecordError> {
+    lock_file(&lock_path(path))
+}
+
+/// Take the advisory exclusive lock on `lock` itself (see
+/// [`lock_recording_destination`]). A recording made of segments holds one such
+/// lock for its whole life, so its numbered files are allocated under it (§59).
+pub(crate) fn lock_file(lock: &Path) -> Result<std::fs::File, RecordError> {
     // `std::fs::File::try_lock` (stable since Rust 1.89) — no fs4 needed
     // for the lock; fs4 stays for the disk-space free functions (§168).
     let lock = std::fs::OpenOptions::new()
@@ -71,7 +78,7 @@ fn lock_recording_destination(path: &Path) -> Result<std::fs::File, RecordError>
         .write(true)
         .create(true)
         .truncate(false)
-        .open(lock_path(path))?;
+        .open(lock)?;
     match lock.try_lock() {
         Ok(()) => Ok(lock),
         Err(std::fs::TryLockError::WouldBlock) => Err(RecordError::DestinationInUse),
@@ -79,7 +86,7 @@ fn lock_recording_destination(path: &Path) -> Result<std::fs::File, RecordError>
     }
 }
 
-fn sidecar_path(path: &Path) -> PathBuf {
+pub(crate) fn sidecar_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".idx");
     PathBuf::from(name)
@@ -107,8 +114,10 @@ pub struct RawFileRecorder {
     /// index points into the wrong part of it.
     stream_offset: u64,
     /// Advisory lock on the destination (§121, ADR-014); held for the recorder's
-    /// lifetime, released deterministically when this std handle drops.
-    _lock: std::fs::File,
+    /// lifetime, released deterministically when this std handle drops. `None`
+    /// for a segment, whose recording holds one lock for all its files.
+    _lock: Option<std::fs::File>,
+    path: PathBuf,
 }
 
 impl RawFileRecorder {
@@ -126,6 +135,18 @@ impl RawFileRecorder {
         // The one uncovered edge — a user pointing one channel's *main* destination at
         // another's sidecar path — is left unguarded as vanishingly unlikely.
         let lock = lock_recording_destination(path)?;
+        let mut recorder = Self::open(path, policy, timestamps).await?;
+        recorder._lock = Some(lock);
+        Ok(recorder)
+    }
+
+    /// Open one segment of a recording whose lock is held elsewhere (§59).
+    /// The overwrite policy applies as in [`create`](Self::create).
+    pub async fn open(
+        path: &Path,
+        policy: OverwritePolicy,
+        timestamps: bool,
+    ) -> Result<Self, RecordError> {
         // Sidecar BEFORE the main destination: opening can create/truncate,
         // so the fallible pair must touch the derived artifact first — a
         // failed begin must never have modified the main recording (the
@@ -155,7 +176,8 @@ impl RawFileRecorder {
             file: BufWriter::new(file),
             sidecar,
             stream_offset,
-            _lock: lock,
+            _lock: None,
+            path: path.to_path_buf(),
         })
     }
 
@@ -171,17 +193,21 @@ impl RawFileRecorder {
 impl RawRecorder for RawFileRecorder {
     async fn write_chunk(&mut self, chunk: &ReceivedData) -> Result<(), RecordError> {
         let bytes = chunk.payload.bytes();
+        let offset = self.stream_offset;
+        // Bytes before their index line (§57): an interrupted write then leaves
+        // bytes the index does not describe, never an index entry pointing past
+        // the end of the `.raw`.
+        self.file.write_all(bytes).await?;
+        self.stream_offset += bytes.len() as u64;
         if let Some(sidecar) = &mut self.sidecar {
             // Key the timestamp by the offset of this chunk's first byte (§57).
             let line = format!(
                 "{},{}\n",
-                self.stream_offset,
+                offset,
                 wall_clock_nanos(chunk.received_at.wall_clock)
             );
             sidecar.write_all(line.as_bytes()).await?;
         }
-        self.file.write_all(bytes).await?;
-        self.stream_offset += bytes.len() as u64;
         Ok(())
     }
 
@@ -199,6 +225,14 @@ impl RawRecorder for RawFileRecorder {
         // when the recorder is dropped after the task ends.
         self.flush().await
     }
+
+    fn written_len(&self) -> u64 {
+        self.stream_offset
+    }
+
+    fn file_path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
 }
 
 /// Display Recording to a file: appends a view's rendered text exactly as
@@ -209,8 +243,11 @@ impl RawRecorder for RawFileRecorder {
 /// arrive pre-framed with their own newlines.
 pub struct DisplayFileRecorder {
     file: BufWriter<File>,
+    /// Bytes in the file, for the size cap (§59).
+    len: u64,
     /// Advisory lock on the destination (§121, ADR-014); see `RawFileRecorder._lock`.
-    _lock: std::fs::File,
+    _lock: Option<std::fs::File>,
+    path: PathBuf,
 }
 
 impl DisplayFileRecorder {
@@ -218,8 +255,21 @@ impl DisplayFileRecorder {
         // Lock the destination first (§121, ADR-014) — same as Raw, so a `.disp` cannot
         // be shared by two recordings either.
         let lock = lock_recording_destination(path)?;
-        let file = BufWriter::new(open_recording_file(path, policy).await?);
-        Ok(Self { file, _lock: lock })
+        let mut recorder = Self::open(path, policy).await?;
+        recorder._lock = Some(lock);
+        Ok(recorder)
+    }
+
+    /// Open one segment of a recording whose lock is held elsewhere (§59).
+    pub async fn open(path: &Path, policy: OverwritePolicy) -> Result<Self, RecordError> {
+        let file = open_recording_file(path, policy).await?;
+        let len = file.metadata().await?.len();
+        Ok(Self {
+            file: BufWriter::new(file),
+            len,
+            _lock: None,
+            path: path.to_path_buf(),
+        })
     }
 }
 
@@ -227,6 +277,7 @@ impl DisplayFileRecorder {
 impl DisplayRecorder for DisplayFileRecorder {
     async fn write_rendered(&mut self, output: &RenderedOutput) -> Result<(), RecordError> {
         self.file.write_all(output.text.as_bytes()).await?;
+        self.len += output.text.len() as u64;
         Ok(())
     }
 
@@ -238,13 +289,23 @@ impl DisplayRecorder for DisplayFileRecorder {
     async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
         self.flush().await
     }
+
+    fn written_len(&self) -> u64 {
+        self.len
+    }
+
+    fn file_path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::{ChannelId, ChunkTime};
-    use crate::record::{start_display_recording, start_raw_recording};
+    use crate::record::{
+        start_display_recording, start_raw_recording, StreamPos, DEFAULT_QUEUE_BUDGET,
+    };
     use crate::transport::ReceivedPayload;
     use std::sync::Arc;
 
@@ -252,6 +313,14 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("listener-rec-{tag}-{}.bin", uuid::Uuid::new_v4()));
         path
+    }
+
+    /// Where an item sits in the stream does not matter to these tests.
+    fn pos() -> StreamPos {
+        StreamPos {
+            offset: 0,
+            at: std::time::SystemTime::now(),
+        }
     }
 
     fn chunk(bytes: &[u8]) -> Arc<ReceivedData> {
@@ -331,13 +400,13 @@ mod tests {
         let recorder = RawFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
             .await
             .unwrap();
-        let mut recording = start_raw_recording(recorder, 16);
+        let mut recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
 
         // Chunk boundaries must not appear in the byte stream (§53).
-        recording.try_record(chunk(b"$GPGGA,"));
-        recording.try_record(chunk(b"123.4*7F\r\n"));
-        recording.try_record(chunk(b"\x00\x01\x02"));
-        recording.finalize(RecordingStopReason::Disabled).await;
+        recording.try_record(chunk(b"$GPGGA,"), pos());
+        recording.try_record(chunk(b"123.4*7F\r\n"), pos());
+        recording.try_record(chunk(b"\x00\x01\x02"), pos());
+        let _ = recording.finalize(RecordingStopReason::Disabled).await;
 
         let written = tokio::fs::read(&path).await.unwrap();
         assert_eq!(written, b"$GPGGA,123.4*7F\r\n\x00\x01\x02");
@@ -351,10 +420,10 @@ mod tests {
         let recorder = RawFileRecorder::create(&path, OverwritePolicy::Overwrite, true)
             .await
             .unwrap();
-        let mut recording = start_raw_recording(recorder, 16);
-        recording.try_record(chunk(b"AB"));
-        recording.try_record(chunk(b"CDE"));
-        recording.finalize(RecordingStopReason::Disabled).await;
+        let mut recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
+        recording.try_record(chunk(b"AB"), pos());
+        recording.try_record(chunk(b"CDE"), pos());
+        let _ = recording.finalize(RecordingStopReason::Disabled).await;
 
         // Byte stream holds only payload bytes — no timestamps interleaved (§53).
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"ABCDE");
@@ -387,18 +456,18 @@ mod tests {
             let recorder = RawFileRecorder::create(&path, OverwritePolicy::Overwrite, true)
                 .await
                 .unwrap();
-            let mut recording = start_raw_recording(recorder, 16);
-            recording.try_record(chunk(b"ABCDE"));
-            recording.finalize(RecordingStopReason::Disabled).await;
+            let mut recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
+            recording.try_record(chunk(b"ABCDE"), pos());
+            let _ = recording.finalize(RecordingStopReason::Disabled).await;
         }
         {
             let recorder = RawFileRecorder::create(&path, OverwritePolicy::AppendIfExists, true)
                 .await
                 .unwrap();
-            let mut recording = start_raw_recording(recorder, 16);
-            recording.try_record(chunk(b"FG"));
-            recording.try_record(chunk(b"HIJ"));
-            recording.finalize(RecordingStopReason::Disabled).await;
+            let mut recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
+            recording.try_record(chunk(b"FG"), pos());
+            recording.try_record(chunk(b"HIJ"), pos());
+            let _ = recording.finalize(RecordingStopReason::Disabled).await;
         }
 
         let raw = tokio::fs::read(&path).await.unwrap();
@@ -434,9 +503,9 @@ mod tests {
             let recorder = RawFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
                 .await
                 .unwrap();
-            let mut recording = start_raw_recording(recorder, 16);
-            recording.try_record(chunk(b"early-bytes"));
-            recording.finalize(RecordingStopReason::Disabled).await;
+            let mut recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
+            recording.try_record(chunk(b"early-bytes"), pos());
+            let _ = recording.finalize(RecordingStopReason::Disabled).await;
         }
         assert!(
             tokio::fs::metadata(&sidecar_path(&path)).await.is_err(),
@@ -446,9 +515,9 @@ mod tests {
             let recorder = RawFileRecorder::create(&path, OverwritePolicy::AppendIfExists, true)
                 .await
                 .unwrap();
-            let mut recording = start_raw_recording(recorder, 16);
-            recording.try_record(chunk(b"late"));
-            recording.finalize(RecordingStopReason::Disabled).await;
+            let mut recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
+            recording.try_record(chunk(b"late"), pos());
+            let _ = recording.finalize(RecordingStopReason::Disabled).await;
         }
 
         let sidecar = tokio::fs::read_to_string(&sidecar_path(&path))
@@ -474,19 +543,25 @@ mod tests {
         let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Overwrite)
             .await
             .unwrap();
-        let mut recording = start_display_recording(recorder, 16);
+        let mut recording = start_display_recording(recorder, DEFAULT_QUEUE_BUDGET);
         let cid = ChannelId::new();
-        recording.try_record(RenderedOutput {
-            channel_id: cid,
-            text: "first".to_string(),
-            timestamp: None,
-        });
-        recording.try_record(RenderedOutput {
-            channel_id: cid,
-            text: "second".to_string(),
-            timestamp: None,
-        });
-        recording.finalize(RecordingStopReason::Disabled).await;
+        recording.try_record(
+            RenderedOutput {
+                channel_id: cid,
+                text: "first".to_string(),
+                timestamp: None,
+            },
+            pos(),
+        );
+        recording.try_record(
+            RenderedOutput {
+                channel_id: cid,
+                text: "second".to_string(),
+                timestamp: None,
+            },
+            pos(),
+        );
+        let _ = recording.finalize(RecordingStopReason::Disabled).await;
 
         // The recorder appends verbatim — no injected separators (ADR-018): the
         // rendered stream's own text is the file, byte for byte.

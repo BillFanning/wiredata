@@ -65,7 +65,10 @@ const MIN_WINDOW_SIZE: [f32; 2] = [640.0, 480.0];
 /// never in either `main`.
 pub fn run() -> anyhow::Result<()> {
     detach_console(); // drop the double-click console before the window opens
-    crate::diagnostics::init_logging(); // §114; non-fatal if already installed (§117)
+                      // §114, §118; non-fatal (§117). Held until the window closes, so the event
+                      // log drains and flushes on exit.
+    let event_log = crate::diagnostics::init_logging();
+    let event_log_status = event_log.status();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             // Title carries the version, like talker's. The `run_native` app
@@ -85,7 +88,7 @@ pub fn run() -> anyhow::Result<()> {
         persist_window: false,
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "Listener",
         options,
         Box::new(|cc| {
@@ -107,10 +110,13 @@ pub fn run() -> anyhow::Result<()> {
                 repaint,
                 &cc.egui_ctx,
                 cc.storage,
+                event_log_status,
             )))
         }),
     )
-    .map_err(|e| anyhow!("{e}"))
+    .map_err(|e| anyhow!("{e}"));
+    drop(event_log);
+    result
 }
 
 /// Apply the app's base style. This fork keeps visuals *per theme* and the active
@@ -198,6 +204,10 @@ struct ListenerApp {
     /// warning — a silently dropped "Stop all" cost a debugging session once.
     /// Shown as a top banner; auto-expires, or dismiss by button.
     command_drop: Option<(String, std::time::Instant)>,
+    /// The persistent event log's status (§118). A problem is shown as a
+    /// lasting top banner: unattended logging that silently stopped saving
+    /// its log would leave nothing to diagnose later.
+    event_log: crate::diagnostics::EventLogStatus,
 }
 
 /// How long the dropped-command banner stays up if not dismissed.
@@ -272,6 +282,7 @@ impl ListenerApp {
         repaint: std::sync::Arc<wiredata_ui::repaint::RepaintCoalescer>,
         ctx: &egui::Context,
         storage: Option<&dyn eframe::Storage>,
+        event_log: crate::diagnostics::EventLogStatus,
     ) -> Self {
         // Restore the recent-profiles list from eframe storage (survives restarts).
         let recent_profiles = storage
@@ -316,6 +327,7 @@ impl ListenerApp {
             current_profile_path: None,
             recent_profiles,
             command_drop: None,
+            event_log,
         }
     }
 
@@ -363,6 +375,30 @@ impl ListenerApp {
                 std::time::Instant::now(),
             ));
         }
+    }
+
+    /// The event log banner (§118): a lasting top strip while the persistent
+    /// event log cannot be written, or once any of its lines were lost. It is
+    /// not dismissable, because the condition it reports is still true.
+    fn show_event_log_banner(&mut self, ui: &mut egui::Ui) {
+        let problem = self.event_log.problem();
+        let lost = self.event_log.lost_entries();
+        if problem.is_none() && lost == 0 {
+            return;
+        }
+        let mut message = match &problem {
+            Some(problem) => format!("The event log is not being saved: {problem}"),
+            None => "The event log could not keep up".to_owned(),
+        };
+        if lost > 0 {
+            message.push_str(&format!(" — {lost} log lines were not saved"));
+        }
+        egui::Panel::top("event_log_notice")
+            .resizable(false)
+            .show_inside(ui, |ui| {
+                let warn = ui.visuals().warn_fg_color;
+                ui.colored_label(warn, format!("\u{26A0} {message}"));
+            });
     }
 
     /// The dropped-command banner (see [`Self::send`]): a top strip in the
@@ -584,6 +620,7 @@ impl eframe::App for ListenerApp {
         self.drain_updates();
         self.handle_tab_keys(ui.ctx());
         self.show_command_drop_banner(ui);
+        self.show_event_log_banner(ui);
         let channels_collapsed = self.channels_collapsed;
         let channel_panel = if channels_collapsed {
             // Collapsed: a thin strip — an expand button plus mini tabs (a status dot

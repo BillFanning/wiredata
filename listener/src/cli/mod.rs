@@ -5,13 +5,15 @@
 //! `RuntimeEvent` stream, and shuts down gracefully on Ctrl-C. It contains no
 //! business logic — channel construction lives in `runtime`/`config` (§3, §128).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use crate::config::{templates, ChannelConfig, InterfaceConfig, Profile};
-use crate::core::RuntimeEvent;
+use crate::core::{ChannelId, RuntimeEvent};
+use crate::diagnostics::EventLogStatus;
 use crate::runtime::Listener;
 
 /// Receive and inspect byte-oriented data from serial and network sources.
@@ -85,12 +87,20 @@ pub fn parse() -> Cli {
 /// Headless CLI entry point: build a Tokio runtime and run the event loop over the
 /// already-parsed arguments (§3). The GUI path is dispatched in [`crate::run`].
 pub fn run(cli: Cli) -> Result<()> {
-    crate::diagnostics::init_logging(); // §114; non-fatal if already installed (§117)
+    // §114, §118; non-fatal (§117). Declared first so it is dropped last: the
+    // event log drains and flushes after the runtime has stopped every Channel.
+    let event_log = crate::diagnostics::init_logging();
+    let status = event_log.status();
+    match (status.folder(), status.problem()) {
+        (_, Some(problem)) => eprintln!("WARNING: the event log is not being saved: {problem}"),
+        (Some(folder), None) => println!("event log: {}", folder.display()),
+        (None, None) => {}
+    }
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    runtime.block_on(run_cli(cli))
+    runtime.block_on(run_cli(cli, status))
 }
 
-async fn run_cli(cli: Cli) -> Result<()> {
+async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<()> {
     let configs = build_channel_configs(&cli)?;
 
     let mut listener = Listener::with_default_capacities();
@@ -98,13 +108,15 @@ async fn run_cli(cli: Cli) -> Result<()> {
         .take_events()
         .expect("the event stream is available exactly once");
 
+    let mut names = HashMap::new();
     let mut started = 0usize;
     for config in configs {
         let name = config.name.as_str().to_string();
         let id = listener.add_channel(config);
+        names.insert(id, name.clone());
         match listener.start(id).await {
             Ok(()) => {
-                println!("started \"{name}\" [{id}]");
+                println!("started \"{name}\"");
                 started += 1;
             }
             Err(err) => eprintln!("could not start \"{name}\": {err}"),
@@ -116,14 +128,25 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
     println!("listening on {started} channel(s) — press Ctrl-C to stop");
     // Drive auto-reconnect (§162): the orchestrator has no background loop, so the
-    // app ticks it. Channels without reconnect enabled are unaffected.
+    // app ticks it. Channels without reconnect enabled are unaffected. The same
+    // tick checks the event log, so a failure that starts mid-run is reported.
     let mut reconnect = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut reported_problem = event_log.problem();
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            _ = reconnect.tick() => listener.reconnect_tick().await,
+            _ = reconnect.tick() => {
+                listener.reconnect_tick().await;
+                let problem = event_log.problem();
+                if problem != reported_problem {
+                    if let Some(problem) = &problem {
+                        eprintln!("WARNING: the event log is not being saved: {problem}");
+                    }
+                    reported_problem = problem;
+                }
+            }
             maybe = events.recv() => match maybe {
-                Some(event) => println!("{}", format_event(&event)),
+                Some(event) => println!("{}", format_event(&event, &names)),
                 None => break,
             },
         }
@@ -131,6 +154,10 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
     println!("stopping…");
     listener.shutdown().await;
+    let lost = event_log.lost_entries();
+    if lost > 0 {
+        eprintln!("WARNING: {lost} event log lines were not saved; the log marks where");
+    }
     Ok(())
 }
 
@@ -176,34 +203,41 @@ fn build_channel_configs(cli: &Cli) -> Result<Vec<ChannelConfig>> {
     Ok(vec![config])
 }
 
-fn format_event(event: &RuntimeEvent) -> String {
+/// One line for a runtime event, naming the Channel (§3.1). An id with no name
+/// (a TCP connection) is shown as its UUID.
+fn format_event(event: &RuntimeEvent, names: &HashMap<ChannelId, String>) -> String {
+    let label = |id: &ChannelId| names.get(id).cloned().unwrap_or_else(|| id.to_string());
     match event {
-        RuntimeEvent::ChannelStarted(id) => format!("[{id}] started"),
-        RuntimeEvent::ChannelStopped(id) => format!("[{id}] stopped"),
-        RuntimeEvent::ChannelFaulted(id) => format!("[{id}] FAULTED"),
+        RuntimeEvent::ChannelStarted(id) => format!("[{}] started", label(id)),
+        RuntimeEvent::ChannelStopped(id) => format!("[{}] stopped", label(id)),
+        RuntimeEvent::ChannelFaulted(id) => format!("[{}] FAULTED", label(id)),
         RuntimeEvent::RecordingFaulted(id, tap) => {
-            format!("[{id}] {} recording faulted", tap.label())
+            format!("[{}] {} recording faulted", label(id), tap.label())
         }
         RuntimeEvent::RecordingStarted(id, tap) => {
-            format!("[{id}] {} recording started", tap.label())
+            format!("[{}] {} recording started", label(id), tap.label())
         }
-        RuntimeEvent::WarningRaised(id) => format!("[{id}] warning raised"),
+        RuntimeEvent::WarningRaised(id) => format!("[{}] warning raised", label(id)),
         RuntimeEvent::ReceptionStalled(id, dur) => {
-            format!("[{id}] reception stalled {} ms", dur.as_millis())
+            format!("[{}] reception stalled {} ms", label(id), dur.as_millis())
         }
-        RuntimeEvent::TcpClientConnected(id) => format!("[{id}] TCP client connected"),
-        RuntimeEvent::TcpClientDisconnected(id) => format!("[{id}] TCP client disconnected"),
-        RuntimeEvent::ControlLinesChanged(id) => format!("[{id}] control lines changed"),
+        RuntimeEvent::TcpClientConnected(id) => format!("[{}] TCP client connected", label(id)),
+        RuntimeEvent::TcpClientDisconnected(id) => {
+            format!("[{}] TCP client disconnected", label(id))
+        }
+        RuntimeEvent::ControlLinesChanged(id) => format!("[{}] control lines changed", label(id)),
         RuntimeEvent::ChannelReconnecting(id, attempt) => {
-            format!("[{id}] reconnecting (attempt {attempt})")
+            format!("[{}] reconnecting (attempt {attempt})", label(id))
         }
-        RuntimeEvent::ChannelReconnected(id) => format!("[{id}] reconnected"),
-        RuntimeEvent::ChannelReconnectGaveUp(id) => format!("[{id}] reconnect gave up"),
-        RuntimeEvent::DiskSpaceLow(id) => format!("[{id}] LOW DISK"),
+        RuntimeEvent::ChannelReconnected(id) => format!("[{}] reconnected", label(id)),
+        RuntimeEvent::ChannelReconnectGaveUp(id) => format!("[{}] reconnect gave up", label(id)),
+        RuntimeEvent::DiskSpaceLow(id) => format!("[{}] LOW DISK", label(id)),
         RuntimeEvent::RecordingStoppedLowDisk(id) => {
-            format!("[{id}] recording stopped (low disk)")
+            format!("[{}] recording stopped (low disk)", label(id))
         }
-        RuntimeEvent::MatchTriggered(id, rule) => format!("[{id}] match rule {rule} fired"),
+        RuntimeEvent::MatchTriggered(id, rule) => {
+            format!("[{}] match rule {rule} fired", label(id))
+        }
     }
 }
 
@@ -296,6 +330,23 @@ mod tests {
             }
             other => panic!("expected serial, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn events_name_the_channel_rather_than_its_uuid() {
+        // §3.1: output names Channels by name. An id with no name (a TCP
+        // connection) falls back to the UUID.
+        let id = crate::core::ChannelId::new();
+        let names = std::collections::HashMap::from([(id, "GPS feed".to_owned())]);
+        assert_eq!(
+            format_event(&RuntimeEvent::ChannelFaulted(id), &names),
+            "[GPS feed] FAULTED"
+        );
+        let unnamed = crate::core::ChannelId::new();
+        assert_eq!(
+            format_event(&RuntimeEvent::ChannelStarted(unnamed), &names),
+            format!("[{unnamed}] started")
+        );
     }
 
     #[test]

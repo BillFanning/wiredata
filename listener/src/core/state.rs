@@ -53,12 +53,53 @@ pub enum DisplayState {
 }
 
 /// Recording state, independent of Channel state (§12). A Channel may be
-/// `Running` while recording is `Faulted`.
+/// `Running` while its recording is in a gap or faulted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordingState {
     Disabled,
+    /// Writing, or opening its first segment with bytes queued (§56.1).
     Enabled,
+    /// In a gap: bytes are being omitted until the next segment opens (§56.1).
+    Gap(GapReason),
+    /// Could not begin at all — a missing destination, a refused overwrite —
+    /// and waits for the user; retrying cannot fix it (§55).
     Faulted,
+}
+
+impl RecordingState {
+    /// Whether this recording is on: writing, opening, or in a gap it will
+    /// recover from. `Faulted` and `Disabled` are off.
+    pub fn is_on(self) -> bool {
+        matches!(self, Self::Enabled | Self::Gap(_))
+    }
+}
+
+/// Why a recording is in a gap (§56.1). Every gap names one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapReason {
+    /// The recording queue filled faster than the disk drained it.
+    QueueOverflow,
+    /// Writing or flushing the segment failed.
+    WriteFailed,
+    /// The next segment could not be opened.
+    OpenFailed,
+    /// The recording folder, or its marker, is not there (§59).
+    DestinationMissing,
+    /// Free space is below the disk guard's threshold (§56.2).
+    LowDisk,
+}
+
+impl GapReason {
+    /// The reason in words, for diagnostics and the event log.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::QueueOverflow => "the recording queue overflowed",
+            Self::WriteFailed => "writing the file failed",
+            Self::OpenFailed => "the next file could not be opened",
+            Self::DestinationMissing => "the recording folder is missing",
+            Self::LowDisk => "free disk space is low",
+        }
+    }
 }
 
 #[cfg(test)]

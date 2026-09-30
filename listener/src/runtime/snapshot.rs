@@ -96,7 +96,8 @@ pub struct StreamDelta {
 /// high-water mark since Start (the value that matters — a transient spike a 5 Hz poll
 /// would miss); `capacity` is the bound. A `peak` approaching `capacity` means the queue
 /// is backing up: the recorder/disk (or the reader) can't keep up, the precursor to a
-/// reception stall or a recording-queue-overflow fault.
+/// reception stall or a recording-queue-overflow gap. The ingest queue counts chunks;
+/// a recording queue counts bytes (ADR-043).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QueueDepth {
     pub current: usize,
@@ -159,9 +160,9 @@ pub struct ChannelStats {
     /// Depth of the Transport→Pipeline ingest queue (§99) — the edge that backpressures
     /// the reader. A rising `peak` is the first sign reception is outrunning processing.
     pub ingest_queue: QueueDepth,
-    /// Depth of the Raw-recording queue (§56.1), or `None` when no recorder is attached.
-    /// A `peak` near `capacity` precedes a `QueueOverflow` recording fault — i.e. the
-    /// disk can't keep up with the inflow.
+    /// Depth of the Raw-recording queue **in bytes** (§56.1, ADR-043), or `None` when
+    /// no recorder is attached. A `peak` near `capacity` precedes a queue-overflow
+    /// gap — i.e. the disk can't keep up with the inflow.
     pub raw_recording_queue: Option<QueueDepth>,
 }
 
@@ -231,8 +232,8 @@ pub struct ChannelSnapshot {
     pub stream_end_offset: u64,
     /// Ingest queue occupancy (§99) — see [`ChannelStats::ingest_queue`].
     pub ingest_queue: QueueDepth,
-    /// Raw-recording queue occupancy (§56.1), or `None` when no recorder is attached —
-    /// see [`ChannelStats::raw_recording_queue`].
+    /// Raw-recording queue occupancy in bytes (§56.1), or `None` when no recorder is
+    /// attached — see [`ChannelStats::raw_recording_queue`].
     pub raw_recording_queue: Option<QueueDepth>,
 }
 

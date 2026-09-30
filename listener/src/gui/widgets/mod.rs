@@ -600,6 +600,30 @@ mod tests {
     }
 
     #[test]
+    fn a_recording_gap_has_its_own_glyph_and_names_what_it_waits_for() {
+        // Shape and words carry the state, never colour alone: a gap is on but
+        // not writing, so it takes the half-filled glyph, not the running dot.
+        use crate::core::{GapReason, RecordingState};
+        let pal = &wiredata_ui::palette::LIGHT;
+        let (glyph, _, label) =
+            recording_indicator(Some(RecordingState::Gap(GapReason::WriteFailed)), pal);
+        assert_eq!(glyph, wiredata_ui::glyphs::RECONNECTING);
+        assert_eq!(label, "gap — retrying");
+        assert_eq!(
+            recording_indicator(Some(RecordingState::Gap(GapReason::LowDisk)), pal).2,
+            "gap — waiting for disk space"
+        );
+        assert_eq!(
+            recording_indicator(
+                Some(RecordingState::Gap(GapReason::DestinationMissing)),
+                pal
+            )
+            .2,
+            "gap — waiting for the folder"
+        );
+    }
+
+    #[test]
     fn config_change_detection_excludes_live_applied_fields() {
         let base = templates::udp_template();
         // Identical config = no change.

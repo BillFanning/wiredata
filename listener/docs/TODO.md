@@ -17,19 +17,15 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 The spec states these; the code does not do them yet.
 
-- [ ] **Recording continuity (ADR-043, §56.1, §59).** A recording fault is still
-  terminal (`check_recording_faults`), and `begin_recording` still opens files on
-  the pipeline task. There are no numbered segments, no `size_cap`, no
-  `.wiredata-destination` marker, and rotation is not forward-only.
-  `ensure_rotation_dir` still creates a missing folder. Recorder queues are still
-  counted in chunks (`PipelineCapacities`).
-- [ ] **Low disk (§56.2).** Not yet a lasting fault. Display-only recordings are
-  unguarded, a failed `check_disk_guard` is silent, and there is no resume
-  after a gap. Status does not show the recordings' total size.
-- [ ] **Append repair (§57).** `RawFileRecorder::write_chunk` writes the index line
-  before the bytes, and reopening does not repair the sidecar.
-- [ ] **Persistent event log (ADR-044, §118).** `init_logging` writes to stdout
-  only, and the `wiredata-log` crate does not exist yet.
+- [ ] **Lasting recording faults and disk status (§56.1, §56.2).** "Recording
+  unstable" and low disk are diagnostics that scroll away, not lasting faults;
+  `Recording::is_unstable` is not surfaced. Display-only recordings are
+  unguarded, and a failed `check_disk_guard` is silent. Status does not show the
+  current file, the recordings' total size, free space, or the time to the next
+  rotation.
+- [ ] **Append repair (§57).** Reopening a `.raw` to append does not trim index
+  entries past its end, repair a half-written last line, or report an unindexed
+  tail.
 - [ ] **Unattended GUI (ADR-045, §9.1, §70).** No reconnect checkbox or prompt,
   and no resume registration.
 - [ ] **Unattended CLI (ADR-046, §3.1, §113).** The CLI still bails with "no
@@ -302,17 +298,6 @@ Message-model removal). Everything below this block is verified done:
       `stopped_channel_retains_exact_totals_at_rest` +
       `totals_survive_stop_and_reset_on_start`.
 
-- [x] **Recorder faults are now visible on a quiet stream** (§56.1). The recorder
-      task publishes its terminal error into a shared fault cell before exiting
-      (`Recording::fault_error`); `Recording::state()` reads it eagerly, and
-      `ChannelPipeline::check_recording_faults` — run after each ingest *and* on
-      `run_channel`'s 250 ms tick — reports it once (error diagnostic carrying
-      the cause + `RecordingFaulted`), for Raw and Display recordings alike.
-      Previously the handle learned of a write/flush fault only on the *next*
-      enqueue, so a stream that went quiet after a disk failure showed Enabled
-      forever. Pinned by
-      `write_fault_is_visible_on_the_handle_without_further_enqueues` +
-      `flush_failure_faults_the_recording`.
 - [x] **Command acks** — DONE (`6d4da3b`). A dropped `UiCommand` now raises the
       dismissable top banner (`show_command_drop_banner`, auto-expires after
       `COMMAND_DROP_NOTICE_TTL`) in addition to the tracing warning — the
@@ -355,22 +340,6 @@ Message-model removal). Everything below this block is verified done:
 
 ## Robustness (external review round 2, 2026-07-12)
 
-- [x] **Recorder stop honesty (§56.1)** — a stop that truncates the accepted
-      backlog or fails finalize no longer reads as clean: the recorder task
-      publishes drain/finalize failures into the fault cell,
-      `Recording::finalize` returns the fault, and the pipeline reports it
-      (error diagnostic + `RecordingFaulted`) via `note_recording_stop` in
-      every stop path (live toggle, match-action stop, channel finish).
-      Pinned by `dirty_stop_truncating_backlog_reports_a_fault` +
-      `clean_stop_reports_no_fault`.
-- [x] **Faulted recordings are restartable from the UI** — Begin on a faulted
-      Raw/Display recording drops the dead recording and recreates it instead
-      of no-op'ing as "already recording" (the button says Record; it works
-      without a channel restart). A faulted recorder is inactive, so retry also
-      adopts the editor's latest destination/policy/capacity rather than silently
-      reopening the old path. Pinned by
-      `faulted_raw_retry_uses_the_latest_settings` +
-      `faulted_display_retry_uses_the_latest_settings`.
 - [x] **Sidecar opens before the main destination** — a failed Raw begin can
       no longer have created/truncated the main `.raw` (only the derived
       `.idx` is at risk on the inverse edge).

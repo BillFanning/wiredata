@@ -54,6 +54,7 @@ async fn sustained_recording_records_every_byte() {
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
         disk_guard: None,
+        size_cap: None,
     };
 
     let mut listener = Listener::with_default_capacities();

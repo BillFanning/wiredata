@@ -38,19 +38,32 @@ pub(crate) fn stop_enabled(status: ChannelStatus) -> bool {
 
 /// The recording-state indicator: glyph, color, and label for a channel's raw
 /// recording state (§53). Uses the **same symbol set and colors as channel status**
-/// ([`status_glyph`] / [`status_color`]) — `■` off, `●` recording, `⚠` faulted —
-/// so the two read consistently. Pure, unit-tested; the detail pane
-/// renders it as a colored label sized via [`recording_glyph_size`].
+/// ([`status_glyph`] / [`status_color`]) — `■` off, `●` recording, `◐` in a gap
+/// and recovering, `⚠` could not begin — so the two read consistently. Pure,
+/// unit-tested; the detail pane renders it as a colored label sized via
+/// [`recording_glyph_size`].
 pub(crate) fn recording_indicator(
     recording: Option<crate::core::RecordingState>,
     pal: &Palette,
 ) -> (&'static str, egui::Color32, &'static str) {
-    use crate::core::RecordingState;
+    use crate::core::{GapReason, RecordingState};
     // Same colors as channel status (`status_color`): active ● matches a Running
-    // channel, faulted ⚠ the fault accent, off ■ the idle grey.
+    // channel, a gap ◐ a Reconnecting one (on, but not writing yet), faulted ⚠
+    // the fault accent, off ■ the idle grey.
     use wiredata_ui::glyphs;
     match recording {
         Some(RecordingState::Enabled) => (glyphs::RUNNING, pal.running, "recording"),
+        Some(RecordingState::Gap(reason)) => (
+            glyphs::RECONNECTING,
+            pal.warning,
+            match reason {
+                GapReason::LowDisk => "gap — waiting for disk space",
+                GapReason::DestinationMissing => "gap — waiting for the folder",
+                GapReason::QueueOverflow | GapReason::WriteFailed | GapReason::OpenFailed => {
+                    "gap — retrying"
+                }
+            },
+        ),
         Some(RecordingState::Faulted) => (glyphs::FAULT, pal.fault, "faulted"),
         Some(RecordingState::Disabled) | None => (glyphs::STOPPED, pal.idle, "off"),
     }

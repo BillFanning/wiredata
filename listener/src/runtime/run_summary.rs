@@ -204,7 +204,11 @@ impl ListenerRunSummary {
             self.idle_deadline_timer.windows_request_failures
         );
         write_queue(&mut out, "ingest_queue", Some(self.ingest_queue));
-        write_queue(&mut out, "raw_recording_queue", self.raw_recording_queue);
+        write_queue(
+            &mut out,
+            "raw_recording_queue_bytes",
+            self.raw_recording_queue,
+        );
         write_transport_health(&mut out, self.transport_health);
         out
     }

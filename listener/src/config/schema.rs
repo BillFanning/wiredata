@@ -269,15 +269,37 @@ pub struct RawRecordingConfig {
     /// Time-based file rotation (§59); `None` = single file (additive, §72.1).
     #[serde(default)]
     pub file_rotation: FileRotationPolicy,
+    /// The soft size cap per file, in bytes (§59); `None` is the default cap.
+    #[serde(default)]
+    pub size_cap: Option<u64>,
     /// Disk-space guard for long-running recordings (§56.2, §168); `None` = off.
     #[serde(default)]
     pub disk_guard: Option<DiskGuard>,
 }
 
+impl RawRecordingConfig {
+    /// The size cap this recording uses (§59).
+    pub fn size_cap(&self) -> u64 {
+        effective_size_cap(self.size_cap)
+    }
+}
+
+/// The default soft size cap per recording file (§59).
+pub const DEFAULT_SIZE_CAP: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The smallest size cap a recording accepts (§59, ADR-048).
+pub const MIN_SIZE_CAP: u64 = 64 * 1024 * 1024;
+
+/// The configured cap, or the default, and never below the minimum: the
+/// runtime enforces the limit validation reports (ADR-048).
+pub fn effective_size_cap(configured: Option<u64>) -> u64 {
+    configured.unwrap_or(DEFAULT_SIZE_CAP).max(MIN_SIZE_CAP)
+}
+
 /// The default recording destination for a **new** channel: a `listener` folder
 /// in the user's home area (`%USERPROFILE%\Documents\listener` on Windows,
 /// `$HOME/listener` elsewhere) — writable without elevation, and created on the
-/// first recording begin (the rotating recorder `create_dir_all`s its folder).
+/// first recording begin (the first file's open creates its folder).
 /// `None` only if the home environment variable is unset (rare; the user then
 /// picks a destination by hand, exactly as before).
 ///
@@ -308,6 +330,7 @@ impl Default for RawRecordingConfig {
             timestamp_enabled: false,
             overwrite_policy: OverwritePolicy::AppendIfExists,
             file_rotation: FileRotationPolicy::Hourly,
+            size_cap: None,
             disk_guard: None,
         }
     }
@@ -330,6 +353,16 @@ pub struct DisplayRecordingConfig {
     /// Time-based file rotation (§59); `None` = single file.
     #[serde(default)]
     pub file_rotation: FileRotationPolicy,
+    /// The soft size cap per file, in bytes (§59); `None` is the default cap.
+    #[serde(default)]
+    pub size_cap: Option<u64>,
+}
+
+impl DisplayRecordingConfig {
+    /// The size cap this recording uses (§59).
+    pub fn size_cap(&self) -> u64 {
+        effective_size_cap(self.size_cap)
+    }
 }
 
 impl Default for DisplayRecordingConfig {
@@ -342,6 +375,7 @@ impl Default for DisplayRecordingConfig {
             destination: default_recording_destination(),
             overwrite_policy: OverwritePolicy::AppendIfExists,
             file_rotation: FileRotationPolicy::Hourly,
+            size_cap: None,
         }
     }
 }

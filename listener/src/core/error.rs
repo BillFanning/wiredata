@@ -30,4 +30,13 @@ pub enum RecordError {
          file — choose a folder, or turn rotation off to record to that file"
     )]
     RotationDestinationIsFile(String),
+    /// The recording folder is gone, or no longer holds its
+    /// `.wiredata-destination` marker (§59). Recovery waits for it to return
+    /// rather than recreating it — an unplugged drive can leave an empty mount
+    /// point on the system disk.
+    #[error(
+        "the recording folder '{0}' is missing or is not the one recording began in \
+         (no .wiredata-destination marker) — waiting for it to return"
+    )]
+    DestinationMissing(String),
 }

@@ -46,9 +46,9 @@ use crate::display::{
     AnnotationPlacement, DisplayView, RenderAnnotation, RenderedOutput, StreamRenderer,
 };
 use crate::record::{
-    start_display_recording, start_raw_recording, DisplayFileRecorder, FileRotationPolicy,
-    OverwritePolicy, RawFileRecorder, Recording, RecordingStopReason, RotatingDisplayRecorder,
-    RotatingRawRecorder,
+    start_recording, DisplaySegments, FileRotationPolicy, Finalized, OpenKind, OverwritePolicy,
+    RawSegments, RecorderReport, Recording, RecordingStopReason, SegmentPlan, StreamPos, Timings,
+    DEFAULT_QUEUE_BUDGET,
 };
 use crate::transport::{ReceivedData, SerialStallState, TransportNotice};
 
@@ -102,7 +102,8 @@ pub struct PipelineCapacities {
     /// Stream scrollback (§87): how many of the most recent received bytes to
     /// keep for display. Byte-capped — there are no Message boundaries (§18).
     pub stream_display: usize,
-    pub raw_recording: usize,
+    /// Each recording's queue to its recorder, in bytes (ADR-043).
+    pub recording_queue_budget: usize,
     /// Per-type retained-diagnostic limits (§88): events, warnings, errors.
     /// `None` falls back to the retention backstop (~1 M entries) — the defaults
     /// below set real limits instead, because a recurring diagnostic (a flapping
@@ -124,7 +125,7 @@ impl Default for PipelineCapacities {
         Self {
             ingest: 256,
             stream_display: 128 * 1024,
-            raw_recording: 1024,
+            recording_queue_budget: DEFAULT_QUEUE_BUDGET,
             event_retention: Some(DIAGNOSTIC_RETENTION),
             warning_retention: Some(DIAGNOSTIC_RETENTION),
             error_retention: Some(DIAGNOSTIC_RETENTION),
@@ -192,13 +193,15 @@ impl PipelineDisplayView {
 
 /// A detached recorder stop's outcome: the arguments
 /// [`ChannelPipeline::note_recording_stop`] needs to report it honestly —
-/// `(tap, fault_already_reported, terminal_fault, announce_clean)`.
-type RetiredRecording = (RecordingTap, bool, Option<String>, bool);
+/// `(tap, how it ended, announce_clean)`.
+type RetiredRecording = (RecordingTap, Finalized, bool);
 
 /// One Channel's stream pipeline (§102). Driven synchronously via
 /// [`ChannelPipeline::ingest`]; [`run_channel`] is the async loop around it.
 pub struct ChannelPipeline {
     channel_id: ChannelId,
+    /// The Channel's name, as diagnostics and the event log state it (§118).
+    channel_name: String,
     /// Opaque identity for this pipeline run. Stream offsets restart at zero for
     /// every fresh pipeline, so the GUI needs an identity alongside the offset to
     /// reject stale deltas without confusing them with a restart.
@@ -213,22 +216,17 @@ pub struct ChannelPipeline {
     /// Last shared diagnostics snapshot and the log revision it was built from,
     /// so repeated polls of an unchanged log cost an `Arc` clone (§124).
     diagnostics_cache: Option<(u64, Arc<DiagnosticsSnapshot>)>,
-    /// Raw Recording handle (§53). `None` when recording is disabled or its
-    /// enable failed (§55). Faults non-blockingly on overflow (§56.1).
+    /// Raw Recording handle (§53). `None` when recording is off. A fault gaps
+    /// it rather than ending it (§56.1).
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     /// Queue high-water mark retained after a Raw recorder is finalized or
     /// restarted. The active handle owns the live counter; this preserves its
     /// run-level evidence after that handle is gone.
     raw_recording_queue_history: Option<QueueDepth>,
-    /// Whether the raw recorder's fault has already been reported.
-    recording_fault_reported: bool,
-    /// Whether a display recorder's fault has already been reported —
-    /// `recording_fault_reported`'s Display sibling (§54 parity).
-    display_fault_reported: bool,
-    /// A `begin_recording` that failed to even open the file leaves no recorder, so the
-    /// recording state would otherwise read back as "off". This sticky flag makes it
-    /// read `Faulted` instead (so the GUI shows ⚠, not ■). Cleared on a successful
-    /// begin or a stop.
+    /// A begin with no destination leaves no recorder, so the recording state
+    /// would otherwise read back as "off". This sticky flag makes it read
+    /// `Faulted` instead (so the GUI shows ⚠, not ■). Cleared on a begin or a
+    /// stop.
     begin_faulted: bool,
     /// Display-recording sibling of `begin_faulted` (§54, ADR-012).
     display_begin_faulted: bool,
@@ -287,6 +285,8 @@ pub struct ChannelPipeline {
     /// failure (e.g. Refuse over an existing file) records a diagnostic and emits
     /// `RecordingFaulted` — it doesn't fail silently.
     auto_begin_recording: bool,
+    /// "Record on start" for the Display recording (§54), begun the same way.
+    auto_begin_display_recording: bool,
     /// Anchor for the `Idle` condition before any data has arrived (§50.2): idle is
     /// measured from the last data, or from this instant when none has arrived yet.
     created_at: Instant,
@@ -327,7 +327,23 @@ pub struct RawRecordingSettings {
     pub overwrite: OverwritePolicy,
     pub timestamps: bool,
     pub file_rotation: FileRotationPolicy,
-    pub capacity: usize,
+    /// The recording queue's budget, in bytes (ADR-043).
+    pub queue_budget: usize,
+    /// The soft size cap per file, in bytes (§59).
+    pub size_cap: u64,
+}
+
+impl RawRecordingSettings {
+    fn plan(&self) -> SegmentPlan {
+        SegmentPlan {
+            destination: self.destination.clone(),
+            channel: self.channel_name.clone(),
+            ext: ".raw".to_owned(),
+            rotation: self.file_rotation,
+            overwrite: self.overwrite,
+            size_cap: Some(self.size_cap),
+        }
+    }
 }
 
 /// The Display recording settings for a live begin (§54, ADR-012/-013): the Raw
@@ -340,8 +356,24 @@ pub struct DisplayRecordingSettings {
     pub channel_name: String,
     pub overwrite: OverwritePolicy,
     pub file_rotation: FileRotationPolicy,
-    pub capacity: usize,
+    /// The recording queue's budget, in bytes (ADR-043).
+    pub queue_budget: usize,
+    /// The soft size cap per file, in bytes (§59).
+    pub size_cap: u64,
     pub renderer: DisplayView,
+}
+
+impl DisplayRecordingSettings {
+    fn plan(&self) -> SegmentPlan {
+        SegmentPlan {
+            destination: self.destination.clone(),
+            channel: self.channel_name.clone(),
+            ext: ".disp".to_owned(),
+            rotation: self.file_rotation,
+            overwrite: self.overwrite,
+            size_cap: Some(self.size_cap),
+        }
+    }
 }
 
 /// Bound on the retained recent-match log (§165) — generous but constant (§124).
@@ -352,18 +384,20 @@ impl ChannelPipeline {
     pub fn new(channel_id: ChannelId, caps: PipelineCapacities) -> Self {
         Self {
             channel_id,
+            // A Channel without a configured name (a TCP connection) is named
+            // by its UUID; `with_channel_name` replaces it.
+            channel_name: channel_id.to_string(),
             stream_generation: NEXT_STREAM_GENERATION.fetch_add(1, Ordering::Relaxed),
             display_views: vec![PipelineDisplayView::new()],
             diagnostics: DiagnosticLog::new(
                 caps.event_retention,
                 caps.warning_retention,
                 caps.error_retention,
-            ),
+            )
+            .for_channel(channel_id.to_string(), channel_id),
             diagnostics_cache: None,
             raw_recorder: None,
             raw_recording_queue_history: None,
-            recording_fault_reported: false,
-            display_fault_reported: false,
             begin_faulted: false,
             display_begin_faulted: false,
             display_recording_settings: None,
@@ -389,6 +423,7 @@ impl ChannelPipeline {
             retiring: JoinSet::new(),
             recording_settings: None,
             auto_begin_recording: false,
+            auto_begin_display_recording: false,
             created_at: Instant::now(),
             stream_buf: VecDeque::new(),
             stream_cap: caps.stream_display,
@@ -406,6 +441,16 @@ impl ChannelPipeline {
         self.ingest_depth = current;
         self.ingest_capacity = capacity;
         self.ingest_peak = self.ingest_peak.max(current);
+    }
+
+    /// Name the Channel in diagnostics and the event log (§118). Call before the
+    /// pipeline records anything.
+    pub fn with_channel_name(mut self, name: impl Into<String>) -> Self {
+        self.channel_name = name.into();
+        self.diagnostics = self
+            .diagnostics
+            .for_channel(self.channel_name.clone(), self.channel_id);
+        self
     }
 
     /// Attach compiled find/trigger rules (§50.2, §165). `BytePattern` rules are
@@ -448,6 +493,13 @@ impl ChannelPipeline {
     /// Whether "Record on start" was set (consumed by `run_channel` at startup).
     pub fn should_auto_begin_recording(&self) -> bool {
         self.auto_begin_recording
+    }
+
+    /// Mark "Record on start" for the Display recording (§54). Pair with
+    /// `with_display_recording_settings`.
+    pub fn with_auto_begin_display_recording(mut self) -> Self {
+        self.auto_begin_display_recording = true;
+        self
     }
 
     /// Attach a Raw Recording handle (§53). The orchestrator creates it at Start
@@ -517,12 +569,18 @@ impl ChannelPipeline {
         // quiet episode (§50.2). Cheap no-op when there are no idle rules.
         self.match_rules.note_activity();
 
-        // 1. Raw recorder tap (§53). Non-blocking: a full recorder queue faults
-        // the recording rather than stalling reception (§56.1). `try_record`
-        // no-ops once faulted; faults are reported (once) by the
-        // `check_recording_faults` call at the end of this method.
+        // Where this chunk sits in the stream, for gap records (§56.1).
+        let pos = StreamPos {
+            offset: chunk_offset,
+            at: data.received_at.wall_clock,
+        };
+
+        // 1. Raw recorder tap (§53). Non-blocking: a full recorder queue gaps
+        // the recording rather than stalling reception (§56.1). What the
+        // recorder reports is surfaced by the `poll_recorders` call at the end
+        // of this method.
         if let Some(recorder) = self.raw_recorder.as_mut() {
-            recorder.try_record(Arc::clone(&data));
+            recorder.try_record(Arc::clone(&data), pos);
         }
 
         // 2. Stream scrollback (§87): keep the most recent bytes exactly as
@@ -580,7 +638,7 @@ impl ChannelPipeline {
 
         // 4. Display Recording (§54, §58): render this chunk per recording view and
         // record it — regardless of pause (pausing presentation never pauses
-        // recording). Non-blocking; a full queue faults that recording only. Mark
+        // recording). Non-blocking; a full queue gaps that recording only. Mark
         // timestamps for this chunk are spliced inline at their within-chunk offset
         // (§50.2) — the `.disp` mirrors what the live display shows, never `.raw`.
         let channel_id = self.channel_id;
@@ -591,22 +649,25 @@ impl ChannelPipeline {
                 // Streaming render (ADR-018): the concatenated .disp is the exact
                 // rendered stream — read boundaries leave no trace. Possibly
                 // empty (a chunk held back as an incomplete multi-byte tail).
-                // The chunk's arrival time rides on the rendered output so a
-                // rotating display recorder picks its period file from arrival,
-                // not write time (§59) — the two differ under a backlog.
+                // The chunk's arrival time rides in `pos`, so a rotating
+                // recording picks its period file from arrival, not write time
+                // (§59) — the two differ under a backlog.
                 let text = rec.renderer.render_chunk(bytes, &chunk_marks);
                 if !text.is_empty() {
-                    rec.recording.try_record(RenderedOutput {
-                        channel_id,
-                        text,
-                        timestamp: Some(data.received_at),
-                    });
+                    rec.recording.try_record(
+                        RenderedOutput {
+                            channel_id,
+                            text,
+                            timestamp: Some(data.received_at),
+                        },
+                        pos,
+                    );
                 }
             }
         }
 
-        // 5. Surface any recorder fault (raw or display) exactly once (§56.1).
-        self.check_recording_faults();
+        // 5. Surface what the recorders reported (§56.1).
+        self.poll_recorders();
 
         let ingest_finished = Instant::now();
         let processing = ingest_finished.saturating_duration_since(ingest_started);
@@ -615,63 +676,146 @@ impl ChannelPipeline {
             .record_at(ingest_finished, processing);
     }
 
-    /// Report any recorder fault once: an error diagnostic carrying the
-    /// recorder's terminal error, plus a `RecordingFaulted` event (§56.1, §137).
+    /// Surface what the recorders have reported since the last call (§56.1).
     ///
-    /// Called after every ingest *and* from `run_channel`'s periodic tick — the
-    /// recorder task dies asynchronously (write/flush failure), so on a stream
-    /// that then goes quiet there is no later enqueue to trip on; without the
-    /// periodic check the UI would show a dead recording as Enabled forever.
-    pub fn check_recording_faults(&mut self) {
-        if !self.recording_fault_reported
-            && self
-                .raw_recorder
-                .as_ref()
-                .is_some_and(|r| r.state() == RecordingState::Faulted)
-        {
-            self.recording_fault_reported = true;
-            let why = self
-                .raw_recorder
-                .as_ref()
-                .and_then(|r| r.fault_error())
-                .unwrap_or("recorder task ended unexpectedly")
-                .to_owned();
-            self.diagnostics.record(Diagnostic::error(format!(
-                "raw recording faulted on channel {}: {why}",
-                self.channel_id
-            )));
-            if let Some(events) = &self.events {
-                let _ = events.try_send(RuntimeEvent::RecordingFaulted(
-                    self.channel_id,
-                    RecordingTap::Raw,
-                ));
-            }
+    /// Called after every ingest *and* from `run_channel`'s periodic tick — a
+    /// recorder opens files and meets faults in its own task, so on a quiet
+    /// stream there is no later chunk to report them on.
+    pub fn poll_recorders(&mut self) {
+        let raw = self
+            .raw_recorder
+            .as_ref()
+            .map(Recording::take_reports)
+            .unwrap_or_default();
+        for report in raw {
+            self.note_recorder_report(RecordingTap::Raw, report);
         }
-        let display_fault = self.display_views.iter().find_map(|v| {
-            v.recorder
-                .as_ref()
-                .filter(|r| r.recording.state() == RecordingState::Faulted)
-                .map(|r| {
-                    r.recording
-                        .fault_error()
-                        .unwrap_or("recorder task ended unexpectedly")
-                        .to_owned()
-                })
-        });
-        if let Some(why) = display_fault {
-            if !self.display_fault_reported {
-                self.display_fault_reported = true;
-                self.diagnostics.record(Diagnostic::error(format!(
-                    "display recording faulted on channel {}: {why}",
-                    self.channel_id
-                )));
-                if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(
-                        self.channel_id,
-                        RecordingTap::Display,
-                    ));
+        let display: Vec<RecorderReport> = self
+            .display_views
+            .iter()
+            .filter_map(|v| v.recorder.as_ref())
+            .flat_map(|r| r.recording.take_reports())
+            .collect();
+        for report in display {
+            self.note_recorder_report(RecordingTap::Display, report);
+        }
+    }
+
+    /// Turn one recorder report into a diagnostic — which also reaches the
+    /// event log (§118) — and, where §137 names one, an event (§56.1).
+    fn note_recorder_report(&mut self, tap: RecordingTap, report: RecorderReport) {
+        let what = format!("{} recording", tap.label());
+        let channel = self.channel_name.clone();
+        let (diagnostic, event) = match report {
+            RecorderReport::SegmentOpened { path, kind } => {
+                let file = path.map_or_else(|| "its file".to_owned(), |p| p.display().to_string());
+                match kind {
+                    OpenKind::First => (
+                        Some(Diagnostic::event(format!("{what} started → {file}"))),
+                        Some(RuntimeEvent::RecordingStarted(self.channel_id, tap)),
+                    ),
+                    OpenKind::Recovery => (
+                        Some(Diagnostic::event(format!(
+                            "{what} on channel {channel} resumed in a new file → {file}"
+                        ))),
+                        Some(RuntimeEvent::RecordingStarted(self.channel_id, tap)),
+                    ),
+                    OpenKind::SizeCap => (
+                        Some(Diagnostic::event(format!(
+                            "{what} on channel {channel} reached its size cap; continuing → {file}"
+                        ))),
+                        None,
+                    ),
+                    // Routine, and the status shows the current file (§56.2).
+                    OpenKind::Rotation => (None, None),
                 }
             }
+            RecorderReport::GapOpened { reason, detail } => (
+                Some(Diagnostic::error(format!(
+                    "{what} gap on channel {channel}: {} ({detail}) — bytes are not being \
+                     recorded; retrying in a new file",
+                    reason.describe()
+                ))),
+                Some(RuntimeEvent::RecordingFaulted(self.channel_id, tap)),
+            ),
+            RecorderReport::GapClosed { reason, start, end } => (
+                Some(match start {
+                    Some(start) => Diagnostic::warning(format!(
+                        "{what} gap on channel {channel} closed: {} received bytes were not \
+                         recorded, stream offsets {}–{}, {} to {} ({})",
+                        end.offset.saturating_sub(start.offset),
+                        start.offset,
+                        end.offset,
+                        local_time(start.at),
+                        local_time(end.at),
+                        reason.describe()
+                    )),
+                    None => Diagnostic::event(format!(
+                        "{what} gap on channel {channel} closed at stream offset {}; nothing \
+                         arrived during it ({})",
+                        end.offset,
+                        reason.describe()
+                    )),
+                }),
+                None,
+            ),
+            RecorderReport::GapEndedByStop { reason, start } => (
+                Some(match start {
+                    Some(start) => Diagnostic::warning(format!(
+                        "{what} on channel {channel} stopped during a gap: received bytes from \
+                         stream offset {} ({}) on were not recorded ({})",
+                        start.offset,
+                        local_time(start.at),
+                        reason.describe()
+                    )),
+                    None => Diagnostic::event(format!(
+                        "{what} on channel {channel} stopped during a gap; nothing arrived \
+                         during it ({})",
+                        reason.describe()
+                    )),
+                }),
+                None,
+            ),
+            RecorderReport::Unstable {
+                faults,
+                window,
+                retry,
+            } => (
+                Some(Diagnostic::error(format!(
+                    "{what} on channel {channel} is unstable: {faults} faults within {}; \
+                     retrying every {} until recording is stopped",
+                    describe_wait(window),
+                    describe_wait(retry)
+                ))),
+                None,
+            ),
+            RecorderReport::CouldNotBegin { detail } => {
+                let target = match tap {
+                    RecordingTap::Raw => self
+                        .recording_settings
+                        .as_ref()
+                        .map(|s| (s.destination.display().to_string(), s.overwrite)),
+                    RecordingTap::Display => self
+                        .display_recording_settings
+                        .as_ref()
+                        .map(|s| (s.destination.display().to_string(), s.overwrite)),
+                };
+                let to = target
+                    .map(|(dest, overwrite)| format!(" to {dest} (on-exists: {overwrite:?})"))
+                    .unwrap_or_default();
+                (
+                    Some(Diagnostic::error(format!(
+                        "could not begin {what}{to}: {detail}"
+                    ))),
+                    Some(RuntimeEvent::RecordingFaulted(self.channel_id, tap)),
+                )
+            }
+        };
+        if let Some(diagnostic) = diagnostic {
+            self.diagnostics.record(diagnostic);
+        }
+        if let (Some(event), Some(events)) = (event, &self.events) {
+            let _ = events.try_send(event);
         }
     }
 
@@ -728,7 +872,7 @@ impl ChannelPipeline {
                     "match rule {} on channel {} spanned a read-chunk boundary{at} \
                      (recovered by cross-chunk carry); later splits this run are \
                      counted, not listed",
-                    rule.id, self.channel_id
+                    rule.id, self.channel_name
                 )));
             }
             for action in &rule.actions {
@@ -739,7 +883,7 @@ impl ChannelPipeline {
                             .unwrap_or_default();
                         self.diagnostics.record(Diagnostic::new(
                             *severity,
-                            format!("match rule fired on channel {}{where_}", self.channel_id),
+                            format!("match rule fired on channel {}{where_}", self.channel_name),
                         ));
                     }
                     // A timestamped Mark splices either compact local time or a ZDA
@@ -767,7 +911,7 @@ impl ChannelPipeline {
                                         Err(error) => {
                                             self.diagnostics.record(Diagnostic::error(format!(
                                                 "could not render NMEA ZDA Mark on channel {}: {error}",
-                                                self.channel_id
+                                                self.channel_name
                                             )));
                                             continue;
                                         }
@@ -827,13 +971,17 @@ impl ChannelPipeline {
         // (ADR-018), so the marker provides its own line breaks.
         let text = format!("\n\u{2039}MARK rule={rule_id}{suffix}\u{203a}\n");
         let channel_id = self.channel_id;
+        let pos = self.stream_pos_now();
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.as_mut() {
-                rec.recording.try_record(RenderedOutput {
-                    channel_id,
-                    text: text.clone(),
-                    timestamp: None,
-                });
+                rec.recording.try_record(
+                    RenderedOutput {
+                        channel_id,
+                        text: text.clone(),
+                        timestamp: None,
+                    },
+                    pos,
+                );
             }
         }
     }
@@ -948,23 +1096,25 @@ impl ChannelPipeline {
     }
 
     /// Lazily create the Raw recording on a `Begin` (§50.2): nothing is on disk until
-    /// now. A no-op if a recording is already active; if no destination is set it
-    /// reports a fault rather than silently doing nothing; an open failure (e.g. an
-    /// existing file under a Refuse policy) reports the reason without faulting the
-    /// Channel (§55).
+    /// now. A no-op if a recording is already on; if no destination is set it
+    /// reports a fault rather than silently doing nothing. The recorder opens its
+    /// first file in its own task (§56.1): bytes queue meanwhile, and an open that
+    /// cannot work (e.g. an existing file under a Refuse policy) arrives as a
+    /// report, without faulting the Channel (§55).
     async fn begin_recording(&mut self) {
         // A predecessor's detached stop must fully land first: a begin to the
         // same destination would otherwise race the closing file.
         self.drain_retiring().await;
         match self.raw_recorder.as_ref().map(|r| r.state()) {
-            // Already recording — `Begin` is idempotent.
+            // Already on — writing, opening or in a gap — so `Begin` is idempotent.
             Some(state) if state != RecordingState::Faulted => return,
-            // A faulted recording still occupies the slot, and Begin is the
-            // user's retry (the button reads "Record" — it must work without
-            // a channel restart). Drop the dead recording, then recreate.
+            // A recording that could not begin still occupies the slot, and
+            // Begin is the user's retry (the button reads "Record" — it must
+            // work without a channel restart). Drop it, then recreate.
             Some(_) => {
                 if let Some(recorder) = self.take_raw_recorder() {
-                    let _ = recorder.finalize(RecordingStopReason::Disabled).await;
+                    let finalized = recorder.finalize(RecordingStopReason::Disabled).await;
+                    self.note_recording_stop(RecordingTap::Raw, finalized, false);
                 }
             }
             None => {}
@@ -985,64 +1135,18 @@ impl ChannelPipeline {
             }
             return;
         };
-        let created = if settings.file_rotation == FileRotationPolicy::None {
-            RawFileRecorder::create(
-                &settings.destination,
-                settings.overwrite,
-                settings.timestamps,
-            )
-            .await
-            .map(|r| start_raw_recording(r, settings.capacity))
-        } else {
-            RotatingRawRecorder::create(
-                &settings.destination,
-                &settings.channel_name,
-                ".raw",
-                settings.overwrite,
-                settings.timestamps,
-                settings.file_rotation,
-            )
-            .await
-            .map(|r| start_raw_recording(r, settings.capacity))
-        };
-        match created {
-            Ok(rec) => {
-                self.raw_recorder = Some(rec);
-                self.recording_fault_reported = false;
-                self.begin_faulted = false; // a successful begin clears the prior fault
-                                            // Positive feedback: record an INFO so the headline becomes "recording
-                                            // started" (pushing a prior begin-error off the headline) and the user
-                                            // sees the begin actually took.
-                self.diagnostics.record(Diagnostic::event(format!(
-                    "Raw recording started → {}",
-                    settings.destination.display(),
-                )));
-                if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::RecordingStarted(
-                        self.channel_id,
-                        RecordingTap::Raw,
-                    ));
-                }
-            }
-            Err(err) => {
-                self.begin_faulted = true;
-                // Record *why* the begin failed (e.g. Refuse over an existing file) in
-                // the diagnostic log, and signal it as a recording fault so the GUI can
-                // surface it — a silent no-op left the user clicking "Record now" with
-                // no feedback (§55).
-                self.diagnostics.record(Diagnostic::error(format!(
-                    "could not begin Raw recording to {} (on-exists: {:?}): {err}",
-                    settings.destination.display(),
-                    settings.overwrite,
-                )));
-                if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(
-                        self.channel_id,
-                        RecordingTap::Raw,
-                    ));
-                }
-            }
+        // "started" — or why it could not — arrives as a report once the first
+        // file's open resolves (`note_recorder_report`).
+        let recording = start_recording(
+            RawSegments::new(settings.plan(), settings.timestamps),
+            settings.queue_budget,
+            Timings::default(),
+        );
+        if self.low_disk_holds_recording() {
+            recording.set_low_disk(true);
         }
+        self.raw_recorder = Some(recording);
+        self.begin_faulted = false;
     }
 
     /// Stop the Raw recording on a `Record { Stop }` (§50.2, §56): the recorder
@@ -1055,10 +1159,9 @@ impl ChannelPipeline {
     async fn stop_recording(&mut self) {
         self.begin_faulted = false;
         if let Some(recorder) = self.take_raw_recorder() {
-            let already_reported = self.recording_fault_reported;
             self.retiring.spawn(async move {
-                let fault = recorder.finalize(RecordingStopReason::Disabled).await;
-                (RecordingTap::Raw, already_reported, fault, true)
+                let finalized = recorder.finalize(RecordingStopReason::Disabled).await;
+                (RecordingTap::Raw, finalized, true)
             });
         }
     }
@@ -1069,8 +1172,8 @@ impl ChannelPipeline {
         retired: Result<RetiredRecording, tokio::task::JoinError>,
     ) {
         match retired {
-            Ok((tap, already_reported, fault, announce_clean)) => {
-                self.note_recording_stop(tap, already_reported, fault, announce_clean);
+            Ok((tap, finalized, announce_clean)) => {
+                self.note_recording_stop(tap, finalized, announce_clean);
             }
             // A panicked finalize task cannot report which tap it served;
             // don't let it pass as a clean stop silently (§56.1).
@@ -1103,19 +1206,22 @@ impl ChannelPipeline {
         }
     }
 
-    /// Record the outcome of a recording stop honestly (§56.1): a clean stop
-    /// gets its INFO note (when `announce_clean`); a dirty one — accepted
-    /// backlog truncated or finalize failed — gets an error diagnostic and a
-    /// `RecordingFaulted` event, unless that fault was already reported live.
+    /// Record the outcome of a recording stop honestly (§56.1): first the
+    /// reports the recorder made that were not yet surfaced — a gap the stop
+    /// ended among them — then the stop itself. A clean stop gets its INFO note
+    /// (when `announce_clean`); a dirty one — accepted backlog truncated or
+    /// finalize failed — gets an error diagnostic and a `RecordingFaulted` event.
     fn note_recording_stop(
         &mut self,
         tap: RecordingTap,
-        already_reported: bool,
-        fault: Option<String>,
+        finalized: Finalized,
         announce_clean: bool,
     ) {
+        for report in finalized.reports {
+            self.note_recorder_report(tap, report);
+        }
         let what = format!("{} recording", tap.label());
-        match fault {
+        match finalized.fault {
             None => {
                 if announce_clean {
                     self.diagnostics
@@ -1123,15 +1229,12 @@ impl ChannelPipeline {
                 }
             }
             Some(why) => {
-                if !already_reported {
-                    self.diagnostics.record(Diagnostic::error(format!(
-                        "{what} faulted while stopping on channel {}: {why}",
-                        self.channel_id
-                    )));
-                    if let Some(events) = &self.events {
-                        let _ =
-                            events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id, tap));
-                    }
+                self.diagnostics.record(Diagnostic::error(format!(
+                    "{what} faulted while stopping on channel {}: {why}",
+                    self.channel_name
+                )));
+                if let Some(events) = &self.events {
+                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id, tap));
                 }
             }
         }
@@ -1165,8 +1268,8 @@ impl ChannelPipeline {
     }
 
     /// Lazily create the Display recording on a begin (§54, §55): a no-op if one
-    /// is already active; no destination reports a fault rather than a silent
-    /// no-op; an open failure reports the reason without faulting the Channel.
+    /// is already on; no destination reports a fault rather than a silent
+    /// no-op; the first file opens in the recorder's task, as for Raw.
     async fn begin_display_recording(&mut self) {
         // Same rule as the Raw begin: land any detached predecessor stop
         // before opening a file it might still hold.
@@ -1177,19 +1280,25 @@ impl ChannelPipeline {
             .and_then(|v| v.recorder.as_ref())
             .map(|r| r.recording.state())
         {
-            // Already recording — begin is idempotent.
+            // Already on — begin is idempotent.
             Some(state) if state != RecordingState::Faulted => return,
-            // Faulted: Begin is the retry — drop the dead recording first
-            // (the Raw sibling's rule).
+            // Could not begin: Begin is the retry — drop it first (the Raw
+            // sibling's rule).
             Some(_) => {
                 if let Some(rec) = self
                     .display_views
                     .first_mut()
                     .and_then(|v| v.recorder.take())
                 {
-                    let _ =
-                        finalize_view_recorder(self.channel_id, rec, RecordingStopReason::Disabled)
-                            .await;
+                    let end = self.stream_pos_now();
+                    let finalized = finalize_view_recorder(
+                        self.channel_id,
+                        rec,
+                        RecordingStopReason::Disabled,
+                        end,
+                    )
+                    .await;
+                    self.note_recording_stop(RecordingTap::Display, finalized, false);
                 }
             }
             None => {}
@@ -1208,52 +1317,16 @@ impl ChannelPipeline {
             }
             return;
         };
-        let created = if settings.file_rotation == FileRotationPolicy::None {
-            DisplayFileRecorder::create(&settings.destination, settings.overwrite)
-                .await
-                .map(|r| start_display_recording(r, settings.capacity))
-        } else {
-            RotatingDisplayRecorder::create(
-                &settings.destination,
-                &settings.channel_name,
-                ".disp",
-                settings.overwrite,
-                settings.file_rotation,
-            )
-            .await
-            .map(|r| start_display_recording(r, settings.capacity))
-        };
-        match created {
-            Ok(rec) => {
-                self.set_display_recorder(settings.renderer.clone(), rec);
-                self.display_fault_reported = false;
-                self.display_begin_faulted = false;
-                self.diagnostics.record(Diagnostic::event(format!(
-                    "Display recording started → {}",
-                    settings.destination.display(),
-                )));
-                if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::RecordingStarted(
-                        self.channel_id,
-                        RecordingTap::Display,
-                    ));
-                }
-            }
-            Err(err) => {
-                self.display_begin_faulted = true;
-                self.diagnostics.record(Diagnostic::error(format!(
-                    "could not begin Display recording to {} (on-exists: {:?}): {err}",
-                    settings.destination.display(),
-                    settings.overwrite,
-                )));
-                if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(
-                        self.channel_id,
-                        RecordingTap::Display,
-                    ));
-                }
-            }
+        let recording = start_recording(
+            DisplaySegments::new(settings.plan()),
+            settings.queue_budget,
+            Timings::default(),
+        );
+        if self.low_disk_holds_recording() {
+            recording.set_low_disk(true);
         }
+        self.set_display_recorder(settings.renderer.clone(), recording);
+        self.display_begin_faulted = false;
     }
 
     /// Stop the Display recording (§54): retires **detached**, like the Raw
@@ -1267,12 +1340,13 @@ impl ChannelPipeline {
             .first_mut()
             .and_then(|v| v.recorder.take());
         if let Some(rec) = taken {
-            let already_reported = self.display_fault_reported;
             let channel_id = self.channel_id;
+            let end = self.stream_pos_now();
             self.retiring.spawn(async move {
-                let fault =
-                    finalize_view_recorder(channel_id, rec, RecordingStopReason::Disabled).await;
-                (RecordingTap::Display, already_reported, fault, true)
+                let finalized =
+                    finalize_view_recorder(channel_id, rec, RecordingStopReason::Disabled, end)
+                        .await;
+                (RecordingTap::Display, finalized, true)
             });
         }
     }
@@ -1288,9 +1362,10 @@ impl ChannelPipeline {
                 stalled_for,
             } => {
                 self.diagnostics.record(Diagnostic::warning(format!(
-                    "reception stalled {} ms on channel {channel_id}; possible transport-specific \
+                    "reception stalled {} ms on channel {}; possible transport-specific \
                      loss (UART/driver overrun) — lost byte count is not observable (§101)",
                     stalled_for.as_millis(),
+                    self.channel_name,
                 )));
                 // The matching event (§137); advisory, non-blocking like the rest.
                 // Dedicated `ReceptionStalled` (v1.2) so observers can tell a stall
@@ -1315,13 +1390,17 @@ impl ChannelPipeline {
             } => {
                 self.transport_health.arrival_timestamps.status = status;
             }
-            TransportNotice::TransportFaulted { channel_id, cause } => {
+            TransportNotice::TransportFaulted {
+                channel_id: _,
+                cause,
+            } => {
                 // The fault's CAUSE, retained where an operator will look for
                 // it (the diagnostics log, which survives stop via the
                 // retained snapshot). The paired `ChannelFaulted` lifecycle
                 // event (§137) is emitted by the fault monitor, not here.
                 self.diagnostics.record(Diagnostic::error(format!(
-                    "transport fault on channel {channel_id}: {cause}"
+                    "transport fault on channel {}: {cause}",
+                    self.channel_name
                 )));
             }
         }
@@ -1345,8 +1424,10 @@ impl ChannelPipeline {
 
     /// Poll the recording filesystem's free space and act on a low condition
     /// (§56.2, §168). Called periodically (not per write). Warns once per low
-    /// episode and, if the policy is `StopRecording`, finalizes and stops the
-    /// recordings while reception continues (§96). A failed space query is ignored.
+    /// episode and, if the policy is `StopRecording`, gaps the recordings —
+    /// each finalizes its file — while reception continues (§96). They resume
+    /// in new files once free space is 10% above the threshold. A failed space
+    /// query is ignored.
     pub async fn check_disk_guard(&mut self) {
         let Some((guard, path)) = self.disk_guard.clone() else {
             return;
@@ -1371,50 +1452,60 @@ impl ChannelPipeline {
         else {
             return; // cannot determine free space (or the query hung); do not act
         };
-        if !disk_is_low(free, total, guard.min_free) {
-            self.disk_low_reported = false;
+        if self.disk_low_reported {
+            // Hysteresis: a low episode ends only 10% above the threshold, so
+            // free space hovering at the line cannot churn files (§56.2).
+            if disk_has_recovered(free, total, guard.min_free) {
+                self.disk_low_reported = false;
+                self.diagnostics.record(Diagnostic::event(format!(
+                    "free disk space for recording on channel {} has recovered: {free} bytes free",
+                    self.channel_name
+                )));
+                if guard.on_low == LowDiskAction::StopRecording {
+                    self.set_low_disk(false);
+                }
+            }
             return;
         }
-        if self.disk_low_reported {
-            return; // already reported this episode
+        if !disk_is_low(free, total, guard.min_free) {
+            return;
         }
         self.disk_low_reported = true;
         self.diagnostics.record(Diagnostic::warning(format!(
             "low disk for recording on channel {}: {free} bytes free",
-            self.channel_id
+            self.channel_name
         )));
         if let Some(events) = &self.events {
             let _ = events.try_send(RuntimeEvent::DiskSpaceLow(self.channel_id));
         }
         if guard.on_low == LowDiskAction::StopRecording {
-            self.stop_all_recording().await;
+            self.set_low_disk(true);
             if let Some(events) = &self.events {
                 let _ = events.try_send(RuntimeEvent::RecordingStoppedLowDisk(self.channel_id));
             }
         }
     }
 
-    /// Stop and drop every recording on this Channel (§56), each retiring
-    /// detached (this runs from the disk guard on the acquisition task — the
-    /// low-disk stop must not itself stall reception, §96).
-    async fn stop_all_recording(&mut self) {
-        if let Some(recorder) = self.take_raw_recorder() {
-            let already = self.recording_fault_reported;
-            self.retiring.spawn(async move {
-                let fault = recorder.finalize(RecordingStopReason::Disabled).await;
-                (RecordingTap::Raw, already, fault, false)
-            });
+    /// Whether a low-disk episode is holding recordings in a gap (§56.2), so a
+    /// recording begun during it starts in that gap too.
+    fn low_disk_holds_recording(&self) -> bool {
+        self.disk_low_reported
+            && self
+                .disk_guard
+                .as_ref()
+                .is_some_and(|(guard, _)| guard.on_low == LowDiskAction::StopRecording)
+    }
+
+    /// Tell every recording on this Channel that free space is low, or has
+    /// recovered (§56.2). Each recorder handles it in its own task, so this
+    /// never waits on a file (§96).
+    fn set_low_disk(&self, low: bool) {
+        if let Some(recorder) = &self.raw_recorder {
+            recorder.set_low_disk(low);
         }
-        for view in &mut self.display_views {
-            if let Some(rec) = view.recorder.take() {
-                let already = self.display_fault_reported;
-                let channel_id = self.channel_id;
-                self.retiring.spawn(async move {
-                    let fault =
-                        finalize_view_recorder(channel_id, rec, RecordingStopReason::Disabled)
-                            .await;
-                    (RecordingTap::Display, already, fault, false)
-                });
+        for view in &self.display_views {
+            if let Some(rec) = &view.recorder {
+                rec.recording.set_low_disk(low);
             }
         }
     }
@@ -1433,26 +1524,26 @@ impl ChannelPipeline {
         // recording outcome before the final snapshot is taken (§56.1).
         self.drain_retiring().await;
         if let Some(recorder) = self.take_raw_recorder() {
-            let already = self.recording_fault_reported;
-            let fault = recorder.finalize(RecordingStopReason::ChannelStopped).await;
-            self.note_recording_stop(RecordingTap::Raw, already, fault, true);
+            let finalized = recorder.finalize(RecordingStopReason::ChannelStopped).await;
+            self.note_recording_stop(RecordingTap::Raw, finalized, true);
         }
-        let mut display_faults = Vec::new();
+        let end = self.stream_pos_now();
+        let mut display_stops = Vec::new();
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
-                display_faults.push(
+                display_stops.push(
                     finalize_view_recorder(
                         self.channel_id,
                         rec,
                         RecordingStopReason::ChannelStopped,
+                        end,
                     )
                     .await,
                 );
             }
         }
-        for fault in display_faults {
-            let already = self.display_fault_reported;
-            self.note_recording_stop(RecordingTap::Display, already, fault, false);
+        for finalized in display_stops {
+            self.note_recording_stop(RecordingTap::Display, finalized, false);
         }
         self.record_event("Channel stopped");
     }
@@ -1668,6 +1759,15 @@ impl ChannelPipeline {
         }
     }
 
+    /// The position just past the last received byte, now — for recorder
+    /// items that belong to no chunk (§56.1).
+    fn stream_pos_now(&self) -> StreamPos {
+        StreamPos {
+            offset: self.activity.total_bytes(),
+            at: std::time::SystemTime::now(),
+        }
+    }
+
     /// Absolute stream offset just past the last retained byte (§87): total bytes
     /// accepted into the scrollback since Start.
     pub fn stream_end_offset(&self) -> u64 {
@@ -1718,19 +1818,24 @@ impl ChannelPipeline {
 /// Finalize one Display recording: flush the streaming renderer's tail (a
 /// still-carried incomplete sequence and any deferred annotations — rendered
 /// lossily now that the stream has truly ended) into the recording, then
-/// finalize the file (§56, ADR-018).
+/// finalize the file (§56, ADR-018). `end` is the stream position the tail
+/// belongs to.
 async fn finalize_view_recorder(
     channel_id: ChannelId,
     mut rec: ViewRecorder,
     reason: RecordingStopReason,
-) -> Option<String> {
+    end: StreamPos,
+) -> Finalized {
     let tail = rec.renderer.finish();
     if !tail.is_empty() {
-        rec.recording.try_record(RenderedOutput {
-            channel_id,
-            text: tail,
-            timestamp: None,
-        });
+        rec.recording.try_record(
+            RenderedOutput {
+                channel_id,
+                text: tail,
+                timestamp: None,
+            },
+            end,
+        );
     }
     rec.recording.finalize(reason).await
 }
@@ -1742,6 +1847,37 @@ fn disk_is_low(free: u64, total: u64, threshold: DiskThreshold) -> bool {
         DiskThreshold::Percent { percent } => {
             total > 0 && (free as u128) * 100 < (total as u128) * (percent as u128)
         }
+    }
+}
+
+/// Whether `free` bytes is at least 10% above the disk-guard threshold — the
+/// point a low episode ends (§56.2).
+fn disk_has_recovered(free: u64, total: u64, threshold: DiskThreshold) -> bool {
+    match threshold {
+        DiskThreshold::Bytes { bytes } => (free as u128) * 10 >= (bytes as u128) * 11,
+        DiskThreshold::Percent { percent } => {
+            total > 0 && (free as u128) * 1000 >= (total as u128) * (percent as u128) * 11
+        }
+    }
+}
+
+/// A wall-clock instant in local time, for gap records (§56.1).
+fn local_time(at: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(at)
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
+}
+
+/// A wait in the largest whole unit that states it exactly.
+fn describe_wait(wait: Duration) -> String {
+    let secs = wait.as_secs();
+    if secs >= 60 && secs.is_multiple_of(60) {
+        let minutes = secs / 60;
+        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    } else if wait.subsec_millis() == 0 {
+        format!("{secs} s")
+    } else {
+        format!("{} ms", wait.as_millis())
     }
 }
 
@@ -1774,7 +1910,7 @@ pub async fn run_channel(
     let mut disk_check = tokio::time::interval(Duration::from_secs(5));
     disk_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Recorder maintenance cadence, independent of rule timing. It bounds
-    // asynchronous fault visibility and detached-stop outcome reaping on a quiet
+    // recorder-report visibility and detached-stop outcome reaping on a quiet
     // stream; Idle rules use exact deadlines below rather than this poll.
     let mut recorder_check = tokio::time::interval(Duration::from_millis(250));
     recorder_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1784,6 +1920,9 @@ pub async fn run_channel(
     // diagnostic and emits RecordingFaulted instead of failing silently.
     if pipeline.should_auto_begin_recording() {
         pipeline.begin_recording().await;
+    }
+    if pipeline.auto_begin_display_recording {
+        pipeline.begin_display_recording().await;
     }
     loop {
         // Detached recorder stops (§56.1): report any outcome that landed
@@ -1824,14 +1963,14 @@ pub async fn run_channel(
                 }
             },
             _ = disk_check.tick() => pipeline.check_disk_guard().await,
-            _ = recorder_check.tick() => pipeline.check_recording_faults(),
+            _ = recorder_check.tick() => pipeline.poll_recorders(),
             timer_mode = wait_for_idle_deadline(idle_deadline) => {
                 pipeline.idle_deadline_timer.record(timer_mode);
                 pipeline.evaluate_idle_rules(Instant::now());
                 pipeline.apply_pending_records().await;
-                // Recorder tasks fault asynchronously; on a quiet stream this
-                // tick is the only place the fault gets reported (§56.1).
-                pipeline.check_recording_faults();
+                // Recorders report from their own tasks; on a quiet stream a
+                // tick is the only place those reports surface (§56.1).
+                pipeline.poll_recorders();
             }
             maybe = ingest.recv(), if ingest_open => match maybe {
                 Some(data) => {
@@ -1898,8 +2037,10 @@ async fn wait_for_idle_deadline(deadline: Option<Instant>) -> IdleDeadlineTimerM
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::DEFAULT_SIZE_CAP;
     use crate::config::MatchCondition;
     use crate::core::ChunkTime;
+    use crate::record::{start_raw_recording, RawFileRecorder};
     use crate::transport::ReceivedPayload;
 
     fn pipeline(cid: ChannelId, caps: PipelineCapacities) -> ChannelPipeline {
@@ -2199,7 +2340,7 @@ mod tests {
         let recorder = RawFileRecorder::create(&path, OverwritePolicy::Refuse, false)
             .await
             .unwrap();
-        let recording = start_raw_recording(recorder, 64);
+        let recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
         let mut p = pipeline(cid, PipelineCapacities::default()).with_raw_recorder(recording);
 
         p.ingest(bytes_chunk(cid, b"$GPGLL,1*00\r\n"));
@@ -2220,7 +2361,7 @@ mod tests {
         let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Refuse)
             .await
             .unwrap();
-        let recording = start_display_recording(recorder, 64);
+        let recording = start_display_recording(recorder, DEFAULT_QUEUE_BUDGET);
         let mut p = pipeline(cid, PipelineCapacities::default());
         p.set_display_recorder(DisplayView::default(), recording);
 
@@ -2249,7 +2390,7 @@ mod tests {
                 mode: crate::display::DisplayMode::Rendered,
                 ..DisplayView::default()
             },
-            start_display_recording(disp, 64),
+            start_display_recording(disp, DEFAULT_QUEUE_BUDGET),
         );
 
         // One sentence split arbitrarily across three reads, with the é split
@@ -2277,7 +2418,7 @@ mod tests {
         let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Refuse)
             .await
             .unwrap();
-        let recording = start_display_recording(recorder, 64);
+        let recording = start_display_recording(recorder, DEFAULT_QUEUE_BUDGET);
         let mut p = pipeline(cid, PipelineCapacities::default());
         p.set_display_recorder(DisplayView::default(), recording);
         let view = p.display_view_handles()[0].clone();
@@ -2293,9 +2434,24 @@ mod tests {
         let _ = tokio::fs::remove_file(&path).await;
     }
 
+    /// Poll the recorders until `done` holds: a recorder opens files and meets
+    /// faults in its own task, so its state settles a moment after the call
+    /// that began it.
+    async fn settle(p: &mut ChannelPipeline, what: &str, done: impl Fn(&ChannelPipeline) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            p.poll_recorders();
+            if done(p) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test]
-    async fn recording_overflow_faults_emits_event_and_reception_continues() {
-        // §56.1: a recorder that cannot keep up faults; reception continues.
+    async fn a_recording_overflow_gaps_emits_an_event_and_reception_continues() {
+        // §56.1: a recorder that cannot keep up gaps; reception continues.
         use crate::record::RawRecorder;
         struct StallingRecorder(tokio::sync::oneshot::Receiver<()>);
         #[async_trait::async_trait]
@@ -2321,20 +2477,31 @@ mod tests {
 
         let cid = ChannelId::new();
         let (_hold_tx, hold_rx) = tokio::sync::oneshot::channel();
-        let recording = start_raw_recording(StallingRecorder(hold_rx), 1);
+        // Room for two one-byte chunks.
+        let budget = 2 * (1 + crate::record::controller::PER_ITEM_OVERHEAD);
+        let recording = start_raw_recording(StallingRecorder(hold_rx), budget);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
         let mut p = pipeline(cid, PipelineCapacities::default())
             .with_raw_recorder(recording)
             .with_event_sender(event_tx);
 
-        // Flood: the 1-slot queue fills while the writer is parked; the recording
-        // faults, reception continues, and the stream keeps accumulating.
+        // Flood: the queue fills while the writer is parked; the recording
+        // gaps at once, reception continues, and the stream keeps accumulating.
         for _ in 0..8 {
             p.ingest(bytes_chunk(cid, b"x"));
             tokio::task::yield_now().await;
         }
-        assert_eq!(p.raw_recording_state(), Some(RecordingState::Faulted));
+        assert_eq!(
+            p.raw_recording_state(),
+            Some(RecordingState::Gap(crate::core::GapReason::QueueOverflow))
+        );
         assert_eq!(p.snapshot().activity.total_bytes, 8);
+        assert!(
+            p.diagnostics()
+                .errors()
+                .any(|e| e.message.contains("Raw recording gap")),
+            "the gap is in the diagnostics"
+        );
         let mut saw_fault = false;
         while let Ok(ev) = event_rx.try_recv() {
             if matches!(ev, RuntimeEvent::RecordingFaulted(id, RecordingTap::Raw) if id == cid) {
@@ -2585,16 +2752,30 @@ mod tests {
         assert!(!disk_is_low(0, 0, DiskThreshold::Percent { percent: 5 }));
     }
 
+    #[test]
+    fn a_low_disk_episode_ends_ten_percent_above_the_threshold() {
+        // §56.2: hysteresis, so free space hovering at the line cannot churn files.
+        let bytes = DiskThreshold::Bytes { bytes: 1000 };
+        assert!(!disk_has_recovered(1000, 0, bytes));
+        assert!(!disk_has_recovered(1099, 0, bytes));
+        assert!(disk_has_recovered(1100, 0, bytes));
+        let percent = DiskThreshold::Percent { percent: 10 };
+        assert!(!disk_has_recovered(109, 1000, percent));
+        assert!(disk_has_recovered(110, 1000, percent));
+        assert!(!disk_has_recovered(0, 0, percent));
+    }
+
     #[tokio::test]
-    async fn disk_guard_stops_recording_once_and_emits_events() {
+    async fn the_disk_guard_gaps_recording_once_and_emits_events() {
         // §56.2/§168: an impossible byte threshold (u64::MAX) is always "low", so
-        // the guard warns, stops the recording cleanly, and debounces the report.
+        // the guard warns, ends the file cleanly in a low-disk gap, and debounces
+        // the report. The recording stays on, waiting for space.
         let cid = ChannelId::new();
         let path = temp_path("guard");
         let recorder = RawFileRecorder::create(&path, OverwritePolicy::Refuse, false)
             .await
             .unwrap();
-        let recording = start_raw_recording(recorder, 64);
+        let recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
         let mut p = pipeline(cid, PipelineCapacities::default())
             .with_raw_recorder(recording)
@@ -2609,8 +2790,12 @@ mod tests {
 
         p.ingest(bytes_chunk(cid, b"data"));
         p.check_disk_guard().await;
-        // The recording was stopped and finalized; reception continues.
-        assert!(p.raw_recording_state().is_none());
+        // The file ended and the recording waits in a gap; reception continues.
+        settle(&mut p, "the low-disk gap", |p| {
+            p.raw_recording_state() == Some(RecordingState::Gap(crate::core::GapReason::LowDisk))
+        })
+        .await;
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"data");
         let mut low = 0;
         let mut stopped = 0;
         while let Ok(ev) = event_rx.try_recv() {
@@ -2671,6 +2856,30 @@ mod tests {
             }
         }
         assert!(saw_match);
+    }
+
+    #[test]
+    fn a_transport_fault_reaches_the_event_log_naming_the_channel_and_cause() {
+        // §118: an unplugged device during an unattended run must leave a line
+        // naming the Channel and the OS error, not only a UUID.
+        let cid = ChannelId::new();
+        let text = crate::diagnostics::test_support::capture(|| {
+            let mut p = pipeline(cid, PipelineCapacities::default()).with_channel_name("GPS");
+            p.record_notice(TransportNotice::TransportFaulted {
+                channel_id: cid,
+                cause: "serial read failed: The device does not recognize the command.".into(),
+            });
+        });
+        assert!(text.contains("ERROR"), "{text}");
+        assert!(
+            text.contains(
+                "transport fault on channel GPS: serial read failed: \
+                 The device does not recognize the command."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("channel=GPS"), "{text}");
+        assert!(text.contains(&cid.to_string()), "{text}");
     }
 
     #[test]
@@ -2815,7 +3024,10 @@ mod tests {
             b"$",
             vec![mark],
         )]);
-        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+        p.set_display_recorder(
+            DisplayView::default(),
+            start_display_recording(disp, DEFAULT_QUEUE_BUDGET),
+        );
 
         p.ingest(bytes_chunk(cid, b"$GPGGA,1 $GPRMC,2"));
         let snap = p.snapshot();
@@ -2859,7 +3071,10 @@ mod tests {
             b"$GPGGA",
             vec![mark],
         )]);
-        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+        p.set_display_recorder(
+            DisplayView::default(),
+            start_display_recording(disp, DEFAULT_QUEUE_BUDGET),
+        );
 
         p.ingest(bytes_chunk(cid, b"xx$GPGGA,1"));
         let snap = p.snapshot();
@@ -2988,7 +3203,8 @@ mod tests {
                 overwrite: OverwritePolicy::Refuse,
                 timestamps: false,
                 file_rotation: FileRotationPolicy::None,
-                capacity: 64,
+                queue_budget: DEFAULT_QUEUE_BUDGET,
+                size_cap: DEFAULT_SIZE_CAP,
             });
 
         // Before the match: nothing on disk, nothing recorded.
@@ -3046,7 +3262,8 @@ mod tests {
                 channel_name: "armed-disp".to_string(),
                 overwrite: OverwritePolicy::Refuse,
                 file_rotation: FileRotationPolicy::None,
-                capacity: 64,
+                queue_budget: DEFAULT_QUEUE_BUDGET,
+                size_cap: DEFAULT_SIZE_CAP,
                 renderer: DisplayView::default(),
             });
 
@@ -3107,14 +3324,16 @@ mod tests {
                 overwrite: OverwritePolicy::Refuse,
                 timestamps: false,
                 file_rotation: FileRotationPolicy::None,
-                capacity: 64,
+                queue_budget: DEFAULT_QUEUE_BUDGET,
+                size_cap: DEFAULT_SIZE_CAP,
             })
             .with_display_recording_settings(DisplayRecordingSettings {
                 destination: disp_path.clone(),
                 channel_name: "both".to_string(),
                 overwrite: OverwritePolicy::Refuse,
                 file_rotation: FileRotationPolicy::None,
-                capacity: 64,
+                queue_budget: DEFAULT_QUEUE_BUDGET,
+                size_cap: DEFAULT_SIZE_CAP,
                 renderer: DisplayView::default(),
             });
 
@@ -3140,38 +3359,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn faulted_raw_retry_uses_the_latest_settings() {
-        // A faulted recording still occupies the recorder slot; Begin must be
-        // the user's retry, not a silent "already recording" no-op that
-        // forces a channel restart. Fault deterministically via queue
-        // overflow: capacity 1, and the recorder task is starved (no await
-        // between ingests on the single-threaded test runtime).
+    async fn a_raw_retry_after_a_failed_begin_uses_the_latest_settings() {
+        // A recording that could not begin still occupies the recorder slot;
+        // Begin must be the user's retry, not a silent "already recording"
+        // no-op that forces a channel restart. Refuse over an existing file
+        // cannot begin, and retrying on its own cannot fix it (§55).
         let cid = ChannelId::new();
         let first_path = temp_path("refault-first");
         let retry_path = temp_path("refault-retry");
+        tokio::fs::write(&first_path, b"keep").await.unwrap();
         let first_settings = RawRecordingSettings {
             destination: first_path.clone(),
             channel_name: "refault".to_string(),
-            overwrite: OverwritePolicy::Overwrite,
+            overwrite: OverwritePolicy::Refuse,
             timestamps: false,
             file_rotation: FileRotationPolicy::None,
-            capacity: 1,
+            queue_budget: DEFAULT_QUEUE_BUDGET,
+            size_cap: DEFAULT_SIZE_CAP,
         };
-        let mut p = pipeline(cid, PipelineCapacities::default());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_event_sender(event_tx);
         p.set_recording(true, Some(first_settings.clone())).await;
-        assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
-
-        p.ingest(bytes_chunk(cid, b"a"));
-        p.ingest(bytes_chunk(cid, b"b"));
-        p.ingest(bytes_chunk(cid, b"c")); // queue full → overflow fault
-        assert_eq!(p.raw_recording_state(), Some(RecordingState::Faulted));
+        settle(&mut p, "the refused begin", |p| {
+            p.raw_recording_state() == Some(RecordingState::Faulted)
+        })
+        .await;
+        let error = p.diagnostics().errors().last().unwrap().message.clone();
+        assert!(
+            error.starts_with("could not begin Raw recording to") && error.contains("Refuse"),
+            "the reason reaches the diagnostics: {error}"
+        );
+        assert!(std::iter::from_fn(|| event_rx.try_recv().ok())
+            .any(|e| matches!(e, RuntimeEvent::RecordingFaulted(_, RecordingTap::Raw))));
 
         // The editor changed after the fault. Begin again must drop the dead
         // recorder and recreate it from the click-time settings, not reopen
         // the old destination merely because its handle still occupied the slot.
         let retry_settings = RawRecordingSettings {
             destination: retry_path.clone(),
-            capacity: 64,
             ..first_settings
         };
         p.set_recording(true, Some(retry_settings)).await;
@@ -3182,8 +3407,9 @@ mod tests {
         assert_eq!(
             tokio::fs::read(&retry_path).await.unwrap(),
             b"recovered",
-            "the retry must use the latest destination and capacity"
+            "the retry must use the latest destination"
         );
+        assert_eq!(tokio::fs::read(&first_path).await.unwrap(), b"keep");
         let _ = tokio::fs::remove_file(&first_path).await;
         let _ = tokio::fs::remove_file(&retry_path).await;
     }
@@ -3203,7 +3429,8 @@ mod tests {
                 overwrite: OverwritePolicy::Refuse,
                 timestamps: false,
                 file_rotation: FileRotationPolicy::None,
-                capacity: 64,
+                queue_budget: DEFAULT_QUEUE_BUDGET,
+                size_cap: DEFAULT_SIZE_CAP,
             },
         );
 
@@ -3248,7 +3475,8 @@ mod tests {
                 overwrite: OverwritePolicy::Refuse,
                 timestamps: false,
                 file_rotation: FileRotationPolicy::None,
-                capacity: 64,
+                queue_budget: DEFAULT_QUEUE_BUDGET,
+                size_cap: DEFAULT_SIZE_CAP,
             },
         );
         p.set_recording(true, None).await;
@@ -3263,7 +3491,7 @@ mod tests {
             .raw_recording_queue
             .expect("queue peak survives recorder teardown");
         assert!(queue.peak >= 1);
-        assert_eq!(queue.capacity, 64);
+        assert_eq!(queue.capacity, DEFAULT_QUEUE_BUDGET);
         p.ingest(bytes_chunk(cid, b"while closing"));
 
         // The outcome is reported through the reap path.
@@ -3316,7 +3544,10 @@ mod tests {
             byte_rule("zz", b"ZZ", vec![mark("|z|")]),
             byte_rule("aa", b"AA", vec![mark("|a|")]),
         ]);
-        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+        p.set_display_recorder(
+            DisplayView::default(),
+            start_display_recording(disp, DEFAULT_QUEUE_BUDGET),
+        );
 
         // "AA" at offset 1 fires the SECOND rule; "ZZ" at offset 4 fires the
         // first — collected order [ZZ@4, AA@1], i.e. offsets out of order.
@@ -3356,7 +3587,10 @@ mod tests {
             b"ABC",
             vec![mark],
         )]);
-        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+        p.set_display_recorder(
+            DisplayView::default(),
+            start_display_recording(disp, DEFAULT_QUEUE_BUDGET),
+        );
 
         p.ingest(bytes_chunk(cid, b"xABCy"));
         let snapshot = p.snapshot();
@@ -3402,7 +3636,10 @@ mod tests {
             b"ABC",
             vec![mark],
         )]);
-        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+        p.set_display_recorder(
+            DisplayView::default(),
+            start_display_recording(disp, DEFAULT_QUEUE_BUDGET),
+        );
 
         p.ingest(bytes_chunk(cid, b"xAB"));
         p.ingest(bytes_chunk(cid, b"Cy"));
@@ -3437,7 +3674,8 @@ mod tests {
             channel_name: "disp-live".to_string(),
             overwrite: OverwritePolicy::Refuse,
             file_rotation: FileRotationPolicy::None,
-            capacity: 64,
+            queue_budget: DEFAULT_QUEUE_BUDGET,
+            size_cap: DEFAULT_SIZE_CAP,
             renderer: DisplayView::default(),
         };
         p.set_display_recording(true, Some(settings)).await;
@@ -3483,33 +3721,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn faulted_display_retry_uses_the_latest_settings() {
-        // Display has the same retry contract as Raw: a faulted recorder is
-        // inactive, so click-time settings may replace its old destination.
+    async fn a_display_retry_after_a_failed_begin_uses_the_latest_settings() {
+        // Display has the same retry contract as Raw: a recording that could
+        // not begin is inactive, so click-time settings may replace its old
+        // destination.
         let cid = ChannelId::new();
         let first_path = temp_path("disp-refault-first");
         let retry_path = temp_path("disp-refault-retry");
+        tokio::fs::write(&first_path, b"keep").await.unwrap();
         let first_settings = DisplayRecordingSettings {
             destination: first_path.clone(),
             channel_name: "disp-refault".to_string(),
-            overwrite: OverwritePolicy::Overwrite,
+            overwrite: OverwritePolicy::Refuse,
             file_rotation: FileRotationPolicy::None,
-            capacity: 1,
+            queue_budget: DEFAULT_QUEUE_BUDGET,
+            size_cap: DEFAULT_SIZE_CAP,
             renderer: DisplayView::default(),
         };
         let mut p = pipeline(cid, PipelineCapacities::default());
         p.set_display_recording(true, Some(first_settings.clone()))
             .await;
-        assert_eq!(p.display_recording_state(), Some(RecordingState::Enabled));
-
-        p.ingest(bytes_chunk(cid, b"a"));
-        p.ingest(bytes_chunk(cid, b"b"));
-        p.ingest(bytes_chunk(cid, b"c")); // queue full -> overflow fault
-        assert_eq!(p.display_recording_state(), Some(RecordingState::Faulted));
+        settle(&mut p, "the refused begin", |p| {
+            p.display_recording_state() == Some(RecordingState::Faulted)
+        })
+        .await;
 
         let retry_settings = DisplayRecordingSettings {
             destination: retry_path.clone(),
-            capacity: 64,
             ..first_settings
         };
         p.set_display_recording(true, Some(retry_settings)).await;
@@ -3522,6 +3760,7 @@ mod tests {
             written.contains("recovered"),
             "the Display retry must use the latest destination: {written:?}"
         );
+        assert_eq!(tokio::fs::read(&first_path).await.unwrap(), b"keep");
         let _ = tokio::fs::remove_file(&first_path).await;
         let _ = tokio::fs::remove_file(&retry_path).await;
     }
@@ -3541,13 +3780,16 @@ mod tests {
             .await
             .unwrap();
         let mut p = pipeline(cid, PipelineCapacities::default())
-            .with_raw_recorder(start_raw_recording(raw, 64))
+            .with_raw_recorder(start_raw_recording(raw, DEFAULT_QUEUE_BUDGET))
             .with_match_rules(&[byte_rule(
                 "mark",
                 b"HERE",
                 vec![MatchAction::Mark { timestamp: None }],
             )]);
-        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+        p.set_display_recorder(
+            DisplayView::default(),
+            start_display_recording(disp, DEFAULT_QUEUE_BUDGET),
+        );
 
         p.ingest(bytes_chunk(cid, b"data HERE data"));
         p.finish().await;
@@ -3587,9 +3829,12 @@ mod tests {
         // The default Display view is Raw/Native, so the disp render is the bytes
         // verbatim with the timestamp spliced before the '$'.
         let mut p = pipeline(cid, PipelineCapacities::default())
-            .with_raw_recorder(start_raw_recording(raw, 64))
+            .with_raw_recorder(start_raw_recording(raw, DEFAULT_QUEUE_BUDGET))
             .with_match_rules(&[byte_rule("gga", b"$GPGGA", vec![mark])]);
-        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+        p.set_display_recorder(
+            DisplayView::default(),
+            start_display_recording(disp, DEFAULT_QUEUE_BUDGET),
+        );
 
         p.ingest(bytes_chunk(cid, b"xx$GPGGA,1"));
         let snap = p.snapshot();
@@ -3652,9 +3897,12 @@ mod tests {
             }),
         };
         let mut pipeline = pipeline(cid, PipelineCapacities::default())
-            .with_raw_recorder(start_raw_recording(raw, 64))
+            .with_raw_recorder(start_raw_recording(raw, DEFAULT_QUEUE_BUDGET))
             .with_match_rules(&[byte_rule("zda", b"$GP", vec![mark])]);
-        pipeline.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+        pipeline.set_display_recorder(
+            DisplayView::default(),
+            start_display_recording(disp, DEFAULT_QUEUE_BUDGET),
+        );
         let arrival = ChunkTime {
             monotonic: Instant::now(),
             wall_clock: std::time::UNIX_EPOCH + Duration::from_millis(1_784_282_096_789),
