@@ -34,7 +34,7 @@ pub(super) fn encode(text: &str, code_page: CodePage) -> Vec<u8> {
         .collect()
 }
 
-/// Decode one byte through `code_page`. Inverse of [`encode_char`].
+/// Decode one byte through `code_page`. Inverse of `encode_char`.
 /// Every byte 0x00..=0xFF maps to exactly one `char`; the five
 /// undefined bytes in Windows-1252 (0x81, 0x8D, 0x8F, 0x90, 0x9D)
 /// decode to `U+FFFD`. Public so the GUI message preview can mix

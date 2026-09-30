@@ -129,6 +129,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt
 cargo fmt --all -- --check
 
+# Rustdoc — broken links and links to private items (CI denies warnings)
+$env:RUSTDOCFLAGS = "-D warnings"; cargo doc --workspace --no-deps
+
 # Verify nmea0183 optional serde feature compiles cleanly
 cargo build -p nmea0183
 cargo build -p nmea0183 --features serde
@@ -142,10 +145,11 @@ cargo deny check
 This is a menu, not a per-commit checklist: scope the gate to the crates a change
 actually touches. A single-crate change needs that crate's tests plus the workspace
 clippy and fmt checks; the `nmea0183` serde build only guards what `nmea0183` can
-break; `cargo deny check` matters when dependencies change.
+break; the rustdoc check matters when doc comments change; `cargo deny check`
+matters when dependencies change.
 
-MSRV is **1.95**. Stable moves ahead of it — run `rustup update stable` if the build
-rejects your toolchain.
+MSRV is **1.97**, raised to current stable with each Rust release (talker ADR-008) —
+run `rustup update stable` if the build rejects your toolchain.
 
 ---
 

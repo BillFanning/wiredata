@@ -2,7 +2,7 @@
 //!
 //! Both use async file I/O (`tokio::fs` + buffered `tokio::io`) so the recorder
 //! task never blocks a runtime worker (§142). [`open_recording_file`] enforces
-//! the [`OverwritePolicy`](super::OverwritePolicy) atomically at enable time
+//! the [`OverwritePolicy`] atomically at enable time
 //! (§55, §121): `Refuse` uses `create_new`, so an existing file is never
 //! clobbered.
 
@@ -64,7 +64,7 @@ fn lock_path(path: &Path) -> PathBuf {
 /// asynchronously, so its lock would linger past drop. Returns
 /// [`RecordError::DestinationInUse`] if the destination is already locked.
 fn lock_recording_destination(path: &Path) -> Result<std::fs::File, RecordError> {
-    // `std::fs::File::try_lock` (stable since Rust 1.89; MSRV is 1.95) — no fs4 needed
+    // `std::fs::File::try_lock` (stable since Rust 1.89) — no fs4 needed
     // for the lock; fs4 stays for the disk-space free functions (§168).
     let lock = std::fs::OpenOptions::new()
         .read(true)

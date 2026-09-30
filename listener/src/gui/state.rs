@@ -125,7 +125,7 @@ pub struct ChannelView {
     pub stream_bytes: std::collections::VecDeque<u8>,
     /// Inline Mark annotations pinned to the accumulated bytes (§50.2), sorted by
     /// `offset` (the renderer needs ascending annotations). Folded from snapshot
-    /// firings by [`merge_marks`](Self::merge_marks); trimmed with the window;
+    /// firings by `merge_marks`; trimmed with the window;
     /// cleared on restart. See [`StreamMark`] for why this outlives the
     /// snapshot's bounded `matches` window.
     pub marks: Vec<StreamMark>,

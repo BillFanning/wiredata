@@ -8,7 +8,7 @@
 //! no file and a rotation happens when the first item of the next period arrives.
 //! Period keys are in **local time** so filenames match the operator's wall clock
 //! (`<channel>_2026-06-03_08` is the local 08:00 hour). The trade-off is the DST edge
-//! (a repeated/skipped local hour around the change) — see [`period_key`]. Each file
+//! (a repeated/skipped local hour around the change) — see `period_key`. Each file
 //! stays contiguous and byte-exact for the data it holds; a rotation is a clean file
 //! boundary, never a gap (§56).
 

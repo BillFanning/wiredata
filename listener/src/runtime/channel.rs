@@ -1,16 +1,16 @@
 //! Channel orchestration: wiring a transport to its pipeline and driving the
 //! Channel lifecycle (spec §10, §97, §110, §111).
 //!
-//! [`spawn_monitored_channel`] is the runtime's per-Channel setup for a single
+//! `spawn_monitored_channel` is the runtime's per-Channel setup for a single
 //! data-bearing transport (Serial, UDP, or an accepted TCP connection): it
 //! creates the bounded Transport→Pipeline queue (§97.2), spawns the pipeline
 //! task, hands the transport its `out` sender, and adds the fault monitor. The
-//! returned [`MonitoredChannel`] owns the cancellation tokens and join handles
+//! returned `MonitoredChannel` owns the cancellation tokens and join handles
 //! for shutdown.
 //!
-//! [`spawn_channel_tasks`] is the lower-level primitive: it takes an externally
+//! `spawn_channel_tasks` is the lower-level primitive: it takes an externally
 //! supplied event sender (so many channels can share one event stream, as the
-//! TCP listener supervisor does) and returns the raw [`ChannelTasks`]. A
+//! TCP listener supervisor does) and returns the raw `ChannelTasks`. A
 //! test-only `start_data_channel`/`RunningChannel` wrapper runs one standalone
 //! channel with its own event receiver, so the spawn/monitor/stop paths are
 //! testable without a `Listener` registry.

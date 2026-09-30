@@ -1,9 +1,9 @@
 //! GUI presentation layer (spec §3, listener ADR-008).
 //!
 //! A thin egui App over the runtime [`bridge`]: on startup it spawns the
-//! background [`Driver`](bridge::Driver) (which owns the [`Listener`]) and then,
+//! background [`Driver`](bridge::Driver) (which owns the [`Listener`](crate::runtime::Listener)) and then,
 //! each frame, drains [`UiUpdate`](bridge::UiUpdate)s into its [`AppState`] and
-//! lays out widgets that read that model and emit [`UiCommand`](bridge::UiCommand)s.
+//! lays out widgets that read that model and emit [`UiCommand`]s.
 //! Per AGENTS §5 this layer never owns the runtime, never does I/O, and never
 //! blocks — every runtime touch is a non-blocking channel send. The egui-free,
 //! unit-tested pieces live in [`bridge`] and [`state`].

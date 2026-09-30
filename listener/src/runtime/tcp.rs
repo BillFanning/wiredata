@@ -4,7 +4,7 @@
 //! and the runtime turns each into an independent TCP connection channel (Model
 //! A, §16.4). This supervisor task:
 //!
-//! - runs the listener acceptor and, per [`NewConnection`](crate::transport::NewConnection),
+//! - runs the listener acceptor and, per [`NewConnection`],
 //!   mints a fresh `ChannelId` (§97.1) and starts a connection channel;
 //! - enforces `max_connections` (§16.1): at the limit it closes the incoming
 //!   connection and raises a `ConnectionRejected` warning (§93) without faulting

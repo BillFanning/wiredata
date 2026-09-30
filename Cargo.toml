@@ -14,7 +14,7 @@ version      = "0.1.0"
 edition      = "2021"
 authors      = ["Bill"]
 license      = "MIT OR Apache-2.0"
-rust-version = "1.95"
+rust-version = "1.97"
 
 # Shared dependency versions — reference these in member crates with
 # { workspace = true } to keep versions consistent across the workspace.

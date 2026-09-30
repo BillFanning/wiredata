@@ -309,7 +309,7 @@ pub enum PayloadConfig {
     },
     /// A standard NMEA 0183 sentence. Fields are the payload values after the
     /// sentence type; the trailing `*XX` checksum is appended per
-    /// [`nmea_checksum`].
+    /// `nmea_checksum`.
     Nmea {
         talker: String,
         sentence_type: String,

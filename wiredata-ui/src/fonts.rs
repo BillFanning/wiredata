@@ -151,7 +151,7 @@ pub fn bold(text: impl Into<String>) -> egui::RichText {
 }
 
 /// A selectable message-view monospace face. `Hack` is egui's built-in monospace;
-/// the rest are bundled (see [`MONO_FONTS`]).
+/// the rest are bundled (see `MONO_FONTS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonoFont {
     Hack,

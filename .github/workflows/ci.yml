@@ -48,6 +48,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Broken links and links to private items fail here, so rustdoc warnings
+      # cannot pile up unseen. Per-OS for the same reason as clippy.
+      - name: Docs
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   # Formatting is platform-independent, so check it once.
   fmt:
     name: rustfmt

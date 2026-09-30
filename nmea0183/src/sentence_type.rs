@@ -25,7 +25,7 @@ pub enum SentenceType {
     APA,
     /// Autopilot sentence B
     APB,
-    /// `$PASHR` — Ashtech attitude/heading. Pair with [`TalkerId::P`].
+    /// `$PASHR` — Ashtech attitude/heading. Pair with [`TalkerId::P`](crate::TalkerId::P).
     ASHR,
     /// Bearing and distance to waypoint, dead reckoning
     BEC,
@@ -118,7 +118,7 @@ pub enum SentenceType {
     /// Waypoints in active route
     R00,
     /// `$PRDID` — Teledyne RDI ADCP pitch/roll/heading. Pair with
-    /// [`TalkerId::P`]; PRDID has no checksum by convention, so the
+    /// [`TalkerId::P`](crate::TalkerId::P); PRDID has no checksum by convention, so the
     /// `NmeaChecksumMode::Omit` mode is appropriate when building one.
     RDID,
     /// Recommended minimum specific Loran-C data (obsolete)

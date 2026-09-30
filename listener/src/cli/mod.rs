@@ -1,6 +1,6 @@
 //! CLI presentation layer (spec §3).
 //!
-//! A thin layer over the runtime [`Listener`](crate::runtime::Listener): it
+//! A thin layer over the runtime [`Listener`]: it
 //! turns arguments (or a profile) into channel configs, starts them, prints the
 //! `RuntimeEvent` stream, and shuts down gracefully on Ctrl-C. It contains no
 //! business logic — channel construction lives in `runtime`/`config` (§3, §128).

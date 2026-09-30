@@ -8,7 +8,7 @@
 //! threshold (a display threshold, or a Match Rule's `Idle` timeout — §50.2), so
 //! there is one source of truth and no competing definitions of idle.
 //!
-//! The rolling rate uses a fixed ring of one-second buckets ([`WINDOW_SECS`]), so
+//! The rolling rate uses a fixed ring of one-second buckets (`WINDOW_SECS`), so
 //! memory is constant regardless of throughput and never affects reception (§100,
 //! §124). A quiet stream decays to a zero rate.
 
