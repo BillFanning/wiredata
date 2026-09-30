@@ -1,25 +1,171 @@
+//! One bounded log-file worker, shared by talker and listener (talker ADR-061).
+//!
+//! Formatting happens on the thread that emits an event; opening, writing,
+//! flushing, rotating and closing the file happen only on a dedicated worker
+//! behind a bounded, non-blocking handoff. When that handoff is full the event is
+//! dropped and counted, and the worker writes a gap line once the records queued
+//! ahead of the loss have drained. A failed open or write is published as a
+//! state the application shows; it never stops the application.
+//!
+//! The crate owns only that mechanism, plus daily rotation and age-based
+//! deletion of old log files. What is logged, its level and format, the folder
+//! and file prefix, and how any of it is presented stay in the applications.
+
 use std::{
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
     thread::JoinHandle,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Context;
 use tracing_subscriber::fmt::MakeWriter;
 
-use super::{make_rolling_appender, FileLogConfig};
-
 const FILE_EVENT_QUEUE_CAP: usize = 4_096;
 
+/// How often a long-running log file checks for old files to delete. Daily
+/// rotation makes one hour ample: a file is deleted within an hour of passing
+/// its age limit.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 type FileWriter = Box<dyn Write + Send>;
-type OpenFileFn = Box<dyn Fn(&FileLogConfig) -> anyhow::Result<FileWriter> + Send>;
+type OpenFileFn = Box<dyn Fn(&LogFileConfig) -> anyhow::Result<FileWriter> + Send>;
 type Notify = Arc<dyn Fn() + Send + Sync>;
 
-/// Runtime state of the GUI's optional file destination.
+/// Where a log file goes and how long old files are kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogFileConfig {
+    pub directory: PathBuf,
+    /// File name prefix; rotated files are named `<prefix>.<date>`.
+    pub prefix: String,
+    pub rotation: Rotation,
+    /// Log files with this prefix older than this are deleted when the file
+    /// opens and hourly after that. `None` keeps every file.
+    pub max_age: Option<Duration>,
+}
+
+impl LogFileConfig {
+    /// Daily rotation, keeping every file.
+    pub fn new(directory: impl Into<PathBuf>, prefix: impl Into<String>) -> Self {
+        Self {
+            directory: directory.into(),
+            prefix: prefix.into(),
+            rotation: Rotation::Daily,
+            max_age: None,
+        }
+    }
+}
+
+/// When a log file is closed and the next one opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rotation {
+    Never,
+    Hourly,
+    #[default]
+    Daily,
+}
+
+/// Open a rotating log file, first deleting files older than `max_age`.
+///
+/// The returned writer keeps deleting old files, at most hourly, while it is
+/// written to. Deletion is best-effort: a file that cannot be deleted is left
+/// and tried again at the next check.
+pub fn open_rolling_file(config: &LogFileConfig) -> anyhow::Result<RollingLogFile> {
+    let rotation = match config.rotation {
+        Rotation::Never => tracing_appender::rolling::Rotation::NEVER,
+        Rotation::Hourly => tracing_appender::rolling::Rotation::HOURLY,
+        Rotation::Daily => tracing_appender::rolling::Rotation::DAILY,
+    };
+    if let Some(max_age) = config.max_age {
+        prune_old_files(
+            &config.directory,
+            &config.prefix,
+            max_age,
+            SystemTime::now(),
+        );
+    }
+    let inner = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(rotation)
+        .filename_prefix(config.prefix.clone())
+        .build(&config.directory)
+        .with_context(|| {
+            format!(
+                "opening file log {:?} in {:?}",
+                config.prefix, config.directory
+            )
+        })?;
+    Ok(RollingLogFile {
+        inner,
+        directory: config.directory.clone(),
+        prefix: config.prefix.clone(),
+        max_age: config.max_age,
+        next_prune: Instant::now() + PRUNE_INTERVAL,
+    })
+}
+
+/// A rotating log file that also deletes its own old files.
+pub struct RollingLogFile {
+    inner: tracing_appender::rolling::RollingFileAppender,
+    directory: PathBuf,
+    prefix: String,
+    max_age: Option<Duration>,
+    next_prune: Instant,
+}
+
+impl Write for RollingLogFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(max_age) = self.max_age {
+            let now = Instant::now();
+            if now >= self.next_prune {
+                self.next_prune = now + PRUNE_INTERVAL;
+                prune_old_files(&self.directory, &self.prefix, max_age, SystemTime::now());
+            }
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Delete the log files in `directory` with this prefix that were last written
+/// more than `max_age` before `now`. Returns how many were deleted.
+///
+/// Only `<prefix>` itself and `<prefix>.<anything>` are candidates, so other
+/// files in the folder are never touched.
+fn prune_old_files(directory: &Path, prefix: &str, max_age: Duration, now: SystemTime) -> usize {
+    let Some(cutoff) = now.checked_sub(max_age) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    let dotted = format!("{prefix}.");
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == prefix || name.starts_with(&dotted)
+        })
+        .filter(|entry| {
+            entry
+                .metadata()
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .and_then(|meta| meta.modified().ok())
+                .is_some_and(|modified| modified < cutoff)
+        })
+        .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
+        .count()
+}
+
+/// Runtime state of an optional file destination.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileLogState {
     Disabled,
@@ -29,10 +175,10 @@ pub enum FileLogState {
     Failed(String),
 }
 
-/// Cloneable, non-blocking control for the GUI's optional file destination.
+/// Cloneable, non-blocking control for an optional file destination.
 ///
 /// Requests cross a channel to the file worker. Opening, writing, flushing, and
-/// closing the file therefore never happen on the UI or talker threads.
+/// closing the file therefore never happen on a UI or application thread.
 #[derive(Clone)]
 pub struct FileLogToggle {
     commands: crossbeam_channel::Sender<FileCommand>,
@@ -55,7 +201,8 @@ impl FileLogToggle {
         *lock_notify(&self.notify) = Some(notify);
     }
 
-    pub fn enable(&self, config: FileLogConfig) -> anyhow::Result<()> {
+    pub fn enable(&self, config: impl Into<LogFileConfig>) -> anyhow::Result<()> {
+        let config = config.into();
         // Do not enqueue events until the worker has proved it can open the
         // destination. Events emitted while the file is opening still reach
         // the pane and any other installed sink.
@@ -91,26 +238,37 @@ impl FileLogToggle {
     }
 }
 
-pub(super) struct RuntimeFileSink {
-    pub writer: RuntimeFileMakeWriter,
+/// The three handles of a running file-log worker.
+pub struct FileSink {
+    /// The `tracing` writer: formats on the emitting thread and hands off
+    /// without blocking.
+    pub writer: FileMakeWriter,
+    /// Turns the file on and off, and reports its state and loss count.
     pub toggle: FileLogToggle,
-    pub guard: RuntimeFileGuard,
+    /// Drains, flushes and stops the worker when dropped.
+    pub guard: FileSinkGuard,
 }
 
-pub(super) fn spawn() -> anyhow::Result<RuntimeFileSink> {
-    spawn_with(Box::new(|config| {
-        Ok(Box::new(make_rolling_appender(config)?) as FileWriter)
-    }))
+/// Start a file-log worker, with no file open yet.
+///
+/// `label` names the application in the worker thread's name and in gap lines,
+/// such as "--- Talker file log gap: 3 earlier log entries were not saved. ---".
+pub fn spawn(label: &'static str) -> anyhow::Result<FileSink> {
+    spawn_with(
+        label,
+        Box::new(|config| Ok(Box::new(open_rolling_file(config)?) as FileWriter)),
+    )
 }
 
-fn spawn_with(open: OpenFileFn) -> anyhow::Result<RuntimeFileSink> {
-    spawn_with_capacity(open, FILE_EVENT_QUEUE_CAP)
+fn spawn_with(label: &'static str, open: OpenFileFn) -> anyhow::Result<FileSink> {
+    spawn_with_capacity(label, open, FILE_EVENT_QUEUE_CAP)
 }
 
 fn spawn_with_capacity(
+    label: &'static str,
     open: OpenFileFn,
     event_queue_cap: usize,
-) -> anyhow::Result<RuntimeFileSink> {
+) -> anyhow::Result<FileSink> {
     let (event_tx, event_rx) = crossbeam_channel::bounded(event_queue_cap);
     let (command_tx, command_rx) = crossbeam_channel::unbounded();
     let state = Arc::new(Mutex::new(FileLogState::Disabled));
@@ -127,7 +285,7 @@ fn spawn_with_capacity(
     };
     let worker_notify = Arc::clone(&notify);
     let thread = std::thread::Builder::new()
-        .name("talker-file-log".into())
+        .name(format!("{}-file-log", label.to_ascii_lowercase()))
         .spawn(move || {
             run_worker(
                 event_rx,
@@ -136,13 +294,13 @@ fn spawn_with_capacity(
                 worker_accepting,
                 worker_generations,
                 worker_notify,
-                open,
+                Opener { label, open },
             )
         })
         .context("starting file-log worker")?;
 
-    Ok(RuntimeFileSink {
-        writer: RuntimeFileMakeWriter {
+    Ok(FileSink {
+        writer: FileMakeWriter {
             events: event_tx,
             accepting: Arc::clone(&accepting),
             generation: Arc::clone(&generation),
@@ -157,7 +315,7 @@ fn spawn_with_capacity(
             dropped_events,
             notify,
         },
-        guard: RuntimeFileGuard {
+        guard: FileSinkGuard {
             commands: command_tx,
             thread: Some(thread),
         },
@@ -165,7 +323,7 @@ fn spawn_with_capacity(
 }
 
 enum FileCommand {
-    Enable(FileLogConfig),
+    Enable(LogFileConfig),
     Disable,
     CheckGap(Arc<GenerationDrops>),
     Shutdown,
@@ -176,6 +334,13 @@ struct WorkerGenerations {
     drops: Arc<RwLock<Arc<GenerationDrops>>>,
 }
 
+/// How the worker opens a destination, and the application label its gap lines
+/// carry.
+struct Opener {
+    label: &'static str,
+    open: OpenFileFn,
+}
+
 fn run_worker(
     events: crossbeam_channel::Receiver<FileEvent>,
     commands: crossbeam_channel::Receiver<FileCommand>,
@@ -183,7 +348,7 @@ fn run_worker(
     accepting: Arc<AtomicBool>,
     generations: WorkerGenerations,
     notify: Arc<Mutex<Option<Notify>>>,
-    open: OpenFileFn,
+    opener: Opener,
 ) {
     let mut file: Option<ActiveFile> = None;
     loop {
@@ -201,7 +366,7 @@ fn run_worker(
                         );
                         continue;
                     }
-                    match open(&config) {
+                    match (opener.open)(&config) {
                         Ok(opened) => {
                             // The worker owns generation allocation as well as
                             // file replacement. Concurrent control clones cannot
@@ -211,6 +376,7 @@ fn run_worker(
                             let drops = Arc::new(GenerationDrops::new(generation));
                             *write_generation_drops(&generations.drops) = Arc::clone(&drops);
                             file = Some(ActiveFile {
+                                label: opener.label,
                                 generation,
                                 writer: opened,
                                 marker_baseline: 0,
@@ -313,6 +479,7 @@ fn run_worker(
 }
 
 struct ActiveFile {
+    label: &'static str,
     generation: u64,
     writer: FileWriter,
     drops: Arc<GenerationDrops>,
@@ -445,7 +612,7 @@ fn write_gap_marker(active: &mut ActiveFile, target: u64) -> io::Result<()> {
         return Ok(());
     }
 
-    let marker = gap_marker_line(delta);
+    let marker = gap_marker_line(active.label, delta);
     active.writer.write_all(marker.as_bytes())?;
     active.marker_baseline = target;
     Ok(())
@@ -457,11 +624,11 @@ fn close_active_file(file: &mut Option<ActiveFile>) {
     }
 }
 
-fn gap_marker_line(dropped: u64) -> String {
+fn gap_marker_line(label: &str, dropped: u64) -> String {
     if dropped == 1 {
-        "--- Talker file log gap: 1 earlier log entry was not saved. ---\n".to_owned()
+        format!("--- {label} file log gap: 1 earlier log entry was not saved. ---\n")
     } else {
-        format!("--- Talker file log gap: {dropped} earlier log entries were not saved. ---\n")
+        format!("--- {label} file log gap: {dropped} earlier log entries were not saved. ---\n")
     }
 }
 
@@ -510,7 +677,7 @@ fn publish_state(state: &Mutex<FileLogState>, notify: &Mutex<Option<Notify>>, ne
 }
 
 #[derive(Clone)]
-pub(super) struct RuntimeFileMakeWriter {
+pub struct FileMakeWriter {
     events: crossbeam_channel::Sender<FileEvent>,
     accepting: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
@@ -519,8 +686,8 @@ pub(super) struct RuntimeFileMakeWriter {
     commands: crossbeam_channel::Sender<FileCommand>,
 }
 
-impl<'a> MakeWriter<'a> for RuntimeFileMakeWriter {
-    type Writer = RuntimeEventWriter<'a>;
+impl<'a> MakeWriter<'a> for FileMakeWriter {
+    type Writer = FileEventWriter<'a>;
 
     fn make_writer(&'a self) -> Self::Writer {
         let accepting = self.accepting.load(Ordering::Acquire);
@@ -529,7 +696,7 @@ impl<'a> MakeWriter<'a> for RuntimeFileMakeWriter {
         } else {
             0
         };
-        RuntimeEventWriter {
+        FileEventWriter {
             events: &self.events,
             bytes: Vec::new(),
             accepted_at_start: accepting,
@@ -543,7 +710,7 @@ impl<'a> MakeWriter<'a> for RuntimeFileMakeWriter {
     }
 }
 
-pub(super) struct RuntimeEventWriter<'a> {
+pub struct FileEventWriter<'a> {
     events: &'a crossbeam_channel::Sender<FileEvent>,
     bytes: Vec<u8>,
     accepted_at_start: bool,
@@ -555,7 +722,7 @@ pub(super) struct RuntimeEventWriter<'a> {
     commands: &'a crossbeam_channel::Sender<FileCommand>,
 }
 
-impl Write for RuntimeEventWriter<'_> {
+impl Write for FileEventWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.accepted_at_start {
             self.bytes.extend_from_slice(buf);
@@ -568,7 +735,7 @@ impl Write for RuntimeEventWriter<'_> {
     }
 }
 
-impl Drop for RuntimeEventWriter<'_> {
+impl Drop for FileEventWriter<'_> {
     fn drop(&mut self) {
         if !self.accepted_at_start
             || !self.accepting.load(Ordering::Acquire)
@@ -653,12 +820,12 @@ fn record_full_queue_drop(
     }
 }
 
-pub(super) struct RuntimeFileGuard {
+pub struct FileSinkGuard {
     commands: crossbeam_channel::Sender<FileCommand>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl Drop for RuntimeFileGuard {
+impl Drop for FileSinkGuard {
     fn drop(&mut self) {
         let _ = self.commands.send(FileCommand::Shutdown);
         if let Some(thread) = self.thread.take() {
@@ -674,8 +841,99 @@ mod tests {
     use super::*;
     use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt as _, reload, Layer as _};
 
-    fn config() -> FileLogConfig {
-        FileLogConfig::new("unused-by-the-in-memory-writer")
+    /// The label the tests' gap lines carry.
+    const LABEL: &str = "Talker";
+
+    fn spawn_with(open: OpenFileFn) -> anyhow::Result<FileSink> {
+        super::spawn_with(LABEL, open)
+    }
+
+    fn spawn_with_capacity(open: OpenFileFn, cap: usize) -> anyhow::Result<FileSink> {
+        super::spawn_with_capacity(LABEL, open, cap)
+    }
+
+    fn gap_marker_line(dropped: u64) -> String {
+        super::gap_marker_line(LABEL, dropped)
+    }
+
+    fn config() -> LogFileConfig {
+        LogFileConfig::new("unused-by-the-in-memory-writer", "talker.log")
+    }
+
+    // ── old-file deletion ─────────────────────────────────────────────────────
+
+    /// A fresh, empty folder under the system temp directory.
+    fn temp_folder(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wiredata_log_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn file_last_written(path: &Path, when: SystemTime) {
+        std::fs::write(path, b"x").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    #[test]
+    fn only_this_prefix_older_than_the_limit_is_deleted() {
+        let dir = temp_folder("prune");
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(40 * 24 * 60 * 60);
+        let recent = now - Duration::from_secs(2 * 24 * 60 * 60);
+        file_last_written(&dir.join("listener.log.2026-08-01"), old);
+        file_last_written(&dir.join("listener.log.2026-09-28"), recent);
+        file_last_written(&dir.join("listener.logbook"), old); // not this prefix
+        file_last_written(&dir.join("other.log.2026-08-01"), old);
+
+        let deleted = prune_old_files(
+            &dir,
+            "listener.log",
+            Duration::from_secs(30 * 24 * 60 * 60),
+            now,
+        );
+
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            left,
+            [
+                "listener.log.2026-09-28",
+                "listener.logbook",
+                "other.log.2026-08-01"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opening_deletes_old_files_first_and_keeping_all_deletes_none() {
+        let dir = temp_folder("open_prune");
+        let old = SystemTime::now() - Duration::from_secs(40 * 24 * 60 * 60);
+        let stale = dir.join("app.log.2026-08-01");
+
+        file_last_written(&stale, old);
+        let keep_all = LogFileConfig::new(&dir, "app.log");
+        drop(open_rolling_file(&keep_all).unwrap());
+        assert!(stale.exists(), "max_age None keeps every file");
+
+        let thirty_days = LogFileConfig {
+            max_age: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+            ..keep_all
+        };
+        drop(open_rolling_file(&thirty_days).unwrap());
+        assert!(!stale.exists(), "opening deletes files past the limit");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn wait_for_state(
@@ -696,7 +954,7 @@ mod tests {
         }
     }
 
-    fn emit(writer: &RuntimeFileMakeWriter, bytes: &[u8]) {
+    fn emit(writer: &FileMakeWriter, bytes: &[u8]) {
         let mut event = writer.make_writer();
         event.write_all(bytes).unwrap();
     }
@@ -989,7 +1247,7 @@ mod tests {
         let drops = Arc::new(GenerationDrops::new(1));
         let generation_drops = Arc::new(RwLock::new(Arc::clone(&drops)));
         let (commands, _command_receiver) = crossbeam_channel::unbounded();
-        let writer = RuntimeFileMakeWriter {
+        let writer = FileMakeWriter {
             events,
             accepting: Arc::new(AtomicBool::new(true)),
             generation,
@@ -1028,7 +1286,7 @@ mod tests {
         let drops = Arc::new(GenerationDrops::new(1));
         let generation_drops = Arc::new(RwLock::new(Arc::clone(&drops)));
         let (commands, command_receiver) = crossbeam_channel::unbounded();
-        let writer = RuntimeFileMakeWriter {
+        let writer = FileMakeWriter {
             events,
             accepting: Arc::new(AtomicBool::new(true)),
             generation,
@@ -1057,7 +1315,7 @@ mod tests {
         let drops = Arc::new(GenerationDrops::new(1));
         let generation_drops = Arc::new(RwLock::new(Arc::clone(&drops)));
         let (commands, command_receiver) = crossbeam_channel::unbounded();
-        let writer = RuntimeFileMakeWriter {
+        let writer = FileMakeWriter {
             events,
             accepting: Arc::new(AtomicBool::new(true)),
             generation,
@@ -1087,7 +1345,7 @@ mod tests {
         let old_drops = Arc::new(GenerationDrops::new(1));
         let generation_drops = Arc::new(RwLock::new(Arc::clone(&old_drops)));
         let (commands, command_receiver) = crossbeam_channel::unbounded();
-        let writer = RuntimeFileMakeWriter {
+        let writer = FileMakeWriter {
             events,
             accepting: Arc::new(AtomicBool::new(true)),
             generation: Arc::clone(&generation),

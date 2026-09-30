@@ -1,6 +1,5 @@
 mod folder;
 mod gui_layer;
-mod runtime_file;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -12,7 +11,7 @@ use tracing_subscriber::{
 
 pub(crate) use folder::{LogFolderOpener, LogFolderState};
 pub use gui_layer::{GuiLogHealth, GuiLogLayer, LogEvent};
-pub use runtime_file::{FileLogState, FileLogToggle};
+pub use wiredata_log::{FileLogState, FileLogToggle};
 
 /// Run a test closure with GUI log capture on its current thread.
 ///
@@ -97,6 +96,23 @@ impl FileLogConfig {
     }
 }
 
+/// The profile's file-log settings as the shared worker takes them. Talker
+/// keeps every log file (ADR-061), so no age limit is set.
+impl From<FileLogConfig> for wiredata_log::LogFileConfig {
+    fn from(config: FileLogConfig) -> Self {
+        Self {
+            directory: config.directory,
+            prefix: config.prefix,
+            rotation: match config.rotation {
+                Rotation::Never => wiredata_log::Rotation::Never,
+                Rotation::Hourly => wiredata_log::Rotation::Hourly,
+                Rotation::Daily => wiredata_log::Rotation::Daily,
+            },
+            max_age: None,
+        }
+    }
+}
+
 /// Minimum log level emitted by the subscriber.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -154,7 +170,7 @@ impl LogLevelHandle {
 /// will stop file log flushing.
 pub struct LoggingHandle {
     _guards: Vec<tracing_appender::non_blocking::WorkerGuard>,
-    _runtime_file_guard: Option<runtime_file::RuntimeFileGuard>,
+    _runtime_file_guard: Option<wiredata_log::FileSinkGuard>,
     level: LogLevelHandle,
     file_log: Option<FileLogToggle>,
     gui_log_health: Option<GuiLogHealth>,
@@ -221,7 +237,7 @@ pub fn init(
 
     if !gui_mode {
         if let Some(fc) = &config.file {
-            let appender = make_rolling_appender(fc)?;
+            let appender = wiredata_log::open_rolling_file(&fc.clone().into())?;
             let (non_blocking, guard) = tracing_appender::non_blocking(appender);
             guards.push(guard);
             layers.push(
@@ -237,7 +253,7 @@ pub fn init(
     // installed. Its layer is permanent, while the worker owns the optional
     // file handle; no open, write, flush, or close runs on the UI/talker thread.
     if gui_mode {
-        let sink = runtime_file::spawn()?;
+        let sink = wiredata_log::spawn("Talker")?;
         if let Some(config) = config.file.clone() {
             sink.toggle.enable(config)?;
         }
@@ -295,26 +311,6 @@ fn to_level_filter(level: LogLevel) -> LevelFilter {
         LogLevel::Warn => LevelFilter::WARN,
         LogLevel::Error => LevelFilter::ERROR,
     }
-}
-
-fn make_rolling_appender(
-    config: &FileLogConfig,
-) -> anyhow::Result<tracing_appender::rolling::RollingFileAppender> {
-    let rotation = match config.rotation {
-        Rotation::Never => tracing_appender::rolling::Rotation::NEVER,
-        Rotation::Hourly => tracing_appender::rolling::Rotation::HOURLY,
-        Rotation::Daily => tracing_appender::rolling::Rotation::DAILY,
-    };
-    tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(rotation)
-        .filename_prefix(config.prefix.clone())
-        .build(&config.directory)
-        .with_context(|| {
-            format!(
-                "opening file log {:?} in {:?}",
-                config.prefix, config.directory
-            )
-        })
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

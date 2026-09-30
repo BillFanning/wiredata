@@ -1,9 +1,9 @@
 # AGENTS.md
 
 Working agreement and codebase guide for the **wiredata** workspace. Applies to all
-six crates (`talker`, `nmea0183`, `listener`, `wiredata-ui`, `wiredata-timing`,
-`wiredata-telemetry`) and to **any** contributor — human or coding agent (Claude Code,
-Codex, or otherwise). This is the tool-neutral source of truth; tool-specific files
+seven crates (`talker`, `nmea0183`, `listener`, `wiredata-ui`, `wiredata-timing`,
+`wiredata-telemetry`, `wiredata-log`) and to **any** contributor — human or coding
+agent (Claude Code, Codex, or otherwise). This is the tool-neutral source of truth; tool-specific files
 (e.g. `CLAUDE.md`) should import it rather than duplicate it.
 
 ---
@@ -35,9 +35,9 @@ Each crate owns a `docs/` folder:
   and small by design. Its decisions live in the app ADR series — talker ADR-016 and
   listener ADR-019 — and any chrome change that alters both apps' look should reference
   them.
-- `wiredata-timing` and `wiredata-telemetry` likewise have **no** `docs/` folders.
-  Their narrow cross-app scope is governed by the owning app ADRs (talker ADR-038/039
-  and listener ADR-030/032).
+- `wiredata-timing`, `wiredata-telemetry` and `wiredata-log` likewise have **no**
+  `docs/` folders. Their narrow cross-app scope is governed by the owning app ADRs
+  (talker ADR-038/039/061 and listener ADR-030/032/044).
 - Record any non-trivial design choice as a **new ADR entry** in the owning crate's
   `ADR.md` (talker and nmea0183 share one ADR number series; listener has its own).
 - Track concrete implementation reminders in the owning crate's `TODO.md`.
@@ -157,7 +157,7 @@ run `rustup update stable` if the build rejects your toolchain.
 
 ### Workspace layout
 
-Six crates in a Cargo workspace:
+Seven crates in a Cargo workspace:
 
 - **`nmea0183/`** — library crate; no dependency on `talker` or `listener`; intended for
   independent crates.io publication. Handles NMEA 0183 sentence construction, parsing,
@@ -199,6 +199,11 @@ Six crates in a Cargo workspace:
   primitives. It owns the fixed duration-histogram buckets and the ten-segment recent
   window used by both applications. Measurement boundaries, aggregate report types,
   timer policy, chunk-shape telemetry, retention, and presentation stay in their apps.
+- **`wiredata-log/`** — internal (`publish = false`) shared bounded log-file worker
+  (talker ADR-061). It owns the worker thread behind a bounded, non-blocking handoff,
+  loss counting and gap lines, visible open/write failure, daily rotation, and
+  deletion of log files past a caller-given age. What is logged, levels, formatting,
+  the folder and prefix, and presentation stay in their apps.
 
 ```
 talker/src/
@@ -247,6 +252,8 @@ I/O shape (see talker ADR-002 vs listener ADR-001):
 - `wiredata-telemetry` owns only the dependency-free duration histogram and bounded
   recent-window engine. Application measurement boundaries, aggregate telemetry
   types, and runtime/configuration policy remain in `talker` and `listener`.
+- `wiredata-log` owns only the log-file mechanism. It must never depend on `talker`,
+  `listener` or GUI crates, and it deletes only log files, never recordings.
 - UI threads never perform I/O and never block.
 - `cli/` and `gui/` are thin layers; business logic lives in `core/` (or the equivalent
   internal modules).

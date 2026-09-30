@@ -21,8 +21,6 @@ The spec states these; the code does not do them yet.
   There is no retry of a failed open, no loud-warning banner or reminder, no
   `--require-all`, and no defined exit codes. Only Ctrl+C is handled, since
   `ctrlc` is built without SIGTERM support.
-- [ ] **`wiredata-log` (ADR-061).** The file worker still lives in
-  `core::logging::runtime_file`.
 - [ ] **Strict profiles (ADR-062, §8.2).** Unknown keys are ignored, and
   `extract_version` treats a missing version as current.
 

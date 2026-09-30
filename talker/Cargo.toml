@@ -25,6 +25,7 @@ nmea0183 = { path = "../nmea0183" }
 wiredata-ui = { path = "../wiredata-ui" }   # shared GUI chrome (ADR-016)
 wiredata-timing = { path = "../wiredata-timing" }
 wiredata-telemetry = { path = "../wiredata-telemetry" }
+wiredata-log = { path = "../wiredata-log" }         # bounded log-file worker (ADR-061)
 
 # Serial
 serialport = { workspace = true }
