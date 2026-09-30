@@ -269,6 +269,8 @@ struct SlotFaults {
     command_target_mismatch: InternalFaultTally,
     /// A completed run's summary named a different channel than its slot.
     summary_misrouted: InternalFaultTally,
+    /// A runner thread ended by panicking.
+    runner_panicked: InternalFaultTally,
 }
 
 struct Slot {
@@ -732,6 +734,7 @@ impl TalkerSupervisor {
         let mut samples = Vec::new();
         let mut command_completions = Vec::new();
         for (i, slot) in self.slots.iter_mut().enumerate() {
+            let mut exited = false;
             if let Some(h) = &slot.handle {
                 // Sample occupancy *before* draining so the peak reflects the
                 // backlog as it stood, then drain. Finished check comes
@@ -766,7 +769,16 @@ impl TalkerSupervisor {
                         "the channel stopped before carrying this out",
                     );
                     slot.pending_start = None;
-                    slot.handle = None; // runner exited on its own (open failed / disconnect)
+                    exited = true;
+                }
+            }
+            // The runner exited on its own (open failed, disconnect, or a panic).
+            // Joining a finished thread does not block, and it is the only way
+            // to learn whether it panicked.
+            if exited {
+                let label = slot.display_label();
+                if let Some(h) = slot.handle.take() {
+                    reap_finished_runner(h.thread, &mut slot.faults.runner_panicked, &label);
                 }
             }
             // Draining runners: keep collecting their tail (the final
@@ -775,18 +787,22 @@ impl TalkerSupervisor {
             // everything the runner ever sent, so nothing is lost when the
             // entry is dropped.
             let slot_id = slot.id;
+            let label = slot.display_label();
             let last_run_summary = &mut slot.last_run_summary;
             let telemetry = &mut slot.telemetry;
             let misrouted = &mut slot.faults.summary_misrouted;
-            slot.draining.retain_mut(|d| {
+            let reaped = slot.draining.extract_if(.., |d| {
                 let finished = d.thread.is_finished();
                 // Results from a stopped predecessor no longer describe a live
                 // interface. Retain only its self-contained completion summary;
                 // drain the other results to keep the reliable lane unblocked.
                 drain_finished_summaries(&d.control_rx, slot_id, last_run_summary, misrouted);
                 drain_statuses(i, &d.status_rx, telemetry, &mut samples);
-                !finished
+                finished
             });
+            for d in reaped {
+                reap_finished_runner(d.thread, &mut slot.faults.runner_panicked, &label);
+            }
             slot.retired_control.retain_mut(|control_rx| {
                 !drain_finished_summaries(control_rx, slot_id, last_run_summary, misrouted)
             });
@@ -805,6 +821,30 @@ impl TalkerSupervisor {
         self.command_completions.extend(command_completions);
         samples
     }
+}
+
+/// Join a runner thread that has already finished, and report it if it ended
+/// by panicking. A panic is a bug in talker, not a fault of the channel's link,
+/// so it is an internal fault (ADR-054), logged at ERROR because the channel
+/// has stopped sending. Returns the line logged, if any.
+fn reap_finished_runner(
+    thread: std::thread::JoinHandle<()>,
+    tally: &mut InternalFaultTally,
+    label: &str,
+) -> Option<String> {
+    let payload = thread.join().err()?;
+    let why = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_string());
+    let line = tally.report(
+        label,
+        format_args!("the channel's sending thread stopped unexpectedly ({why})"),
+        "This channel is no longer sending; start it again to resume",
+    )?;
+    tracing::error!("{line}");
+    Some(line)
 }
 
 struct ControlDrainState<'a> {
@@ -1238,6 +1278,45 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A runner that panics is a bug in talker, not a fault of the link. Reaping
+    /// it must count it as an internal fault rather than read like a normal exit.
+    #[test]
+    fn a_runner_that_panics_is_reported_as_an_internal_fault() {
+        struct PanickingInterface;
+        impl Interface for PanickingInterface {
+            fn send(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+                panic!("send panicked on purpose");
+            }
+        }
+
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::every_send());
+        sup.push_slot();
+        start_with_interface(
+            &mut sup,
+            0,
+            Box::new(PanickingInterface),
+            schedule(&[msg("AB", 5)]),
+        );
+        let mut samples = Vec::new();
+        poll_until(&mut sup, &mut samples, |s| !s.is_running(0));
+
+        assert_ne!(
+            sup.slots[0].faults.runner_panicked,
+            InternalFaultTally::default()
+        );
+    }
+
+    #[test]
+    fn a_runner_that_exits_normally_is_not_an_internal_fault() {
+        let mut tally = InternalFaultTally::default();
+        let thread = std::thread::spawn(|| {});
+        while !thread.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(reap_finished_runner(thread, &mut tally, "1"), None);
+        assert_eq!(tally, InternalFaultTally::default());
     }
 
     #[test]
