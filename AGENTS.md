@@ -210,7 +210,7 @@ talker/src/
     ├── channel/     # serial, UDP unicast/broadcast/multicast, TCP interfaces
     ├── message/     # payload formats, encoding, code pages, byte markers, timestamps, checksums
     ├── scheduler/   # priority-queue schedule: per-message send intervals
-    ├── profile/     # TOML load/save, schema v2 (clean break — no migration)
+    ├── profile/     # TOML load/save, schema v3 (clean break — no migration)
     └── logging/     # tracing-subscriber setup; GUI status pane layer
 ```
 
@@ -267,10 +267,12 @@ I/O shape (see talker ADR-002 vs listener ADR-001):
 - Format: TOML via `serde` + `toml = "1"` (OQ-2 resolved — the 1.x API is sufficient).
 - Every profile struct field gets `#[serde(default)]`, so additive schema changes need
   no migration code.
-- Header field `version: u32` — current schema is **2** (`CURRENT_VERSION` in
-  `core::profile`). `Profile::load` refuses any profile whose version differs: a newer
-  version is unsupported, and v1 is rejected with a "recreate the profile" error. This
-  is a deliberate clean break — there is no `migration` module (ADR-013 update).
+- Header field `version: u32` — current schema is **3** (`CURRENT_VERSION` in
+  `core::profile`; ADR-057). `Profile::load` refuses any profile whose version differs:
+  a newer version is unsupported, and an older one is rejected with a "recreate the
+  profile" error. This is a deliberate clean break — there is no `migration` module
+  (ADR-013 update). ADR-062 decides that unknown keys and a missing `version` are also
+  refused; until that lands, unknown keys are still ignored.
 - An NMEA payload is stored as plain strings (`PayloadConfig::Nmea { talker,
   sentence_type, fields }`), not `nmea0183` types; the `nmea0183` dependency does not
   enable the `serde` feature (OQ-3 resolved).
@@ -281,8 +283,8 @@ I/O shape (see talker ADR-002 vs listener ADR-001):
 ### NMEA 0183 (`nmea0183` crate)
 
 - NMEA XOR checksum is implemented inline (trivial byte fold) — no `crc` crate dependency.
-- `talker` uses the `crc` crate for general checksums (CRC-8, CRC-16/CCITT,
-  CRC-16/MODBUS, CRC-32, XOR).
+- `talker` uses the `crc` crate for general checksums (CRC-8, CRC-16/KERMIT,
+  CRC-16/MODBUS, CRC-32, XOR). MODBUS is appended low byte first (ADR-057).
 - `TalkerId` and sentence type enums have a `Custom(String)` variant for non-standard IDs.
 - `ProprietarySentence` has named variants (`Prdid`, `Pashr`) and a `Raw` variant.
   `$PRDID` does **not** include a checksum by convention. `$PASHR` field 10 (GNSS

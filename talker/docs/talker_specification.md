@@ -1,26 +1,29 @@
 # Talker — Program Specification
-**Version:** 2.4.15
+**Version:** 2.5.0
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-08-12) — both GUI log destinations now disclose when they
-cannot keep up:
+Revision note (2026-09-30) — unattended operation and protocol-correct
+checksums:
 
-- **§4.4 / §9.2 pane completeness** — a persistent,
-  session-cumulative notice reports entries that did not reach the Log pane.
-  Those entries are absent from its retained history and its per-channel
-  INFO/WARN/ERROR tallies, while saved files remain an independent destination.
-- **§9.2 retained history and saved gaps** — all five levels share one
-  newest-2,000-entry history before pane visibility is applied. File loss
-  remains non-blocking and session-counted; after entries accepted ahead of a
-  loss drain, or when the enabled destination closes, the worker attempts a
-  plain gap line for the omitted batch. The visible queue-loss count remains
-  available if the destination can no longer be written.
-- **§9.2 file access and limits** — GUI logging uses a fixed local-data
-  directory when the platform provides one, rotates daily, deletes no old
-  files, and adds a
-  non-blocking **Open folder** action that neither enables logging nor shares
-  the file worker. Folder failures remain visible in the Log pane.
+- **§3.1 unattended CLI (ADR-060)** — the CLI starts the channels that open,
+  retries the others, warns loudly while any is down, stops gracefully on every
+  OS stop signal, and exits with defined codes. `--require-all` keeps
+  all-or-nothing.
+- **§4.5 TCP client (ADR-059)** — reconnects at retry points and never resends
+  the failed message; replies from the peer are drained and counted.
+- **§3.2 / §4.4 possibly partial (ADR-059)** — a write that fails after
+  transferring bytes is its own send outcome, for serial and TCP.
+- **§7 checksums (ADR-057)** — "CRC-16/CCITT" is named for what it computes,
+  CRC-16/KERMIT, stored as `crc16_kermit`. MODBUS is appended low byte first.
+- **§8.2 profiles (ADR-057, ADR-062)** — schema 3; unknown keys and a missing
+  `version` are refused. The illustrative example gives way to the real
+  `profiles/profile.example.toml`.
+- **Drift corrected** — §8.1 and §8.2 no longer describe the Standard/Precise
+  timing mode that ADR-047 removed. §12.1 drops TCP reconnect, now decided.
+
+These requirements lead the implementation. Until each lands,
+[TODO.md](TODO.md) lists what is not yet built.
 
 Earlier revisions are in [REVISIONS.md](REVISIONS.md). They live there rather
 than here for two reasons: a document's version number belongs only in its own
@@ -75,7 +78,7 @@ wiredata/                        # workspace root
 │   │       ├── channel/         # serial, UDP, TCP abstractions; channel collection
 │   │       ├── message/         # message formats, encoding, timestamp, checksum
 │   │       ├── scheduler/       # priority-queue send loop
-│   │       ├── profile/         # profile management; schema v2 clean break
+│   │       ├── profile/         # profile management; schema v3 clean break
 │   │       └── logging/         # logging subsystem
 │   └── tests/                   # integration tests (Rust convention)
 │
@@ -204,6 +207,36 @@ talker --profile full_bridge_sim
 
 This loads the profile, spawns a talker thread for each channel defined in it, and runs until interrupted. *(Planned)* Single-channel ad-hoc invocation without a profile — a fast path for simple cases — is not yet implemented; today the CLI requires `--profile` / `--profile-path`.
 
+#### Unattended Operation (ADR-060)
+
+The CLI must survive running headless, under systemd or Task Scheduler, where
+nobody watches the terminal:
+
+- **Start what can start.** A channel whose interface fails to open is retried
+  with backoff, 1 s doubling to 30 s, while the others send. `--require-all`
+  instead stops everything and exits when any channel fails to open.
+- **Warn loudly.** A WARNING banner on stderr, not hidden by `--quiet`, names each
+  channel that did not open and why, using the word rather than colour. A reminder
+  repeats every 5 minutes while any channel is down, giving how long it has been
+  down and the latest reason. A line reports each recovery.
+- **Final summary.** At exit the CLI prints each channel's outcome, its final send
+  counters (§4.4), and the number of `--echo` lines dropped (§5.8).
+- **Stop signals.** Ctrl-C, SIGTERM on Linux, and console close, logoff and
+  shutdown on Windows all stop every channel gracefully, bounded by a shutdown
+  time limit.
+- **Exit codes:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | Healthy, or every outage recovered (the summary lists them) |
+  | 1 | Internal error |
+  | 2 | Invalid profile, nothing could start, or `--require-all` failed |
+  | 3 | Degraded: a channel never started, its retries ran out, or it was down at shutdown |
+  | 4 | Shutdown did not finish within its time limit |
+
+The CLI does not install itself as a service; `deploy/` at the workspace root
+holds example definitions.
+
 #### Profile Compatibility
 
 Channel and message configuration is fully compatible between CLI and GUI. A
@@ -249,7 +282,8 @@ The **detail pane** (right) shows the selected channel:
 - **Header** — status glyph + editable name (duplicates allowed but hinted);
   a `status · interface summary` row; then the readouts, grouped by subsystem:
   - *Send outcomes:* `Send outcomes: <scheduled> scheduled - <f> failed -
-    <s> suppressed - <m> missed = <sent> sent`, shown **always** and directly
+    <p> possibly partial - <s> suppressed - <m> missed = <sent> sent`, shown
+    **always** and directly
     beneath the `status · interface` row — amber when any deduction is nonzero,
     red when any write failed. The line is stated as visible arithmetic over the
     schedule's own cadence points, so the successful remainder is defined by the
@@ -266,7 +300,8 @@ The **detail pane** (right) shows the selected channel:
   - **Sent** throughout the GUI means the configured-interface write returned
     success. It never asserts that bytes reached the wire or that a peer received
     them; the tooltips carry that boundary. The aggregate `unsent`
-    (`failed + suppressed + missed`) remains in the completed-run summary and in
+    (`failed + possibly partial + suppressed + missed`) remains in the
+    completed-run summary and in
     `RunSummary::unsent_sends`, where a single shortfall number is still useful.
   - *Capacity:* aggregate `msg/s` and wire `B/s` **for the configuration that is
     actually sending** — each message's wire size and interval as reported by the
@@ -375,9 +410,9 @@ The **detail pane** (right) shows the selected channel:
     names `last ~10 s` and adds update age after one second; stale timing reads
     `recent timing unavailable`; and a clean run end retains `final ~10 s before
     stop`. Capacity, Cadence, and this line use the same classification. The timer
-    readout names the configured timing mode, active policy, shortest active
-    interval, cadence alignment, wall-clock re-alignment count, and any Windows
-    1 ms request failure (ADR-032 through ADR-042).
+    readout names the active wait policy, shortest active interval, cadence
+    alignment, wall-clock re-alignment count, and any Windows 1 ms request failure
+    (ADR-032 through ADR-042, ADR-047).
   - *Sample counts are stated once with their context.* The Cadence line puts its
     count in the tooltip beside the current, final, or run-wide period it
     qualifies. A readout that already names a count — the per-message table's
@@ -458,7 +493,7 @@ Each channel has exactly one interface port. The supported interface types are:
 | UDP Unicast | Host and port configurable |
 | UDP Broadcast | Broadcast address and port configurable |
 | UDP Multicast | Group address, port, outgoing interface, and TTL configurable |
-| TCP Client | Connect to a remote host/port |
+| TCP Client | Connect to a remote host/port; reconnects after a failure (see 4.5) |
 
 The channel abstraction in `core::channel` is designed for easy addition of future interface types (e.g., WebSocket, raw socket) without changes to the interface layers or scheduler.
 
@@ -494,7 +529,9 @@ action, while CLI mode must start a new run. Recovery does not search for a
 renamed port: if the replacement appears under a different name, the configured
 port must be changed. A failed write may have transferred a prefix before the
 operating system reported the error, so serial recovery cannot promise
-exactly-once delivery. Disconnecting only the far-end RS-232 cable or device may
+exactly-once delivery. When the write reported part of the message transferred
+before failing, the send counts as **possibly partial** (§4.4) rather than
+failed; the message is never resent. Disconnecting only the far-end RS-232 cable or device may
 produce no operating-system write error at all; automatic recovery starts only
 when the owned port handle reports a failure.
 
@@ -520,8 +557,12 @@ channel, as in listener.
 
 Each channel maintains and displays:
 
-- **Send outcomes** — cumulative scheduled, failed, suppressed, missed, and sent
-  totals for the current run; they remain visible after recovery and after Stop
+- **Send outcomes** — cumulative scheduled, failed, possibly partial, suppressed,
+  missed, and sent totals for the current run; they remain visible after recovery
+  and after Stop. **Possibly partial** is a write that failed after transferring
+  part of the message: the receiver may hold a fragment. Wire bytes are counted
+  separately from whole messages
+- **Peer replies** — for a TCP client, "peer sent N bytes" (§4.5)
 - **Log counts** — channel-attributed INFO, WARN, and ERROR entries delivered
   to the global Log pane since Start; DEBUG and TRACE remain available there
   when Detail admits them, but do not inflate INFO. While **log entries not
@@ -536,6 +577,20 @@ Each channel maintains and displays:
 Event history lives in the global Log pane. There is no separate clickable
 per-channel error log. A recovered channel can therefore have no current fault
 while its current-run Send outcomes and log counts still show earlier failures.
+
+### 4.5 TCP Client (ADR-059)
+
+- **Reconnect.** After a failed write, at each retry point the backoff allows
+  (§9.2), the client closes the failed stream and connects again with a 5 s
+  timeout. The failed message is never resent; the next due message goes out on
+  the new connection. The recovery line names the address.
+- **Replies are drained.** Talker is a sender, but a device may answer. Before
+  each write the client reads whatever the peer has sent, without blocking,
+  discards it and counts it: "peer sent N bytes". Leaving it unread would fill the
+  receive buffer, and closing a socket with unread data makes most stacks reset
+  the connection, which can discard the peer's own in-flight data.
+- There is no acknowledgement protocol and no server mode. Viewing replies is
+  listener's job.
 
 ---
 
@@ -853,7 +908,7 @@ At minimum the following are supported:
 |-----------|-------------|
 | XOR (1-byte) | NMEA-style, simple device protocols |
 | CRC-8 | Sensor buses, simple embedded protocols |
-| CRC-16/CCITT | Serial protocols |
+| CRC-16/KERMIT | Serial protocols; some devices call it "CCITT" |
 | CRC-16/MODBUS | MODBUS RTU |
 | CRC-32 | File integrity, Ethernet |
 
@@ -861,7 +916,9 @@ Additional algorithms may be added as specific device requirements are identifie
 
 ### 7.2 Behavior
 
-The checksum is computed over the complete wire output for the message — including the prepended timestamp if present. The result is appended after the payload. The option to intentionally send an incorrect checksum (for negative testing) is supported.
+The checksum is computed over the complete wire output for the message — including the prepended timestamp if present. The result is appended after the payload, high byte first, except CRC-16/MODBUS, which MODBUS RTU carries low byte first (ADR-057). The option to intentionally send an incorrect checksum (for negative testing) is supported; it alters the last appended byte.
+
+"CCITT" names several different CRC-16 variants. The one talker computes is CRC-16/KERMIT (reflected, initial value 0, check value 0x2189 for `123456789`), stored in profiles as `crc16_kermit`. Other variants, such as CCITT-FALSE and XMODEM, and a byte-order setting are not provided until a device needs one.
 
 Checksum configuration is saved as part of a profile.
 
@@ -914,21 +971,19 @@ at least 250 ms rephases every active message to its next future UTC boundary an
 increments a visible re-alignment counter. It never emits catch-up sends or counts
 the elapsed wall-clock grid as scheduler misses.
 
-**Deadline waiting and channel Timing mode (ADR-017 / ADR-034):**
+**Deadline waiting (ADR-017 / ADR-034 / ADR-047):**
 
 - Every active runner blocks on an interruptible monotonic deadline wait. It does
   not busy-spin, and queued commands can interrupt the wait.
-- **Standard** preserves the automatic policy: on Windows, a shortest active
-  interval below 32 ms holds the process's refcounted 1 ms timer-resolution request
-  continuously. Slower schedules use the platform's normal deadline wait.
-- **Precise** uses the same continuous policy when the shortest active interval is
-  below 32 ms. At exactly 32 ms and for every slower active schedule, the runner
-  first waits normally until 32 ms before the next send deadline, acquires the 1 ms
-  request for the final wait, and releases it before payload rendering and
-  `Interface::send`. Closely spaced deadlines may make these windows touch; making
-  every message dormant releases any request before the runner's indefinite command
-  wait.
-- On macOS and Linux, Precise keeps one native deadline wait. It adds no staging
+- The wait policy follows the schedule; there is no user setting (ADR-047). On
+  Windows, a shortest active interval below 32 ms holds the process's refcounted
+  1 ms timer-resolution request continuously. At 32 ms and for every slower active
+  schedule, the runner first waits normally until 32 ms before the next send
+  deadline, acquires the 1 ms request for the final wait, and releases it before
+  payload rendering and `Interface::send`. Closely spaced deadlines may make these
+  windows touch; making every message dormant releases any request before the
+  runner's indefinite command wait.
+- On macOS and Linux the runner keeps one native deadline wait. It adds no staging
   wake and makes no Windows-style resolution request.
 
 The runner's `TimerReconciler` owns the current timer intent, resolution guard,
@@ -936,7 +991,7 @@ derived status, edge notification, and observer-drop accounting. It reconciles
 schedule transitions, stages and releases bounded windows, and drops the guard
 before windowed rendering/sending and before final blocking status delivery.
 
-Timing mode controls deadline-wake policy, not timestamp formatting or cadence phase.
+The wait policy controls deadline wakes, not timestamp formatting or cadence phase.
 Cadence alignment independently chooses Immediate or UTC-phase startup/rebase
 deadlines. Neither choice changes `SystemTime` accuracy, compensates for render or
 interface time, or establishes when serial/network bytes physically leave the host.
@@ -1020,7 +1075,6 @@ A profile is a named, saved configuration. A profile defines one or more channel
 Each channel entry within a profile includes:
 
 - Interface type and all parameters
-- Timing mode (`standard` by default, or `precise`)
 - Cadence alignment (`immediate` by default, or `utc_phase`)
 - One or more message definitions, each containing:
   - Format and encoding (including code page for ASCII)
@@ -1036,61 +1090,24 @@ Profiles can be:
 - Specified by name at launch in the CLI (`--profile <name>`)
 - Stored in TOML so they can be inspected, edited, and version-controlled outside the program
 
-**Example profile sketch** (illustrative, not final schema):
-```toml
-version = 2
-name = "GPS sim"
-
-[[channels]]
-name = "GPS feed"   # optional display name; omitted when unnamed
-timing_mode = "precise" # optional; omitted when Standard
-cadence_alignment = "utc_phase" # optional; omitted when Immediate
-type = "serial"
-port = "COM3"
-baud = 9600
-
-  [[channels.messages]]
-  format = "nmea0183"
-  talker = "GP"
-  sentence = "GGA"
-  fields = ["143045.00", "4807.038", "N", "01131.000", "E"]
-  live_time = true
-  live_time_millis = true
-  interval_ms = 1000
-
-  [channels.messages.timestamp]
-  enabled = true
-  include_date = false
-  include_ms = true
-  include_timezone = false
-
-  [channels.messages.checksum]
-  enabled = false
-
-  [[channels.messages]]
-  format = "hex"
-  data = "DEAD BEEF"
-  interval_ms = 500
-
-  [channels.messages.timestamp]
-  enabled = false
-
-  [channels.messages.checksum]
-  enabled = true
-  algorithm = "crc16_ccitt"
-```
+**Example profile:** [`talker/profiles/profile.example.toml`](../profiles/profile.example.toml)
+is a complete, working profile: a named UDP broadcast channel with UTC-phase
+cadence, an NMEA message with a live time field, and a hex message with a
+timestamp and a checksum. A test loads it and checks that every key in it is one
+the profile types read back, so it cannot drift from the schema.
 
 #### Profile Schema Versioning
 
-Every profile file includes a `version` integer field in its header. The current schema version is `2`. This field enables `talker` to detect and handle schema changes as the program evolves.
+Every profile file includes a `version` integer field in its header. The current schema version is `3` (ADR-057). This field enables `talker` to detect and handle schema changes as the program evolves.
 
 **Loading behavior by version:**
 
 - **Matches current version:** load normally.
-- **Older version:** refuse to load and instruct the user to recreate the profile. Version 1 predates release, so the v2 schema deliberately takes a clean break rather than carrying migration code.
+- **Older version:** refuse to load and instruct the user to recreate the profile. Nothing was deployed before schema 3, so each schema so far has taken a clean break rather than carrying migration code.
 - **Newer version than the running binary understands:** warn the user and refuse to load.
+- **No `version`:** refuse to load, with "add `version = 3`" (ADR-062).
 
-All profile fields use `#[serde(default)]` so that additive changes within schema version 2 can load cleanly when fields are missing. The version number only increments when a breaking schema change occurs that `serde(default)` cannot handle alone; a future breaking version can add migration code at that point.
+A missing field takes its default (`#[serde(default)]`), so additive changes within a schema version load older files cleanly. An **unknown key is refused** (ADR-062), with a message naming the key and where it is: a misspelled key would otherwise silently become a default. The version number only increments when a breaking schema change occurs that defaults cannot absorb; a future breaking version can add migration code at that point.
 
 ---
 
@@ -1289,11 +1306,8 @@ Coverage requirements:
 ### 12.1 Open Items
 
 - Additional interface types beyond TCP/UDP/serial (WebSocket, raw socket, etc.)
-- Automatic TCP client reconnect after an established stream fails. Current
-  bounded retries retain that stream rather than creating a new connection; a
-  future decision must preserve failed-write versus withheld-send accounting and
-  must not assume that an errored write transferred no bytes.
-- Additional CRC/checksum algorithms beyond the initial set
+- Additional CRC/checksum algorithms beyond the initial set, and a per-message
+  byte-order setting (§7.2)
 - Additional named proprietary NMEA sentences beyond `$PRDID` and `$PASHR`
 - Installer/packaging requirements for broader distribution
 - Binary field construction (typed fields: u8, u16, u24, u32, u64, i8, i16, i32, i64, f32, f64 with per-field byte order) — deferred; hex format covers the immediate need

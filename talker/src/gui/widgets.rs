@@ -2159,7 +2159,7 @@ pub(super) fn checksum_label(algorithm: ChecksumAlgorithm) -> &'static str {
     match algorithm {
         ChecksumAlgorithm::Xor => "XOR",
         ChecksumAlgorithm::Crc8 => "CRC-8",
-        ChecksumAlgorithm::Crc16Ccitt => "CRC-16/CCITT",
+        ChecksumAlgorithm::Crc16Kermit => "CRC-16/KERMIT",
         ChecksumAlgorithm::Crc16Modbus => "CRC-16/MODBUS",
         ChecksumAlgorithm::Crc32 => "CRC-32",
     }

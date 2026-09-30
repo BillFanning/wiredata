@@ -9,6 +9,23 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 ---
 
+## Spec 2.5.0 requirements not yet built (2026-09-30)
+
+The spec states these; the code does not do them yet.
+
+- [ ] **TCP client (ADR-059, §4.5).** `TcpClientInterface` has no retry
+  preparation, so it never reconnects, and it never reads the socket.
+- [ ] **Possibly partial (ADR-059, §4.4).** Not a send outcome yet, and wire bytes
+  are not counted apart from whole messages.
+- [ ] **Unattended CLI (ADR-060, §3.1).** `run` still opens every channel or none.
+  There is no retry of a failed open, no loud-warning banner or reminder, no
+  `--require-all`, and no defined exit codes. Only Ctrl+C is handled, since
+  `ctrlc` is built without SIGTERM support.
+- [ ] **`wiredata-log` (ADR-061).** The file worker still lives in
+  `core::logging::runtime_file`.
+- [ ] **Strict profiles (ADR-062, §8.2).** Unknown keys are ignored, and
+  `extract_version` treats a missing version as current.
+
 ## Profiles
 
 - [ ] **Make the profile directory user-configurable.** Default stays the OS config

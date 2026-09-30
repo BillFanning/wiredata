@@ -8,11 +8,11 @@ use crate::core::logging::LoggingConfig;
 
 /// Current profile schema version.
 ///
-/// Schema v2 is the baseline established by the program specification v2.0.
-/// The v1 schema predates it and is not supported; a v1 profile is rejected
-/// at load time. When a breaking v3 change is introduced, add a migration
-/// step and reinstate version-downgrade handling in [`Profile::load`].
-pub const CURRENT_VERSION: u32 = 2;
+/// Schema 3 renamed the stored CRC-16/KERMIT algorithm (ADR-057). Like the
+/// move to 2, it is a clean break: nothing was deployed, so older profiles are
+/// refused at load time with a "recreate the profile" message, not migrated
+/// (ADR-013).
+pub const CURRENT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -64,8 +64,7 @@ impl Profile {
     /// Load a profile from a TOML file.
     ///
     /// A profile whose version is newer than [`CURRENT_VERSION`] is rejected,
-    /// and so is an older (v1) profile — the v1 schema predates the current
-    /// schema and is not migrated automatically.
+    /// and so is an older one — earlier schemas are not migrated.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("reading profile {:?}", path))?;
@@ -408,6 +407,17 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Schema 3 renamed a stored checksum name (ADR-057), so a version-2 file is
+    /// refused rather than read with a name that no longer exists.
+    #[test]
+    fn load_rejects_v2_profile() {
+        let path = temp_path("v2");
+        std::fs::write(&path, "version = 2\n").unwrap();
+        let err = Profile::load(&path).unwrap_err();
+        assert!(err.to_string().contains("recreate the profile"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn load_missing_version_defaults_to_current() {
         let path = temp_path("noversion");
@@ -444,6 +454,27 @@ mod tests {
         let profile = Profile::load(path).expect("profile.example.toml should load");
         assert_eq!(profile.version, CURRENT_VERSION);
         assert!(!profile.channels.is_empty());
+
+        // The spec points readers here, so a misspelled key must not pass for a
+        // default: everything the file says has to survive a round trip through
+        // the profile types.
+        fn contained(written: &toml::Value, read_back: &toml::Value) -> bool {
+            match (written, read_back) {
+                (toml::Value::Table(w), toml::Value::Table(r)) => w
+                    .iter()
+                    .all(|(key, value)| r.get(key).is_some_and(|back| contained(value, back))),
+                (toml::Value::Array(w), toml::Value::Array(r)) => {
+                    w.len() == r.len() && w.iter().zip(r).all(|(a, b)| contained(a, b))
+                }
+                _ => written == read_back,
+            }
+        }
+        let written: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let read_back = toml::Value::try_from(&profile).unwrap();
+        assert!(
+            contained(&written, &read_back),
+            "profile.example.toml holds a key or value the profile types drop"
+        );
     }
 
     // ── default_dir ───────────────────────────────────────────────────────────

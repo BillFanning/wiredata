@@ -23,9 +23,9 @@ is. Percentiles are histogram-bucket upper bounds.";
 
 pub(in crate::gui) const TIMER_TOOLTIP: &str =
     "The shortest active interval selects the deadline-wait policy. On \
-Windows, intervals below 32 ms hold the shared process-wide 1 ms timer-resolution request in \
-either mode. At 32 ms or longer, Standard uses ordinary deadline waits; Precise requests 1 ms \
-only for the final 32 ms before a waited deadline. An Immediate schedule's first send has \
+Windows, intervals below 32 ms hold the shared process-wide 1 ms timer-resolution request \
+continuously. At 32 ms or longer, the runner requests 1 ms only for the final 32 ms before a \
+waited deadline. An Immediate schedule's first send has \
 no preceding precision window. This channel releases a bounded-window request before rendering \
 and writing, although another channel may keep the process-wide request active. Commands interrupt \
 both wait stages. Other platforms use native deadline waits. This affects wake timing, not \

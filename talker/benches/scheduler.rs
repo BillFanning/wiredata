@@ -72,7 +72,7 @@ fn bench_poll_due_send(c: &mut Criterion) {
 
 /// The dynamic-render counterpart of `due-and-render`: the same 64-byte payload
 /// with a full timestamp (date+millis+timezone, three chrono format calls into
-/// a temporary `String`) prepended and a CRC-16/CCITT appended per send. The
+/// a temporary `String`) prepended and a CRC-16/KERMIT appended per send. The
 /// static case's `render_into` KILL verdict covered only the plain payload
 /// clone; this is the case that says whether that verdict generalizes to the
 /// per-send rendering path (the "observer-path allocations" TODO).
@@ -88,7 +88,7 @@ fn bench_poll_due_send_rendered(c: &mut Criterion) {
     ts.include_timezone = true;
     message.timestamp = Some(ts);
     let mut cs = ChecksumConfig::default();
-    cs.algorithm = ChecksumAlgorithm::Crc16Ccitt;
+    cs.algorithm = ChecksumAlgorithm::Crc16Kermit;
     message.checksum = Some(cs);
     let mut schedule = Schedule::compile(&[message], start).unwrap();
     let mut now = start;

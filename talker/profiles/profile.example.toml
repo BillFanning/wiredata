@@ -1,5 +1,7 @@
-# Sample talker profile (schema v2).
-# One channel: a UDP broadcast interface sending a GPS GGA sentence at 1 Hz.
+# Sample talker profile (schema v3).
+# One channel: a UDP broadcast interface sending a GPS GGA sentence at 1 Hz with
+# a live UTC time field, and a hex payload every 500 ms with a timestamp in front
+# and a CRC-16/KERMIT behind.
 #
 # Copy this file to `profile.toml` and edit it for local testing;
 # `profile.toml` is gitignored, so your edits won't be committed.
@@ -7,9 +9,11 @@
 # The profile's display name is the file root — rename this file
 # (e.g. `udp-broadcast-gga.toml`) to change how it appears in the GUI.
 
-version = 2
+version = 3
 
 [[channels]]
+name = "GPS feed"                # optional; omitted when unnamed
+cadence_alignment = "utc_phase"  # optional; omitted when "immediate"
 
 [channels.interface]
 type = "udp"
@@ -26,6 +30,23 @@ type = "nmea"
 talker = "GP"
 sentence_type = "GGA"
 fields = []
+live_time = true                 # refresh the UTC time field on every send
+
+[[channels.messages]]
+interval_ms = 500
+
+[channels.messages.payload]
+type = "raw_hex"
+data = "DEAD BEEF"
+
+[channels.messages.timestamp]
+include_date = false
+include_millis = true
+include_timezone = false
+
+[channels.messages.checksum]
+algorithm = "crc16_kermit"       # xor, crc8, crc16_kermit, crc16_modbus, crc32
+intentionally_wrong = false
 
 [logging]
 level = "info"

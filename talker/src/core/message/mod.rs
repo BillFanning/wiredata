@@ -731,7 +731,7 @@ mod tests {
             MessageConfig {
                 timestamp: Some(TimestampConfig::default()),
                 checksum: Some(ChecksumConfig {
-                    algorithm: ChecksumAlgorithm::Crc16Ccitt,
+                    algorithm: ChecksumAlgorithm::Crc16Kermit,
                     intentionally_wrong: true,
                 }),
                 ..MessageConfig::new(
@@ -1250,7 +1250,7 @@ mod tests {
                 include_timezone: true,
             }),
             checksum: Some(ChecksumConfig {
-                algorithm: ChecksumAlgorithm::Crc16Ccitt,
+                algorithm: ChecksumAlgorithm::Crc16Kermit,
                 intentionally_wrong: false,
             }),
         };

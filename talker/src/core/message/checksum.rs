@@ -15,8 +15,10 @@ pub enum ChecksumAlgorithm {
     Xor,
     /// CRC-8/SMBUS (1 byte).
     Crc8,
-    /// CRC-16/CCITT, a.k.a. KERMIT (2 bytes, big-endian).
-    Crc16Ccitt,
+    /// CRC-16/KERMIT: reflected, initial value 0, check value 0x2189 (2 bytes,
+    /// high byte first). Some devices call it "CCITT", a name several different
+    /// CRC-16 variants share (ADR-057).
+    Crc16Kermit,
     /// CRC-16/MODBUS (2 bytes, low byte first, as MODBUS RTU carries it).
     Crc16Modbus,
     /// CRC-32/ISO-HDLC (4 bytes, big-endian).
@@ -58,7 +60,7 @@ impl ChecksumConfig {
     pub(crate) const fn wire_len(&self) -> usize {
         match self.algorithm {
             ChecksumAlgorithm::Xor | ChecksumAlgorithm::Crc8 => 1,
-            ChecksumAlgorithm::Crc16Ccitt | ChecksumAlgorithm::Crc16Modbus => 2,
+            ChecksumAlgorithm::Crc16Kermit | ChecksumAlgorithm::Crc16Modbus => 2,
             ChecksumAlgorithm::Crc32 => 4,
         }
     }
@@ -67,7 +69,7 @@ impl ChecksumConfig {
         let mut bytes = match self.algorithm {
             ChecksumAlgorithm::Xor => vec![data.iter().fold(0u8, |acc, &b| acc ^ b)],
             ChecksumAlgorithm::Crc8 => vec![CRC8_SMBUS.checksum(data)],
-            ChecksumAlgorithm::Crc16Ccitt => CRC16_KERMIT.checksum(data).to_be_bytes().to_vec(),
+            ChecksumAlgorithm::Crc16Kermit => CRC16_KERMIT.checksum(data).to_be_bytes().to_vec(),
             ChecksumAlgorithm::Crc16Modbus => CRC16_MODBUS.checksum(data).to_le_bytes().to_vec(),
             ChecksumAlgorithm::Crc32 => CRC32_ISO_HDLC.checksum(data).to_be_bytes().to_vec(),
         };
@@ -108,11 +110,22 @@ mod tests {
     }
 
     #[test]
-    fn crc16_ccitt_check_value() {
+    fn crc16_kermit_check_value() {
         assert_eq!(
-            cfg(ChecksumAlgorithm::Crc16Ccitt).compute(CHECK),
+            cfg(ChecksumAlgorithm::Crc16Kermit).compute(CHECK),
             vec![0x21, 0x89]
         );
+    }
+
+    /// Profiles store the name of what the algorithm computes (ADR-057); the
+    /// old "CCITT" name no longer loads.
+    #[test]
+    fn kermit_is_stored_by_its_own_name() {
+        assert_eq!(
+            serde_json::to_string(&ChecksumAlgorithm::Crc16Kermit).unwrap(),
+            "\"crc16_kermit\""
+        );
+        assert!(serde_json::from_str::<ChecksumAlgorithm>("\"crc16_ccitt\"").is_err());
     }
 
     /// MODBUS RTU carries its CRC low byte first (ADR-057): the catalog check
@@ -147,7 +160,7 @@ mod tests {
         for algo in [
             ChecksumAlgorithm::Xor,
             ChecksumAlgorithm::Crc8,
-            ChecksumAlgorithm::Crc16Ccitt,
+            ChecksumAlgorithm::Crc16Kermit,
             ChecksumAlgorithm::Crc16Modbus,
             ChecksumAlgorithm::Crc32,
         ] {
@@ -166,7 +179,7 @@ mod tests {
     fn checksum_width_per_algorithm() {
         assert_eq!(cfg(ChecksumAlgorithm::Xor).compute(CHECK).len(), 1);
         assert_eq!(cfg(ChecksumAlgorithm::Crc8).compute(CHECK).len(), 1);
-        assert_eq!(cfg(ChecksumAlgorithm::Crc16Ccitt).compute(CHECK).len(), 2);
+        assert_eq!(cfg(ChecksumAlgorithm::Crc16Kermit).compute(CHECK).len(), 2);
         assert_eq!(cfg(ChecksumAlgorithm::Crc16Modbus).compute(CHECK).len(), 2);
         assert_eq!(cfg(ChecksumAlgorithm::Crc32).compute(CHECK).len(), 4);
     }

@@ -13,6 +13,25 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-08-12) — both GUI log destinations now disclose when they
+cannot keep up:
+
+- **§4.4 / §9.2 pane completeness** — a persistent,
+  session-cumulative notice reports entries that did not reach the Log pane.
+  Those entries are absent from its retained history and its per-channel
+  INFO/WARN/ERROR tallies, while saved files remain an independent destination.
+- **§9.2 retained history and saved gaps** — all five levels share one
+  newest-2,000-entry history before pane visibility is applied. File loss
+  remains non-blocking and session-counted; after entries accepted ahead of a
+  loss drain, or when the enabled destination closes, the worker attempts a
+  plain gap line for the omitted batch. The visible queue-loss count remains
+  available if the destination can no longer be written.
+- **§9.2 file access and limits** — GUI logging uses a fixed local-data
+  directory when the platform provides one, rotates daily, deletes no old
+  files, and adds a
+  non-blocking **Open folder** action that neither enables logging nor shares
+  the file worker. Folder failures remain visible in the Log pane.
+
 Revision note (2026-08-11) — logging controls and channel fault state now say
 exactly what is current, what is retained, and what is saved:
 

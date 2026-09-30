@@ -1796,7 +1796,7 @@ fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
                     for algo in [
                         ChecksumAlgorithm::Xor,
                         ChecksumAlgorithm::Crc8,
-                        ChecksumAlgorithm::Crc16Ccitt,
+                        ChecksumAlgorithm::Crc16Kermit,
                         ChecksumAlgorithm::Crc16Modbus,
                         ChecksumAlgorithm::Crc32,
                     ] {
