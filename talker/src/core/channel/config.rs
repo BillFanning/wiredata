@@ -65,6 +65,26 @@ pub enum InterfaceConfig {
     TcpClient(TcpClientConfig),
 }
 
+impl InterfaceConfig {
+    /// Check that `message` compiles and that one send fits this interface.
+    ///
+    /// Only UDP limits size today, to what one datagram carries. Checked at
+    /// validation, so an oversized message is refused before Start rather
+    /// than failing every send.
+    pub fn check_message(&self, message: &MessageConfig) -> anyhow::Result<()> {
+        let compiled = message.compile()?;
+        if let Self::Udp(udp) = self {
+            let len = compiled.wire_len();
+            let limit = udp.max_message_len();
+            anyhow::ensure!(
+                len <= limit,
+                "a {len}-byte message is larger than one UDP datagram can carry ({limit} bytes)"
+            );
+        }
+        Ok(())
+    }
+}
+
 // ── Serial ────────────────────────────────────────────────────────────────────
 
 #[non_exhaustive]
@@ -178,6 +198,26 @@ impl UdpConfig {
         }
     }
 
+    /// Where datagrams go: the unicast or broadcast destination, or the
+    /// multicast group and port.
+    pub fn destination(&self) -> SocketAddr {
+        match &self.mode {
+            UdpMode::Unicast { destination } | UdpMode::Broadcast { destination } => *destination,
+            UdpMode::Multicast { group, port, .. } => SocketAddr::from((*group, *port)),
+        }
+    }
+
+    /// The largest message one datagram to [`Self::destination`] can carry:
+    /// 65,535 bytes less the 8-byte UDP header and, for IPv4, the 20-byte IP
+    /// header (IPv6's length field excludes its own header).
+    pub fn max_message_len(&self) -> usize {
+        if self.destination().is_ipv6() {
+            65_527
+        } else {
+            65_507
+        }
+    }
+
     /// Multicast with an explicit outgoing `interface` and/or `ttl`
     /// (either `None` = OS default). See [`UdpMode::Multicast`].
     pub fn multicast_with(
@@ -250,6 +290,28 @@ mod tests {
         let json = serde_json::to_string(value).unwrap();
         let back: T = serde_json::from_str(&json).unwrap();
         assert_eq!(*value, back);
+    }
+
+    fn raw_message(len: usize) -> MessageConfig {
+        MessageConfig::new(PayloadConfig::raw_hex("AA".repeat(len)), 100)
+    }
+
+    /// One send must fit one datagram: 65,535 bytes less the UDP header and,
+    /// for IPv4, the IP header. Validation refuses anything larger, so it
+    /// never reaches the send path.
+    #[test]
+    fn a_udp_message_must_fit_one_datagram() {
+        let v4 = InterfaceConfig::Udp(UdpConfig::unicast("127.0.0.1:9".parse().unwrap()));
+        assert!(v4.check_message(&raw_message(65_507)).is_ok());
+        let err = v4.check_message(&raw_message(65_508)).unwrap_err();
+        assert!(format!("{err:#}").contains("65507"), "{err:#}");
+
+        let v6 = InterfaceConfig::Udp(UdpConfig::unicast("[::1]:9".parse().unwrap()));
+        assert!(v6.check_message(&raw_message(65_527)).is_ok());
+        assert!(v6.check_message(&raw_message(65_528)).is_err());
+
+        let serial = InterfaceConfig::Serial(SerialConfig::new("COM1"));
+        assert!(serial.check_message(&raw_message(70_000)).is_ok());
     }
 
     #[test]

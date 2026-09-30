@@ -161,7 +161,7 @@ fn drafts_to_channels(
             .enumerate()
         {
             match d.to_message_config() {
-                Some(mc) => match mc.validate() {
+                Some(mc) => match interface.check_message(&mc) {
                     Ok(()) => messages.push(mc),
                     Err(err) => problems.push(format!("{label}, message {}: {err:#}", m + 1)),
                 },
@@ -409,6 +409,13 @@ fn prepare_channel_run(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let schedule = Schedule::compile_unarmed(&messages)?.with_alignment(conn.cadence_alignment);
+    // Compiling the schedule proved each message compiles; this adds whether
+    // one send fits the interface (a UDP datagram's size limit).
+    for (i, message) in messages.iter().enumerate() {
+        interface
+            .check_message(message)
+            .with_context(|| format!("message {}", i + 1))?;
+    }
     Ok(PreparedChannelRun {
         interface,
         messages,

@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
 use anyhow::Context;
 
@@ -12,8 +12,15 @@ pub(super) struct UdpInterface {
 
 impl UdpInterface {
     pub(super) fn open(config: &UdpConfig) -> anyhow::Result<Self> {
+        // Bound in the destination's address family: an IPv4 socket cannot
+        // send to an IPv6 address, or the reverse.
+        let any: IpAddr = if config.destination().is_ipv6() {
+            Ipv6Addr::UNSPECIFIED.into()
+        } else {
+            Ipv4Addr::UNSPECIFIED.into()
+        };
         let local_port = config.local_port.unwrap_or(0);
-        let socket = UdpSocket::bind(("0.0.0.0", local_port)).context("binding UDP socket")?;
+        let socket = UdpSocket::bind((any, local_port)).context("binding UDP socket")?;
         let destination = apply_socket_config(&socket, config, false)?;
         Ok(Self {
             socket,
@@ -38,7 +45,10 @@ impl Interface for UdpInterface {
         let (InterfaceConfig::Udp(current), InterfaceConfig::Udp(next)) = (current, next) else {
             return Ok(false);
         };
-        if current.local_port != next.local_port {
+        // A new port or address family needs a new socket.
+        if current.local_port != next.local_port
+            || current.destination().is_ipv6() != next.destination().is_ipv6()
+        {
             return Ok(false);
         }
 
@@ -75,9 +85,18 @@ fn apply_socket_config(
     config: &UdpConfig,
     reset_inactive_multicast_options: bool,
 ) -> anyhow::Result<SocketAddr> {
-    socket
-        .set_broadcast(matches!(&config.mode, UdpMode::Broadcast { .. }))
-        .context("updating UDP broadcast mode")?;
+    let broadcast = matches!(&config.mode, UdpMode::Broadcast { .. });
+    if config.destination().is_ipv6() {
+        // IPv6 has no broadcast; its sockets have no broadcast mode to set.
+        anyhow::ensure!(
+            !broadcast,
+            "IPv6 has no broadcast; use a multicast group or a unicast address"
+        );
+    } else {
+        socket
+            .set_broadcast(broadcast)
+            .context("updating UDP broadcast mode")?;
+    }
     let destination = match &config.mode {
         UdpMode::Unicast { destination } | UdpMode::Broadcast { destination } => {
             if reset_inactive_multicast_options {
@@ -128,6 +147,35 @@ mod tests {
             .unwrap();
         let (n, _) = receiver.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[test]
+    fn unicast_send_reaches_an_ipv6_destination() {
+        // An IPv4 socket cannot send to an IPv6 address, so the socket is bound
+        // in the destination's address family.
+        let Ok(receiver) = UdpSocket::bind("[::1]:0") else {
+            return; // no IPv6 loopback on this host
+        };
+        let dest = receiver.local_addr().unwrap();
+        let mut conn = UdpInterface::open(&UdpConfig::unicast(dest)).unwrap();
+        conn.send(b"v6").unwrap();
+
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let (n, _) = receiver.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"v6");
+    }
+
+    #[test]
+    fn a_change_of_address_family_asks_for_a_new_socket() {
+        let current = UdpConfig::unicast("127.0.0.1:9".parse().unwrap());
+        let next = UdpConfig::unicast("[::1]:9".parse().unwrap());
+        let mut interface = UdpInterface::open(&current).unwrap();
+        assert!(!interface
+            .reconfigure(&InterfaceConfig::Udp(current), &InterfaceConfig::Udp(next))
+            .unwrap());
     }
 
     #[test]

@@ -94,18 +94,20 @@ impl Profile {
         Ok(profile)
     }
 
-    /// Check that every message in every channel would compile.
+    /// Check that every message in every channel would compile and fits its
+    /// channel's interface.
     ///
-    /// Cheap preflight (see [`MessageConfig::validate`]): run it after load
-    /// to surface all payload errors before any interface is opened or any
-    /// thread spawned. Labels are 1-based to match the UI.
+    /// Cheap preflight (see [`InterfaceConfig::check_message`]): run it after
+    /// load to surface all payload errors before any interface is opened or
+    /// any thread spawned. Labels are 1-based to match the UI.
     ///
-    /// [`MessageConfig::validate`]: crate::core::message::MessageConfig::validate
+    /// [`InterfaceConfig::check_message`]: crate::core::channel::InterfaceConfig::check_message
     pub fn validate(&self) -> anyhow::Result<()> {
         for (ci, channel) in self.channels.iter().enumerate() {
             for (mi, message) in channel.messages.iter().enumerate() {
-                message
-                    .validate()
+                channel
+                    .interface
+                    .check_message(message)
                     .with_context(|| format!("channel {} message {}", ci + 1, mi + 1))?;
             }
         }
