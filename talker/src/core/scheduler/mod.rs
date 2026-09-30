@@ -1,7 +1,7 @@
 //! The per-channel scheduler.
 //!
 //! Each message in a channel fires on its own independent interval. The
-//! scheduler tracks a next-fire time per message and, on each [`poll`], hands
+//! scheduler tracks a next-fire time per message and, on each [`poll`](Schedule::poll), hands
 //! the talker loop the message that is due earliest (ties broken by message
 //! order). A message whose interval is zero is *dormant*: it is kept so its
 //! interval can later be changed, but it never fires.
@@ -262,6 +262,7 @@ impl Schedule {
         let interval = msg.interval;
         if next_fire <= now {
             let Some(mut following) = next_fire.checked_add(interval) else {
+                warn_deadline_unrepresentable(index, interval);
                 msg.next_fire = None;
                 return Tick::Due {
                     index,
@@ -384,13 +385,29 @@ impl Schedule {
             } else if self.alignment == CadenceAlignment::UtcPhase {
                 next_phase_delay(wall_clock, msg.interval).and_then(|delay| now.checked_add(delay))
             } else {
-                now.checked_add(msg.interval)
+                let next = now.checked_add(msg.interval);
+                if next.is_none() {
+                    warn_deadline_unrepresentable(index, msg.interval);
+                }
+                next
             };
             true
         } else {
             false
         }
     }
+}
+
+/// A next send past what `Instant` can represent leaves the message dormant.
+/// No supported platform reaches this — an `Instant` spans far more than the
+/// largest millisecond interval — so it is reported rather than handled, and
+/// never silent.
+fn warn_deadline_unrepresentable(index: usize, interval: Duration) {
+    tracing::warn!(
+        "message {}: its next send, {interval:?} ahead, is past what the system clock \
+         can represent; it will not be sent again",
+        index + 1
+    );
 }
 
 /// Delay to the strict next Unix-epoch multiple of `interval`.
