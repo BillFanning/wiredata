@@ -17,7 +17,7 @@
 //!
 //! Opening the port is a bounded blocking operation and runs on `spawn_blocking`
 //! (§97.1); it is fallible so resource errors surface at Channel Start (§71).
-//! The continuous read loop is generic over a small [`BlockingReader`] seam so
+//! The continuous read loop is generic over a small `BlockingReader` seam so
 //! its logic is unit-testable without serial hardware.
 
 use std::io::{self, Read};
@@ -39,8 +39,8 @@ use super::{
 
 /// Live serial control/status line state (§14.3, §161). Outputs (RTS, DTR) are
 /// driven by Listener; inputs (CTS, DSR, DCD, RI) are driven by the device. Output
-/// states reflect what Listener has set this session (serial outputs are not
-/// read-back), inputs reflect the last poll.
+/// states reflect what Listener set at open or since (serial outputs are not
+/// read back), inputs reflect the last poll.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SerialControlLines {
     pub rts: bool,
@@ -236,6 +236,17 @@ impl SerialTransport {
         self
     }
 
+    /// The control lines as this transport leaves them at open: the outputs it
+    /// sets, and everything else not asserted. A line left at the OS default
+    /// cannot be read back, so it is shown as not asserted.
+    fn opened_lines(&self) -> SerialControlLines {
+        SerialControlLines {
+            rts: self.rts.unwrap_or(false),
+            dtr: self.dtr.unwrap_or(false),
+            ..SerialControlLines::default()
+        }
+    }
+
     pub fn with_read_timeout(mut self, read_timeout: Duration) -> Self {
         self.read_timeout = read_timeout;
         self
@@ -271,6 +282,7 @@ impl SerialTransport {
     }
 
     fn open_blocking(self) -> serialport::Result<OpenSerialTransport> {
+        let lines = self.opened_lines();
         let mut port = serialport::new(&self.port, self.baud_rate)
             .data_bits(self.data_bits)
             .parity(self.parity)
@@ -288,6 +300,7 @@ impl SerialTransport {
         Ok(OpenSerialTransport {
             channel_id: self.channel_id,
             port,
+            lines,
             notices: None,
             control: None,
             stall_state: SerialStallState::default(),
@@ -299,6 +312,8 @@ impl SerialTransport {
 pub struct OpenSerialTransport {
     channel_id: ChannelId,
     port: Box<dyn SerialPort>,
+    /// The control lines as open left them, which seed the shared state cell.
+    lines: SerialControlLines,
     /// Optional sink for transport notices (§95, §101). When set, a sustained
     /// reader stall sends `ReceptionStalled`; the pipeline turns it into a retained
     /// warning diagnostic and emits the dedicated `RuntimeEvent::ReceptionStalled`
@@ -329,8 +344,10 @@ impl OpenSerialTransport {
 
     /// Attach live control-line hooks (§161): the reader applies RTS/DTR commands
     /// and polls CTS/DSR/DCD/RI between reads, updating the shared state cell and
-    /// signalling `ControlLinesChanged`.
+    /// signalling `ControlLinesChanged`. The cell starts from the lines as open
+    /// left them, so an output set at open shows from the first snapshot.
     pub fn with_control(mut self, control: SerialControlHooks) -> Self {
+        *lock_recover(&control.state) = self.lines;
         self.control = Some(control);
         self
     }
@@ -460,8 +477,13 @@ fn run_blocking_receive_loop(
     mut hooks: SerialReceiveHooks,
 ) -> TransportOutcome {
     let mut buf = vec![0u8; READ_BUFFER];
-    // Live control-line state (§161), tracked across the session.
-    let mut lines = SerialControlLines::default();
+    // Live control-line state (§161), tracked across the session. It starts from
+    // the shared cell, which holds the outputs set at open.
+    let mut lines = hooks
+        .control
+        .as_ref()
+        .map(|ctl| *lock_recover(&ctl.state))
+        .unwrap_or_default();
     // First input-line poll happens immediately (initial state), then throttled.
     let mut next_line_poll = Instant::now();
     loop {
@@ -905,6 +927,61 @@ mod tests {
             }
         }
 
+        cancel.cancel();
+    }
+
+    #[test]
+    fn the_panel_starts_from_the_outputs_set_at_open() {
+        let lines = SerialTransport::new(ChannelId::new(), "COM1", 9600)
+            .with_rts(true)
+            .opened_lines();
+        assert!(lines.rts);
+        // An unset line keeps the OS default, which cannot be read back.
+        assert!(!lines.dtr);
+    }
+
+    #[tokio::test]
+    async fn an_input_change_keeps_the_outputs_set_at_open() {
+        // The cell was seeded with RTS on at open. The loop must start from the
+        // cell, so the first input change doesn't report RTS off.
+        let reader = ControlReader::default();
+        reader.inputs.lock().unwrap().0 = true; // CTS on at the first poll
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(8);
+        let state = Arc::new(Mutex::new(SerialControlLines {
+            rts: true,
+            ..SerialControlLines::default()
+        }));
+        let cancel = CancellationToken::new();
+        let cid = ChannelId::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let hooks = SerialControlHooks {
+            commands: cmd_rx,
+            state: state.clone(),
+            events: ev_tx,
+        };
+        let loop_cancel = cancel.clone();
+        std::thread::spawn(move || {
+            run_blocking_receive_loop(
+                cid,
+                reader,
+                tx,
+                loop_cancel,
+                STALL_WARNING,
+                SerialReceiveHooks {
+                    control: Some(hooks),
+                    ..SerialReceiveHooks::default()
+                },
+            )
+        });
+
+        assert_eq!(
+            ev_rx.recv().await.unwrap(),
+            RuntimeEvent::ControlLinesChanged(cid)
+        );
+        let lines = *state.lock().unwrap();
+        assert!(lines.cts);
+        assert!(lines.rts, "RTS was set on at open");
         cancel.cancel();
     }
 
