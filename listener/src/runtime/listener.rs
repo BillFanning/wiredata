@@ -236,6 +236,10 @@ struct ManagedChannel {
     /// polled just as often as a running one, so regrouping per poll would keep
     /// paying for a log that by definition can no longer change on its own.
     retained_diagnostics_snapshot: Arc<DiagnosticsSnapshot>,
+    /// The newest retained start fault and how often it has repeated, while it
+    /// is still the newest retained entry. Cleared when a run's log replaces
+    /// the retained list.
+    repeated_start_fault: Option<RepeatedStartFault>,
     /// The last run's liveness facts, retained across Stop like the
     /// diagnostics — a stopped channel keeps reading its exact byte total at
     /// rest (the natural moment to cross-check against the sender). Replaced
@@ -260,6 +264,12 @@ struct ManagedChannel {
     last_run_summary: Option<ListenerRunSummary>,
 }
 
+/// A start fault as first reported, and how many times in a row it has occurred.
+struct RepeatedStartFault {
+    message: String,
+    count: u64,
+}
+
 impl ManagedChannel {
     /// The state a caller should see: a tripped fault flag overrides the stored
     /// lifecycle state, so a spontaneous transport fault reads as `Faulted`
@@ -273,11 +283,49 @@ impl ManagedChannel {
     }
 
     /// Retain one diagnostic that never reached a pipeline log — a start-time
-    /// fault such as a bind conflict (§88). Rebuilds the served snapshot in the
-    /// same step, so the retained list and the form `snapshot` hands out cannot
-    /// drift apart. Start faults are rare, so the rebuild is not a poll cost.
-    fn retain_diagnostic(&mut self, diagnostic: crate::diagnostics::Diagnostic) {
-        self.retained_diagnostics.push(diagnostic);
+    /// fault such as a bind conflict (§88).
+    ///
+    /// A reconnect loop retries the same failing start for as long as the fault
+    /// lasts, so a fault identical to the newest retained one updates that entry
+    /// — its count and time — instead of adding another. Each severity keeps at
+    /// most `limit` entries, oldest evicted first (§88, §89).
+    ///
+    /// Rebuilds the served snapshot in the same step, so the retained list and
+    /// the form `snapshot` hands out cannot drift apart.
+    fn retain_diagnostic(&mut self, diagnostic: crate::diagnostics::Diagnostic, limit: usize) {
+        let repeated = match (
+            self.repeated_start_fault.as_mut(),
+            self.retained_diagnostics.last_mut(),
+        ) {
+            (Some(repeat), Some(newest))
+                if repeat.message == diagnostic.message
+                    && newest.severity == diagnostic.severity =>
+            {
+                repeat.count += 1;
+                newest.message = format!("{} (failed {} times)", repeat.message, repeat.count);
+                newest.timestamp = diagnostic.timestamp;
+                true
+            }
+            _ => false,
+        };
+        if !repeated {
+            let severity = diagnostic.severity;
+            self.repeated_start_fault = Some(RepeatedStartFault {
+                message: diagnostic.message.clone(),
+                count: 1,
+            });
+            self.retained_diagnostics.push(diagnostic);
+            let same = |d: &crate::diagnostics::Diagnostic| d.severity == severity;
+            let held = self.retained_diagnostics.iter().filter(|d| same(d)).count();
+            // At least one, so the entry just pushed (the one a repeat updates)
+            // is never the one evicted.
+            let mut excess = held.saturating_sub(limit.max(1));
+            self.retained_diagnostics.retain(|d| {
+                let evict = excess > 0 && same(d);
+                excess -= usize::from(evict);
+                !evict
+            });
+        }
         self.retained_diagnostics_snapshot = Arc::new(DiagnosticsSnapshot::from_diagnostics(
             self.retained_diagnostics.iter().cloned(),
         ));
@@ -364,6 +412,7 @@ impl Listener {
                 reconnect_state: None,
                 retained_diagnostics: Vec::new(),
                 retained_diagnostics_snapshot: Arc::new(DiagnosticsSnapshot::default()),
+                repeated_start_fault: None,
                 retained_activity: ChannelActivity {
                     last_data_at: None,
                     bytes_per_sec: 0.0,
@@ -747,11 +796,17 @@ impl Listener {
                 // Retain the start fault as an ERROR diagnostic (a bind conflict never
                 // ran a pipeline, so it isn't in any pipeline log) — so it shows in the
                 // diagnostics list and survives the next restart like the INFO entries.
-                // Named for the channel, matching how the GUI labels it.
+                // Named for the channel, matching how the GUI labels it. Bounded by the
+                // same error limit a running pipeline applies.
+                let limit = self
+                    .channel_caps(&config)
+                    .error_retention
+                    .unwrap_or(crate::retention::DEFAULT_BACKSTOP);
                 if let Some(channel) = self.channels.get_mut(&id) {
                     let name = channel.config.name.as_str();
                     let message = format!("{name}: {err}");
-                    channel.retain_diagnostic(crate::diagnostics::Diagnostic::error(message));
+                    channel
+                        .retain_diagnostic(crate::diagnostics::Diagnostic::error(message), limit);
                 }
                 let _ = self.events_tx.try_send(RuntimeEvent::ChannelFaulted(id));
                 Err(err)
@@ -854,6 +909,7 @@ impl Listener {
                 channel.retained_recent_rule_timer_lateness = snap.recent_rule_timer_lateness;
                 channel.retained_idle_deadline_timer = snap.idle_deadline_timer;
                 channel.retained_diagnostics = snap.diagnostics.to_sorted_vec();
+                channel.repeated_start_fault = None;
                 // The stopped channel is polled at the same cadence as a live one,
                 // so keep the served form ready rather than regrouping per poll.
                 channel.retained_diagnostics_snapshot = Arc::clone(&snap.diagnostics);
@@ -2027,6 +2083,60 @@ mod tests {
         }
         assert!(gave_up, "expected a ChannelReconnectGaveUp event");
         assert_eq!(listener.state(id), Some(ChannelState::Faulted));
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_start_faults_keep_one_counted_entry() {
+        // A reconnect loop retries the same failing start for as long as the fault
+        // lasts. Each failure must update one entry, not add another (§88).
+        use crate::diagnostics::DiagnosticSeverity;
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let mut config = udp_channel();
+        if let InterfaceConfig::Udp(udp) = &mut config.interface {
+            udp.bind_address = "not-an-ip-address".to_string(); // start always fails
+        }
+        let id = listener.add_channel(config);
+        // Stop then Start, as `reconnect_tick` does.
+        for _ in 0..1000 {
+            let _ = listener.stop(id).await;
+            assert!(listener.start(id).await.is_err());
+        }
+
+        let snapshot = listener.snapshot(id).await.unwrap();
+        let errors: Vec<_> = snapshot
+            .diagnostics
+            .to_sorted_vec()
+            .into_iter()
+            .filter(|d| d.severity == DiagnosticSeverity::Error)
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].message.ends_with("(failed 1000 times)"),
+            "{}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn retained_start_faults_are_capped_per_severity() {
+        // Different faults in a row each get an entry, but the severity's limit
+        // still bounds them, oldest evicted first (§88, §89).
+        let mut listener = Listener::with_default_capacities();
+        let id = listener.add_channel(udp_channel());
+        let channel = listener.channels.get_mut(&id).unwrap();
+        for n in 0..10 {
+            channel.retain_diagnostic(
+                crate::diagnostics::Diagnostic::error(format!("fault {n}")),
+                3,
+            );
+        }
+        let messages: Vec<_> = channel
+            .retained_diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(messages, ["fault 7", "fault 8", "fault 9"]);
     }
 
     #[tokio::test]
