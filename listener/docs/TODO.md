@@ -13,6 +13,37 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 ---
 
+## Spec 2.4.0 requirements not yet built (2026-09-30)
+
+The spec states these; the code does not do them yet.
+
+- [ ] **Recording continuity (ADR-043, §56.1, §59).** A recording fault is still
+  terminal (`check_recording_faults`), and `begin_recording` still opens files on
+  the pipeline task. There are no numbered segments, no `size_cap`, no
+  `.wiredata-destination` marker, and rotation is not forward-only.
+  `ensure_rotation_dir` still creates a missing folder. Recorder queues are still
+  counted in chunks (`PipelineCapacities`).
+- [ ] **Low disk (§56.2).** Not yet a lasting fault. Display-only recordings are
+  unguarded, a failed `check_disk_guard` is silent, and there is no resume
+  after a gap. Status does not show the recordings' total size.
+- [ ] **Append repair (§57).** `RawFileRecorder::write_chunk` writes the index line
+  before the bytes, and reopening does not repair the sidecar.
+- [ ] **Persistent event log (ADR-044, §118).** `init_logging` writes to stdout
+  only, and the `wiredata-log` crate does not exist yet.
+- [ ] **Unattended GUI (ADR-045, §9.1, §70).** No reconnect checkbox or prompt,
+  and no resume registration.
+- [ ] **Unattended CLI (ADR-046, §3.1, §113).** The CLI still bails with "no
+  channels started", stops on Ctrl-C only, has no `--require-all`, and exits
+  without the defined codes. Shutdown has no time limit for finalization.
+- [ ] **TCP Listener disabled (ADR-047, §4.1, §16).** `tcp_listener_template` is
+  still offered, and validation accepts the kind.
+- [ ] **UDP bind scope and shared port (ADR-047, §15, §75).** No `shared_port`
+  field, and the bind scope is not shown in words. `recv_buffer_bytes` has no
+  4 MiB default, and the granted size is not reported.
+- [ ] **Strict profiles and limits (ADR-048, §71, §72.1).** Unknown keys are
+  ignored, and a missing `schema_version` loads as current. There are no upper
+  limits, and `PipelineCapacities` is not validated.
+
 ## v1 → v2 strip (ADR-010) — DONE
 
 The strip is complete and the workspace builds clean (`cargo test -p listener`,
@@ -97,12 +128,14 @@ Message-model removal). Everything below this block is verified done:
 - [x] Find & Triggers runtime: cross-chunk `BytePattern` scanner **with carry** —
       a pattern split across reads now matches, however many short reads it spans
       (`MatchRuleSet` keeps the newest bytes of the stream and scans
-      `carry ++ chunk`, reporting only matches ending in the new chunk). Rules fire **per occurrence** (a chunk holding three `$GPGGA`s
-      fires a GGA rule three times, each at its own `match_offset`) — pinned by
-      `every_occurrence_in_a_chunk_fires`. **Measurement:** a boundary-split firing
-      records a where/why event diagnostic and increments `match_boundary_saves`,
-      surfaced in both `ChannelStats` and `ChannelSnapshot` (the how-often). The
-      carry dies with the pipeline on Stop/Start (pipelines are rebuilt per run).
+      `carry ++ chunk`, reporting only matches ending in the new chunk). Rules fire
+      **per occurrence** (a chunk holding three `$GPGGA`s fires a GGA rule three
+      times, each at its own `match_offset`) — pinned by
+      `every_occurrence_in_a_chunk_fires`. **Measurement:** every boundary-split
+      firing increments `match_boundary_saves`, surfaced in both `ChannelStats` and
+      `ChannelSnapshot` (the how-often); the first split of a run also records a
+      where/why event diagnostic. The carry dies with the pipeline on Stop/Start
+      (pipelines are rebuilt per run).
 - [x] Independent Raw/Display recording config (ADR-013, spec §79 → schema v3).
       `RecordingConfig`/`RecordingMode` split into `RawRecordingConfig` +
       `DisplayRecordingConfig`, each with its own destination/rotation/overwrite/

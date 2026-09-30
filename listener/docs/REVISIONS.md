@@ -10,6 +10,22 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-08-08) — a Mark takes a row of its own in Hex:
+
+- **§45 Hex Mark placement (ADR-042).** A `Mark` is a row, not a cell in a byte
+  row. Hex is a fixed-width grid and reading a field down a column is what the
+  mode is for; a `Mark` spliced into a byte row is as wide as its text, so
+  everything after it landed at an unpredictable column. The byte run now breaks
+  **at the byte the `Mark` targets**, because a `Mark` identifies a byte and a
+  coarser placement would answer a different question. The short row that
+  results is explained by the `Mark` on the line below it.
+- **§45 the column bound is retained** and restated for what it now does: with
+  `Mark`s off the byte rows it is the renderer holding the pane limit for
+  itself, not the thing standing between a `Mark` and a split byte.
+- A Hex `.disp` recording now carries `Mark`s on their own lines, following the
+  display as it always has. Byte-exact timestamping remains `.raw` plus its
+  `.raw.idx` sidecar (ADR-039), which perturbs nothing.
+
 Revision note (2026-08-06) — a Hex line is bounded by columns:
 
 - **§45 Hex line width (ADR-041).** A row ends when the next cell would exceed

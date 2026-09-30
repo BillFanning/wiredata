@@ -1,25 +1,37 @@
-# Listener Specification v2.3.2
+# Listener Specification v2.4.0
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-08-08) — a Mark takes a row of its own in Hex:
+Revision note (2026-09-30) — requirements for unattended, weeks-long logging:
 
-- **§45 Hex Mark placement (ADR-042).** A `Mark` is a row, not a cell in a byte
-  row. Hex is a fixed-width grid and reading a field down a column is what the
-  mode is for; a `Mark` spliced into a byte row is as wide as its text, so
-  everything after it landed at an unpredictable column. The byte run now breaks
-  **at the byte the `Mark` targets**, because a `Mark` identifies a byte and a
-  coarser placement would answer a different question. The short row that
-  results is explained by the `Mark` on the line below it.
-- **§45 the column bound is retained** and restated for what it now does: with
-  `Mark`s off the byte rows it is the renderer holding the pane limit for
-  itself, not the thing standing between a `Mark` and a split byte.
-- A Hex `.disp` recording now carries `Mark`s on their own lines, following the
-  display as it always has. Byte-exact timestamping remains `.raw` plus its
-  `.raw.idx` sidecar (ADR-039), which perturbs nothing.
+- **Recording continuity (ADR-043), §56.1, §56.2, §57, §59.** A recording fault
+  is no longer terminal. The recording records a gap and continues in a new,
+  numbered segment. Recovery never recreates a vanished folder, and files have a
+  soft size cap. Rotation only moves forward in time, and Listener never deletes
+  recordings.
+- **Persistent event log (ADR-044), §118.** Every diagnostic also goes to a daily
+  log file, kept 30 days.
+- **Unattended GUI (ADR-045), §9.1, §70, §159.** Reconnect is a visible,
+  confirmed choice, and one profile can be registered to resume on launch after
+  a cancellable countdown.
+- **Headless CLI (ADR-046, talker ADR-060), §3.1, §113.** The CLI starts what it
+  can, warns loudly, stops on every OS stop signal, and exits with defined codes.
+- **Network (ADR-047).** The TCP Listener is disabled until its data can be shown
+  and recorded (§4.1, §16 and the sections that offer it). UDP states its bind
+  scope in words and can request a shared port (§15, §75).
+- **Strict profiles and bounded capacities (ADR-048), §71, §72.1, §80, §88,
+  §124.** Unknown keys and a missing `schema_version` are refused, and every
+  capacity has a limit.
+- **§50.2 matching** reaches across any number of short reads, and a boundary
+  split is noted once per run.
+- **Drift corrected.** Export (§60–§64) and live network adjustment (§76.1,
+  §167) were never implemented and move to Appendix A. §156 now agrees with §48.
+
+These requirements lead the implementation. Until each lands,
+[TODO.md](TODO.md) lists what is not yet built.
 
 Earlier revisions are in [REVISIONS.md](REVISIONS.md). They live there rather
 than here for two reasons: a document's version number belongs only in its own
@@ -54,7 +66,7 @@ Primary use cases:
 
 - Inspect data arriving from serial ports.
 - Inspect UDP unicast, broadcast, and multicast data.
-- Listen for TCP clients and inspect their transmitted data.
+- Log several Channels unattended for weeks, from the CLI or the GUI.
 - Display the received byte stream in Raw, Rendered, and Hex views.
 - Find and highlight byte patterns in the stream, and trigger actions on them.
 - Record the original received bytes or the rendered display output.
@@ -82,6 +94,36 @@ Both interfaces shall be thin presentation layers over shared core/runtime logic
 
 The UI shall not own transport handles, recording handles, or channel pipeline state.
 
+### 3.1 Unattended CLI Operation
+
+The CLI follows the workspace CLI contract (talker ADR-060) as adopted by
+ADR-046:
+
+- **Start what can start.** A Channel that fails at start is retried under its
+  `ReconnectPolicy` (§9.1) while the others run. A Channel with reconnect off
+  stays down. `--require-all` instead stops everything and exits when any
+  Channel fails to start.
+- **Warn loudly.** A WARNING banner on stderr, not hidden by `--quiet`, names each
+  Channel that did not start and why. A reminder repeats every 5 minutes while a
+  Channel is down, a line reports each recovery, and a final summary names every
+  Channel's outcome and every recording gap (§56.1).
+- **At start,** a warning names each recording Channel that has reconnect off.
+- **Channels are named by name,** never by UUID.
+- **Stop signals.** Ctrl-C, SIGTERM on Linux, and console close, logoff and
+  shutdown on Windows all perform the graceful stop of §113.
+- **Exit codes:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | Healthy, or every outage recovered (recording gaps alone do not change this) |
+  | 1 | Internal error |
+  | 2 | Invalid profile, nothing could start, or `--require-all` failed |
+  | 3 | Degraded: a Channel never started, its retries ran out, or it was down at shutdown |
+  | 4 | Finalization incomplete at shutdown (§113) |
+
+The CLI does not install itself as a service. `deploy/` at the workspace root
+holds example systemd and Task Scheduler definitions.
+
 ---
 
 # Part II — Core Terms and Conceptual Model
@@ -99,11 +141,16 @@ Channel types:
 - TCP Listener Channel
 - TCP Connection Channel
 
-For user-created Serial, UDP, and TCP Listener Channels, the `+ Add` template chooses
-the transport kind. Configure Interface edits that kind's parameters but does not
+For user-created Serial and UDP Channels, the `+ Add` template chooses the
+transport kind. Configure Interface edits that kind's parameters but does not
 replace it with another transport. TCP Connection Channels remain runtime-created
 children of a TCP Listener Channel — *Connection* names an accepted peer session,
 never the configured endpoint, which is why the editor is Configure Interface.
+
+**The TCP Listener and TCP Connection kinds are disabled in this release**
+(ADR-047): their received data cannot yet be displayed or recorded (ADR-024).
+They are not offered by `+ Add` or `--tcp`, and profile validation rejects a TCP
+Listener Channel (§71). §16 describes the design they return to.
 
 ### 4.2 Byte Stream
 
@@ -143,7 +190,7 @@ _Removed (see §4.5)._
 
 A Display View is a presentation of Channel data.
 
-Multiple Display Views may reference the same Channel.
+Each Channel has exactly one Display View, whose modes are switchable (§48).
 
 ### 4.11 Recording
 
@@ -153,9 +200,8 @@ Recording is distinct from Export.
 
 ### 4.12 Export
 
-Export is an on-demand operation performed on currently retained runtime information.
-
-Export is distinct from Recording.
+Export would be an on-demand operation performed on currently retained runtime
+information. It is deferred (§60, Appendix A).
 
 ### 4.13 Profile
 
@@ -364,11 +410,22 @@ Faulted → Starting   (auto-reconnect only, after a backoff delay)
 
 Auto-reconnect is configured per Channel (`ReconnectPolicy`, §80.1) and is
 **disabled by default**, preserving the manual-recovery semantics above. It
-applies to Serial (covering USB hot-plug, §14.4), UDP, and TCP Listener Channels.
-It does **not** apply to TCP Connection Channels: the listener accepts connections
+applies to Serial (covering USB hot-plug, §14.4) and UDP Channels. (It would
+apply to TCP Listener Channels, which are disabled in this release, §4.1.) It
+does **not** apply to TCP Connection Channels: the listener accepts connections
 and does not dial out (TCP client mode is deferred, Appendix A), so a dropped
 client simply ends. Each attempt emits a reconnect event (§137); after
 `max_attempts` (if set) the Channel remains Faulted.
+
+**In the GUI, reconnect is a visible, confirmed choice** (ADR-045):
+
+- Each Channel's interface settings show a "Reconnect automatically" checkbox,
+  with its behaviour stated in words.
+- The first time recording is enabled on a Channel with reconnect off, an inline
+  choice appears, pre-selected to on, and the user confirms either way. A saved
+  profile never changes without the user choosing it.
+- Status states the attempt in words — "Reconnecting — attempt 3, next try in
+  8 s", "Gave up after 10 attempts" — never by colour alone.
 
 ## 10. Start and Stop
 
@@ -562,6 +619,16 @@ A UDP Channel shall receive complete UDP datagrams.
 
 UDP datagram boundaries shall be preserved (as a reception/recording detail, §53); the payload is otherwise carried as ordinary stream bytes.
 
+**Bind scope is stated in words** (ADR-047). The UDP editor lists the host's
+local addresses and labels the all-interfaces choice "All interfaces (reachable
+from the network)"; the Channel header shows the scope.
+
+**Request shared port.** A broadcast or multicast Channel may request a shared
+port, off by default, so another program can bind the same port. Listener sets
+the platform's address-reuse option before binding and status reports whether
+the OS applied it. Sharing is not offered for unicast, where the OS delivers
+each datagram to only one of the sharing sockets.
+
 UDP arrival wall time defaults to the portable post-read capture (§26). When the
 additive `kernel_timestamps` option is enabled, Linux requests a per-datagram software
 receive timestamp with `SO_TIMESTAMPNS`; unavailable support or missing ancillary
@@ -571,6 +638,14 @@ unsupported platforms report that the counter is unavailable rather than reporti
 synthetic zero (§101).
 
 ## 16. TCP Listener and TCP Connection Channels
+
+_Disabled in this release (ADR-047)._ A TCP Listener is not offered by `+ Add`
+or `--tcp`, and profile validation rejects one: "TCP Listener isn't available
+in this release: received data can't be displayed or recorded yet." This section
+describes the design it returns to, together with ADR-024's surfacing and these
+prerequisites for shared networks: a default connection cap, TCP keepalive with
+idle, interval and probe count set for each OS, and per-connection handling of
+accept errors with rate-limited logging.
 
 ### 16.1 TCP Listener Channel
 
@@ -936,7 +1011,7 @@ enum MatchCondition {
 }
 ```
 
-`BytePattern` scans the live stream and matches **across receive-chunk boundaries** (a pattern split between two reads still matches): the runtime retains the previous chunk's tail (the longest enabled pattern minus one byte) and scans it joined to each new chunk, reporting matches once. A match that only completes because of that carry — its first byte lay in the previous chunk — is a **boundary split**: it is recovered (not lost), its firing anchors on the match's true start offset, and it is **measured** so an operator can see read boundaries splitting their patterns. Each boundary split records an event Diagnostic naming *where* (the stream offset) and *why* (the chunk-boundary split), and increments a monotonic `match_boundary_saves` counter exposed in the Channel's stats and snapshot (*how often*). `Idle` uses the per-Channel activity monitor (§166): it waits on the earliest exact monotonic deadline, fires once when the stream has been quiet for `timeout`, and re-arms when data resumes. Firing lateness is measured against that deadline. On Windows only, the final 32 ms of a completed Idle wait requests 1 ms timer resolution; Linux and macOS retain a native deadline wait. New data or cancellation abandons the pending wait and its guard without recording a firing. (The former `DecodedField` and `MessageSize` conditions are removed with the decoder/message infrastructure.)
+`BytePattern` scans the live stream and matches **across receive-chunk boundaries**, however many reads a pattern spans: the runtime retains the newest bytes of the stream (the longest enabled pattern minus one byte, which may span several short reads) and scans them joined to each new chunk, reporting matches once. A match that only completes because of that carry — its first byte lay in an earlier chunk — is a **boundary split**: it is recovered (not lost), its firing anchors on the match's true start offset, and it is **measured** so an operator can see read boundaries splitting their patterns. Every boundary split increments a monotonic `match_boundary_saves` counter exposed in the Channel's stats and snapshot (*how often*). The first split of a run also records an event Diagnostic naming *where* (the stream offset) and *why* (the chunk-boundary split); later splits in that run are counted but not noted, so a pattern that straddles reads constantly cannot flood the log. `Idle` uses the per-Channel activity monitor (§166): it waits on the earliest exact monotonic deadline, fires once when the stream has been quiet for `timeout`, and re-arms when data resumes. Firing lateness is measured against that deadline. On Windows only, the final 32 ms of a completed Idle wait requests 1 ms timer resolution; Linux and macOS retain a native deadline wait. New data or cancellation abandons the pending wait and its guard without recording a firing. (The former `DecodedField` and `MessageSize` conditions are removed with the decoder/message infrastructure.)
 
 **Actions:**
 
@@ -982,7 +1057,7 @@ struct MatchRule {
 
 Rules are part of `ChannelConfig` (§72) as `match_rules: Vec<MatchRule>`.
 
-**Evaluation and constraints.** `BytePattern` rules evaluate as bytes arrive (the scanner keeps a carry of up to `pattern.len() − 1` bytes across chunks); `Idle` uses one recomputed earliest-deadline wait, not a periodic rule poll. Evaluation is bounded and shall not stall reception (§100). Timer resolution can tighten a deadline wake but cannot improve data-arrival timestamps or make Listener hard real-time (§126). One condition per rule; no cross-channel rules; no pre-trigger capture — all deferred.
+**Evaluation and constraints.** `BytePattern` rules evaluate as bytes arrive (the scanner keeps a carry of the newest `pattern.len() − 1` stream bytes, however many chunks they came from); `Idle` uses one recomputed earliest-deadline wait, not a periodic rule poll. Evaluation is bounded and shall not stall reception (§100). Timer resolution can tighten a deadline wake but cannot improve data-arrival timestamps or make Listener hard real-time (§126). One condition per rule; no cross-channel rules; no pre-trigger capture — all deferred.
 
 ---
 
@@ -1019,7 +1094,7 @@ Raw Recording writes received bytes exactly as received.
 
 **Position:** it consumes the transport's `ReceivedData` chunk stream directly. It does not depend on message boundaries (there are none, §17–18).
 
-Up to its truncation point (§56.1), Raw Recording shall preserve:
+Within each segment (§56.1), Raw Recording shall preserve:
 
 - Byte values
 - Byte ordering
@@ -1033,7 +1108,7 @@ sidecar index keyed by byte offset.
 Raw Recording is authoritative for the data it contains. It is **not** guaranteed
 complete under sustained overload — see §56.1.
 
-A raw recording is written with the **`.raw`** extension (§59) and is always full-fidelity — byte-exact and contiguous — or off. There is no subsampling (§50.1 removed): `.raw` replaces the former `.dat`, and the message-framed `.ssdat` variant is removed.
+A raw recording is written with the **`.raw`** extension (§59), and every segment is full-fidelity — byte-exact and contiguous — or not written at all. There is no subsampling (§50.1 removed): `.raw` replaces the former `.dat`, and the message-framed `.ssdat` variant is removed.
 
 ## 54. Display Recording
 
@@ -1061,7 +1136,10 @@ Recording captures only data received while recording is Enabled. On enable:
 - The destination file is validated against the configured `OverwritePolicy`
   (§79). If the file exists and the policy forbids overwrite, enabling **fails**:
   recording remains Disabled and an error is surfaced. No existing file is
-  clobbered (§121).
+  clobbered (§121). The policy governs the first file of an enable only; every
+  later file in that run is a new segment (§59).
+- The first successful start writes a `.wiredata-destination` marker file in the
+  recording folder (§59), which recovery later checks.
 - The destination must not already be in use by another recording (§121, ADR-014).
   The recorder takes an OS advisory exclusive lock on the destination; if it cannot
   (another Channel here, or a second `listener` process, holds it), enabling **fails**
@@ -1070,44 +1148,58 @@ Recording captures only data received while recording is Enabled. On enable:
 
 ## 56. Recording Stop and Fault Behavior
 
-Recording stops in three ways: user disable, Channel stop, or fault. In all
-three, data received after the stopping instant is not written, and the file is
-finalized (flushed and closed) with whatever was durably written.
+A recording ends in three ways: user disable, Channel stop, or a finalization
+abandoned at shutdown (§113). A fault does not end it (§56.1). When it ends, data
+received after the stopping instant is not written, and the current segment is
+finalized (flushed and closed) with whatever was written.
 
 ```rust
 enum RecordingStopReason {
     Disabled,        // user disabled recording
     ChannelStopped,  // channel left the Running state
-    Faulted(RecordError),
+    ShutdownTimeout, // finalization abandoned at shutdown (§113)
 }
 ```
 
-### 56.1 Overload and Fault Semantics (acquisition-priority tiebreak)
+### 56.1 Faults, Gaps and Segments (acquisition-priority tiebreak)
 
-Each recorder drains its own bounded queue, fed by the chunk tap (raw) or the
-fan-out (display). When that queue cannot accept new items because the recorder
-is not draining fast enough (slow disk, etc.):
+Raw and Display recording each run the same controller, independently
+(ADR-043):
 
-- The producer shall **not** block reception to wait for the recorder. A
-  recorder queue uses non-blocking enqueue. Only the Transport→Pipeline queue
-  may exert backpressure on the reader (ADR-001, §97.1; §99).
-- The recorder transitions to `Faulted`. Reception, display,
-  retention, and the *other* recorder continue unaffected (§96).
-- A faulted recording shall **not** silently gap and then resume. It is
-  contiguous from start to a single truncation point, then ends. `Faulted` is
-  terminal until the user re-enables recording, which begins a *new* artifact.
-- On fault, the recorder records the truncation point — total bytes written
-  (raw) or last rendered line written (display), plus wall-clock and monotonic
-  time — finalizes the file, emits `RecordingFaulted(ChannelId, RecordingTap)`
-  (§137), and
-  raises a diagnostic (§101) naming the channel, time, and estimated loss where
-  practical.
+```text
+Off → Opening → Recording → Gap → Opening → …
+any state → Stopping → Off
+```
+
+- **File work never runs on the receive task.** Opening, rotating and finalizing
+  happen in the recorder's own task. Each recorder drains its own bounded queue,
+  fed by the chunk tap (raw) or the fan-out (display), with non-blocking enqueue.
+  Only the Transport→Pipeline queue may exert backpressure on the reader
+  (ADR-001, §97.1; §99).
+- **While Opening,** bytes wait in the recording queue. If it fills before the
+  file opens, a gap starts there.
+- **A fault starts a gap:** the queue overflowed, a write failed, an open failed,
+  the destination went missing, or disk ran low (§56.2). Reception, display,
+  retention and the other recorder continue unaffected (§96).
+- **During a gap,** bytes are deliberately omitted, never buffered. One gap stays
+  open until a segment actually starts.
+- **Retry.** After a gap starts, the recorder tries to open the next segment
+  (§59) after 1 s, doubling to 30 s. A third fault within 10 minutes stretches the
+  retry to 5 minutes and raises a lasting "recording unstable" fault, which stays
+  until recording is stopped.
+- **The gap record** holds the stream offsets (§25) and wall-clock times at both
+  ends, and the reason. A recording that ends records manual stop or shutdown
+  timeout the same way. Gap records go to the event log (§118) and to
+  diagnostics (§93); `RecordingFaulted(ChannelId, RecordingTap)` (§137) is emitted
+  when a gap starts.
 
 This is the explicit resolution of §5.6 (raw recording authoritative) versus
 §100 (reception highest priority): under sustained overload Listener preserves
-reception and faults the recording rather than stalling the reader or writing a
-gapped file. A raw recording is therefore guaranteed **contiguous and byte-exact
-for the data it contains, with a known end** — not guaranteed complete.
+reception and gaps the recording, rather than stalling the reader or writing
+bytes it cannot account for. Each segment is guaranteed **contiguous and
+byte-exact for the data it contains, with a known end**; the recording as a whole
+is the segments in name order plus the gap records between them — not
+guaranteed complete.
 
 ### 56.2 Disk-Space Guard
 
@@ -1122,12 +1214,21 @@ struct DiskGuard {
 }
 ```
 
+Raw and Display recordings may each configure a guard, on their own destination.
+
 Free space is **polled periodically**, not checked on every write. When it falls
-below the threshold Listener raises a warning (§93); if `on_low` is
-`StopRecording`, the recorder finalizes the current file cleanly (§56) and stops,
-emitting `RecordingStoppedLowDisk` (§137) while **reception continues** (§96).
-Status/snapshot expose the current recording file, bytes written, free space, and —
-when rotation is configured (§59) — the time remaining until the next rotation.
+below the threshold Listener raises a **lasting** low-disk fault (§93) that stays
+on screen until free space recovers, rather than a warning that scrolls away. A
+failed free-space check is itself reported, naming the Channel. If `on_low` is
+`StopRecording`, the recorder finalizes the current segment cleanly and enters a
+gap with reason low disk (§56.1), emitting `RecordingStoppedLowDisk` (§137) while
+**reception continues** (§96). It resumes in a new segment once free space is 10%
+above the threshold.
+
+Listener never deletes recordings; retention is the operator's (ADR-043).
+Status/snapshot expose the current recording file, bytes written, the total size
+of the recording's files, free space, and — when rotation is configured (§59) —
+the time remaining until the next rotation.
 
 ## 57. Timestamp Recording
 
@@ -1144,7 +1245,11 @@ fact that cannot be regenerated from them.
   profile. An offset is a **position in the `.raw` beside it**, not a count for the
   current run: appending to an existing recording continues from that file's end, and
   with rotation each period's file has its own sidecar counting from its own start
-  (ADR-039). One line per received block, `<offset>,<wall_clock_nanos>`.
+  (ADR-039). One line per received block, `<offset>,<wall_clock_nanos>`. A block's
+  bytes are written before its index line. On reopening to append, index entries
+  past the end of the `.raw` are trimmed and a half-written last line is dropped;
+  the `.raw` is authoritative, so a tail with no index entry is kept and reported
+  as "N bytes at the end have no timestamp". Index offsets must increase.
 - **Display Recording:** the recorder writes the rendered text verbatim and adds **no**
   timestamps of its own. The only display timestamp is the per-match `Mark` timestamp
   (§50.2), which is spliced inline into the rendered text *before* the recorder sees it
@@ -1161,8 +1266,9 @@ view's presentation does not pause its recording.
 
 ## 59. Recording File Management
 
-Recording supports user-configurable **time-based file rotation**. (Size-based
-rotation and automatic pruning of old files remain deferred — Appendix A.)
+Recording supports user-configurable **time-based file rotation** and a **size
+cap**, and writes **numbered segments** after rotation within a period and after
+every recovery (ADR-043). Listener never deletes recording files.
 
 **Rotation period:**
 
@@ -1195,7 +1301,32 @@ Example (Hourly, channel "GPS"): `GPS_2026-06-03_08.raw`.
 **Rotation boundary.** At each period boundary Listener finalizes the current file
 (flush + close, §56) and opens the next. A rotation is a clean **file boundary, not
 a gap**: each file stays contiguous and byte-exact for the data it contains (§56),
-and recording does not backfill across the boundary (§158).
+and recording does not backfill across the boundary (§158). Rotation only moves
+forward: a period earlier than the current one (the clock stepped back) keeps
+writing the current file, and no rotation reopens an earlier file.
+
+**Size cap.** Each recording has a soft size cap (`size_cap`, §79),
+2 GiB by default and at least 64 MiB. Listener starts the next segment before a
+write that would exceed it, and never splits a received chunk, so every file
+stays within its cap and every sidecar offset lands on a chunk.
+
+**Segments.** A file continues as numbered segments: `GPS_2026-06-03_08.raw`,
+then `GPS_2026-06-03_08_2.raw`, `_3` and so on; a single-file destination
+`run.raw` continues as `run_2.raw`. A new segment starts at the size cap and at
+every recovery from a gap (§56.1).
+
+- Names are allocated under the destination lock (§121) by scanning what exists.
+- A numbered segment is always created new, never overwritten or appended.
+- Numbering restarts each period.
+- A `.raw.idx` takes its name from its `.raw`.
+- On a restart within a period, `AppendIfExists` appends to the highest-numbered
+  segment only if it is under the cap.
+
+**Destination identity.** The first successful start writes a
+`.wiredata-destination` marker file in the recording folder. Recovery never
+creates that folder, and resumes only when the folder exists and holds the
+marker. (On Linux an unplugged drive can leave its empty mount-point directory
+on the system disk; without the marker, recording does not resume there.)
 
 **Channel-name constraints.** Because the channel name appears in filenames,
 `ChannelName` is validated **filesystem-safe** at configuration time (§71):
@@ -1203,8 +1334,9 @@ non-empty, no path separators or reserved characters, a bounded length, and not 
 reserved device name (e.g. Windows `CON`, `PRN`, `COMx`). Invalid names are
 **rejected** by validation, not silently sanitized.
 
-Still deferred (Appendix A): size-based rotation, filename templating beyond this
-scheme, and a retention policy that prunes old recording files.
+Still deferred (Appendix A): filename templating beyond this scheme. Pruning old
+recordings is left to the operator; status shows the recordings' total size and
+free space so they know when (§56.2).
 
 ---
 
@@ -1212,39 +1344,25 @@ scheme, and a retention policy that prunes old recording files.
 
 ## 60. Export Overview
 
-Export is an on-demand operation derived from currently retained runtime information.
-
-Export is distinct from Recording.
+_Deferred (Appendix A)._ Export — an on-demand Raw or Display export of retained
+stream data, events, warnings and errors — was specified but never implemented.
+Recording (§51) is the supported way to keep received data.
 
 ## 61. Export Sources
 
-Exports may operate on:
-
-- Retained Stream Data
-- Retained Events
-- Retained Errors and Warnings
+_Deferred with §60._
 
 ## 62. Export Types
 
-Supported Version 1 export types:
-
-- Raw Export
-- Display Export
+_Deferred with §60._
 
 ## 63. Export Limits
 
-Export operates only on currently retained runtime information.
-
-Evicted data is not exportable unless it was separately recorded.
+_Deferred with §60._
 
 ## 64. Deferred Export Features
 
-Deferred:
-
-- CSV export
-- JSON export
-- Structured semantic export
-- Session replay
+_Deferred with §60; see Appendix A._
 
 ---
 
@@ -1280,7 +1398,6 @@ Profiles may contain:
 
 - Serial Channel configuration
 - UDP Channel configuration
-- TCP Listener Channel configuration
 - Display configuration
 - Recording configuration
 - Retention configuration
@@ -1317,6 +1434,17 @@ All Channels shall restore in Stopped state.
 
 Recording shall restore as Disabled.
 
+**Resume on launch (GUI, ADR-045)** is separate from loading, and the user
+registers it. One profile at a time can be registered, in application state
+rather than in the profile.
+
+- On launch, if the registered profile has moved or is invalid, or a recording
+  destination lacks its marker (§59), nothing starts and the GUI says why.
+- Otherwise a 10-second "Resuming <profile> in 10 s — Cancel" countdown runs
+  before any port opens.
+- The GUI then loads the profile, starts every Channel, begins each recording
+  whose `enabled` flag is set (§79), and shows "Resumed automatically at 08:14".
+
 ## 71. Configuration Validation
 
 Profile loading shall validate configuration without Starting Channels.
@@ -1329,10 +1457,31 @@ Examples:
 GPS Receiver       Invalid: COM4 missing
 AIS Receiver       Valid
 UDP Feed           Valid
-TCP Listener       Valid
+TCP Feed           Invalid: TCP Listener isn't available in this release
 ```
 
 Resources that cannot be validated until Start shall be validated during Start.
+
+Validation shall reject a TCP Listener Channel with "TCP Listener isn't available
+in this release: received data can't be displayed or recorded yet" (ADR-047).
+
+**Strict parsing (ADR-048).** An unknown key, or a missing `schema_version`, is
+a parse error rather than a Channel error: the profile does not load, and the
+message names the key and where it is (for a missing version, "add
+`schema_version = 3`"). A misspelled key would otherwise silently become a
+default, which an unattended run would carry unseen.
+
+**Limits (ADR-048).** Validation shall reject a value outside these limits, and
+the runtime's constructors shall enforce the same limits:
+
+| Setting | Limit |
+|---|---|
+| Scrollback (`byte_limit`) | ≤ 16 MiB per Channel |
+| Diagnostics (each of `event_limit`, `warning_limit`, `error_limit`) | ≤ 2,000 |
+| Match pattern | ≤ 256 bytes |
+| Match rules | ≤ 64 per Channel |
+| `ReconnectPolicy` | initial backoff ≤ max backoff; multiplier 1.0–10 |
+| Recording `size_cap` | ≥ 64 MiB (§59) |
 
 Validation shall also reject a `ChannelName` that is not **filesystem-safe**
 (§59), because the name is used to generate recording filenames: a name is rejected
@@ -1391,9 +1540,12 @@ one current schema version. On load, Listener compares the profile's
   unless an explicit migration for that schema has been implemented.
 - **Profile newer than the binary** — refuse to load and report the version
   mismatch.
+- **No `schema_version`** — refuse to load, with "add `schema_version = 3`"
+  (ADR-048).
 
 Additive fields use `#[serde(default)]` so profiles missing newly added optional
-fields load cleanly without a version bump. The version increments only on a
+fields load cleanly without a version bump. Unknown keys are refused (§71), so an
+older binary refuses a newer file's added fields rather than ignoring them. The version increments only on a
 breaking change that defaults alone cannot absorb; a version bump must also
 define whether the older breaking schema is migrated or refused.
 
@@ -1403,7 +1555,7 @@ define whether the older breaking schema is migrated or refused.
 enum InterfaceConfig {
     Serial(SerialConfig),
     Udp(UdpConfig),
-    TcpListener(TcpListenerConfig),
+    TcpListener(TcpListenerConfig), // rejected by validation in this release (§16)
 }
 ```
 
@@ -1433,8 +1585,10 @@ struct UdpConfig {
     mode: UdpMode,
     multicast_group: Option<String>,
     multicast_interface: Option<String>, // NIC to join on (multi-homed hosts)
-    recv_buffer_bytes: Option<usize>,    // SO_RCVBUF
+    recv_buffer_bytes: Option<usize>,    // SO_RCVBUF; 4 MiB when unset
     kernel_timestamps: bool,             // default false; Linux SO_TIMESTAMPNS
+    shared_port: bool,                   // §15 "Request shared port"; default false;
+                                         //   broadcast/multicast only
 }
 
 enum UdpMode {
@@ -1444,7 +1598,12 @@ enum UdpMode {
 }
 ```
 
+The OS may grant less receive buffer than requested (Linux caps it at
+`net.core.rmem_max`), so status reports the size actually granted.
+
 ## 76. TCP Listener Configuration
+
+_Disabled in this release (§16)._
 
 ```rust
 struct TcpListenerConfig {
@@ -1457,21 +1616,10 @@ struct TcpListenerConfig {
 
 ### 76.1 Network Live Adjustment (troubleshooting)
 
-Listener shall support live adjustment of network parameters the OS allows without
-a re-bind:
-
-- **Receive buffer (SO_RCVBUF)** — set at open and adjustable live; the primary
-  lever against kernel-dropped UDP datagrams (§101 — loss the OS does not surface).
-  Live changes are best-effort: some platforms only honor a buffer size set
-  before/at bind, so a full change may require a restart (§13).
-- **Multicast membership** — join/leave groups live, and select the join interface
-  on multi-homed hosts (`JoinMulticast` / `LeaveMulticast` / `SetReceiveBuffer`,
-  §136).
-
-Parameters needing a re-bind (bind address, port) change via the §13 apply-pending
-coordinated restart, not live. Live **socket state** — bound address, connected
-peer(s), multicast membership, throughput/last-received — is exposed in
-status/snapshot for troubleshooting.
+_Deferred (Appendix A)._ Live adjustment of the receive buffer and of multicast
+membership, without a re-bind, was specified but never implemented. Every network
+parameter, including the receive buffer (set at open, §75) and multicast group
+and interface, changes through the §13 apply-pending coordinated restart.
 
 ## 77. Decoder Configuration
 
@@ -1516,17 +1664,23 @@ struct RawRecordingConfig {            // §53 — the verbatim byte stream (.ra
     timestamp_enabled: bool,           // §57: sidecar index
     overwrite_policy: OverwritePolicy,
     file_rotation: FileRotationPolicy, // §59; default None
-    disk_guard: Option<DiskGuard>,     // §56.2 — guards long Raw captures
+    size_cap: Option<u64>,             // §59 soft cap in bytes; None = 2 GiB; ≥ 64 MiB
+    disk_guard: Option<DiskGuard>,     // §56.2
 }
 
 struct DisplayRecordingConfig {        // §54 — the rendered view output (.disp)
     enabled: bool,
     destination: Option<PathBuf>,
-    overwrite_policy: OverwritePolicy,
+    overwrite_policy: OverwritePolicy, // first file of an enable only (§55)
     file_rotation: FileRotationPolicy, // §59; default None
+    size_cap: Option<u64>,             // §59, as for Raw
+    disk_guard: Option<DiskGuard>,     // §56.2, on the Display destination
 }                                      // no timestamp field — the only display
                                        //   timestamp is the per-match Mark (§50.2)
 ```
+
+Each recording's queue to its recorder is bounded in bytes, 8 MiB, with a fixed
+allowance per queued chunk, rather than a count of chunks (ADR-043).
 
 The former single `RecordingConfig`/`RecordingMode` (Disabled/Raw/Display/Both) is
 removed: the four modes are now two `enabled` bools, and "Both" is simply both enabled
@@ -1551,7 +1705,7 @@ At least one applicable retention limit shall be enforced. Profile validation
 Independently, the runtime shall apply a hard implementation backstop cap so that
 bounded resource usage (§124) holds even if a configuration with all retention
 limits unset reaches the runtime (e.g. via a hand-edited profile loaded under
-§71's per-channel isolation).
+§71's per-channel isolation). Each limit also has a maximum (§71).
 
 ## 80.1 Supporting Enumerations and Newtypes
 
@@ -1623,7 +1777,7 @@ pub struct ReconnectPolicy {        // §9.1; enabled defaults false
 }
 
 pub enum DiskThreshold { Bytes(u64), Percent(u8) } // §56.2
-pub enum LowDiskAction { Warn, StopRecording }     // §56.2
+pub enum LowDiskAction { Warn, StopRecording }     // §56.2; Stop gaps, then resumes
 ```
 
 ---
@@ -1673,7 +1827,8 @@ Display: Raw + Hex
 
 ## 85. TCP Listener Template
 
-Defaults:
+_Not offered in this release (§16)._ When the TCP Listener returns, its template
+gains a default connection cap. Defaults as they stood:
 
 ```text
 Kind: TCP Listener
@@ -1718,6 +1873,10 @@ Supported limits:
 - Event Count
 - Warning Count
 - Error Count
+
+Each limit has a maximum (§71). A start fault identical to the newest retained
+one — a reconnect loop retrying the same failure — updates that entry's count and
+time instead of adding another.
 
 Completed-run retention is exactly one self-contained summary per Channel. A newer
 successful run completion replaces the older summary; a failed Start that never
@@ -2186,6 +2345,12 @@ Application exit shall perform Stop on all Running Channels.
 
 Each Channel shall shut down independently.
 
+Shutdown is bounded by a grace period. A blocked file operation cannot be
+cancelled, so a finalization that has not finished when the grace expires is
+abandoned: it is logged as "finalization incomplete" (§118), the CLI exits with
+code 4 (§3.1), and the runtime shuts down within a time limit so a stuck thread
+cannot keep the process alive (ADR-043).
+
 ---
 
 # Part XXI — Logging and Diagnostics
@@ -2230,9 +2395,20 @@ Failure of diagnostic logging shall not terminate Listener operation whenever pr
 
 ## 118. Persistent Diagnostic Logs
 
-Persistent diagnostic log files are optional.
+Every diagnostic (§92–§94) is also written to a persistent event log (ADR-044),
+by both the CLI and the GUI:
 
-Rotation policy is deferred.
+- One file per local day, under the platform's local-data directory in
+  `listener/logs`. The CLI prints the folder at start.
+- Each line names the Channel, and carries its UUID as a stable field.
+- Writing happens on a dedicated worker behind a bounded, non-blocking handoff
+  (the shared `wiredata-log` crate), so a slow disk never stalls the runtime.
+  Lines lost to a full handoff are counted, and a gap line records the loss.
+- A log file that cannot be opened or written is reported as a visible fault
+  (§117: logging failure does not stop Listener).
+- Log files older than 30 days are deleted at start and at each day's rollover.
+  Only log files are deleted, never recordings (§59).
+- The log is flushed at shutdown.
 
 ---
 
@@ -2303,6 +2479,12 @@ Listener shall avoid unbounded growth of:
 - Retained history
 - Runtime metadata
 - Internal buffers
+
+The worst case is about 50 MiB per Channel (ADR-048): a 16 MiB receive queue, two
+8 MiB recording queues, 16 MiB of scrollback and about 2 MiB of diagnostics —
+about 800 MiB at 16 Channels. Socket receive buffers are kernel memory, counted
+separately. Runtime capacities are a validated type with a fallible constructor,
+so the runtime never trusts an unchecked capacity.
 
 ## 125. Deterministic Ordering
 
@@ -2595,10 +2777,10 @@ Commands flow UI → runtime as direct `Listener` async method calls — there i
 `RuntimeCommand` enum (listener ADR-012). The orchestrator exposes one method per
 operation: `start` / `stop` / `apply_pending` (§13), `enable_recording` /
 `disable_recording`, `pause_display` / `resume_display` (§11), and the live
-controls `set_rts` / `set_dtr` (§14.3). Network live-adjustment (§76.1 — multicast
-join/leave, receive-buffer) and match-rule commands (`SetMatchRuleEnabled`, `MarkNow`,
-§50.2) land as further methods plus an internal command channel into the per-Channel
-pipeline (deferred, ADR-008).
+controls `set_rts` / `set_dtr` (§14.3). Match-rule commands (`SetMatchRuleEnabled`,
+`MarkNow`, §50.2) would land as further methods plus an internal command channel
+into the per-Channel pipeline (deferred, ADR-008), as would network live adjustment
+(§76.1, Appendix A).
 
 The GUI's `UiCommand` (`gui::bridge`) is the on-the-wire command form across the
 App↔driver channel; the driver translates each into the matching `Listener` call
@@ -2900,7 +3082,7 @@ Backpressure tests shall verify:
 
 A user shall be able to:
 
-- Create Serial, UDP, and TCP Listener Channels from templates.
+- Create Serial and UDP Channels from templates.
 - Configure the parameters of the transport selected when each Channel was created.
 - Start and Stop Channels independently.
 - Run multiple Channels simultaneously.
@@ -2908,12 +3090,9 @@ A user shall be able to:
 
 ## 154. TCP Connections
 
-A TCP Listener shall:
-
-- Accept incoming clients.
-- Create one TCP Connection Channel per client.
-- Keep client streams independent.
-- Avoid persisting TCP Connection Channels.
+_Deferred with the TCP Listener (§16)._ When it returns, a TCP Listener shall
+accept incoming clients, create one TCP Connection Channel per client, keep
+client streams independent, and avoid persisting TCP Connection Channels.
 
 ## 155. Stream Find and Triggers
 
@@ -2931,7 +3110,7 @@ A user shall be able to:
 A user shall be able to:
 
 - View Raw, Rendered, and Hex display modes.
-- View multiple display modes for one Channel.
+- Switch a Channel's one view among those modes (§48).
 - Configure font, foreground color, background color, wrapping, and character rendering.
 - Pause and Resume display without affecting reception or recording.
 
@@ -2966,6 +3145,8 @@ Recording shall:
 - Write no historical data.
 - Continue during Display Pause.
 - Not include metadata other than optional timestamps.
+- Continue after a fault in a new segment, with the gap recorded (§56.1).
+- Never write into a recording folder that has lost its marker (§59).
 
 ## 159. Profiles
 
@@ -2981,6 +3162,9 @@ Profile loading shall not:
 - Begin recording.
 - Restore TCP Connection Channels.
 - Restore runtime state.
+
+A user shall be able to register one profile to resume on GUI launch, and cancel
+the resume during its countdown (§70).
 
 ## 160. NMEA0183
 
@@ -3002,17 +3186,20 @@ affect reception or Recording (§14.2–§14.3).
 
 ## 162. Auto-Reconnect
 
-With auto-reconnect enabled on a Serial/UDP/TCP-Listener Channel, a transport fault
-shall trigger automatic re-Start with backoff (`Faulted → Starting`, §9.1), bounded
-by `max_attempts`. With it disabled (the default), a Faulted Channel stays Faulted.
-TCP Connection Channels shall not auto-reconnect.
+With auto-reconnect enabled on a Serial or UDP Channel, a transport fault shall
+trigger automatic re-Start with backoff (`Faulted → Starting`, §9.1), bounded by
+`max_attempts`. With it disabled (the default), a Faulted Channel stays Faulted.
+TCP Connection Channels shall not auto-reconnect. The GUI shall show the choice
+and the attempt in words (§9.1).
 
 ## 163. File Rotation
 
 An Hourly/Daily recording shall produce period files named
 `<channel>_<start-time><ext>` with the correct extension (`.raw`/`.disp`),
 finalize each file cleanly at the boundary (no gap, no backfill), and reject a
-filesystem-unsafe channel name at config time (§59, §71).
+filesystem-unsafe channel name at config time (§59, §71). Every recording shall
+start a numbered segment before exceeding its size cap, and a clock stepped back
+shall not reopen an earlier file (§59).
 
 ## 164. Subsampling
 
@@ -3033,28 +3220,39 @@ reception (§91.1).
 
 ## 167. Network Live Adjustment
 
-A user shall be able to set SO_RCVBUF and join/leave multicast groups (with
-interface selection) live where the OS permits; re-bind (address/port) shall occur
-via apply-pending restart (§76.1, §13).
+_Deferred (§76.1, Appendix A)._ Network parameters change through the
+apply-pending restart (§13).
 
 ## 168. Disk-Space Guard
 
-On low disk a recording shall warn and, if configured, stop and finalize cleanly
-while reception continues; status shall surface current file, bytes written, free
-space, and rotation countdown (§56.2).
+On low disk a recording shall raise a lasting fault and, if configured, finalize
+cleanly and gap while reception continues, resuming in a new segment once free
+space recovers; status shall surface current file, bytes written, the
+recordings' total size, free space, and rotation countdown (§56.2).
+
+## 169. Unattended Operation
+
+A headless CLI run shall start the Channels that can start, retry the others,
+warn loudly while any is down, stop gracefully on the OS stop signals, and exit
+with the §3.1 codes. Every diagnostic shall reach the persistent event log
+(§118).
 
 ---
 
 # Appendix A — Deferred Features
 
-Deferred (ADR-023/ADR-024):
+Deferred (ADR-023/ADR-024/ADR-047):
 
 - Multiple simultaneous Display Views per Channel (§48 — one view with switchable
   modes ships; per-view render state would be required for independent pause)
-- TCP Connection-Channel user-facing surfacing (§16.2/ADR-024): per-connection
-  snapshots/stream view, per-connection recording (needs §59 filename
-  templating), per-connection match rules, and `recv_buffer_bytes` on accepted
-  sockets
+- The TCP Listener and TCP Connection Channels (§16, ADR-047). They return with
+  ADR-024's surfacing — per-connection snapshots/stream view, per-connection
+  recording (needs §59 filename templating), per-connection match rules, and
+  `recv_buffer_bytes` on accepted sockets — and with a default connection cap,
+  per-OS keepalive timings, and per-connection accept-error handling
+- Export (§60–§64)
+- Network live adjustment: receive buffer and multicast membership without a
+  re-bind (§76.1, §167)
 
 Deferred from Version 1:
 
@@ -3068,9 +3266,10 @@ Deferred from Version 1:
 - TCP client mode
 - Distributed operation
 - Advanced synchronization recovery
-- Size-based file rotation (time-based rotation is supported — §59)
 - Pre-trigger / pre-match recording capture (§50.2)
-- Persistent diagnostic log rotation
+- Automatic pruning of old recordings (retention is the operator's, §56.2)
+- Power-loss durability for recordings (fsync)
+- A source allow-list for untrusted networks
 - Hard real-time guarantees
 
 ---
@@ -3102,6 +3301,8 @@ Fan-out (Display / Raw Recording / Display Recording / Find)
 ```
 
 ## B.3 TCP
+
+_Deferred with the TCP Listener (§16)._
 
 ```text
 TCP Listener Channel

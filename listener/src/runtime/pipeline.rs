@@ -262,6 +262,9 @@ pub struct ChannelPipeline {
     events: Option<Sender<RuntimeEvent>>,
     /// Compiled find/trigger rules (§50.2, §165); empty when none are configured.
     match_rules: MatchRuleSet,
+    /// Whether this run has already noted a boundary split (§50.2). Only the
+    /// first is noted; every split is still counted in `match_boundary_saves`.
+    boundary_split_noted: bool,
     /// Bounded log of recent rule firings, surfaced in the snapshot (§165).
     recent_matches: DropOldestQueue<TriggeredMatch>,
     /// `Record` actions queued by rule evaluation, applied asynchronously by
@@ -380,6 +383,7 @@ impl ChannelPipeline {
             idle_deadline_timer: IdleDeadlineTimerSummary::default(),
             events: None,
             match_rules: MatchRuleSet::compile(&[]),
+            boundary_split_noted: false,
             recent_matches: DropOldestQueue::with_capacity(RECENT_MATCHES_CAP),
             pending_record_controls: Vec::new(),
             retiring: JoinSet::new(),
@@ -708,18 +712,22 @@ impl ChannelPipeline {
             if let Some(events) = &self.events {
                 let _ = events.try_send(RuntimeEvent::MatchTriggered(self.channel_id, rule.id));
             }
-            // Measurement (§50.2): when a match was a cross-chunk boundary split,
-            // record *where* (the stream offset) and *why* (the split) so an
-            // operator can see that read-chunk boundaries are splitting patterns —
-            // and, via `boundary_saves` in the snapshot, *how often*. An info-level
-            // diagnostic: it is a recovered match, not a fault.
-            if rule.boundary_split {
+            // Measurement (§50.2): the first cross-chunk boundary split of a run
+            // records *where* (the stream offset) and *why* (the split) so an
+            // operator can see that read-chunk boundaries are splitting patterns;
+            // `boundary_saves` in the snapshot counts *how often*. Later splits
+            // are only counted, so a pattern that straddles reads constantly
+            // cannot flood the log. An info-level diagnostic: it is a recovered
+            // match, not a fault.
+            if rule.boundary_split && !self.boundary_split_noted {
+                self.boundary_split_noted = true;
                 let at = byte_offset
                     .map(|n| format!(" at stream offset {n}"))
                     .unwrap_or_default();
                 self.diagnostics.record(Diagnostic::event(format!(
                     "match rule {} on channel {} spanned a read-chunk boundary{at} \
-                     (recovered by cross-chunk carry)",
+                     (recovered by cross-chunk carry); later splits this run are \
+                     counted, not listed",
                     rule.id, self.channel_id
                 )));
             }
@@ -2663,6 +2671,32 @@ mod tests {
             }
         }
         assert!(saw_match);
+    }
+
+    #[test]
+    fn only_the_first_boundary_split_of_a_run_is_noted() {
+        // §50.2: every split is counted, but only the first is noted, so a pattern
+        // that straddles reads constantly cannot flood the log.
+        let cid = ChannelId::new();
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[byte_rule(
+            "gga",
+            b"GGA",
+            vec![MatchAction::Notify {
+                severity: crate::diagnostics::DiagnosticSeverity::Warning,
+            }],
+        )]);
+        for _ in 0..5 {
+            p.ingest(bytes_chunk(cid, b"$GPGG"));
+            p.ingest(bytes_chunk(cid, b"A,1\r\n"));
+        }
+
+        assert_eq!(p.snapshot().match_boundary_saves, 5);
+        let notes = p
+            .diagnostics()
+            .events()
+            .filter(|d| d.message.contains("read-chunk boundary"))
+            .count();
+        assert_eq!(notes, 1);
     }
 
     #[test]
