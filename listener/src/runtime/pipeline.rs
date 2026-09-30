@@ -560,9 +560,9 @@ impl ChannelPipeline {
 
         // 3. Find/triggers (§50.2): evaluate `BytePattern` rules against this chunk
         // **before** rendering for Display Recording, so a `Mark` timestamp can be
-        // spliced into this same chunk's `.disp` render. Matching spans the previous
-        // chunk's boundary via the rule set's carry; each firing carries its true
-        // match start offset (which may fall in the prior chunk for a boundary split).
+        // spliced into this same chunk's `.disp` render. Matching spans earlier
+        // chunks' boundaries via the rule set's carry; each firing carries its true
+        // match start offset (which may fall in an earlier chunk for a boundary split).
         let mark_annotations = if !self.match_rules.is_empty() {
             let fired = self.match_rules.evaluate_stream(bytes, chunk_offset);
             if fired.is_empty() {

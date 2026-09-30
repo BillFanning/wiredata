@@ -95,9 +95,9 @@ Message-model removal). Everything below this block is verified done:
       classification policy while `wiredata-ui` supplies only shared egui chrome.
 
 - [x] Find & Triggers runtime: cross-chunk `BytePattern` scanner **with carry** —
-      a pattern split across two reads now matches (`MatchRuleSet` keeps the prior
-      chunk's tail and scans `carry ++ chunk`, reporting only matches ending in the
-      new chunk). Rules fire **per occurrence** (a chunk holding three `$GPGGA`s
+      a pattern split across reads now matches, however many short reads it spans
+      (`MatchRuleSet` keeps the newest bytes of the stream and scans
+      `carry ++ chunk`, reporting only matches ending in the new chunk). Rules fire **per occurrence** (a chunk holding three `$GPGGA`s
       fires a GGA rule three times, each at its own `match_offset`) — pinned by
       `every_occurrence_in_a_chunk_fires`. **Measurement:** a boundary-split firing
       records a where/why event diagnostic and increments `match_boundary_saves`,

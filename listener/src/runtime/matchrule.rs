@@ -22,9 +22,10 @@
 //!
 //! Received bytes arrive in chunks whose boundaries track OS buffering, not
 //! content (ADR-009): a pattern can be split across two reads (`"GG"` ends one
-//! chunk, `"A"` begins the next). A naive per-chunk scan would miss it. So the set
-//! keeps a small **carry** — the last `max_pattern_len - 1` bytes of the prior
-//! chunk — and runs two scans: a bounded **boundary scan** over `carry` plus just
+//! chunk, `"A"` begins the next), or across several when reads are shorter than
+//! the pattern. A naive per-chunk scan would miss it. So the set keeps a small
+//! **carry** — the last `max_pattern_len - 1` bytes of the stream so far, which
+//! may span several earlier chunks — and runs two scans: a bounded **boundary scan** over `carry` plus just
 //! enough of the new chunk for the longest pattern to complete (finding matches
 //! that *start* in the carry and *end* in the chunk), and a zero-copy **chunk
 //! scan** over the chunk slice itself (matches fully inside the carry were
@@ -71,8 +72,8 @@ pub struct FiredRule {
     /// the extent lets an `After` annotation anchor on the match's final byte
     /// while diagnostics continue to report its first byte.
     pub match_len: usize,
-    /// Whether this match was a **boundary split** — its first byte fell in the
-    /// previous chunk and it completed in this one, so a per-chunk scan would have
+    /// Whether this match was a **boundary split** — its first byte fell in an
+    /// earlier chunk and it completed in this one, so a per-chunk scan would have
     /// missed it. Always `false` for `Idle`. Drives the where/why/how-often
     /// measurement in the pipeline.
     pub boundary_split: bool,
@@ -83,8 +84,8 @@ pub struct FiredRule {
 /// A Channel's compiled Match Rules (§50.2). Owned by the pipeline.
 pub struct MatchRuleSet {
     rules: Vec<CompiledRule>,
-    /// Tail of the previous chunk kept so a pattern split across the boundary
-    /// still matches (`max_pattern_len - 1` bytes). Empty until the first chunk.
+    /// The newest `max_pattern_len - 1` bytes of the stream, kept so a pattern
+    /// split across read boundaries still matches. Empty until the first chunk.
     carry: Vec<u8>,
     /// Absolute stream offset of `carry[0]` — the position of the carry's first
     /// byte, so a match starting in the carry reports its true offset.
@@ -276,20 +277,24 @@ impl MatchRuleSet {
             }
         }
 
-        // Retain the tail of `chunk` as the next carry: enough for the longest
-        // enabled pattern to straddle (`max_pattern_len - 1`). Computed from the
-        // chunk's true end offset so `carry_offset` stays absolute.
+        // The next carry is the newest `max_pattern_len - 1` bytes of the stream:
+        // the tail of carry plus chunk, not of the chunk alone. A chunk shorter
+        // than that keeps older carry bytes, so a pattern spread over three or
+        // more short reads still completes. `carry_offset` is computed from the
+        // chunk's true end offset so it stays absolute.
         let want = self.max_pattern_len.saturating_sub(1);
         let chunk_end_offset = chunk_offset + chunk.len() as u64;
-        if want == 0 || chunk.is_empty() {
+        if want == 0 {
             self.carry.clear();
-            self.carry_offset = chunk_end_offset;
+        } else if chunk.len() >= want {
+            self.carry.clear();
+            self.carry.extend_from_slice(&chunk[chunk.len() - want..]);
         } else {
-            let keep = want.min(chunk.len());
-            self.carry.clear();
-            self.carry.extend_from_slice(&chunk[chunk.len() - keep..]);
-            self.carry_offset = chunk_end_offset - keep as u64;
+            self.carry.extend_from_slice(chunk);
+            let excess = self.carry.len().saturating_sub(want);
+            self.carry.drain(..excess);
         }
+        self.carry_offset = chunk_end_offset - self.carry.len() as u64;
         fired
     }
 
@@ -491,6 +496,67 @@ mod tests {
         let f2 = set.evaluate_stream(b"cd", 4);
         assert!(f2.is_empty());
         assert_eq!(set.boundary_saves(), 0);
+    }
+
+    /// Every way of splitting a stream into reads, down to one byte per read,
+    /// fires exactly the matches one whole-stream read fires, at the same offsets.
+    /// Reads shorter than a pattern spread it over three or more reads, so the
+    /// carry must keep the newest bytes across reads, not only the last read's.
+    #[test]
+    fn every_split_of_a_stream_fires_what_one_read_fires() {
+        fn firings(rules: &[MatchRule], reads: &[&[u8]]) -> Vec<(usize, u64)> {
+            let mut set = MatchRuleSet::compile(rules);
+            let ids = set.ids();
+            let mut offset = 0;
+            let mut out = Vec::new();
+            for read in reads {
+                for fired in set.evaluate_stream(read, offset) {
+                    let rule = ids.iter().position(|id| *id == fired.id).unwrap();
+                    out.push((rule, fired.match_offset.unwrap()));
+                }
+                offset += read.len() as u64;
+            }
+            out.sort_unstable();
+            out
+        }
+
+        let rules = [
+            rule(
+                "gga",
+                MatchCondition::BytePattern {
+                    pattern: b"$GPGGA".to_vec(),
+                },
+            ),
+            rule(
+                "aa",
+                MatchCondition::BytePattern {
+                    pattern: b"AA".to_vec(),
+                },
+            ),
+            rule(
+                "dollar",
+                MatchCondition::BytePattern {
+                    pattern: b"$".to_vec(),
+                },
+            ),
+        ];
+        let stream: &[u8] = b"x$GPGGAA$GPGGA";
+        let whole = firings(&rules, &[stream]);
+        assert_eq!(whole, vec![(0, 1), (0, 8), (1, 6), (2, 1), (2, 8)]);
+
+        // Bit i of `cuts` ends a read after byte i.
+        for cuts in 0u32..1 << (stream.len() - 1) {
+            let mut reads = Vec::new();
+            let mut start = 0;
+            for end in 1..stream.len() {
+                if cuts & (1 << (end - 1)) != 0 {
+                    reads.push(&stream[start..end]);
+                    start = end;
+                }
+            }
+            reads.push(&stream[start..]);
+            assert_eq!(firings(&rules, &reads), whole, "reads: {reads:?}");
+        }
     }
 
     #[test]
