@@ -1580,6 +1580,320 @@ carries `Mark`s on their own lines. It was never byte-exact — that is `.raw`,
 whose sidecar (`.raw.idx`, ADR-039) remains the precise, non-perturbing way to
 timestamp bytes.
 
+## ADR-043 — A recording continues across faults as numbered segments with recorded gaps
+
+**Status:** Accepted 2026-09-30. Amends §56.1, §56.2 and §59.
+
+**Context:** §56.1 made a recording fault terminal until a person re-enabled
+recording. That suits troubleshooting with someone at the screen. It does not
+suit weeks of unattended logging: one queue overflow, one write error or one
+unplugged USB drive ends recording for the rest of the run while reception
+carries on and nobody is there to press Record.
+
+Recovery has to be designed rather than added, because the easy versions are
+wrong. An implementation can move the blocking wait somewhere else, buffer
+without bound, drop bytes silently, recreate a vanished folder on the wrong
+disk, or churn out empty files under sustained overload. Three existing defects
+belong to the same design:
+
+- `begin_recording` opens files on the pipeline task, so a slow drive stalls
+  ingest.
+- Time rotation reopens with the configured policy, so a clock stepped back to a
+  period already used reopens that file, and `Overwrite` truncates it.
+- Nothing bounds a file's size. FAT32, common on USB drives, stops at 4 GiB.
+
+**Decision:** Raw and Display recording each run the same controller,
+independently.
+
+- **States:** Off → Opening → Recording → Gap → Opening, and any state →
+  Stopping → Off. Gap includes the wait before the next attempt.
+- **File work never runs on the receive task.** Opening, rotating and finalizing
+  happen in the recorder's own task. The pipeline only enqueues, without
+  blocking.
+- **While Opening,** bytes wait in the bounded recording queue. If the queue
+  fills before the file opens, a gap starts there.
+- **During a Gap,** bytes are deliberately omitted, never buffered. One gap stays
+  open until a segment actually starts.
+- **Gap record:** the stream offsets (§25, not file offsets) and wall-clock times
+  at both ends, and a reason: open failure, write failure, queue overflow, low
+  disk or destination missing. A recording end records manual stop or shutdown
+  timeout the same way. Gaps go to the event log (ADR-044) and diagnostics only;
+  there is no separate gaps file.
+- **Retry:** 1 s, doubling to 30 s. **Anti-thrash:** a third fault within 10
+  minutes stretches the retry to 5 minutes and raises a lasting "recording
+  unstable" fault, which stays until recording is stopped.
+- **Size cap:** soft. Rotation happens before a write that would exceed it, and a
+  chunk is never split, so a sidecar offset always lands on a chunk. The default
+  is 2 GiB and the minimum 64 MiB; a chunk is at most 64 KiB, so every file stays
+  within its cap.
+- **Segments:** `GPS_2026-09-30_08.raw` continues as `GPS_2026-09-30_08_2.raw`,
+  `_3` and so on; a single-file destination `run.raw` continues as `run_2.raw`.
+  - Names are allocated under the destination lock (ADR-014) by scanning what
+    exists.
+  - A numbered segment is always created new, never overwritten or appended.
+  - Numbering restarts each period.
+  - `.raw.idx` takes its name from its `.raw`.
+- **`OverwritePolicy` applies to the first open of an enable only.** Every later
+  open in that run — rotation, size or recovery — creates a new segment. On a
+  restart within a period, `AppendIfExists` appends to the highest-numbered
+  segment only if it is under the cap.
+- **Rotation only moves forward.** A period earlier than the current one (the
+  clock stepped back) keeps writing the current file.
+- **Destination identity:** the first successful start writes a
+  `.wiredata-destination` marker file in the recording folder. Recovery never
+  creates that folder, and resumes only when the folder exists and holds the
+  marker. On Linux an unplugged drive can leave its empty mount-point directory
+  on the system disk; without the marker, recording does not resume there.
+- **Append repair after an interrupted write:** raw bytes are written before
+  their index line. On reopening to append, index entries past the end of `.raw`
+  are trimmed and a half-written last line is dropped. Raw is authoritative: a
+  raw tail with no index entry is kept and reported as "N bytes at the end have
+  no timestamp". Index offsets must increase.
+- **Low disk** is a lasting, prominent fault, not a warning that scrolls away.
+  Display-only recordings are guarded too. With `StopRecording`, the recording
+  enters a Gap with reason low disk and resumes in a new segment once free space
+  is 10% above the threshold.
+- **Retention is external.** Listener never deletes recordings. Status shows the
+  total size of the recording's files and the destination's free space.
+- **Queues are sized in bytes:** 8 MiB per recording, with a fixed allowance per
+  chunk, replacing the 1,024-chunk count.
+- **Shutdown:** a finalization that cannot finish within the shutdown grace is
+  abandoned, because a blocked file operation cannot be cancelled. It is logged
+  as "finalization incomplete", and the runtime shuts down within a time limit so
+  a stuck thread cannot keep the process alive.
+
+**Boundary:** Durability covers a process crash, not power loss: there is no
+fsync. There is no automatic pruning, no buffering across a gap and no
+pre-trigger capture. Recovery onto network filesystems is not supported, since
+the marker is the only identity check. TCP connections are not recorded
+(ADR-047).
+
+**Alternatives considered:**
+
+- **Keep §56.1's terminal fault:** Rejected for unattended logging, where nobody
+  is there to re-enable.
+- **Buffer bytes during a gap, in memory or a spool file:** Rejected. It is
+  unbounded or moves the same failure to another disk.
+- **Recreate the folder and retry:** Rejected, because of the Linux mount-point
+  case.
+- **Check the filesystem's volume ID:** More precise, but different on every
+  platform. The marker is portable and catches the case that matters.
+- **A hard cap that splits chunks:** Rejected. It breaks the chunk-to-offset
+  sidecar model for a few bytes of precision.
+
+**Consequences:** An unattended recording survives faults, and every loss is
+recorded with its extent and cause. §56.1's guarantee moves from the recording
+to each segment: every segment is contiguous and byte-exact for the data it
+contains, with a known end. Readers join segments in name order and use the gap
+records between them.
+
+## ADR-044 — Diagnostics also go to a persistent daily event log
+
+**Status:** Accepted 2026-09-30. Amends §118.
+
+**Context:** Diagnostics live only in memory: bounded, per Channel, and gone when
+the process exits or retention evicts them. `init_logging` writes to stdout, and
+the runtime emits almost no `tracing` events. An unattended run that loses a
+device at 03:00 leaves no trace for the person who arrives at 09:00. Talker
+already has a bounded log-file worker with loss counting, gap markers and visible
+failure (talker ADR-006).
+
+**Decision:**
+
+- Every diagnostic is also emitted through `tracing`, with the Channel name and
+  its UUID as fields. The message text names the Channel by name.
+- A file layer writes one file per local day under the platform's local-data
+  directory, in `listener/logs`. It uses the shared `wiredata-log` worker (talker
+  ADR-061): a dedicated thread behind a bounded, non-blocking handoff, a
+  cumulative loss count, a gap line after a loss, a visible fault when the file
+  cannot be opened or written, and a flush at shutdown.
+- Log files older than 30 days are deleted at start and at each day's rollover.
+  Only log files are deleted, never recordings (ADR-043).
+- The CLI and the GUI both write it. The CLI prints the log folder at start.
+
+**Boundary:** The event log holds diagnostics, never stream bytes, and is not a
+recording (§114). There is no log shipping and no configurable folder yet.
+
+**Alternatives considered:**
+
+- **Blocking file writes:** Rejected. A stalled disk would stall the runtime.
+- **`tracing-appender`'s non-blocking writer on its own:** Rejected. It drops
+  lines without a gap marker or a count anyone sees.
+- **One file per Channel:** Rejected. A cross-channel incident then needs several
+  files merged by hand.
+
+**Consequences:** §118 stops being optional, and persistent log rotation leaves
+Appendix A. Disk use is bounded by the 30-day retention.
+
+## ADR-045 — Unattended GUI: reconnect is an explicit choice, and resume is registered once
+
+**Status:** Accepted 2026-09-30. Amends §9.1 presentation, §70 and §159.
+
+**Context:** Auto-reconnect is opt-in (§9.1) and the GUI offers no control for
+it, so a recording Channel stops for good at its first unplug. Separately, the
+GUI never starts anything on launch (§70), so after a reboot a logging
+workstation sits idle until someone clicks.
+
+**Decision:**
+
+- **Reconnect choice.** Each Channel's interface settings show a "Reconnect
+  automatically" checkbox, with its behaviour stated in words.
+  - The first time recording is enabled on a Channel with reconnect off, an
+    inline choice appears, pre-selected to on. The user confirms either way.
+  - Nothing changes a saved profile without the user choosing it.
+  - Status reads "Reconnecting — attempt 3, next try in 8 s" and "Gave up after
+    N attempts", in words, not colour alone.
+- **Resume on launch.**
+  - One profile at a time can be registered, in application state, not in the
+    profile.
+  - On launch, if the registered profile has moved or is invalid, or a recording
+    destination lacks its marker (ADR-043), nothing starts and the GUI says why.
+  - Otherwise a 10-second "Resuming <profile> in 10 s — Cancel" countdown runs
+    before any port opens. The GUI then loads the profile, starts every Channel,
+    begins each recording whose `enabled` flag is set, and shows "Resumed
+    automatically at 08:14".
+
+**Boundary:** Loading a profile still never starts anything (§70); resume is a
+separate action the user registers. The CLI is always explicit about what it
+starts. Listener does not install OS autostart entries; the `deploy/` examples
+cover that for the CLI.
+
+**Alternatives considered:**
+
+- **A resume flag in each profile:** Rejected. Opening another profile to
+  troubleshoot would then silently change what resumes.
+- **Always resume the last profile:** Rejected. Ports opening unasked is a
+  surprise, and on shared hardware a conflict.
+- **Reconnect on by default in the schema:** Rejected. A saved profile would
+  behave differently from what its file says.
+
+**Consequences:** A recording Channel's reconnect state is visible and chosen.
+A logging workstation that reboots resumes without a click, and gives anyone at
+the screen ten seconds to stop it.
+
+## ADR-046 — The listener CLI starts what it can and adopts the shared unattended contract
+
+**Status:** Accepted 2026-09-30. Amends §113; adds CLI behaviour under §3.
+
+**Context:** `listener` gives up when no Channel starts, ends on Ctrl-C only, and
+reports start faults by UUID. Under systemd or Task Scheduler that means a
+logging service which exits because a USB adapter enumerated late, and a stop
+signal that skips finalization.
+
+**Decision:** The listener CLI follows the workspace CLI contract in talker
+ADR-060: start what can start, loud warnings that `--quiet` does not hide,
+`--require-all`, the shared exit codes, and graceful stop on every OS stop
+signal. What is specific to listener:
+
+- A Channel that fails at start is retried under its `ReconnectPolicy`. A Channel
+  with reconnect off stays down, and counts as never started.
+- At start, a warning names each recording Channel that has reconnect off.
+- The run summary lists recording gaps (ADR-043). Gaps alone do not change the
+  exit code.
+- A finalization abandoned at shutdown (ADR-043) gives exit code 4.
+- Output names Channels by name, never by UUID.
+
+**Boundary:** The CLI does not install itself as a service. The systemd unit and
+Task Scheduler task in `deploy/` are examples.
+
+**Consequences:** A headless listener outlives a late device, says loudly what
+is down, and exits with a code a supervisor can act on.
+
+## ADR-047 — The TCP Listener is disabled; UDP states its bind scope and can request a shared port
+
+**Status:** Accepted 2026-09-30. Amends §1, §16, §68, §73, §76, §85, §153, §154,
+§162 and Appendix A; builds on ADR-024.
+
+**Context:** A TCP Listener accepts connections, but their data cannot be
+displayed or recorded (ADR-024). Offering it invites the belief that data is
+being captured. It also lacks what a shared network needs: its template binds
+all interfaces with no connection cap, there is no keepalive, and any accept
+error faults the Channel. For UDP, a second program cannot bind the same
+broadcast or multicast port, which users sometimes need, and "0.0.0.0" does not
+tell a reader that the socket is reachable from the network.
+
+**Decision:**
+
+- **The TCP Listener is disabled.** It is gone from `+ Add` and `--tcp`, and
+  profile validation rejects it: "TCP Listener isn't available in this release:
+  received data can't be displayed or recorded yet." The code stays. When it
+  returns, alongside ADR-024's surfacing, it needs a default connection cap,
+  keepalive with idle, interval and probe count set for each OS, and
+  per-connection handling of accept errors with rate-limited logging.
+- **Bind scope in words.** The UDP editor lists local addresses, and labels the
+  all-interfaces choice "All interfaces (reachable from the network)". The
+  Channel header shows the scope.
+- **"Request shared port"** is a per-Channel UDP option, off by default and
+  offered for broadcast and multicast only. It sets the platform's address-reuse
+  option before binding, and status reports whether the OS applied it.
+
+**Boundary:** This targets shared networks, not untrusted ones: there is no
+source allow-list. Sharing is not offered for unicast, where the OS delivers
+each datagram to only one of the sharing sockets.
+
+**Alternatives considered:**
+
+- **Hide the TCP Listener but keep loading it:** Rejected. Nothing is deployed,
+  so there are no profiles to protect, and a loadable but hidden kind is harder
+  to explain than an absent one.
+- **Build the connection view now:** Out of scope for this remediation.
+
+**Consequences:** Every Channel kind offered can display and record what it
+receives. A UDP Channel says in words who can reach it.
+
+## ADR-048 — Profiles load strictly and runtime capacities are bounded
+
+**Status:** Accepted 2026-09-30. Amends §71, §72.1, §80 and §88.
+
+**Context:**
+
+- Every profile field is `#[serde(default)]` and unknown keys are ignored, so a
+  misspelled key silently becomes a default. For an unattended run that is a
+  wrong setting nobody sees.
+- A missing `schema_version` loads as the current one.
+- `PipelineCapacities` is a plain struct that `Listener::new` trusts as given,
+  and `channel_caps` passes a profile's `byte_limit` through unchecked. Nothing
+  bounds process memory at the 16-channel headroom target.
+
+**Decision:**
+
+- **Unknown keys are refused.** The message names the key and where it is. Every
+  profile struct gets serde's deny-unknown-fields attribute. Serde's support is
+  limited with internally tagged enums and `flatten`, so each struct gets a test
+  proving that a misspelled key is refused.
+- **A missing `schema_version` is refused**, with "add `schema_version = 3`".
+- **Limits,** enforced when a profile loads and in constructors:
+
+  | Setting | Limit |
+  |---|---|
+  | Scrollback | ≤ 16 MiB per Channel |
+  | Diagnostics | ≤ 2,000 per severity |
+  | Match pattern | ≤ 256 bytes |
+  | Rules | ≤ 64 per Channel |
+  | Reconnect backoff | initial ≤ max, multiplier 1.0–10 |
+  | Queue capacities | non-zero, with an upper bound |
+  | Segment size cap | ≥ 64 MiB (ADR-043) |
+
+- **`PipelineCapacities` becomes a validated type** with a fallible constructor,
+  and `Listener::new` takes only the validated form.
+- **Worst case is about 50 MiB per Channel:** a 16 MiB receive queue (256 chunks
+  of up to 64 KiB), two 8 MiB recording queues, 16 MiB of scrollback and about
+  2 MiB of diagnostics. That is about 800 MiB at 16 Channels, and far less in
+  normal use. Socket buffers are kernel memory and are counted separately.
+
+**Boundary:** The schema stays at 3. Strict parsing changes what is accepted, not
+the format.
+
+**Alternatives considered:**
+
+- **Warn on unknown keys and continue:** Rejected. An unattended run would carry
+  the wrong setting with the warning long scrolled away.
+- **Enforce limits only in the GUI:** Rejected. The CLI and hand-edited profiles
+  would bypass them.
+
+**Consequences:** A profile either means what it says or does not load. Process
+memory has a stated worst case that the soak test can check.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_
