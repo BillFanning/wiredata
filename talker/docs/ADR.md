@@ -1,14 +1,18 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.21
+**Version:** 1.22
 **Date:** 2026-09-30
 **Status:** Accepted
 
-Revision note (2026-09-30) — outer checksums match their protocols' conventions:
+Revision note (2026-09-30) — decisions for unattended operation:
 
-- **ADR-057** appends CRC-16/MODBUS low byte first, as MODBUS RTU carries it, and
-  names the algorithm labelled "CRC-16/CCITT" for what it computes: KERMIT. The
-  stored name changes, so the talker profile schema moves to 3.
+- **ADR-059** gives the TCP client reconnect at retry points, counts a write that
+  fails after transferring bytes as possibly partial, and drains peer replies.
+- **ADR-060** sets one CLI contract for both apps: start what can start, warn
+  loudly, fixed exit codes, and a graceful stop on every OS stop signal.
+- **ADR-061** moves talker's bounded log-file worker into a shared
+  `wiredata-log` crate.
+- **ADR-062** refuses unknown profile keys and a missing `version`.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -368,6 +372,8 @@ The version number increments only on breaking schema changes that `serde(defaul
 - The `#[non_exhaustive]` attribute is used on profile enums to prevent external code from exhaustively matching on them, enabling future variant addition without breaking changes.
 
 **Update (v2.0, 2026-05-22):** The spec v2.0 upgrade restructured the profile schema (nested channels, each owning an interface and a list of messages). Rather than write a v1→v2 migration, the project chose a **clean break**: `CURRENT_VERSION` is `2`, and `Profile::load` refuses any profile whose version differs from it — newer versions are rejected as unsupported (Layer 2 as designed), and **older versions (v1) are also rejected**, with an error instructing the user to recreate the profile. The reasoning: v1 had no released users, so migration code would have been dead weight maintained forever. Layer 1 (`#[serde(default)]` on every field) still stands and handles all *additive* schema changes within v2. The `core::profile::migration` module was therefore never created; when a breaking v3 change arrives, a migration step and version-downgrade handling are reinstated at that point.
+
+**Update (2026-09-30):** Schema 3 (ADR-057) is again a clean break rather than a migration: nothing is deployed, so there are no version-2 profiles to carry forward. ADR-062 narrows Layer 1: a missing field still takes its default, but an unknown key or a missing `version` is now refused.
 
 ---
 
@@ -1745,6 +1751,10 @@ actually applied. `TimerReason::PrecisionWindow` now means "interval at or above
 the threshold" rather than "the user chose Precise". Non-Windows behaviour is
 unchanged.
 
+**Superseded in part (2026-09-30):** ADR-062 refuses unknown profile keys, so a
+profile still carrying `timing_mode` no longer loads. Schema 3 (ADR-057) refuses
+every version-2 profile in any case.
+
 ---
 
 ## ADR-048 — Semantic color has one source; surfaces are derived, not named
@@ -2402,6 +2412,172 @@ corrupts the last appended byte, which for MODBUS is now the high byte.
 **Consequences:** MODBUS RTU receivers accept talker's frames. A user choosing a
 CRC-16 sees the variant's real name and can match it against a device manual's
 check value.
+
+---
+
+## ADR-059 — A TCP client reconnects, counts possibly-partial writes, and drains replies
+
+**Status:** Accepted 2026-09-30. Resolves the §12.1 open item on TCP reconnect.
+
+**Context:** The TCP client has no retry preparation. Once the peer closes or
+restarts, every later write fails on the dead stream until someone restarts the
+channel. §12.1 set two conditions for any fix: failed-write and withheld-send
+accounting must survive, and an errored write must not be assumed to have
+transferred nothing. Separately, talker never reads the socket. A device that
+answers fills talker's receive buffer, and closing a socket with unread data
+makes most stacks send a reset, which can discard the peer's own in-flight data.
+
+**Decision:**
+
+- **Reconnect.** At each retry point the runner's backoff allows (250 ms doubling
+  to 5 s, §9.2), the client closes the failed stream and connects again with the
+  existing 5 s timeout. The failed message is never resent; the next due message
+  goes out on the new connection. Recovery closes the failure episode with one
+  INFO line naming the address.
+- **Possibly partial.** Writes track the bytes transferred. A write that fails
+  after transferring some bytes counts as **possibly partial**, its own outcome
+  beside failed, suppressed and missed. Serial reports it the same way (§4.2).
+  Wire bytes are counted separately from complete messages. The send-outcomes
+  line and the run summary show it.
+- **Replies are drained.** Before each write, the client reads whatever the peer
+  has sent, without blocking, discards it and counts it. Status shows "peer sent
+  N bytes".
+
+**Boundary:** No resend, no acknowledgement protocol and no server mode. Replies
+are counted, not shown; seeing them is listener's job.
+
+**Alternatives considered:**
+
+- **Resend the failed message on the new connection:** Rejected. The receiver
+  may already hold part of it, so a resend risks a duplicate that looks like
+  valid data.
+- **Leave replies unread:** Rejected, because of the reset on close and because a
+  device that answers is worth knowing about.
+
+**Consequences:** A TCP test run survives a receiver restart without a click. The
+counts never claim a message was delivered whole when it may not have been.
+
+---
+
+## ADR-060 — Both CLIs run unattended under one contract
+
+**Status:** Accepted 2026-09-30. Workspace-level; listener ADR-046 adopts it.
+
+**Context:** Talker's CLI opens every channel or none, so one missing USB adapter
+stops the whole run. Listener's gives up only when nothing starts. Neither
+survives a device that enumerates late after a reboot, both stop only on Ctrl-C,
+and neither exit code says whether a run was healthy. Both apps must run headless
+under systemd and Task Scheduler.
+
+**Decision:**
+
+- **Start what can start.** A channel that fails to open is retried with backoff
+  while the others run. `--require-all` keeps the old all-or-nothing behaviour.
+- **Warn loudly.** "Loudly" means:
+  - A WARNING banner on stderr that `--quiet` does not hide, naming the channel
+    and the reason. It uses the word, never colour alone.
+  - A reminder every 5 minutes while any channel is down, with how long it has
+    been down and the latest reason.
+  - A line when a channel recovers.
+  - A final summary naming each channel's outcome.
+- **Exit codes:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | Healthy, or every outage recovered (the summary lists them) |
+  | 1 | Internal error |
+  | 2 | Invalid profile, cannot start, or `--require-all` failed |
+  | 3 | Degraded: a channel never started, its retries ran out, or it was down at shutdown |
+  | 4 | Finalization incomplete |
+
+- **Stop on every OS stop signal.** Ctrl-C, SIGTERM on Linux, and console close,
+  logoff and shutdown on Windows all get the same graceful stop, bounded by a
+  shutdown time limit.
+
+**Boundary:** Each app keeps its own retry details and summary content. Neither
+installs itself as a service; `deploy/` holds example definitions.
+
+**Alternatives considered:**
+
+- **Exit when any channel fails:** Rejected. A late USB adapter would then need a
+  person to restart the service.
+- **Nonzero exit only when nothing ran:** Rejected. A channel down for the whole
+  run is a degraded run, and a supervisor should be told.
+
+**Consequences:** A headless run outlives a late device and says what is down
+while it is down. Scripts and service managers can act on the exit code.
+
+---
+
+## ADR-061 — One bounded log-file worker, shared as `wiredata-log`
+
+**Status:** Accepted 2026-09-30.
+
+**Context:** Listener needs a persistent event log (listener ADR-044) with the
+same properties talker's GUI log file already has (ADR-006): a dedicated worker
+behind a bounded, non-blocking handoff, a cumulative loss count, a gap line after
+a loss, visible failure, session boundaries and a final flush. That worker is
+about 350 production lines in talker's logging module. Two copies would drift on
+exactly the details that make it trustworthy.
+
+**Decision:** The worker moves into a new internal crate, `wiredata-log`
+(`publish = false`), which both apps use.
+
+- It owns the file worker thread, the bounded handoff, loss accounting, gap
+  lines, failure reporting, daily rotation by local date, deletion of log files
+  older than a caller-given age, and flush and close.
+- Callers own everything else: the `tracing` layers and formatting, the level
+  policy, what is logged, the folder and file prefix, and presentation.
+- Talker keeps its current behaviour, including deleting no old files. Listener
+  keeps 30 days.
+
+**Boundary:** Like `wiredata-timing` and `wiredata-telemetry`, the crate stays
+narrow. No logging policy moves into it.
+
+**Alternatives considered:**
+
+- **Copy the worker into listener:** Rejected. Two implementations of loss
+  accounting drift, and the drift shows up only when a log is most needed.
+- **`tracing-appender`'s non-blocking writer:** Rejected. It drops lines without
+  a gap marker or a count anyone sees.
+
+**Consequences:** The workspace gains a seventh crate. AGENTS.md lists it, with
+its dependency rule, when it is created.
+
+---
+
+## ADR-062 — Talker profiles load strictly
+
+**Status:** Accepted 2026-09-30. Amends ADR-013 and supersedes ADR-047's note on
+ignored fields.
+
+**Context:** Every profile field is `#[serde(default)]` and unknown keys are
+ignored. A misspelled key — `include_ms` for `include_millis` — silently becomes a
+default, and for an unattended run that is a wrong setting nobody sees. ADR-047
+relied on that leniency so profiles still carrying `timing_mode` would load. A
+missing `version` also loads as the current one.
+
+**Decision:**
+
+- **Unknown keys are refused.** The message names the key and where it is, for
+  example "channel 1, message 2". Every profile struct gets serde's
+  deny-unknown-fields attribute. Serde's support is limited with internally
+  tagged enums (`tag = "type"`) and `flatten`, so each struct gets a test proving
+  that a misspelled key is refused.
+- **A missing `version` is refused**, with "add `version = 3`".
+- Missing fields still take their defaults, so an additive change within a
+  schema version still loads older files.
+
+**Boundary:** No migration. Version-2 profiles are already refused by the move to
+schema 3 (ADR-057).
+
+**Alternatives considered:**
+
+- **Warn and ignore unknown keys:** Rejected. In a CLI run the warning scrolls
+  away and the wrong setting stays.
+
+**Consequences:** A profile either means what it says or does not load, with a
+message that points at the line to fix.
 
 ---
 

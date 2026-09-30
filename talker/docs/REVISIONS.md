@@ -386,6 +386,12 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 
 ## Architecture Decision Record
 
+Revision note (2026-09-30) — outer checksums match their protocols' conventions:
+
+- **ADR-057** appends CRC-16/MODBUS low byte first, as MODBUS RTU carries it, and
+  names the algorithm labelled "CRC-16/CCITT" for what it computes: KERMIT. The
+  stored name changes, so the talker profile schema moves to 3.
+
 Revision note (2026-08-12) — both GUI log routes now disclose observer loss:
 
 - **ADR-006 (corrected)** gives the pane and file independent bounded,
