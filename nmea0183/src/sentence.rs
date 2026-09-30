@@ -76,9 +76,11 @@ impl NmeaSentence {
     }
 
     /// Parse a NMEA sentence string. Accepts lines with or without `\r\n`.
-    /// Validates the checksum. Does not accept proprietary `$P...` sentences.
+    /// Validates the checksum, which must be exactly two hex digits, and rejects
+    /// non-ASCII input (ADR-058). Does not accept proprietary `$P...` sentences.
     pub fn parse(line: &str) -> Result<Self, NmeaError> {
         let line = line.trim_end_matches(['\r', '\n']);
+        crate::require_ascii(line)?;
         let rest = line
             .strip_prefix('$')
             .ok_or(NmeaError::MissingStartDelimiter)?;
@@ -95,17 +97,18 @@ impl NmeaSentence {
             None => return Err(NmeaError::MissingChecksum),
         };
 
-        let expected = u8::from_str_radix(chk, 16)
-            .map_err(|_| NmeaError::Parse(format!("invalid checksum hex: {chk:?}")))?;
+        let expected = checksum::parse_suffix(chk)?;
         let computed = checksum::xor(body.as_bytes());
         if expected != computed {
             return Err(NmeaError::InvalidChecksum { expected, computed });
         }
 
-        // Split header (talker + type) from field list
-        let (header, fields_str) = match body.split_once(',') {
-            Some((h, f)) => (h, f),
-            None => (body, ""),
+        // Split header (talker + type) from the field list. A comma starts the
+        // list even when nothing follows it, so `$GPHDT,*..` keeps its one empty
+        // field and round-trips (ADR-058).
+        let (header, fields) = match body.split_once(',') {
+            Some((h, f)) => (h, f.split(',').map(str::to_string).collect()),
+            None => (body, Vec::new()),
         };
 
         // Standard sentences: talker is 2 chars, sentence type is 3 chars → header is 5 chars.
@@ -115,12 +118,6 @@ impl NmeaSentence {
         let (talker_str, type_str) = header.split_at(header.len() - 3);
         let talker_id: TalkerId = talker_str.parse().unwrap();
         let sentence_type: SentenceType = type_str.parse().unwrap();
-
-        let fields = if fields_str.is_empty() {
-            vec![]
-        } else {
-            fields_str.split(',').map(str::to_string).collect()
-        };
 
         Ok(Self {
             talker_id,
@@ -306,6 +303,34 @@ mod tests {
     fn parse_rejects_proprietary() {
         let err = NmeaSentence::parse("$PASHR,045.67,T*XX").unwrap_err();
         assert!(matches!(err, NmeaError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_rejects_non_ascii_without_panicking() {
+        // 'é' is two bytes, and the talker/type split falls inside it.
+        let body = "GP\u{e9}GA,1";
+        let line = format!("${body}*{:02X}", checksum::xor(body.as_bytes()));
+        let err = NmeaSentence::parse(&line).unwrap_err();
+        assert!(matches!(err, NmeaError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_requires_exactly_two_hex_checksum_digits() {
+        let body = "GPHDT,123.4,T";
+        let cs = checksum::xor(body.as_bytes());
+        for suffix in [format!("00{cs:02X}"), format!("+{cs:02X}")] {
+            let err = NmeaSentence::parse(&format!("${body}*{suffix}")).unwrap_err();
+            assert!(matches!(err, NmeaError::Parse(_)), "suffix {suffix:?}");
+        }
+        assert!(NmeaSentence::parse(&format!("${body}*{cs:02x}")).is_ok());
+    }
+
+    #[test]
+    fn an_explicit_empty_field_round_trips() {
+        let s = NmeaSentence::new(TalkerId::GP, SentenceType::HDT, vec![String::new()]);
+        let wire = s.to_wire();
+        assert!(wire.starts_with("$GPHDT,*"));
+        assert_eq!(NmeaSentence::parse(&wire).unwrap(), s);
     }
 
     #[test]

@@ -25,6 +25,18 @@ pub enum AnyNmeaSentence {
     Ais(AisSentence),
 }
 
+/// Sentences are ASCII (ADR-058). Every parser checks this before slicing at
+/// byte offsets, so a multibyte character can never be split.
+pub(crate) fn require_ascii(line: &str) -> Result<(), NmeaError> {
+    if line.is_ascii() {
+        Ok(())
+    } else {
+        Err(NmeaError::Parse(
+            "sentence contains non-ASCII characters".to_string(),
+        ))
+    }
+}
+
 /// Parse any NMEA sentence, dispatching by its start delimiter:
 /// `!` → AIS, `$P` → proprietary, `$` → standard.
 pub fn parse(line: &str) -> Result<AnyNmeaSentence, NmeaError> {

@@ -81,6 +81,54 @@ forms in the library and at both application boundaries.
 
 ---
 
+## ADR-058 — Parsing is strict about framing and permissive about field content
+
+**Status:** Accepted 2026-09-30.
+
+**Context:** A review found framing gaps in the three parsers. A multibyte
+character at the talker/type boundary made `NmeaSentence::parse` panic on a
+byte-offset split, which the typed error model (ADR-004) exists to prevent. The
+checksum suffix was read with `u8::from_str_radix`, which accepts a sign and
+leading zeros, so `*0034` and `*+34` both passed as 0x34. An explicit empty field
+was lost: `$GPHDT,*63` parsed back with no fields, so a built sentence and its
+parsed copy differed. AIS fill bits and fragment numbers were accepted outside
+the values the envelope can mean. The library specification is still a
+placeholder, so this ADR is the parsing contract until it exists.
+
+**Decision:**
+
+- Input containing a non-ASCII character is rejected with an error before any
+  slicing. NMEA 0183 sentences are ASCII.
+- A checksum suffix is exactly two hexadecimal digits, in either case. The public
+  `checksum::from_hex` follows the same rule.
+- A comma after the header starts the field list even when nothing follows it:
+  `$GPHDT,*63` parses to one empty field, and a header with no comma to none.
+  Standard and raw proprietary sentences round-trip through construction and
+  parsing.
+- AIS fill bits are 0–5, the fragment count is at least 1, and the fragment
+  number runs from 1 to the count.
+
+**Boundary:** Field content stays permissive. Construction still accepts any
+field text, including characters that break the framing, because talker uses
+that for negative testing. Parsing validates no field values beyond the `$PRDID`
+and `$PASHR` fields it already checked. Talker IDs and sentence types keep
+ADR-009's extensibility. Strict constructors, fuzzing and the library
+specification wait for a publication date.
+
+**Alternatives considered:**
+
+- **Check only the character boundary before the split:** Rejected. It removes
+  the panic but still accepts a non-ASCII sentence, which no NMEA device emits.
+- **Keep lenient checksum parsing:** Rejected. No device writes `*+34`; accepting
+  it only widens what corrupt input can pass for valid.
+
+**Consequences:** Every parser returns an error for input it cannot represent,
+never a panic. A sentence with an empty field reads back as it was built. Only
+tests in the workspace call the parsers — listener decodes nothing (listener
+ADR-010) and talker only constructs — so no application behaviour changes.
+
+---
+
 ## Open questions
 
 **OQ-4 — `nmea0183` library MSRV policy.** ADR-008 sets the workspace MSRV to current stable Rust. The `nmea0183` library, intended for crates.io publication, may benefit from a looser MSRV to accommodate cautious downstream users. The policy (e.g., N-6 months of stable releases) and the mechanism (per-crate `rust-version` override) are deferred to a future ADR when publication approaches. See ADR-008 (in `talker/docs/ADR.md`) for context.

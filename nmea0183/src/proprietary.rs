@@ -83,8 +83,11 @@ impl ProprietarySentence {
     }
 
     /// Parse a proprietary sentence string. Accepts lines with or without `\r\n`.
+    /// Rejects non-ASCII input and any checksum other than two hex digits
+    /// (ADR-058).
     pub fn parse(line: &str) -> Result<Self, NmeaError> {
         let line = line.trim_end_matches(['\r', '\n']);
+        crate::require_ascii(line)?;
         let rest = line
             .strip_prefix('$')
             .ok_or(NmeaError::MissingStartDelimiter)?;
@@ -102,8 +105,7 @@ impl ProprietarySentence {
         // All other proprietary sentences require a checksum.
         let (body, chk) = rest.rsplit_once('*').ok_or(NmeaError::MissingChecksum)?;
 
-        let expected = u8::from_str_radix(chk, 16)
-            .map_err(|_| NmeaError::Parse(format!("invalid checksum hex: {chk:?}")))?;
+        let expected = checksum::parse_suffix(chk)?;
         let computed = checksum::xor(body.as_bytes());
         if expected != computed {
             return Err(NmeaError::InvalidChecksum { expected, computed });
@@ -112,23 +114,20 @@ impl ProprietarySentence {
         // Strip leading 'P', then split identifier from fields.
         let after_p = &body[1..];
         let (ident, fields_str) = match after_p.split_once(',') {
-            Some((id, fs)) => (id, fs),
-            None => (after_p, ""),
+            Some((id, fs)) => (id, Some(fs)),
+            None => (after_p, None),
         };
 
         match ident {
-            "ASHR" => parse_pashr(fields_str),
-            _ => {
-                let fields = if fields_str.is_empty() {
-                    vec![]
-                } else {
-                    fields_str.split(',').map(str::to_string).collect()
-                };
-                Ok(Self::Raw {
-                    identifier: ident.to_string(),
-                    fields,
-                })
-            }
+            "ASHR" => parse_pashr(fields_str.unwrap_or("")),
+            _ => Ok(Self::Raw {
+                identifier: ident.to_string(),
+                // A comma starts the field list even when nothing follows it,
+                // so `$PFOO,*..` keeps its one empty field (ADR-058).
+                fields: fields_str
+                    .map(|fs| fs.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+            }),
         }
     }
 }
@@ -437,6 +436,31 @@ mod tests {
         assert!(wire.starts_with("$PFOO*"));
         let parsed = ProprietarySentence::parse(&wire).unwrap();
         assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn raw_explicit_empty_field_round_trips() {
+        let s = ProprietarySentence::Raw {
+            identifier: "FOO".to_string(),
+            fields: vec![String::new()],
+        };
+        let wire = s.to_wire();
+        assert!(wire.starts_with("$PFOO,*"));
+        assert_eq!(ProprietarySentence::parse(&wire).unwrap(), s);
+    }
+
+    #[test]
+    fn rejects_non_ascii_and_loose_checksum_digits() {
+        let body = "PGRMZ,93,f,3";
+        let cs = checksum::xor(body.as_bytes());
+        for line in [format!("${body}*00{cs:02X}"), format!("${body}*+{cs:02X}")] {
+            let err = ProprietarySentence::parse(&line).unwrap_err();
+            assert!(matches!(err, NmeaError::Parse(_)), "{line:?}");
+        }
+        let body = "PGRMZ,9\u{e9}";
+        let line = format!("${body}*{:02X}", checksum::xor(body.as_bytes()));
+        let err = ProprietarySentence::parse(&line).unwrap_err();
+        assert!(matches!(err, NmeaError::Parse(_)));
     }
 
     #[test]

@@ -77,16 +77,18 @@ impl AisSentence {
     }
 
     /// Parse an AIS sentence string. Accepts lines with or without `\r\n`.
-    /// Validates the checksum.
+    /// Validates the checksum, which must be exactly two hex digits, and
+    /// rejects non-ASCII input and out-of-range fill bits and fragment numbers
+    /// (ADR-058).
     pub fn parse(line: &str) -> Result<Self, NmeaError> {
         let line = line.trim_end_matches(['\r', '\n']);
+        crate::require_ascii(line)?;
         let rest = line
             .strip_prefix('!')
             .ok_or(NmeaError::MissingStartDelimiter)?;
 
         let (body, chk) = rest.rsplit_once('*').ok_or(NmeaError::MissingChecksum)?;
-        let expected = u8::from_str_radix(chk, 16)
-            .map_err(|_| NmeaError::Parse(format!("invalid checksum hex: {chk:?}")))?;
+        let expected = checksum::parse_suffix(chk)?;
         let computed = checksum::xor(body.as_bytes());
         if expected != computed {
             return Err(NmeaError::InvalidChecksum { expected, computed });
@@ -110,10 +112,23 @@ impl AisSentence {
             }
         };
 
+        let fragment_count = parse_u32(parts[1], "fragment count")?;
+        let fragment_number = parse_u32(parts[2], "fragment number")?;
+        if fragment_number == 0 || fragment_number > fragment_count {
+            return Err(NmeaError::Parse(format!(
+                "fragment {fragment_number} of {fragment_count} is out of range"
+            )));
+        }
+        let fill_bits = parts[6]
+            .parse::<u8>()
+            .ok()
+            .filter(|bits| *bits <= 5)
+            .ok_or_else(|| NmeaError::Parse(format!("invalid fill bits: {:?}", parts[6])))?;
+
         Ok(Self {
             own_vessel,
-            fragment_count: parse_u32(parts[1], "fragment count")?,
-            fragment_number: parse_u32(parts[2], "fragment number")?,
+            fragment_count,
+            fragment_number,
             sequence_id: if parts[3].is_empty() {
                 None
             } else {
@@ -121,9 +136,7 @@ impl AisSentence {
             },
             channel: parts[4].to_string(),
             payload: parts[5].to_string(),
-            fill_bits: parts[6]
-                .parse::<u8>()
-                .map_err(|_| NmeaError::Parse(format!("invalid fill bits: {:?}", parts[6])))?,
+            fill_bits,
         })
     }
 }
@@ -352,6 +365,37 @@ mod tests {
         let line = format!("!{body}*{cs:02X}");
         let err = AisSentence::parse(&line).unwrap_err();
         assert!(matches!(err, NmeaError::Parse(_)));
+    }
+
+    /// `!body*CS` with the body's true checksum, so a parse reaches the field checks.
+    fn line_with_checksum(body: &str) -> String {
+        format!("!{body}*{:02X}", checksum::xor(body.as_bytes()))
+    }
+
+    #[test]
+    fn parse_rejects_out_of_range_fill_bits_and_fragments() {
+        for body in [
+            "AIVDM,1,1,,A,000,6", // fill bits above 5
+            "AIVDM,0,0,,A,000,0", // no fragments
+            "AIVDM,1,0,,A,000,0", // fragment numbers start at 1
+            "AIVDM,2,3,,A,000,0", // fragment 3 of 2
+        ] {
+            let err = AisSentence::parse(&line_with_checksum(body)).unwrap_err();
+            assert!(matches!(err, NmeaError::Parse(_)), "{body}");
+        }
+        assert!(AisSentence::parse(&line_with_checksum("AIVDM,2,2,7,B,000,5")).is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_non_ascii_and_loose_checksum_digits() {
+        let err = AisSentence::parse(&line_with_checksum("AIVDM,1,1,,A,0\u{e9}0,0")).unwrap_err();
+        assert!(matches!(err, NmeaError::Parse(_)));
+        let body = "AIVDM,1,1,,A,000,0";
+        let cs = checksum::xor(body.as_bytes());
+        for line in [format!("!{body}*00{cs:02X}"), format!("!{body}*+{cs:02X}")] {
+            let err = AisSentence::parse(&line).unwrap_err();
+            assert!(matches!(err, NmeaError::Parse(_)), "{line:?}");
+        }
     }
 
     #[test]
