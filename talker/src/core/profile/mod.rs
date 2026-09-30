@@ -118,18 +118,17 @@ impl Profile {
     /// The write is atomic: content goes to a sibling temp file which is
     /// renamed over the target, so a crash mid-save can never leave a
     /// truncated profile — the previous file survives intact until the
-    /// rename replaces it whole.
+    /// rename replaces it whole. Each save gets its own temp file, so two
+    /// saves racing on one path (the GUI and a CLI) never write into each
+    /// other's.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating directory {:?}", parent))?;
         }
         let content = toml::to_string(self).context("serializing profile to TOML")?;
-        let mut tmp_name = path.as_os_str().to_owned();
-        tmp_name.push(".tmp");
-        let tmp = PathBuf::from(tmp_name);
-        std::fs::write(&tmp, content)
-            .with_context(|| format!("writing profile temp file {:?}", tmp))?;
+        let tmp = write_temp_sibling(path, &content)
+            .with_context(|| format!("writing a profile temp file beside {:?}", path))?;
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(anyhow::Error::new(e)
@@ -137,6 +136,34 @@ impl Profile {
         }
         Ok(())
     }
+}
+
+/// Write `content` to a new temp file beside `path` and return its path.
+///
+/// The process id and a per-process counter make the name unique, and
+/// `create_new` refuses a name that is already taken rather than writing into
+/// another save's file.
+fn write_temp_sibling(path: &Path, content: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = PathBuf::from(name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    if let Err(e) = file.write_all(content.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(tmp)
 }
 
 /// The OS-specific directory where profiles are stored by default.
@@ -288,6 +315,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Temp files a save left beside `path`.
+    fn temp_siblings(path: &Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.", path.file_name().unwrap().to_string_lossy());
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.starts_with(&prefix) && name.ends_with(".tmp")
+            })
+            .collect()
+    }
+
     #[test]
     fn save_replaces_existing_file_and_leaves_no_temp() {
         let path = temp_path("atomic");
@@ -295,8 +336,41 @@ mod tests {
         Profile::new("atomic").save(&path).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(!content.contains("old content"));
-        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-        assert!(!tmp.exists(), "temp file left behind: {tmp:?}");
+        assert_eq!(temp_siblings(&path), Vec::<PathBuf>::new());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Saves racing on one path — say the GUI and a CLI saving the same
+    /// profile — each succeed, and the file ends up holding one whole profile.
+    #[test]
+    fn concurrent_saves_to_one_path_each_land_whole() {
+        let path = temp_path(&format!("concurrent_{}", std::process::id()));
+        let writers: Vec<_> = (0..8)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    // Different lengths, so a torn write would not parse.
+                    let iface = InterfaceConfig::TcpClient(TcpClientConfig::new(
+                        "127.0.0.1:4000".parse::<SocketAddr>().unwrap(),
+                    ));
+                    let channel = ChannelConfig::new(
+                        iface,
+                        vec![MessageConfig::new(PayloadConfig::raw_hex("AABB"), 100)],
+                    );
+                    let mut profile = Profile::new("racing");
+                    profile.channels = vec![channel; n];
+                    for _ in 0..25 {
+                        profile.save(&path).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        Profile::load(&path).unwrap();
+        assert_eq!(temp_siblings(&path), Vec::<PathBuf>::new());
         let _ = std::fs::remove_file(&path);
     }
 

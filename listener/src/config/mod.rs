@@ -74,8 +74,17 @@ impl Profile {
     }
 
     /// Save this profile to a file.
+    ///
+    /// The write is atomic: the text goes to a temp file beside the target,
+    /// which is then renamed over it, so a crash mid-save leaves the previous
+    /// profile whole. Each save gets its own temp file, so two saves racing on
+    /// one path (the GUI and a CLI) never write into each other's.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        std::fs::write(path, self.to_toml()?)?;
+        let tmp = write_temp_sibling(path, &self.to_toml()?)?;
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -234,6 +243,34 @@ pub fn channel_warnings(_channel: &ChannelConfig) -> Vec<ChannelConfigWarning> {
     Vec::new()
 }
 
+/// Write `text` to a new temp file beside `path` and return its path.
+///
+/// The process id and a per-process counter make the name unique, and
+/// `create_new` refuses a name that is already taken rather than writing into
+/// another save's file.
+fn write_temp_sibling(path: &Path, text: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = std::path::PathBuf::from(name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    if let Err(error) = file.write_all(text.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(tmp)
+}
+
 /// Errors from loading or saving a profile (§72.1).
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -282,6 +319,51 @@ pub enum ChannelConfigWarning {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Temp files a save left beside `path`.
+    fn temp_siblings(path: &Path) -> Vec<std::path::PathBuf> {
+        let prefix = format!("{}.", path.file_name().unwrap().to_string_lossy());
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.starts_with(&prefix) && name.ends_with(".tmp")
+            })
+            .collect()
+    }
+
+    /// Saves racing on one path — say the GUI and a CLI saving the same
+    /// profile — each succeed, and the file ends up holding one whole profile.
+    #[test]
+    fn concurrent_saves_to_one_path_each_land_whole() {
+        let path = std::env::temp_dir().join(format!(
+            "listener_concurrent_save_{}.toml",
+            std::process::id()
+        ));
+        let writers: Vec<_> = (0..8)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    // Different lengths, so a torn write would not parse.
+                    let mut profile = Profile::new(format!("writer {n}"));
+                    profile.channels = vec![templates::udp_template(); n];
+                    for _ in 0..25 {
+                        profile.save(&path).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let loaded = Profile::load(&path).unwrap();
+        assert!(loaded.name.starts_with("writer "));
+        assert_eq!(temp_siblings(&path), Vec::<std::path::PathBuf>::new());
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn empty_byte_pattern_match_rule_is_rejected() {
