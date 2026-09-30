@@ -17,7 +17,7 @@ pub enum ChecksumAlgorithm {
     Crc8,
     /// CRC-16/CCITT, a.k.a. KERMIT (2 bytes, big-endian).
     Crc16Ccitt,
-    /// CRC-16/MODBUS (2 bytes, big-endian).
+    /// CRC-16/MODBUS (2 bytes, low byte first, as MODBUS RTU carries it).
     Crc16Modbus,
     /// CRC-32/ISO-HDLC (4 bytes, big-endian).
     Crc32,
@@ -26,7 +26,8 @@ pub enum ChecksumAlgorithm {
 /// Configuration for the checksum appended to a message.
 ///
 /// The checksum covers the complete wire output before it — the timestamp (if
-/// any) and the payload — and is appended as raw big-endian bytes. A message
+/// any) and the payload — and is appended as raw bytes: high byte first, except
+/// MODBUS, which its protocol carries low byte first (ADR-057). A message
 /// carries a checksum only when [`MessageConfig::checksum`] is `Some`.
 ///
 /// [`MessageConfig::checksum`]: super::MessageConfig
@@ -67,7 +68,7 @@ impl ChecksumConfig {
             ChecksumAlgorithm::Xor => vec![data.iter().fold(0u8, |acc, &b| acc ^ b)],
             ChecksumAlgorithm::Crc8 => vec![CRC8_SMBUS.checksum(data)],
             ChecksumAlgorithm::Crc16Ccitt => CRC16_KERMIT.checksum(data).to_be_bytes().to_vec(),
-            ChecksumAlgorithm::Crc16Modbus => CRC16_MODBUS.checksum(data).to_be_bytes().to_vec(),
+            ChecksumAlgorithm::Crc16Modbus => CRC16_MODBUS.checksum(data).to_le_bytes().to_vec(),
             ChecksumAlgorithm::Crc32 => CRC32_ISO_HDLC.checksum(data).to_be_bytes().to_vec(),
         };
         if self.intentionally_wrong {
@@ -114,11 +115,13 @@ mod tests {
         );
     }
 
+    /// MODBUS RTU carries its CRC low byte first (ADR-057): the catalog check
+    /// value 0x4B37 goes on the wire as `37 4B`.
     #[test]
-    fn crc16_modbus_check_value() {
+    fn crc16_modbus_check_value_is_appended_low_byte_first() {
         assert_eq!(
             cfg(ChecksumAlgorithm::Crc16Modbus).compute(CHECK),
-            vec![0x4B, 0x37]
+            vec![0x37, 0x4B]
         );
     }
 

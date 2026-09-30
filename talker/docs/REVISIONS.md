@@ -386,6 +386,18 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 
 ## Architecture Decision Record
 
+Revision note (2026-08-12) — both GUI log routes now disclose observer loss:
+
+- **ADR-006 (corrected)** gives the pane and file independent bounded,
+  non-blocking loss accounts. Pane loss qualifies retained history and channel
+  tallies; the file worker attempts a direct gap marker after earlier accepted
+  entries, with enabled-session boundaries preventing reassignment.
+- **ADR-006 (boundary added)** keeps one chronological pane history, a fixed GUI
+  directory when platform local data is available, and time-only rotation.
+  **Open folder** runs independently of the UI and file worker and never enables
+  logging; directory choice, retention, and disk-use bounds remain outside this
+  change.
+
 Revision note (2026-08-11) — logging and channel health separate control,
 history, and current state:
 

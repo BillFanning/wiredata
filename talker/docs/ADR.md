@@ -1,20 +1,14 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.20
-**Date:** 2026-08-12
+**Version:** 1.21
+**Date:** 2026-09-30
 **Status:** Accepted
 
-Revision note (2026-08-12) — both GUI log routes now disclose observer loss:
+Revision note (2026-09-30) — outer checksums match their protocols' conventions:
 
-- **ADR-006 (corrected)** gives the pane and file independent bounded,
-  non-blocking loss accounts. Pane loss qualifies retained history and channel
-  tallies; the file worker attempts a direct gap marker after earlier accepted
-  entries, with enabled-session boundaries preventing reassignment.
-- **ADR-006 (boundary added)** keeps one chronological pane history, a fixed GUI
-  directory when platform local data is available, and time-only rotation.
-  **Open folder** runs independently of the UI and file worker and never enables
-  logging; directory choice, retention, and disk-use bounds remain outside this
-  change.
+- **ADR-057** appends CRC-16/MODBUS low byte first, as MODBUS RTU carries it, and
+  names the algorithm labelled "CRC-16/CCITT" for what it computes: KERMIT. The
+  stored name changes, so the talker profile schema moves to 3.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -2364,6 +2358,50 @@ dropped failure or recovery edge, and the cumulative episode count keeps the
 running send-failure contribution to the application-wide error tally exact even
 when several complete episodes pass between observations. No second per-channel
 error-history view is needed.
+
+---
+
+## ADR-057 — Outer checksums: MODBUS goes low byte first, and "CCITT" is named KERMIT
+
+**Status:** Accepted 2026-09-30.
+
+**Context:** Every outer checksum was appended high byte first. MODBUS RTU carries
+its CRC low byte first: the check value of `123456789` is 0x4B37 and belongs on the
+wire as `37 4B`. A receiver validating MODBUS frames would therefore reject every
+message talker sent with that algorithm. Separately, the algorithm labelled
+"CRC-16/CCITT" computes CRC-16/KERMIT (reflected, initial value 0, check value
+0x2189). "CCITT" names at least three different CRC-16 variants — CCITT-FALSE
+(0x29B1), XMODEM (0x31C3) and KERMIT — so the label could not tell a user which
+one their device expects. Nothing is deployed, so no saved profile depends on
+either behaviour.
+
+**Decision:**
+
+- CRC-16/MODBUS is appended low byte first. The other multi-byte algorithms keep
+  high byte first.
+- The KERMIT algorithm is named for what it computes: `Crc16Kermit` in code,
+  `crc16_kermit` in profiles, and "CRC-16/KERMIT" in the GUI. The rename lands
+  with the specification change to §7.1, which names the algorithm.
+- The stored name changes, so the talker profile schema moves from 2 to 3. A
+  version-2 profile is refused with the existing "recreate this profile" message;
+  there is no migration (ADR-013).
+
+**Boundary:** No other CRC variant is added, and there is no per-message byte-order
+setting. Both wait until a real device needs one. `intentionally_wrong` still
+corrupts the last appended byte, which for MODBUS is now the high byte.
+
+**Alternatives considered:**
+
+- **Keep storing `crc16_ccitt` and change only the label:** Rejected. With no
+  deployed profiles there is nothing to protect, and a stored name that disagrees
+  with the label is the same ambiguity moved into the file.
+- **A byte-order setting per message:** Rejected for now. It adds a choice most
+  users cannot answer, to fix one algorithm whose convention is fixed by its
+  protocol.
+
+**Consequences:** MODBUS RTU receivers accept talker's frames. A user choosing a
+CRC-16 sees the variant's real name and can match it against a device manual's
+check value.
 
 ---
 
