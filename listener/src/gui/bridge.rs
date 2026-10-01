@@ -128,6 +128,13 @@ pub enum UiCommand {
     LoadProfile(std::path::PathBuf),
     /// Discard the workspace and start empty: stop and remove every channel,
     /// emitting the usual `ChannelRemoved` updates so the UI folds the change.
+    /// Check that a registered profile can resume (ADR-045), opening nothing:
+    /// see `resume_check`. Answered with `ResumeChecked`.
+    CheckResume(std::path::PathBuf),
+    /// Resume a registered profile (ADR-045): check it again, load it, and start
+    /// every channel. Recordings set to start with their channel begin then.
+    /// Answered with `Resumed`, or `ResumeChecked` with why it could not.
+    Resume(std::path::PathBuf),
     /// The teardown half of `LoadProfile` with nothing loaded after it.
     NewProfile,
     /// Stop all channels and end the driver (the App is closing).
@@ -179,6 +186,64 @@ pub enum UiUpdate {
     /// A profile save or load failed; carries a human-readable reason. The current
     /// workspace is unchanged.
     ProfileError(String),
+    /// Whether a registered profile can resume: its name, or why not (ADR-045).
+    ResumeChecked(std::path::PathBuf, Result<String, String>),
+    /// A registered profile resumed, at this time (ADR-045).
+    Resumed(String, std::time::SystemTime),
+}
+
+/// Whether a registered profile can resume (ADR-045). It must still be where it
+/// was registered, load, and have only valid channels; and every folder a
+/// channel records to when it starts must carry its destination marker
+/// (ADR-043) — without it the folder may be on a different disk, such as an
+/// empty mount point whose drive is not plugged in. Only reads files.
+pub(crate) fn resume_check(path: &std::path::Path) -> Result<Profile, String> {
+    if !path.is_file() {
+        return Err(format!("{} is no longer there", path.display()));
+    }
+    let profile =
+        Profile::load(path).map_err(|err| format!("{} does not load: {err}", path.display()))?;
+    let invalid: Vec<String> = profile
+        .validate()
+        .into_iter()
+        .filter_map(|(name, result)| result.err().map(|errors| format!("\"{name}\": {errors:?}")))
+        .collect();
+    if !invalid.is_empty() {
+        return Err(format!(
+            "{} has invalid channels: {}",
+            path.display(),
+            invalid.join("; ")
+        ));
+    }
+    for channel in &profile.channels {
+        let raw = &channel.raw_recording;
+        let display = &channel.display_recording;
+        for (destination, rotation) in [
+            (
+                raw.destination.as_ref().filter(|_| raw.enabled),
+                raw.file_rotation,
+            ),
+            (
+                display.destination.as_ref().filter(|_| display.enabled),
+                display.file_rotation,
+            ),
+        ] {
+            let Some(destination) = destination else {
+                continue;
+            };
+            let folder = crate::record::recording_folder(destination, rotation);
+            if !folder.join(crate::record::DESTINATION_MARKER).is_file() {
+                return Err(format!(
+                    "channel \"{}\" records to {}, which has no {} marker: it may be a \
+                     different disk, or nothing has been recorded there yet",
+                    channel.name.as_str(),
+                    folder.display(),
+                    crate::record::DESTINATION_MARKER
+                ));
+            }
+        }
+    }
+    Ok(profile)
 }
 
 /// A one-line, human-readable description of a channel's interface and endpoint,
@@ -485,6 +550,11 @@ impl Driver {
             }
             UiCommand::SaveProfile(path) => self.save_profile(path),
             UiCommand::LoadProfile(path) => self.load_profile(path).await,
+            UiCommand::CheckResume(path) => {
+                let checked = resume_check(&path).map(|profile| profile.name);
+                self.push(UiUpdate::ResumeChecked(path, checked));
+            }
+            UiCommand::Resume(path) => self.resume(path).await,
             UiCommand::NewProfile => self.new_profile().await,
             UiCommand::Shutdown => return false,
         }
@@ -527,6 +597,27 @@ impl Driver {
         }
         self.selected = None;
         self.stream_cursors.clear();
+    }
+
+    /// Resume a registered profile (ADR-045): check it again — the countdown
+    /// gave a drive time to go — then load it and start every channel. A
+    /// channel that cannot start is reported and left to its reconnect policy.
+    async fn resume(&mut self, path: std::path::PathBuf) {
+        let name = match resume_check(&path) {
+            Ok(profile) => profile.name,
+            Err(why) => {
+                self.push(UiUpdate::ResumeChecked(path, Err(why)));
+                return;
+            }
+        };
+        self.load_profile(path).await;
+        for id in self.channels.clone() {
+            if let Err(err) = self.listener.start(id).await {
+                self.push_channel_error(id, err);
+            }
+            self.drain_events();
+        }
+        self.push(UiUpdate::Resumed(name, std::time::SystemTime::now()));
     }
 
     async fn load_profile(&mut self, path: std::path::PathBuf) {
@@ -1031,6 +1122,84 @@ mod tests {
         cmd_tx.send(UiCommand::Shutdown).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A profile with one UDP channel that records on start to `recordings`.
+    fn resume_profile(recordings: &std::path::Path) -> std::path::PathBuf {
+        let mut config = udp_config(free_udp_port());
+        config.raw_recording.enabled = true;
+        config.raw_recording.destination = Some(recordings.to_path_buf());
+        config.raw_recording.file_rotation = crate::record::FileRotationPolicy::Daily;
+        let mut profile = Profile::new("Logging");
+        profile.channels.push(config);
+        let path = temp_profile_path();
+        profile.save(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_profile_resumes_only_where_its_recordings_went_before() {
+        // ADR-045: a missing profile, or a recording folder without its marker —
+        // perhaps a mount point whose drive is not there — means nothing starts.
+        let recordings = temp_profile_path().with_extension("rec");
+        let path = resume_profile(&recordings);
+        let refused = resume_check(&path).unwrap_err();
+        assert!(
+            refused.contains("has no .wiredata-destination marker"),
+            "{refused}"
+        );
+
+        std::fs::create_dir_all(&recordings).unwrap();
+        std::fs::write(recordings.join(crate::record::DESTINATION_MARKER), "").unwrap();
+        assert_eq!(resume_check(&path).unwrap().name, "Logging");
+
+        let _ = std::fs::remove_file(&path);
+        assert!(resume_check(&path)
+            .unwrap_err()
+            .contains("is no longer there"));
+        let _ = std::fs::remove_dir_all(&recordings);
+    }
+
+    #[tokio::test]
+    async fn resume_loads_the_profile_and_starts_its_channels() {
+        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("driver update timed out")
+                .expect("update stream closed")
+        }
+        let recordings = temp_profile_path().with_extension("rec");
+        std::fs::create_dir_all(&recordings).unwrap();
+        std::fs::write(recordings.join(crate::record::DESTINATION_MARKER), "").unwrap();
+        let path = resume_profile(&recordings);
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let handle =
+            tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
+        cmd_tx.send(UiCommand::Resume(path.clone())).await.unwrap();
+
+        let (mut added, mut started) = (false, false);
+        loop {
+            match next(&mut upd_rx).await {
+                UiUpdate::ChannelAdded(..) => added = true,
+                UiUpdate::Event(RuntimeEvent::ChannelStarted(_)) => started = true,
+                UiUpdate::Resumed(name, _) => {
+                    assert_eq!(name, "Logging");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(added, "the profile was loaded");
+        assert!(started, "its channel was started");
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        handle.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&recordings);
     }
 
     /// A LoadProfile of a missing/invalid file reports ProfileError and leaves the

@@ -25,7 +25,7 @@ use crate::display::{CharacterRendering, DisplayMode, StreamRenderer};
 
 use bridge::{BridgeHandle, UiCommand};
 
-use state::{AppState, ChannelStatus};
+use state::{AppState, ChannelStatus, ResumeState};
 use widgets::{
     config_incomplete, list_serial_ports, status_color, status_glyph, template_for, AddKind,
 };
@@ -196,6 +196,9 @@ struct ListenerApp {
     /// loaded). `Save` writes here silently; `Save As…` always re-prompts. `None`
     /// until the first save/load, so the first `Save` falls through to a picker.
     current_profile_path: Option<std::path::PathBuf>,
+    /// The profile to resume when Listener starts (ADR-045), registered from the
+    /// Profile menu. Kept in application state, never in a profile.
+    resume_profile: Option<std::path::PathBuf>,
     /// Recently saved/loaded profile paths, most-recent-first (capped). Listed at the
     /// top of the Profile menu for one-click reload. Session-scoped for now.
     recent_profiles: Vec<std::path::PathBuf>,
@@ -272,6 +275,9 @@ struct StreamRenderCache {
 
 /// eframe storage key for the persisted recent-profiles list (newline-joined paths).
 const RECENT_PROFILES_KEY: &str = "recent_profiles";
+/// eframe storage key for the profile to resume on launch (a path; empty for
+/// none). ADR-045.
+const RESUME_PROFILE_KEY: &str = "listener.resume_profile";
 /// eframe storage key for the dark-theme preference ("true"/"false"; same key
 /// talker uses). Light is the default.
 const DARK_MODE_KEY: &str = "dark_mode";
@@ -305,7 +311,11 @@ impl ListenerApp {
         } else {
             egui::ThemePreference::Light
         });
-        Self {
+        let resume_profile = storage
+            .and_then(|s| s.get_string(RESUME_PROFILE_KEY))
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from);
+        let mut app = Self {
             bridge,
             repaint,
             state: AppState::default(),
@@ -325,10 +335,18 @@ impl ListenerApp {
             stream_cache: None,
             resume_scroll_bottom: None,
             current_profile_path: None,
+            resume_profile,
             recent_profiles,
             command_drop: None,
             event_log,
+        };
+        // Resume on launch (ADR-045): the driver checks the registered profile,
+        // opening nothing; the countdown follows only if the check passes.
+        if let Some(path) = app.resume_profile.clone() {
+            app.state.start_resume_check();
+            app.send(UiCommand::CheckResume(path));
         }
+        app
     }
 
     /// Record a profile path as recently used: move/insert it at the front, dedup, and
@@ -399,6 +417,56 @@ impl ListenerApp {
                 let warn = ui.visuals().warn_fg_color;
                 ui.colored_label(warn, format!("\u{26A0} {message}"));
             });
+    }
+
+    /// Resuming the registered profile on launch (ADR-045): the countdown with
+    /// Cancel, why nothing started, or when it resumed. When the countdown
+    /// runs out, the resume is sent from here.
+    fn show_resume_banner(&mut self, ui: &mut egui::Ui) {
+        if let Some(path) = self.state.resume_due(std::time::Instant::now()) {
+            self.send(UiCommand::Resume(path));
+        }
+        let (message, button) = match self.state.resume() {
+            ResumeState::Idle | ResumeState::Checking => return,
+            ResumeState::Counting { name, until, .. } => {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                // Keep the count moving without input.
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(250));
+                (
+                    format!(
+                        "Resuming \u{201C}{name}\u{201D} in {} s",
+                        left.as_secs() + u64::from(left.subsec_nanos() > 0)
+                    ),
+                    "Cancel",
+                )
+            }
+            ResumeState::Resuming => ("Resuming…".to_owned(), "Dismiss"),
+            ResumeState::Refused(why) => (format!("\u{26A0} Did not resume: {why}"), "Dismiss"),
+            ResumeState::Resumed(name, at) => {
+                let at: chrono::DateTime<chrono::Local> = (*at).into();
+                (
+                    format!(
+                        "Resumed \u{201C}{name}\u{201D} automatically at {}",
+                        at.format("%H:%M")
+                    ),
+                    "Dismiss",
+                )
+            }
+        };
+        let clicked = egui::Panel::top("resume_notice")
+            .resizable(false)
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(message);
+                    ui.button(button).clicked()
+                })
+                .inner
+            })
+            .inner;
+        if clicked {
+            self.state.clear_resume();
+        }
     }
 
     /// Lasting recording faults (§56.1, §56.2): low disk and "recording
@@ -621,6 +689,12 @@ impl eframe::App for ListenerApp {
             .join("\n");
         storage.set_string(RECENT_PROFILES_KEY, joined);
         storage.set_string(DARK_MODE_KEY, self.dark_mode.to_string());
+        let resume = self
+            .resume_profile
+            .as_deref()
+            .and_then(std::path::Path::to_str)
+            .unwrap_or_default();
+        storage.set_string(RESUME_PROFILE_KEY, resume.to_owned());
     }
 
     /// On window close (the X button) or any app exit, shut the driver down and wait
@@ -639,6 +713,7 @@ impl eframe::App for ListenerApp {
         self.drain_updates();
         self.handle_tab_keys(ui.ctx());
         self.show_command_drop_banner(ui);
+        self.show_resume_banner(ui);
         self.show_event_log_banner(ui);
         self.show_recording_faults_banner(ui);
         let channels_collapsed = self.channels_collapsed;

@@ -48,17 +48,23 @@ pub struct SegmentPlan {
     pub size_cap: Option<u64>,
 }
 
+/// The folder a recording writes its files in: the destination's folder for a
+/// single file, the destination itself when it rotates (§59). The destination
+/// marker lives here.
+pub fn recording_folder(destination: &Path, rotation: FileRotationPolicy) -> PathBuf {
+    match rotation {
+        FileRotationPolicy::None => destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+        FileRotationPolicy::Hourly | FileRotationPolicy::Daily => destination.to_path_buf(),
+    }
+}
+
 impl SegmentPlan {
     /// The folder the segments are written in.
     pub fn folder(&self) -> PathBuf {
-        match self.rotation {
-            FileRotationPolicy::None => self
-                .destination
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
-            FileRotationPolicy::Hourly | FileRotationPolicy::Daily => self.destination.clone(),
-        }
+        recording_folder(&self.destination, self.rotation)
     }
 
     /// The one lock the recording holds for its whole life (§121).

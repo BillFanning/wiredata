@@ -89,6 +89,10 @@ impl ListenerApp {
                     ui.close();
                 }
                 ui.separator();
+                // Resume on launch (ADR-045): registered in application state,
+                // never in the profile, and only for a profile saved or loaded.
+                self.resume_menu_item(ui);
+                ui.separator();
                 if ui.button("New").clicked() {
                     self.new_profile();
                     ui.close();
@@ -343,6 +347,48 @@ impl ListenerApp {
         }
         self.current_profile_path = None;
         self.send(UiCommand::NewProfile);
+    }
+
+    /// The Profile menu's "Resume this profile on launch" choice (ADR-045), for
+    /// the current profile, and which profile resumes when that is another.
+    fn resume_menu_item(&mut self, ui: &mut egui::Ui) {
+        const HINT: &str = "When Listener starts, it checks this profile, waits 10 s so \
+            you can cancel, then loads it and starts every channel. Recordings set to \
+            record on start begin too.";
+        match self.current_profile_path.clone() {
+            Some(current) => {
+                let mut on = self.resume_profile.as_ref() == Some(&current);
+                if ui
+                    .checkbox(&mut on, "Resume this profile on launch")
+                    .on_hover_text(HINT)
+                    .changed()
+                {
+                    self.resume_profile = on.then_some(current);
+                }
+            }
+            None => {
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut false, "Resume this profile on launch"),
+                )
+                .on_disabled_hover_text("Save or load a profile first.");
+            }
+        }
+        let other = self
+            .resume_profile
+            .clone()
+            .filter(|path| Some(path) != self.current_profile_path.as_ref());
+        if let Some(other) = other {
+            let name = other.file_name().map_or_else(
+                || other.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            ui.label(egui::RichText::new(format!("Resumes on launch: {name}")).weak())
+                .on_hover_text(other.display().to_string());
+            if ui.button("Stop resuming on launch").clicked() {
+                self.resume_profile = None;
+            }
+        }
     }
 
     /// Load a profile from a known path (used by both the picker and the recent-files

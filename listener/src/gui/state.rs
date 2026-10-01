@@ -357,6 +357,34 @@ pub struct AppState {
     /// A transient workspace-level status line — the result of the last profile
     /// Save/Load (e.g. "Saved profile.toml" or an error). `None` until one happens.
     workspace_status: Option<String>,
+    /// Resuming a registered profile on launch (ADR-045).
+    resume: ResumeState,
+}
+
+/// How long the resume countdown gives anyone at the screen to cancel before
+/// any port opens (ADR-045).
+pub const RESUME_COUNTDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resuming a registered profile on launch (ADR-045).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum ResumeState {
+    /// Nothing to resume, or done with.
+    #[default]
+    Idle,
+    /// The driver is checking the registered profile; nothing opens.
+    Checking,
+    /// Counting down to the resume; Cancel stops it before anything opens.
+    Counting {
+        path: std::path::PathBuf,
+        name: String,
+        until: std::time::Instant,
+    },
+    /// The driver is resuming.
+    Resuming,
+    /// Nothing started, and why.
+    Refused(String),
+    /// Resumed: the profile's name and when.
+    Resumed(String, std::time::SystemTime),
 }
 
 impl AppState {
@@ -575,9 +603,49 @@ impl AppState {
             UiUpdate::ProfileLoaded(name) => {
                 self.workspace_status = Some(format!("Loaded “{name}”"));
             }
+            UiUpdate::ResumeChecked(path, Ok(name)) => {
+                // A check answered after a Cancel starts nothing.
+                if self.resume == ResumeState::Checking {
+                    self.resume = ResumeState::Counting {
+                        path,
+                        name,
+                        until: std::time::Instant::now() + RESUME_COUNTDOWN,
+                    };
+                }
+            }
+            UiUpdate::ResumeChecked(_, Err(why)) => self.resume = ResumeState::Refused(why),
+            UiUpdate::Resumed(name, at) => self.resume = ResumeState::Resumed(name, at),
             UiUpdate::ProfileError(message) => {
                 self.workspace_status = Some(message);
             }
+        }
+    }
+
+    /// Where resuming the registered profile stands (ADR-045).
+    pub fn resume(&self) -> &ResumeState {
+        &self.resume
+    }
+
+    /// Start checking the registered profile at launch.
+    pub fn start_resume_check(&mut self) {
+        self.resume = ResumeState::Checking;
+    }
+
+    /// Cancel a resume before it happens, or dismiss its outcome.
+    pub fn clear_resume(&mut self) {
+        self.resume = ResumeState::Idle;
+    }
+
+    /// The profile to resume once the countdown has run out; it is returned
+    /// once, and the state moves on to resuming.
+    pub fn resume_due(&mut self, now: std::time::Instant) -> Option<std::path::PathBuf> {
+        match &self.resume {
+            ResumeState::Counting { path, until, .. } if now >= *until => {
+                let path = path.clone();
+                self.resume = ResumeState::Resuming;
+                Some(path)
+            }
+            _ => None,
         }
     }
 
@@ -1119,6 +1187,63 @@ mod tests {
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
         state.apply(stats_with_state(id, ChannelState::Starting, false));
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
+    }
+
+    #[test]
+    fn a_resume_counts_down_before_anything_opens_and_cancel_stops_it() {
+        // ADR-045: the check opens nothing; the countdown gives ten seconds to
+        // cancel; only then is the resume asked for, once.
+        let path = std::path::PathBuf::from("logging.toml");
+        let mut state = AppState::default();
+        state.start_resume_check();
+        state.apply(UiUpdate::ResumeChecked(
+            path.clone(),
+            Ok("Logging".to_owned()),
+        ));
+        let ResumeState::Counting { until, .. } = state.resume().clone() else {
+            panic!("expected a countdown, got {:?}", state.resume());
+        };
+        assert_eq!(
+            state.resume_due(until - std::time::Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(state.resume_due(until), Some(path.clone()));
+        assert_eq!(state.resume_due(until), None, "asked for once");
+        assert_eq!(state.resume(), &ResumeState::Resuming);
+
+        // Cancel during the countdown: nothing is ever due.
+        let mut state = AppState::default();
+        state.start_resume_check();
+        state.apply(UiUpdate::ResumeChecked(
+            path.clone(),
+            Ok("Logging".to_owned()),
+        ));
+        state.clear_resume();
+        assert_eq!(
+            state.resume_due(std::time::Instant::now() + RESUME_COUNTDOWN),
+            None
+        );
+
+        // Cancel while still checking: a late answer starts no countdown.
+        let mut state = AppState::default();
+        state.start_resume_check();
+        state.clear_resume();
+        state.apply(UiUpdate::ResumeChecked(path, Ok("Logging".to_owned())));
+        assert_eq!(state.resume(), &ResumeState::Idle);
+    }
+
+    #[test]
+    fn a_refused_resume_says_why() {
+        let mut state = AppState::default();
+        state.start_resume_check();
+        state.apply(UiUpdate::ResumeChecked(
+            std::path::PathBuf::from("logging.toml"),
+            Err("no marker".to_owned()),
+        ));
+        assert_eq!(
+            state.resume(),
+            &ResumeState::Refused("no marker".to_owned())
+        );
     }
 
     #[test]

@@ -33,7 +33,9 @@ pub use controller::{
 };
 pub use file::{DisplayFileRecorder, RawFileRecorder};
 pub use file_rotation::is_filesystem_safe;
-pub use segments::{DisplaySegments, RawSegments, SegmentPlan};
+pub use segments::{
+    recording_folder, DisplaySegments, RawSegments, SegmentPlan, DESTINATION_MARKER,
+};
 
 /// Time-based recording file rotation (§59). `None` writes a single file; the
 /// others write a new file per calendar period, named for the period start (§59).
