@@ -1480,6 +1480,24 @@ impl ChannelPipeline {
                     )));
                 }
             }
+            TransportNotice::UdpReceiveBuffer {
+                channel_id: _,
+                buffer,
+            } => {
+                self.transport_health.udp_receive_buffer = Some(buffer);
+                if buffer.is_short() {
+                    let fix = if cfg!(target_os = "linux") {
+                        "; raise net.core.rmem_max to allow it"
+                    } else {
+                        ""
+                    };
+                    self.diagnostics.record(Diagnostic::warning(format!(
+                        "channel {} has a {}-byte receive buffer, less than the {} bytes \
+                         requested{fix}",
+                        self.channel_name, buffer.granted, buffer.requested
+                    )));
+                }
+            }
             TransportNotice::TransportFaulted {
                 channel_id: _,
                 cause,

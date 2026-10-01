@@ -52,6 +52,23 @@ pub enum SharedPortStatus {
     NotApplied,
 }
 
+/// The receive buffer a UDP socket asked for and what the OS granted (§75).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiveBuffer {
+    pub requested: usize,
+    /// In the request's terms. Linux reports twice the size it set, to cover
+    /// its bookkeeping (socket(7)), so its figure is halved.
+    pub granted: usize,
+}
+
+impl ReceiveBuffer {
+    /// The OS granted less than was asked for. On Linux the cap is
+    /// `net.core.rmem_max`.
+    pub fn is_short(&self) -> bool {
+        self.granted < self.requested
+    }
+}
+
 /// An unbound UDP transport description (§15, §75). Call [`bind`](Self::bind) at
 /// Channel Start to acquire the socket.
 #[derive(Clone, Debug)]
@@ -93,7 +110,8 @@ impl UdpTransport {
         self
     }
 
-    /// Set SO_RCVBUF in bytes (§167) — the lever against kernel-dropped UDP (§101).
+    /// Ask for SO_RCVBUF in bytes (§75) — the lever against kernel-dropped UDP
+    /// (§101). The OS may grant less; the bound transport reports what it got.
     pub fn with_recv_buffer(mut self, bytes: usize) -> Self {
         self.recv_buffer = Some(bytes);
         self
@@ -123,6 +141,7 @@ impl UdpTransport {
             drop_counter_supported,
             kernel_timestamps_active,
             shared_port,
+            receive_buffer,
         } = build_udp_socket(&self)?;
         std_socket.set_nonblocking(true)?;
         let socket = UdpSocket::from_std(std_socket)?;
@@ -153,6 +172,7 @@ impl UdpTransport {
             kernel_timestamps_requested: self.kernel_timestamps,
             kernel_timestamps_active,
             shared_port,
+            receive_buffer,
         })
     }
 }
@@ -163,6 +183,7 @@ struct BuiltSocket {
     drop_counter_supported: bool,
     kernel_timestamps_active: bool,
     shared_port: SharedPortStatus,
+    receive_buffer: Option<ReceiveBuffer>,
 }
 
 /// Build and bind a std UDP socket, setting SO_RCVBUF (§167) and address reuse
@@ -177,9 +198,9 @@ fn build_udp_socket(transport: &UdpTransport) -> io::Result<BuiltSocket> {
         Domain::IPV6
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    if let Some(bytes) = transport.recv_buffer {
-        socket.set_recv_buffer_size(bytes)?;
-    }
+    let receive_buffer = transport
+        .recv_buffer
+        .map(|requested| request_receive_buffer(&socket, requested));
     let drop_counter_supported = enable_udp_drop_counter(&socket);
     let kernel_timestamps_active =
         enable_udp_kernel_timestamps(&socket, transport.kernel_timestamps);
@@ -194,7 +215,22 @@ fn build_udp_socket(transport: &UdpTransport) -> io::Result<BuiltSocket> {
         drop_counter_supported,
         kernel_timestamps_active,
         shared_port,
+        receive_buffer,
     })
+}
+
+/// Ask for `requested` bytes of receive buffer (§75) and read back what the
+/// OS granted. A refusal is not fatal: macOS refuses a size over its limit
+/// outright, and the socket then keeps its default, which status reports.
+fn request_receive_buffer(socket: &socket2::Socket, requested: usize) -> ReceiveBuffer {
+    let _ = socket.set_recv_buffer_size(requested);
+    let reported = socket.recv_buffer_size().unwrap_or(0);
+    let granted = if cfg!(target_os = "linux") {
+        reported / 2
+    } else {
+        reported
+    };
+    ReceiveBuffer { requested, granted }
 }
 
 /// Set address reuse before the bind (§15, ADR-047): SO_REUSEADDR, and on Unix
@@ -275,6 +311,7 @@ pub struct BoundUdpTransport {
     kernel_timestamps_requested: bool,
     kernel_timestamps_active: bool,
     shared_port: SharedPortStatus,
+    receive_buffer: Option<ReceiveBuffer>,
 }
 
 impl BoundUdpTransport {
@@ -303,6 +340,7 @@ impl DataTransportRunner for BoundUdpTransport {
             kernel_timestamps_requested,
             kernel_timestamps_active,
             shared_port,
+            receive_buffer,
         } = self;
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_DATAGRAM];
@@ -327,6 +365,10 @@ impl DataTransportRunner for BoundUdpTransport {
                         channel_id,
                         status: shared_port,
                     });
+                }
+                if let Some(buffer) = receive_buffer {
+                    let _ =
+                        notices.try_send(TransportNotice::UdpReceiveBuffer { channel_id, buffer });
                 }
             }
             loop {
@@ -469,22 +511,77 @@ fn receive_datagram_with_metadata(
 mod tests {
     use super::*;
 
+    /// §75: the receive buffer is asked for before the bind, and what the OS
+    /// granted is what the socket has, in the request's terms.
     #[test]
-    fn recv_buffer_size_is_applied_at_bind() {
-        // §167: SO_RCVBUF is set before bind. The OS may round up (Linux commonly
-        // doubles), so the effective size is at least what we requested.
+    fn the_granted_receive_buffer_is_what_the_socket_has() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let requested = 512 * 1024;
         let transport =
             UdpTransport::new(ChannelId::new(), addr, UdpMode::Unicast).with_recv_buffer(requested);
         let built = build_udp_socket(&transport).unwrap();
-        let actual = socket2::SockRef::from(&built.socket)
+        let buffer = built.receive_buffer.expect("a size was requested");
+        assert_eq!(buffer.requested, requested);
+        let reported = socket2::SockRef::from(&built.socket)
             .recv_buffer_size()
             .unwrap();
-        assert!(
-            actual >= requested,
-            "recv buffer {actual} should be >= requested {requested}"
-        );
+
+        #[cfg(target_os = "linux")]
+        {
+            // Linux sets min(requested, rmem_max) and reports twice that.
+            let rmem_max: usize = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(buffer.granted, requested.min(rmem_max));
+            assert_eq!(buffer.granted, reported / 2);
+            assert_eq!(buffer.is_short(), rmem_max < requested);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(buffer.granted, reported);
+            assert!(!buffer.is_short(), "{buffer:?}");
+        }
+    }
+
+    #[test]
+    fn a_receive_buffer_is_short_only_when_less_was_granted() {
+        let buffer = |granted| ReceiveBuffer {
+            requested: 4 << 20,
+            granted,
+        };
+        assert!(!buffer(4 << 20).is_short());
+        assert!(!buffer(8 << 20).is_short());
+        assert!(buffer(208 * 1024).is_short());
+    }
+
+    #[tokio::test]
+    async fn the_receive_buffer_is_reported_when_one_was_asked_for() {
+        let cid = ChannelId::new();
+        let bound = UdpTransport::new(cid, "127.0.0.1:0".parse().unwrap(), UdpMode::Unicast)
+            .with_recv_buffer(256 * 1024)
+            .bind()
+            .await
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(2);
+        let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let handle = bound.with_notice_sender(notice_tx).run(tx, cancel.clone());
+
+        let _drop_status = notice_rx.recv().await.unwrap();
+        let _arrival_status = notice_rx.recv().await.unwrap();
+        match notice_rx.recv().await.unwrap() {
+            TransportNotice::UdpReceiveBuffer { channel_id, buffer } => {
+                assert_eq!(channel_id, cid);
+                assert_eq!(buffer.requested, 256 * 1024);
+                assert!(buffer.granted > 0, "{buffer:?}");
+            }
+            other => panic!("expected the receive buffer, got {other:?}"),
+        }
+
+        cancel.cancel();
+        assert!(matches!(handle.join().await, TransportOutcome::Cancelled));
     }
 
     fn broadcast(addr: SocketAddr) -> UdpTransport {

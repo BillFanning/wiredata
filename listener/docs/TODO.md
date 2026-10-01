@@ -13,13 +13,6 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 ---
 
-## Spec 2.4.0 requirements not yet built (2026-09-30)
-
-The spec states these; the code does not do them yet.
-
-- [ ] **UDP receive buffer (§75).** `recv_buffer_bytes` has no 4 MiB default,
-  and the granted size is not reported.
-
 ## v1 → v2 strip (ADR-010) — DONE
 
 The strip is complete and the workspace builds clean (`cargo test -p listener`,

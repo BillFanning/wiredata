@@ -280,6 +280,20 @@ fn write_transport_health(out: &mut String, health: TransportHealth) {
         SharedPortStatus::NotApplied => "not_applied",
     };
     let _ = writeln!(out, "udp_shared_port={shared_port}");
+    match health.udp_receive_buffer {
+        Some(buffer) => {
+            let _ = writeln!(
+                out,
+                "udp_receive_buffer_requested_bytes={}",
+                buffer.requested
+            );
+            let _ = writeln!(out, "udp_receive_buffer_granted_bytes={}", buffer.granted);
+        }
+        None => {
+            let _ = writeln!(out, "udp_receive_buffer_requested_bytes=not_applicable");
+            let _ = writeln!(out, "udp_receive_buffer_granted_bytes=not_applicable");
+        }
+    }
     match health.udp_kernel_drops {
         CounterAvailability::NotApplicable => {
             let _ = writeln!(out, "udp_kernel_drops=not_applicable");
@@ -369,6 +383,10 @@ mod tests {
                 udp_kernel_drops: CounterAvailability::Available(4),
                 arrival_timestamps: arrivals,
                 udp_shared_port: SharedPortStatus::Applied,
+                udp_receive_buffer: Some(crate::transport::udp::ReceiveBuffer {
+                    requested: 4_194_304,
+                    granted: 212_992,
+                }),
             },
             ingest_queue: QueueDepth {
                 current: 0,
@@ -390,6 +408,8 @@ mod tests {
         assert!(report.contains("ingest_handoff_p99_upper_us=250\n"));
         assert!(report.contains("arrival_timestamp_status=kernel_software\n"));
         assert!(report.contains("udp_shared_port=applied\n"));
+        assert!(report.contains("udp_receive_buffer_requested_bytes=4194304\n"));
+        assert!(report.contains("udp_receive_buffer_granted_bytes=212992\n"));
         assert!(report.contains("udp_kernel_drops=4\n"));
         assert!(report.contains("ingest_queue_peak=8\n"));
     }

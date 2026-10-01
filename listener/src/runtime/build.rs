@@ -142,9 +142,11 @@ pub fn build_udp(channel_id: ChannelId, config: &UdpConfig) -> Result<UdpTranspo
             .map_err(|_| BuildError::InvalidMulticastInterface(iface.clone()))?;
         transport = transport.with_multicast_interface(ip);
     }
-    if let Some(bytes) = config.recv_buffer_bytes {
-        transport = transport.with_recv_buffer(bytes);
-    }
+    transport = transport.with_recv_buffer(
+        config
+            .recv_buffer_bytes
+            .unwrap_or(crate::config::DEFAULT_RECV_BUFFER_BYTES),
+    );
     if config.kernel_timestamps {
         transport = transport.with_kernel_timestamps();
     }

@@ -133,6 +133,12 @@ pub enum TransportNotice {
         channel_id: ChannelId,
         status: udp::SharedPortStatus,
     },
+    /// The receive buffer a UDP socket asked for and what the OS granted
+    /// (§75). Sent when a size was requested.
+    UdpReceiveBuffer {
+        channel_id: ChannelId,
+        buffer: udp::ReceiveBuffer,
+    },
     /// The transport ended on a spontaneous fault (§94). Sent by the channel's
     /// fault monitor so the **cause** reaches the pipeline's diagnostics log —
     /// the paired `ChannelFaulted` lifecycle event (§137) carries only the id,

@@ -176,9 +176,10 @@ pub struct UdpConfig {
     /// multi-homed host (§75/§167). `None` = the OS default interface.
     #[serde(default)]
     pub multicast_interface: Option<String>,
-    /// SO_RCVBUF in bytes (§167): the primary lever against kernel-dropped UDP
-    /// (§101). `None` = OS default. Applied at bind; a change takes effect via the
-    /// §13 apply-pending restart.
+    /// SO_RCVBUF in bytes (§75): the primary lever against kernel-dropped UDP
+    /// (§101). `None` = [`DEFAULT_RECV_BUFFER_BYTES`]. Applied at bind; a change
+    /// takes effect via the §13 apply-pending restart. The OS may grant less, and
+    /// status reports what it granted.
     #[serde(default)]
     pub recv_buffer_bytes: Option<usize>,
     /// Request a kernel software receive timestamp for each UDP datagram. Linux
@@ -192,6 +193,11 @@ pub struct UdpConfig {
     #[serde(default)]
     pub shared_port: bool,
 }
+
+/// The UDP receive buffer a Channel asks for when its profile sets none (§75):
+/// enough to ride out a pause in reading at the 1,000 datagrams a second the
+/// headroom target sends (ADR-048).
+pub const DEFAULT_RECV_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// TCP listener interface configuration (§76).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

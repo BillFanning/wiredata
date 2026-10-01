@@ -14,7 +14,7 @@ use crate::core::{ArrivalTimestampStatus, ChannelId, RecordingState};
 use crate::runtime::{
     ByteHistogram, CounterAvailability, DurationHistogram, QueueDepth, TransportHealth,
 };
-use crate::transport::udp::SharedPortStatus;
+use crate::transport::udp::{ReceiveBuffer, SharedPortStatus};
 
 use super::super::state::{ChannelStatus, ChannelView};
 use super::super::widgets::human_bytes;
@@ -211,6 +211,30 @@ const SHARED_PORT_TOOLTIP: &str = concat!(
     "receive the same broadcast or multicast datagrams. This line says whether the ",
     "operating system applied it; it cannot say whether another program is bound."
 );
+
+const RECEIVE_BUFFER_TOOLTIP: &str = concat!(
+    "SO_RCVBUF: how much received data the operating system holds for this socket ",
+    "while Listener reads. When it fills, the operating system drops datagrams. ",
+    "Listener asks for 4 MiB unless the profile sets recv_buffer_bytes. Linux grants ",
+    "at most net.core.rmem_max; raise it with sysctl to allow more. The figure is in ",
+    "the request's terms: Linux reports twice what it set, and that is halved here."
+);
+
+/// The receive-buffer line (§75): what was granted against what was asked.
+fn receive_buffer_words(buffer: ReceiveBuffer) -> String {
+    if buffer.is_short() {
+        format!(
+            "Receive buffer: {} granted, less than the {} requested",
+            human_bytes(buffer.granted as u64),
+            human_bytes(buffer.requested as u64)
+        )
+    } else {
+        format!(
+            "Receive buffer: {} granted",
+            human_bytes(buffer.granted as u64)
+        )
+    }
+}
 
 /// The shared-port line (§15, ADR-047), or `None` when sharing was not requested.
 fn shared_port_words(status: SharedPortStatus) -> Option<&'static str> {
@@ -698,6 +722,16 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
         .on_hover_text(SHARED_PORT_TOOLTIP);
     }
 
+    if let Some(buffer) = view.transport_health.udp_receive_buffer {
+        let text = egui::RichText::new(receive_buffer_words(buffer));
+        ui.label(if buffer.is_short() {
+            text.color(palette(ui).warning)
+        } else {
+            text.weak()
+        })
+        .on_hover_text(RECEIVE_BUFFER_TOOLTIP);
+    }
+
     match view.transport_health.udp_kernel_drops {
         CounterAvailability::NotApplicable => {
             ui.label(egui::RichText::new("UDP kernel drops: not applicable").weak())
@@ -838,13 +872,13 @@ mod tests {
 
     use super::{
         card_tone, compact_timing, counted, detail_timing, diagnostics_badge, pressure_signal,
-        queue_level_reaches_half, shared_port_words, size_figures, timing_figures, timing_window,
-        transport_signal, ChannelStatus, SharedPortStatus, ARRIVAL_TIMESTAMP_TOOLTIP,
-        CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP, IDLE_RULE_TIMING_TOOLTIP, IDLE_TIMER_TOOLTIP,
-        PIPELINE_TOOLTIP, PRESSURE_TOOLTIP, PROCESSING_TOOLTIP, RAW_QUEUE_ACTIVE_TOOLTIP,
-        RAW_QUEUE_FAULTED_TOOLTIP, RAW_QUEUE_GAP_TOOLTIP, RECEIVE_DETAILS_TOOLTIP,
-        SERIAL_BACKPRESSURE_TOOLTIP, SHARED_PORT_TOOLTIP, TRANSPORT_TOOLTIP, UDP_AVAILABLE_TOOLTIP,
-        UDP_UNAVAILABLE_TOOLTIP,
+        queue_level_reaches_half, receive_buffer_words, shared_port_words, size_figures,
+        timing_figures, timing_window, transport_signal, ChannelStatus, ReceiveBuffer,
+        SharedPortStatus, ARRIVAL_TIMESTAMP_TOOLTIP, CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP,
+        IDLE_RULE_TIMING_TOOLTIP, IDLE_TIMER_TOOLTIP, PIPELINE_TOOLTIP, PRESSURE_TOOLTIP,
+        PROCESSING_TOOLTIP, RAW_QUEUE_ACTIVE_TOOLTIP, RAW_QUEUE_FAULTED_TOOLTIP,
+        RAW_QUEUE_GAP_TOOLTIP, RECEIVE_DETAILS_TOOLTIP, SERIAL_BACKPRESSURE_TOOLTIP,
+        SHARED_PORT_TOOLTIP, TRANSPORT_TOOLTIP, UDP_AVAILABLE_TOOLTIP, UDP_UNAVAILABLE_TOOLTIP,
     };
     use crate::core::RecordingState;
     use crate::runtime::{
@@ -1196,6 +1230,24 @@ mod tests {
         assert_eq!(counted(1, "chunk"), "1 chunk");
         assert_eq!(counted(0, "chunk"), "0 chunks");
         assert_eq!(counted(12_500, "firing"), "12,500 firings");
+    }
+
+    #[test]
+    fn the_receive_buffer_line_says_when_less_was_granted() {
+        assert_eq!(
+            receive_buffer_words(ReceiveBuffer {
+                requested: 4_194_304,
+                granted: 4_194_304,
+            }),
+            "Receive buffer: 4.194 MB granted"
+        );
+        assert_eq!(
+            receive_buffer_words(ReceiveBuffer {
+                requested: 4_194_304,
+                granted: 212_992,
+            }),
+            "Receive buffer: 212.992 kB granted, less than the 4.194 MB requested"
+        );
     }
 
     #[test]
