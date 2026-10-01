@@ -18,6 +18,7 @@ use crate::runtime::{ChannelSnapshot, ReconnectProgress, RecordingStatus, Trigge
 use crate::transport::SerialControlLines;
 use wiredata_ui::format::human_bytes;
 
+use super::bind_scope::LocalAddresses;
 use super::bridge::UiUpdate;
 
 /// One inline Mark timestamp pinned to a view-space byte offset (§50.2), owned by
@@ -359,6 +360,8 @@ pub struct AppState {
     workspace_status: Option<String>,
     /// Resuming a registered profile on launch (ADR-045).
     resume: ResumeState,
+    /// The host's local addresses, for the UDP bind choice (§15).
+    local_addresses: LocalAddresses,
 }
 
 /// How long the resume countdown gives anyone at the screen to cancel before
@@ -615,10 +618,21 @@ impl AppState {
             }
             UiUpdate::ResumeChecked(_, Err(why)) => self.resume = ResumeState::Refused(why),
             UiUpdate::Resumed(name, at) => self.resume = ResumeState::Resumed(name, at),
+            UiUpdate::LocalAddresses(Ok(listed)) => {
+                self.local_addresses = LocalAddresses::Listed(listed);
+            }
+            UiUpdate::LocalAddresses(Err(why)) => {
+                self.local_addresses = LocalAddresses::Failed(why);
+            }
             UiUpdate::ProfileError(message) => {
                 self.workspace_status = Some(message);
             }
         }
+    }
+
+    /// The host's local addresses, as last listed (§15).
+    pub fn local_addresses(&self) -> &LocalAddresses {
+        &self.local_addresses
     }
 
     /// Where resuming the registered profile stands (ADR-045).

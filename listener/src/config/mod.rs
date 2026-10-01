@@ -164,6 +164,13 @@ pub fn validate_channel(
     } else if !kind_matches {
         errors.push(ChannelConfigError::KindInterfaceMismatch);
     }
+    // Disabled in this release (§4.1, ADR-047): its connections' data cannot be
+    // displayed or recorded yet (ADR-024). The code stays for when it returns.
+    if channel.kind == ChannelKind::TcpListener
+        || matches!(channel.interface, InterfaceConfig::TcpListener(_))
+    {
+        errors.push(ChannelConfigError::TcpListenerUnavailable);
+    }
 
     if let InterfaceConfig::Udp(udp) = &channel.interface {
         if udp.mode == UdpMode::Multicast
@@ -293,6 +300,11 @@ pub enum ChannelConfigError {
     KindInterfaceMismatch,
     #[error("TCP Connection channels are runtime-only and cannot be persisted")]
     TcpConnectionNotPersistable,
+    #[error(
+        "TCP Listener isn't available in this release: received data can't be displayed or \
+         recorded yet"
+    )]
+    TcpListenerUnavailable,
     #[error("multicast UDP requires a multicast group address")]
     MissingMulticastGroup,
     #[error("retention is unbounded: set a limit on the channel or in defaults")]
@@ -539,14 +551,26 @@ mod tests {
     #[test]
     fn templates_are_valid() {
         let mut profile = Profile::new("templates");
-        profile.channels = vec![
-            templates::serial_template(),
-            templates::udp_template(),
-            templates::tcp_listener_template(),
-        ];
+        profile.channels = vec![templates::serial_template(), templates::udp_template()];
         for (name, result) in profile.validate() {
             assert!(result.is_ok(), "{name} should be valid: {result:?}");
         }
+    }
+
+    #[test]
+    fn a_tcp_listener_is_not_available_in_this_release() {
+        // §4.1, ADR-047: rejected with the reason, not silently skipped.
+        let err = validate_channel(
+            &templates::tcp_listener_template(),
+            &DefaultConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, [ChannelConfigError::TcpListenerUnavailable]);
+        assert_eq!(
+            err[0].to_string(),
+            "TCP Listener isn't available in this release: received data can't be displayed \
+             or recorded yet"
+        );
     }
 
     #[test]

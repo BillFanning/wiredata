@@ -33,10 +33,6 @@ pub struct Cli {
     #[arg(long, value_name = "PORT")]
     udp: Option<u16>,
 
-    /// Quick start: accept TCP clients on this port (binds 0.0.0.0).
-    #[arg(long, value_name = "PORT")]
-    tcp: Option<u16>,
-
     /// Quick start: open this serial port (e.g. COM3 or /dev/ttyUSB0).
     #[arg(long, value_name = "PORT")]
     serial: Option<String>,
@@ -65,7 +61,7 @@ pub struct Cli {
 impl Cli {
     /// Whether any data source was requested on the command line.
     fn has_source(&self) -> bool {
-        self.profile.is_some() || self.udp.is_some() || self.tcp.is_some() || self.serial.is_some()
+        self.profile.is_some() || self.udp.is_some() || self.serial.is_some()
     }
 
     /// Whether to launch the GUI (§3). Explicit `--gui` always wins; explicit
@@ -421,12 +417,6 @@ fn build_channel_configs(cli: &Cli) -> Result<Vec<ChannelConfig>> {
             udp.port = port;
         }
         config
-    } else if let Some(port) = cli.tcp {
-        let mut config = templates::tcp_listener_template();
-        if let InterfaceConfig::TcpListener(tcp) = &mut config.interface {
-            tcp.port = port;
-        }
-        config
     } else if let Some(port) = &cli.serial {
         let mut config = templates::serial_template();
         if let InterfaceConfig::Serial(serial) = &mut config.interface {
@@ -435,7 +425,7 @@ fn build_channel_configs(cli: &Cli) -> Result<Vec<ChannelConfig>> {
         }
         config
     } else {
-        bail!("specify --profile, --udp, --tcp, or --serial (see --help)");
+        bail!("specify --profile, --udp, or --serial (see --help)");
     };
 
     Ok(vec![config])
@@ -487,7 +477,6 @@ mod tests {
         Cli {
             profile: None,
             udp: None,
-            tcp: None,
             serial: None,
             baud: 9600,
             require_all: false,

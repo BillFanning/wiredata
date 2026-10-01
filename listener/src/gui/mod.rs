@@ -8,6 +8,7 @@
 //! blocks — every runtime touch is a non-blocking channel send. The egui-free,
 //! unit-tested pieces live in [`bridge`] and [`state`].
 
+pub mod bind_scope;
 pub mod bridge;
 mod channels;
 mod detail;
@@ -346,6 +347,7 @@ impl ListenerApp {
             app.state.start_resume_check();
             app.send(UiCommand::CheckResume(path));
         }
+        app.refresh_local_addresses();
         app
     }
 
@@ -359,6 +361,13 @@ impl ListenerApp {
 
     pub(super) fn refresh_serial_ports(&mut self) {
         self.serial_ports = list_serial_ports();
+    }
+
+    /// Ask the driver to list the host's local addresses for the UDP bind
+    /// choice (§15). The OS is asked off the UI thread; the list arrives as an
+    /// update.
+    pub(super) fn refresh_local_addresses(&mut self) {
+        self.send(UiCommand::ListLocalAddresses);
     }
 
     /// Drain every pending update into the view-model (non-blocking, §99). A newly

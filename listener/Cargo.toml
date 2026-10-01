@@ -56,6 +56,9 @@ chrono = { workspace = true }
 # Raw socket options: SO_RCVBUF to mitigate kernel UDP drops (§167, §101)
 socket2 = { workspace = true }
 
+# The host's local addresses, listed in the UDP bind choice (§15, ADR-047)
+if-addrs = { workspace = true }
+
 # Filesystem free space for the recording disk-space guard (§168, §56.2)
 fs4 = { workspace = true }
 

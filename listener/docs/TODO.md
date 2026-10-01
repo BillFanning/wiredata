@@ -17,11 +17,9 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 The spec states these; the code does not do them yet.
 
-- [ ] **TCP Listener disabled (ADR-047, §4.1, §16).** `tcp_listener_template` is
-  still offered, and validation accepts the kind.
-- [ ] **UDP bind scope and shared port (ADR-047, §15, §75).** No `shared_port`
-  field, and the bind scope is not shown in words. `recv_buffer_bytes` has no
-  4 MiB default, and the granted size is not reported.
+- [ ] **UDP shared port and receive buffer (ADR-047, §15, §75).** No
+  `shared_port` field. `recv_buffer_bytes` has no 4 MiB default, and the granted
+  size is not reported.
 - [ ] **Strict profiles and limits (ADR-048, §71, §72.1).** Unknown keys are
   ignored, and a missing `schema_version` loads as current. There are no upper
   limits, and `PipelineCapacities` is not validated.

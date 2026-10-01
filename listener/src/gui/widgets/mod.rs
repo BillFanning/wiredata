@@ -22,21 +22,22 @@ use crate::config::{
 use crate::core::ChannelId;
 use crate::transport::udp::UdpMode;
 
+use super::bind_scope::{bind_choice_label, bind_choices, LocalAddresses, ALL_INTERFACES_ADDRESS};
+
 /// Which interface a new channel uses, in the Add menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum AddKind {
     Udp,
-    Tcp,
     Serial,
 }
 
 impl AddKind {
-    pub const ADD_MENU: [Self; 3] = [Self::Udp, Self::Tcp, Self::Serial];
+    /// The TCP Listener is not offered in this release (§4.1, ADR-047).
+    pub const ADD_MENU: [Self; 2] = [Self::Udp, Self::Serial];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Udp => "UDP",
-            Self::Tcp => "TCP",
             Self::Serial => "Serial",
         }
     }
@@ -195,17 +196,26 @@ fn port_field(ui: &mut egui::Ui, id: &str, port: &mut u16) {
     });
 }
 
+/// A list the interface editor asks to have listed again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Refresh {
+    SerialPorts,
+    LocalAddresses,
+}
+
 /// Edit a channel's interface config in place, laid out like talker (§74/§75).
-/// Presentation only — applied via a §13 Reconfigure. Returns whether the serial
-/// port list should be refreshed (the ⟳ button was clicked). `channel_id` keys the
-/// per-channel custom-baud text buffer so it survives frames and resets on switch.
+/// Presentation only — applied via a §13 Reconfigure. Returns the list to
+/// refresh, if its ⟳ button was clicked or its choice opened. `channel_id` keys
+/// the per-channel custom-baud text buffer so it survives frames and resets on
+/// switch.
 pub(super) fn edit_interface(
     ui: &mut egui::Ui,
     channel_id: ChannelId,
     config: &mut ChannelConfig,
     serial_ports: &[String],
-) -> bool {
-    let mut refresh = false;
+    local_addresses: &LocalAddresses,
+) -> Option<Refresh> {
+    let mut refresh = None;
 
     ui.separator();
 
@@ -223,20 +233,21 @@ pub(super) fn edit_interface(
                         ui.radio_value(&mut udp.mode, UdpMode::Broadcast, "Broadcast")
                             .on_hover_text(
                                 "Receive broadcast datagrams (sent to the subnet \
-                                 broadcast address). Bind to 0.0.0.0 to accept them on \
-                                 any local interface.",
+                                 broadcast address). Bind to All interfaces to accept \
+                                 them on any local interface.",
                             );
                         ui.radio_value(&mut udp.mode, UdpMode::Unicast, "Unicast")
                             .on_hover_text(
                                 "Receive datagrams addressed directly to this host. \
-                                 Bind to 0.0.0.0 to listen on every local interface, or \
-                                 a specific local IP to listen on just that one.",
+                                 Bind to All interfaces to listen on every local \
+                                 interface, or one local address to listen on just that \
+                                 one.",
                             );
                         ui.radio_value(&mut udp.mode, UdpMode::Multicast, "Multicast")
                             .on_hover_text(
                                 "Join a multicast group and receive its datagrams. Bind \
-                                 to 0.0.0.0 to join on any interface; set the Group \
-                                 address below.",
+                                 to All interfaces to join on any interface; set the \
+                                 Group address below.",
                             );
                     });
                     ui.end_row();
@@ -244,34 +255,65 @@ pub(super) fn edit_interface(
                     // Binding address + port — always directly under Mode, so it
                     // never moves when switching modes (#2, #3). The multicast Group
                     // row appears *below* it.
-                    // The bind-address tip is mode-aware: 0.0.0.0 is the right default
-                    // in every mode (accept on any local interface), but *why* differs.
+                    // The bind-address tip is mode-aware: All interfaces is the right
+                    // default in every mode (accept on any local interface), but *why*
+                    // differs.
                     let bind_hint = match udp.mode {
                         UdpMode::Broadcast => {
-                            "The local network interface(s) to receive on. 0.0.0.0 means \"any \
-                             network interface\" — the usual choice for broadcast, since the \
-                             sender targets the subnet, not a specific host."
+                            "The local network interface(s) to receive on. All interfaces \
+                             (0.0.0.0) is the usual choice for broadcast, since the sender \
+                             targets the subnet, not a specific host."
                         }
                         UdpMode::Unicast => {
-                            "The local network interface(s) to receive on. 0.0.0.0 means \"any \
-                             network interface\" (accept on all NICs); use a specific local IP \
-                             to receive only on that NIC."
+                            "The local network interface(s) to receive on. All interfaces \
+                             (0.0.0.0) accepts on every NIC; choose one local address to \
+                             receive only on that NIC, or 127.0.0.1 for this computer only."
                         }
                         UdpMode::Multicast => {
-                            "The local network interface to join the group on. 0.0.0.0 means \
-                             \"any network interface\" — fine for most setups; use a specific \
-                             local IP to join on just that NIC."
+                            "The local network interface to join the group on. All \
+                             interfaces (0.0.0.0) is fine for most setups; choose one local \
+                             address to join on just that NIC."
                         }
                     };
                     ui.label("Binding address").on_hover_text(bind_hint);
                     ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut udp.bind_address)
-                                .id_salt("udp_bind")
-                                .desired_width(130.0)
-                                .hint_text("0.0.0.0"),
-                        )
-                        .on_hover_text(bind_hint);
+                        // The choices say who can reach the socket (§15, ADR-047).
+                        // If the OS cannot list its addresses, the address is typed.
+                        if let LocalAddresses::Failed(why) = local_addresses {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut udp.bind_address)
+                                    .id_salt("udp_bind")
+                                    .desired_width(130.0)
+                                    .hint_text(ALL_INTERFACES_ADDRESS),
+                            )
+                            .on_hover_text(format!(
+                                "{bind_hint}\n\nThis computer's addresses could not be \
+                                 listed: {why}"
+                            ));
+                        } else {
+                            let listed = local_addresses.listed();
+                            let combo = egui::ComboBox::from_id_salt("udp_bind")
+                                .selected_text(bind_choice_label(&udp.bind_address, listed))
+                                .width(280.0)
+                                .show_ui(ui, |ui| {
+                                    for (address, label) in bind_choices(&udp.bind_address, listed)
+                                    {
+                                        ui.selectable_value(&mut udp.bind_address, address, label);
+                                    }
+                                });
+                            // Listed again as the choice opens, as the serial
+                            // port list is: an adapter may have come or gone.
+                            if combo.response.on_hover_text(bind_hint).clicked() {
+                                refresh = Some(Refresh::LocalAddresses);
+                            }
+                        }
+                        if ui
+                            .small_button("\u{2B6E}")
+                            .on_hover_text("Refresh this computer's addresses")
+                            .clicked()
+                        {
+                            refresh = Some(Refresh::LocalAddresses);
+                        }
                         ui.label("port").on_hover_text(
                             "The UDP port to listen on — i.e. the destination port the \
                              sending machine sends to.",
@@ -386,14 +428,14 @@ pub(super) fn edit_interface(
                         // Enumeration is not free, so this fires on the click
                         // that opens the list rather than every frame it is open.
                         if combo.response.clicked() {
-                            refresh = true;
+                            refresh = Some(Refresh::SerialPorts);
                         }
                         if ui
                             .small_button("\u{2B6E}")
                             .on_hover_text("Refresh port list")
                             .clicked()
                         {
-                            refresh = true;
+                            refresh = Some(Refresh::SerialPorts);
                         }
                     });
                     ui.end_row();
@@ -502,7 +544,6 @@ pub(super) fn template_for(kind: AddKind) -> ChannelConfig {
             }
             config
         }
-        AddKind::Tcp => templates::tcp_listener_template(),
         AddKind::Serial => templates::serial_template(),
     }
 }
@@ -553,10 +594,7 @@ mod tests {
 
     #[test]
     fn add_menu_defines_the_shared_transport_order() {
-        assert_eq!(
-            AddKind::ADD_MENU.map(AddKind::label),
-            ["UDP", "TCP", "Serial"]
-        );
+        assert_eq!(AddKind::ADD_MENU.map(AddKind::label), ["UDP", "Serial"]);
     }
 
     #[test]

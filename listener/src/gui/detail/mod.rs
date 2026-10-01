@@ -16,6 +16,7 @@ use super::widgets::{
     config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
     line_indicator, line_toggle, paint_glyph, recording_facts, recording_glyph_size,
     recording_indicator, start_button, status_color, status_glyph, status_words, stop_enabled,
+    Refresh,
 };
 use super::ListenerApp;
 use wiredata_ui::fonts::bold;
@@ -198,10 +199,11 @@ impl ListenerApp {
         // with one click — "Apply & Restart" installs it and brings the channel up
         // (no separate Apply-then-Start step).
         let ports = self.serial_ports.clone();
+        let addresses = self.state.local_addresses().clone();
         // Force the section open for one frame when focus moved to a needy channel
         // (task 1); `None` afterwards so the user can still collapse it.
         let force_open = self.force_config_open.then_some(true);
-        let mut refresh = false;
+        let mut refresh = None;
         // Configure is edit-only: there's no Apply button here. Edits commit via the
         // Start / Apply & Restart button at the top, which applies the pending draft.
         if let Some((_, config)) = &mut self.edit_draft {
@@ -218,7 +220,9 @@ impl ListenerApp {
                 .default_open(true)
                 .show(ui, |ui| {
                     refresh = ui
-                        .push_id("edit_iface", |ui| edit_interface(ui, id, config, &ports))
+                        .push_id("edit_iface", |ui| {
+                            edit_interface(ui, id, config, &ports, &addresses)
+                        })
                         .inner;
                     // The reconnect choice inside applies live (§9.1); see
                     // `persist_reconnect` below.
@@ -230,8 +234,10 @@ impl ListenerApp {
         }
         self.force_config_open = false;
         self.persist_reconnect(id);
-        if refresh {
-            self.refresh_serial_ports();
+        match refresh {
+            Some(Refresh::SerialPorts) => self.refresh_serial_ports(),
+            Some(Refresh::LocalAddresses) => self.refresh_local_addresses(),
+            None => {}
         }
 
         // Live serial control/status lines (§161): green = high, grey = low.

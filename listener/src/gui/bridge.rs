@@ -24,6 +24,8 @@ use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities
 use crate::transport::udp::UdpMode;
 use crate::transport::SerialControlLines;
 
+use super::bind_scope::{local_addresses, BindScope, LocalAddress};
+
 /// How often the driver polls running Channels for a fresh snapshot (the pull
 /// surface, ADR-006). 5 Hz is responsive without busy-polling.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
@@ -126,8 +128,6 @@ pub enum UiCommand {
     /// `ProfileLoaded`; a load/parse error yields `ProfileError` and leaves the
     /// workspace untouched.
     LoadProfile(std::path::PathBuf),
-    /// Discard the workspace and start empty: stop and remove every channel,
-    /// emitting the usual `ChannelRemoved` updates so the UI folds the change.
     /// Check that a registered profile can resume (ADR-045), opening nothing:
     /// see `resume_check`. Answered with `ResumeChecked`.
     CheckResume(std::path::PathBuf),
@@ -135,6 +135,11 @@ pub enum UiCommand {
     /// every channel. Recordings set to start with their channel begin then.
     /// Answered with `Resumed`, or `ResumeChecked` with why it could not.
     Resume(std::path::PathBuf),
+    /// List the host's local addresses for the UDP bind choice (§15). Answered
+    /// with `LocalAddresses`.
+    ListLocalAddresses,
+    /// Discard the workspace and start empty: stop and remove every channel,
+    /// emitting the usual `ChannelRemoved` updates so the UI folds the change.
     /// The teardown half of `LoadProfile` with nothing loaded after it.
     NewProfile,
     /// Stop all channels and end the driver (the App is closing).
@@ -190,6 +195,8 @@ pub enum UiUpdate {
     ResumeChecked(std::path::PathBuf, Result<String, String>),
     /// A registered profile resumed, at this time (ADR-045).
     Resumed(String, std::time::SystemTime),
+    /// The host's local addresses, or why the OS could not list them (§15).
+    LocalAddresses(Result<Vec<LocalAddress>, String>),
 }
 
 /// Whether a registered profile can resume (ADR-045). It must still be where it
@@ -256,7 +263,12 @@ fn describe_interface(config: &ChannelConfig) -> String {
                 UdpMode::Broadcast => "broadcast",
                 UdpMode::Multicast => "multicast",
             };
-            format!("UDP {mode} · bind {}:{}", udp.bind_address, udp.port)
+            let endpoint = format!("UDP {mode} · bind {}:{}", udp.bind_address, udp.port);
+            // Who can reach it, in words (§15, ADR-047).
+            match BindScope::of(&udp.bind_address).words() {
+                Some(scope) => format!("{endpoint} · {scope}"),
+                None => endpoint,
+            }
         }
         InterfaceConfig::TcpListener(tcp) => {
             format!("TCP listener · {}:{}", tcp.bind_address, tcp.port)
@@ -555,6 +567,9 @@ impl Driver {
                 self.push(UiUpdate::ResumeChecked(path, checked));
             }
             UiCommand::Resume(path) => self.resume(path).await,
+            UiCommand::ListLocalAddresses => {
+                self.push(UiUpdate::LocalAddresses(local_addresses()));
+            }
             UiCommand::NewProfile => self.new_profile().await,
             UiCommand::Shutdown => return false,
         }
@@ -832,6 +847,50 @@ mod tests {
             udp.port = port;
         }
         config
+    }
+
+    #[test]
+    fn a_udp_header_states_who_can_reach_it() {
+        let mut config = templates::udp_template();
+        let InterfaceConfig::Udp(udp) = &mut config.interface else {
+            unreachable!("the UDP template is UDP")
+        };
+        udp.bind_address = "0.0.0.0".to_string();
+        udp.port = 10110;
+        assert_eq!(
+            describe_interface(&config),
+            "UDP unicast · bind 0.0.0.0:10110 · all interfaces (reachable from the network)"
+        );
+        assert_eq!(
+            describe_interface(&udp_config(10110)),
+            "UDP unicast · bind 127.0.0.1:10110 · this computer only"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_driver_lists_local_addresses() {
+        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("driver update timed out")
+                .expect("update stream closed")
+        }
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let handle =
+            tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
+        cmd_tx.send(UiCommand::ListLocalAddresses).await.unwrap();
+        loop {
+            if let UiUpdate::LocalAddresses(listed) = next(&mut upd_rx).await {
+                let listed = listed.expect("the OS lists its addresses");
+                assert!(listed.iter().any(|a| a.ip.is_loopback()), "{listed:?}");
+                break;
+            }
+        }
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        handle.await.unwrap();
     }
 
     /// The driver translates commands into runtime calls, forwards lifecycle events,
