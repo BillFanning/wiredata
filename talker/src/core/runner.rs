@@ -1051,7 +1051,7 @@ fn run_loop(
                                 if e.downcast_ref::<MissingRetryConfiguration>().is_some() {
                                     if let Some(line) = retry_config_faults.report(
                                         &who.label,
-                                        "serial recovery had no confirmed interface settings",
+                                        "recovery had no confirmed interface settings",
                                         "That send was withheld; automatic reopen cannot proceed \
                                          until the interface is updated or the channel is restarted",
                                     ) {
@@ -1132,42 +1132,28 @@ fn run_loop(
                                 // line and nowhere the log reader can see, so
                                 // this states what happened to those sends.
                                 let failed_noun = if ep.failures == 1 { "send" } else { "sends" };
-                                if ep.handle_replaced {
-                                    if let Some(InterfaceConfig::Serial(config)) =
-                                        current_config.as_ref()
-                                    {
-                                        tracing::info!(
-                                            channel = who.id.as_u64(),
-                                            "channel {} reopened serial port {}; sending recovered \
-                                             after {} failed {} and {} withheld while retrying",
-                                            who.label,
-                                            config.port,
-                                            ep.failures,
-                                            failed_noun,
-                                            ep.suppressed
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            channel = who.id.as_u64(),
-                                            "channel {} sending recovered after {} failed {} and {} \
-                                             withheld while retrying",
-                                            who.label,
-                                            ep.failures,
-                                            failed_noun,
-                                            ep.suppressed
-                                        );
+                                // A replaced handle names what it reconnected
+                                // to (ADR-059, §4.5).
+                                let replaced = match current_config.as_ref() {
+                                    Some(InterfaceConfig::Serial(config)) if ep.handle_replaced => {
+                                        format!("reopened serial port {}; ", config.port)
                                     }
-                                } else {
-                                    tracing::info!(
-                                        channel = who.id.as_u64(),
-                                        "channel {} sending recovered after {} failed {} and {} \
-                                         withheld while retrying",
-                                        who.label,
-                                        ep.failures,
-                                        failed_noun,
-                                        ep.suppressed
-                                    );
-                                }
+                                    Some(InterfaceConfig::TcpClient(config))
+                                        if ep.handle_replaced =>
+                                    {
+                                        format!("reconnected to {}; ", config.address)
+                                    }
+                                    _ => String::new(),
+                                };
+                                tracing::info!(
+                                    channel = who.id.as_u64(),
+                                    "channel {} {replaced}sending recovered after {} failed {} \
+                                     and {} withheld while retrying",
+                                    who.label,
+                                    ep.failures,
+                                    failed_noun,
+                                    ep.suppressed
+                                );
                                 timer.emit(TalkerStatus::SendRecovered {
                                     channel: who.id,
                                     failures: ep.failures,
@@ -2723,6 +2709,93 @@ mod tests {
         );
     }
 
+    /// ADR-059, §4.5: the receiving server is killed and restarted on the
+    /// same address. Sending resumes on a new connection without a click, and
+    /// one line closes the episode, naming the address.
+    #[test]
+    fn a_restarted_tcp_server_gets_the_next_message_on_a_new_connection() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        fn accept_within(listener: &TcpListener, limit: Duration) -> std::net::TcpStream {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + limit;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        return stream;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "talker never connected");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            }
+        }
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let config =
+            InterfaceConfig::TcpClient(crate::core::channel::TcpClientConfig::new(address));
+        let interface = config.open().unwrap();
+        let mut first = accept_within(&server, Duration::from_secs(5));
+        let (handle, logs) = spawn_logging_interface_runner(interface, Some(config));
+        let mut buf = [0u8; 2];
+        first.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &[0xAB, 0xAB]);
+
+        // Kill the server, and wait until talker sees a write fail.
+        drop(first);
+        drop(server);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "no write ever failed");
+            if handle
+                .status_rx
+                .try_iter()
+                .any(|s| matches!(s, TalkerStatus::ConnectionError { .. }))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Restart it on the same address: the next message arrives there.
+        let server = TcpListener::bind(address).expect("the port can be bound again");
+        let mut second = accept_within(&server, Duration::from_secs(20));
+        let mut buf = [0u8; 2];
+        second.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &[0xAB, 0xAB], "whole messages on the new connection");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle
+            .status_rx
+            .try_iter()
+            .any(|s| matches!(s, TalkerStatus::SendRecovered { .. }))
+        {
+            assert!(Instant::now() < deadline, "no recovery was reported");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(2));
+
+        let recoveries: Vec<String> = logs
+            .try_iter()
+            .map(|event| event.message)
+            .filter(|line| line.contains("sending recovered"))
+            .collect();
+        assert_eq!(recoveries.len(), 1, "{recoveries:#?}");
+        assert!(
+            recoveries[0].contains(&format!("reconnected to {address}; sending recovered")),
+            "{recoveries:#?}"
+        );
+    }
+
     /// Model the serial failure mode where a removed device's old handle stays
     /// unusable after a replacement appears under the same port name. Recovery
     /// must prepare a replacement handle rather than assuming every transport
@@ -2923,7 +2996,7 @@ mod tests {
             if let Ok(event) = log_rx.recv_timeout(Duration::from_millis(20)) {
                 if event
                     .message
-                    .contains("serial recovery had no confirmed interface settings")
+                    .contains("recovery had no confirmed interface settings")
                 {
                     break event;
                 }

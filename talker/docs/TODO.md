@@ -13,8 +13,8 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 The spec states these; the code does not do them yet.
 
-- [ ] **TCP client (ADR-059, §4.5).** `TcpClientInterface` has no retry
-  preparation, so it never reconnects, and it never reads the socket.
+- [ ] **TCP replies (ADR-059, §4.5).** `TcpClientInterface` never reads the
+  socket, so replies are neither drained nor counted.
 - [ ] **Possibly partial (ADR-059, §4.4).** Not a send outcome yet, and wire bytes
   are not counted apart from whole messages.
 - [ ] **Strict profiles (ADR-062, §8.2).** Unknown keys are ignored, and
@@ -60,15 +60,6 @@ The spec states these; the code does not do them yet.
   does not cause port reopen or DTR-reset churn. The automated coverage fixes the
   state and accounting contract; this check validates real driver mappings and
   hardware behavior.
-- [ ] **Define automatic TCP reconnect after an established stream fails.** The
-  current bounded failure episode retries the existing stream, which cannot heal
-  after a reset or broken connection. Decide whether and how to establish a fresh
-  connection from the confirmed address at an eligible retry. A failed reconnect
-  must withhold that due send without render, interface-write, or send-call timing;
-  it must not count as a failed write or replay a write that may already have
-  transferred a prefix. UDP retains its existing socket because replacing it can
-  change source-port semantics. Amend the current-behaviour spec and record the
-  transport decision before implementation.
 - [x] **Telemetry split (ADR-018, accepted + implemented 2026-07-11).**
   `TalkerStatus::Sent` replaced by the three lanes: `Counters` (≤5 Hz +
   final-at-stop, cumulative totals plus current send-failure state,

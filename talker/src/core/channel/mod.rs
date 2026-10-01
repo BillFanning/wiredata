@@ -90,7 +90,7 @@ pub(crate) struct MissingRetryConfiguration;
 
 impl std::fmt::Display for MissingRetryConfiguration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("serial retry has no current serial configuration")
+        f.write_str("retry has no current interface configuration")
     }
 }
 
