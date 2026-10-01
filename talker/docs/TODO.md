@@ -36,6 +36,10 @@ found again. Remove an item when it is done: the commit says what changed.
   pane shows the newest `SendSample` per interval, not every send. Confirm in a
   real high-rate run that it reads as a sample rather than as lost data. A fix
   would be in how the pane labels what it shows, not in the lane.
+- [ ] **The new send outcomes in a live run.** Nobody has checked these in the GUI
+  yet: "possibly partial" in the send outcomes and the Channel detail line, and
+  "Peer sent N bytes" for a TCP peer that replies (`gui/diagnostics/outcomes.rs`).
+  Check that each reads clearly and is not mistaken for a failure count.
 
 ## GUI
 
@@ -74,6 +78,15 @@ found again. Remove an item when it is done: the commit says what changed.
   `/dev/cu.*`; prefer `cu` to `tty`), eframe and winit windowing, and that every
   `windows-sys` use stays behind `cfg(windows)`. Fonts are bundled, so no font work
   is expected.
+- [ ] **Unattended use on macOS.** Unattended use is supported on Windows and
+  Linux (`deploy/README.md`). macOS builds and tests in CI, but nobody has run it
+  unattended. After the platform pass:
+  - Add a launchd example beside `deploy/linux` and `deploy/windows`.
+  - Check that launchd's stop (SIGTERM) reaches `wiredata-stop` and that
+    recordings finish their files.
+  - Check what `request_receive_buffer` reads back. Only Linux reports
+    double the size, which the code halves.
+  - Run a soak. `run-soak.sh` reads memory from `/proc`, which macOS lacks.
 
 ## Project README
 
