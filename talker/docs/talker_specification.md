@@ -1,29 +1,17 @@
 # Talker — Program Specification
-**Version:** 2.5.0
+**Version:** 2.5.1
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-09-30) — unattended operation and protocol-correct
-checksums:
+Revision note (2026-10-01) — a TCP peer that has closed:
 
-- **§3.1 unattended CLI (ADR-060)** — the CLI starts the channels that open,
-  retries the others, warns loudly while any is down, stops gracefully on every
-  OS stop signal, and exits with defined codes. `--require-all` keeps
-  all-or-nothing.
-- **§4.5 TCP client (ADR-059)** — reconnects at retry points and never resends
-  the failed message; replies from the peer are drained and counted.
-- **§3.2 / §4.4 possibly partial (ADR-059)** — a write that fails after
-  transferring bytes is its own send outcome, for serial and TCP.
-- **§7 checksums (ADR-057)** — "CRC-16/CCITT" is named for what it computes,
-  CRC-16/KERMIT, stored as `crc16_kermit`. MODBUS is appended low byte first.
-- **§8.2 profiles (ADR-057, ADR-062)** — schema 3; unknown keys and a missing
-  `version` are refused. The illustrative example gives way to the real
-  `profiles/profile.example.toml`.
-- **Drift corrected** — §8.1 and §8.2 no longer describe the Standard/Precise
-  timing mode that ADR-047 removed. §12.1 drops TCP reconnect, now decided.
+- **§4.5 TCP client (ADR-059, amended)** — when the reply drain finds that the
+  peer has closed the connection, that send fails with nothing written and the
+  next retry point reconnects. A message is no longer written into a connection
+  whose peer has gone and counted as sent.
 
-These requirements lead the implementation. Until each lands,
-[TODO.md](TODO.md) lists what is not yet built.
+Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
+not yet built.
 
 Earlier revisions are in [REVISIONS.md](REVISIONS.md). They live there rather
 than here for two reasons: a document's version number belongs only in its own
@@ -588,7 +576,9 @@ while its current-run Send outcomes and log counts still show earlier failures.
   each write the client reads whatever the peer has sent, without blocking,
   discards it and counts it: "peer sent N bytes". Leaving it unread would fill the
   receive buffer, and closing a socket with unread data makes most stacks reset
-  the connection, which can discard the peer's own in-flight data.
+  the connection, which can discard the peer's own in-flight data. When a drain
+  finds that the peer has closed the connection, that send fails with nothing
+  written, and the next retry point reconnects.
 - There is no acknowledgement protocol and no server mode. Viewing replies is
   listener's job.
 

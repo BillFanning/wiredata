@@ -13,6 +13,25 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-09-30) — unattended operation and protocol-correct
+checksums:
+
+- **§3.1 unattended CLI (ADR-060)** — the CLI starts the channels that open,
+  retries the others, warns loudly while any is down, stops gracefully on every
+  OS stop signal, and exits with defined codes. `--require-all` keeps
+  all-or-nothing.
+- **§4.5 TCP client (ADR-059)** — reconnects at retry points and never resends
+  the failed message; replies from the peer are drained and counted.
+- **§3.2 / §4.4 possibly partial (ADR-059)** — a write that fails after
+  transferring bytes is its own send outcome, for serial and TCP.
+- **§7 checksums (ADR-057)** — "CRC-16/CCITT" is named for what it computes,
+  CRC-16/KERMIT, stored as `crc16_kermit`. MODBUS is appended low byte first.
+- **§8.2 profiles (ADR-057, ADR-062)** — schema 3; unknown keys and a missing
+  `version` are refused. The illustrative example gives way to the real
+  `profiles/profile.example.toml`.
+- **Drift corrected** — §8.1 and §8.2 no longer describe the Standard/Precise
+  timing mode that ADR-047 removed. §12.1 drops TCP reconnect, now decided.
+
 Revision note (2026-08-12) — both GUI log destinations now disclose when they
 cannot keep up:
 
@@ -404,6 +423,16 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-09-30) — decisions for unattended operation:
+
+- **ADR-059** gives the TCP client reconnect at retry points, counts a write that
+  fails after transferring bytes as possibly partial, and drains peer replies.
+- **ADR-060** sets one CLI contract for both apps: start what can start, warn
+  loudly, fixed exit codes, and a graceful stop on every OS stop signal.
+- **ADR-061** moves talker's bounded log-file worker into a shared
+  `wiredata-log` crate.
+- **ADR-062** refuses unknown profile keys and a missing `version`.
 
 Revision note (2026-09-30) — outer checksums match their protocols' conventions:
 

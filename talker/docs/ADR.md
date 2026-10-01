@@ -1,18 +1,14 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.22
-**Date:** 2026-09-30
+**Version:** 1.23
+**Date:** 2026-10-01
 **Status:** Accepted
 
-Revision note (2026-09-30) — decisions for unattended operation:
+Revision note (2026-10-01) — a TCP peer that has closed:
 
-- **ADR-059** gives the TCP client reconnect at retry points, counts a write that
-  fails after transferring bytes as possibly partial, and drains peer replies.
-- **ADR-060** sets one CLI contract for both apps: start what can start, warn
-  loudly, fixed exit codes, and a graceful stop on every OS stop signal.
-- **ADR-061** moves talker's bounded log-file worker into a shared
-  `wiredata-log` crate.
-- **ADR-062** refuses unknown profile keys and a missing `version`.
+- **ADR-059 (amended)** — a reply drain that finds the peer has closed the
+  connection fails that send with nothing written, and the client reconnects at
+  the next retry point.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -2418,6 +2414,7 @@ check value.
 ## ADR-059 — A TCP client reconnects, counts possibly-partial writes, and drains replies
 
 **Status:** Accepted 2026-09-30. Resolves the §12.1 open item on TCP reconnect.
+Amended 2026-10-01: a drain that finds the peer has closed fails that send.
 
 **Context:** The TCP client has no retry preparation. Once the peer closes or
 restarts, every later write fails on the dead stream until someone restarts the
@@ -2442,6 +2439,12 @@ makes most stacks send a reset, which can discard the peer's own in-flight data.
 - **Replies are drained.** Before each write, the client reads whatever the peer
   has sent, without blocking, discards it and counts it. Status shows "peer sent
   N bytes".
+- **A closed peer fails the send** (amended 2026-10-01). When a drain reads
+  end-of-stream, the peer has closed the connection. That send fails with
+  nothing written, and the client reconnects at the next retry point. Writing
+  anyway would put the message into a connection whose peer has gone and count
+  it as sent; usually only a later write would fail. The cost falls on a peer
+  that half-closes on purpose but keeps reading, which would see reconnects.
 
 **Boundary:** No resend, no acknowledgement protocol and no server mode. Replies
 are counted, not shown; seeing them is listener's job.
