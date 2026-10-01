@@ -70,6 +70,12 @@ pub trait Interface: Send {
         Ok(false)
     }
 
+    /// Bytes the peer sent since the last call, read and discarded (ADR-059,
+    /// §4.5). Only a transport that reads its peer reports any.
+    fn take_peer_bytes(&mut self) -> u64 {
+        0
+    }
+
     /// Apply `next` to the existing handle when reopening would conflict with
     /// the resource it already owns. Returns `true` when applied in place;
     /// `false` asks the runner to open a replacement and swap on success.

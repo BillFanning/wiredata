@@ -137,6 +137,10 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
                 summary.missed_sends,
             ))
             .on_hover_text(SENT_MEANING_TOOLTIP);
+            if let Some(bytes) = summary.peer_bytes {
+                ui.weak(peer_sent_words(bytes))
+                    .on_hover_text(PEER_SENT_TOOLTIP);
+            }
             let (timer_detail, timer_hot) = timer_status_detail(summary.timer);
             let timer = egui::RichText::new(format!("Timer: {timer_detail}")).weak();
             ui.label(if timer_hot {
@@ -545,6 +549,10 @@ impl TalkerApp {
             false,
             THROUGHPUT_TOOLTIP,
         );
+        // A TCP client counts what its peer sent (§4.5).
+        if let Some(bytes) = telemetry.peer_bytes {
+            detail_line(ui, peer_sent_words(bytes), false, PEER_SENT_TOOLTIP);
+        }
 
         // Lifecycle controls sit directly under the basic readouts, matching
         // listener's control block. Below the diagnostics they were reachable

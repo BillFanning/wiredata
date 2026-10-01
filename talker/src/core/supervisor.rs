@@ -88,6 +88,8 @@ pub struct ChannelTelemetry {
     /// Interface send attempts that failed after part of the message was
     /// accepted (§4.4).
     pub possibly_partial_sends: u64,
+    /// Bytes the TCP peer sent this run (§4.5); `None` for other transports.
+    pub peer_bytes: Option<u64>,
     /// Due fires intentionally suppressed while send retry backoff was active.
     pub suppressed_sends: u64,
     /// Bounded cumulative send-path timing measurements from the runner.
@@ -1083,6 +1085,7 @@ fn drain_statuses(
                 missed_sends,
                 failed_sends,
                 possibly_partial_sends,
+                peer_bytes,
                 send_failure_episodes,
                 suppressed_sends,
                 active_send_error,
@@ -1100,6 +1103,7 @@ fn drain_statuses(
                 telemetry.missed_sends = missed_sends;
                 telemetry.failed_sends = failed_sends;
                 telemetry.possibly_partial_sends = possibly_partial_sends;
+                telemetry.peer_bytes = peer_bytes;
                 telemetry.suppressed_sends = suppressed_sends;
                 // Immediate failure/recovery edges paint quickly, but share the
                 // bounded observer queue. The cumulative count repairs every
@@ -1250,6 +1254,7 @@ mod tests {
             final_snapshot: false,
             timer: TimerStatus::default(),
             possibly_partial_sends: 0,
+            peer_bytes: None,
         }
     }
 
@@ -1440,6 +1445,7 @@ mod tests {
             timing: Default::default(),
             timer: Default::default(),
             possibly_partial_sends: 0,
+            peer_bytes: None,
         }
     }
 
@@ -1468,6 +1474,7 @@ mod tests {
                 timing: Default::default(),
                 timer: Default::default(),
                 possibly_partial_sends: 0,
+                peer_bytes: None,
             })
         };
         let mut retained = None;

@@ -146,6 +146,10 @@ pub enum TalkerStatus {
         /// of the message (§4.4, ADR-059): the receiver may hold a fragment.
         /// Never resent, and not in `failed_sends`.
         possibly_partial_sends: u64,
+        /// Bytes the TCP peer sent during this run, read and discarded before
+        /// each write (ADR-059, §4.5): "peer sent N bytes". `None` for a
+        /// transport that does not read its peer.
+        peer_bytes: Option<u64>,
         /// Cumulative send-failure episodes. Repeated attempts inside one
         /// bounded-backoff episode do not increase this count.
         send_failure_episodes: u64,
@@ -816,6 +820,7 @@ fn run_loop(
     let mut total_bytes = 0u64;
     let mut failed_sends = 0u64;
     let mut possibly_partial_sends = 0u64;
+    let mut peer_bytes = 0u64;
     let mut send_failure_episodes = 0u64;
     let mut suppressed_sends = 0u64;
     let mut send_timing = SendTimingRecorder::default();
@@ -1130,6 +1135,7 @@ fn run_loop(
 
                     let send_started = Instant::now();
                     let send_result = interface.send(&payload);
+                    peer_bytes += interface.take_peer_bytes();
                     let send_finished = Instant::now();
                     send_timing.record_send_duration(
                         send_finished,
@@ -1284,6 +1290,7 @@ fn run_loop(
                         missed_sends: schedule.missed_sends(),
                         failed_sends,
                         possibly_partial_sends,
+                        peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
                         send_failure_episodes,
                         suppressed_sends,
                         active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
@@ -1377,6 +1384,7 @@ fn run_loop(
         missed_sends,
         failed_sends,
         possibly_partial_sends,
+        peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
         send_failure_episodes,
         suppressed_sends,
         active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
@@ -1409,12 +1417,19 @@ fn run_loop(
                 missed_sends,
                 failed_sends,
                 possibly_partial_sends,
+                peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
                 suppressed_sends,
                 timing: final_timing,
                 timer: timer_status,
             }),
         },
     );
+}
+
+/// The run's peer-reply total, for a transport that reads its peer: only the
+/// TCP client does (ADR-059, §4.5).
+fn peer_sent(config: Option<&InterfaceConfig>, bytes: u64) -> Option<u64> {
+    matches!(config, Some(InterfaceConfig::TcpClient(_))).then_some(bytes)
 }
 
 /// What a closed failure episode cost, for its recovery line: the sends that
@@ -2846,6 +2861,42 @@ mod tests {
                 .any(|line| line.contains("sending recovered after 1 possibly partial send and")),
             "{lines:#?}"
         );
+    }
+
+    /// ADR-059, §4.5: what a TCP peer sends is counted, and only a TCP
+    /// client carries the count at all.
+    #[test]
+    fn a_tcp_peer_s_replies_are_counted_in_the_run() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = InterfaceConfig::TcpClient(crate::core::channel::TcpClientConfig::new(
+            server.local_addr().unwrap(),
+        ));
+        let interface = config.open().unwrap();
+        let (mut peer, _) = server.accept().unwrap();
+        let handle = spawn_interface_runner(interface, Some(config));
+        peer.write_all(b"OK\r\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut counted = None;
+        while counted != Some(Some(4)) {
+            assert!(
+                Instant::now() < deadline,
+                "the reply was never counted: {counted:?}"
+            );
+            for status in handle.status_rx.try_iter() {
+                if let TalkerStatus::Counters { peer_bytes, .. } = status {
+                    counted = Some(peer_bytes);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(2));
+
+        assert_eq!(peer_sent(None, 9), None, "no transport, no peer count");
     }
 
     /// ADR-059, §4.5: the receiving server is killed and restarted on the

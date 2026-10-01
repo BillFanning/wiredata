@@ -409,6 +409,7 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
                         total_bytes,
                         failed_sends,
                         possibly_partial_sends,
+                        peer_bytes,
                         dropped_statuses,
                         ..
                     } => {
@@ -419,6 +420,7 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
                                 bytes: total_bytes,
                                 failed: failed_sends,
                                 possibly_partial: possibly_partial_sends,
+                                peer_bytes,
                                 dropped: dropped_statuses,
                             },
                         );
@@ -482,6 +484,8 @@ struct FinalCounts {
     failed: u64,
     /// Sends that failed after part of the message was written (§4.4).
     possibly_partial: u64,
+    /// Bytes the TCP peer sent (§4.5); `None` for other transports.
+    peer_bytes: Option<u64>,
     /// Status updates dropped because the reader was full: with `--echo`,
     /// echo lines not printed (§5.8).
     dropped: u64,
@@ -503,6 +507,12 @@ fn counters_note(counts: Option<&FinalCounts>, echo: bool) -> String {
     );
     if counts.possibly_partial > 0 {
         note.push_str(&format!(", {} possibly partial", counts.possibly_partial));
+    }
+    if let Some(bytes) = counts.peer_bytes.filter(|&bytes| bytes > 0) {
+        note.push_str(&format!(
+            "; peer sent {bytes} byte{}",
+            if bytes == 1 { "" } else { "s" }
+        ));
     }
     if echo && counts.dropped > 0 {
         note.push_str(&format!("; {} echo lines dropped", counts.dropped));
@@ -689,6 +699,7 @@ mod tests {
             bytes: 4_800,
             failed: 1,
             possibly_partial: 0,
+            peer_bytes: None,
             dropped: 3,
         };
         assert_eq!(
@@ -705,6 +716,13 @@ mod tests {
         assert_eq!(
             counters_note(Some(&counts), false),
             "; sent 120 messages (4800 bytes), 1 failed send, 2 possibly partial"
+        );
+        // §4.5: a TCP peer that answered.
+        counts.peer_bytes = Some(12);
+        assert_eq!(
+            counters_note(Some(&counts), false),
+            "; sent 120 messages (4800 bytes), 1 failed send, 2 possibly partial; \
+             peer sent 12 bytes"
         );
     }
 

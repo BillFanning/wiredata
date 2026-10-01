@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -15,6 +16,25 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `write_all` forever — it can then never see its Stop command.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The most one drain reads before a write (ADR-059, §4.5). A peer that keeps
+/// sending could otherwise hold up the schedule; what is left over is not
+/// lost, it waits for the next send's drain.
+const DRAIN_LIMIT: usize = 64 * 1024;
+
+/// A drain read end-of-stream: the peer closed the connection. The send fails
+/// with nothing written, rather than writing into a connection whose peer
+/// has gone and counting the message as sent.
+#[derive(Debug)]
+struct PeerClosed;
+
+impl std::fmt::Display for PeerClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the peer closed the connection")
+    }
+}
+
+impl std::error::Error for PeerClosed {}
+
 pub(super) struct TcpClientInterface {
     // `None` only between a failed stream being dropped and a later retry
     // connecting again.
@@ -23,6 +43,8 @@ pub(super) struct TcpClientInterface {
     /// peer may be gone, or may hold part of a message the next one would be
     /// appended to. The next retry point connects afresh instead.
     reconnect_required: bool,
+    /// Bytes the peer sent, read and discarded, that the runner has not taken.
+    peer_bytes: u64,
 }
 
 impl TcpClientInterface {
@@ -30,6 +52,7 @@ impl TcpClientInterface {
         Ok(Self {
             stream: Some(connect(config)?),
             reconnect_required: false,
+            peer_bytes: 0,
         })
     }
 }
@@ -47,9 +70,52 @@ fn connect(config: &TcpClientConfig) -> anyhow::Result<TcpStream> {
     Ok(stream)
 }
 
+/// Read and discard whatever the peer has sent, without blocking, up to
+/// [`DRAIN_LIMIT`] (ADR-059, §4.5). Unread replies would fill the receive
+/// buffer, and closing a socket with unread data makes most stacks reset the
+/// connection, which can discard the peer's own in-flight data. Returns the
+/// bytes read, and the error that ends this connection, if one did.
+fn drain(stream: &mut TcpStream) -> (u64, Option<anyhow::Error>) {
+    if let Err(error) = stream.set_nonblocking(true) {
+        return (
+            0,
+            Some(anyhow::Error::new(error).context("reading the peer's replies")),
+        );
+    }
+    let mut buf = [0u8; 8 * 1024];
+    let mut drained = 0;
+    let mut ended = None;
+    while drained < DRAIN_LIMIT {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                ended = Some(anyhow::Error::new(PeerClosed));
+                break;
+            }
+            Ok(n) => drained += n,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                ended = Some(anyhow::Error::new(error).context("reading the peer's replies"));
+                break;
+            }
+        }
+    }
+    if let Err(error) = stream.set_nonblocking(false) {
+        ended
+            .get_or_insert_with(|| anyhow::Error::new(error).context("reading the peer's replies"));
+    }
+    (drained as u64, ended)
+}
+
 impl Interface for TcpClientInterface {
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
         let stream = self.stream.as_mut().context("not connected")?;
+        let (drained, ended) = drain(stream);
+        self.peer_bytes += drained;
+        if let Some(error) = ended {
+            self.reconnect_required = true;
+            return Err(error);
+        }
         if let Err(failure) = write_counted(stream, data) {
             self.reconnect_required = true;
             return Err(failure.into_error("writing to TCP stream"));
@@ -72,6 +138,10 @@ impl Interface for TcpClientInterface {
         self.stream = Some(connect(config)?);
         self.reconnect_required = false;
         Ok(true)
+    }
+
+    fn take_peer_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.peer_bytes)
     }
 }
 
@@ -149,6 +219,46 @@ mod tests {
             .unwrap();
         second.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"next", "the next message goes on the new stream");
+    }
+
+    #[test]
+    fn replies_are_drained_and_counted_before_each_write() {
+        use std::io::Write;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut conn =
+            TcpClientInterface::open(&TcpClientConfig::new(listener.local_addr().unwrap()))
+                .unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.write_all(b"ACK\r\n").unwrap();
+
+        // The reply reaches talker's socket in its own time: send until a
+        // drain has counted it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut counted = 0;
+        while counted < 5 {
+            assert!(std::time::Instant::now() < deadline, "reply never drained");
+            conn.send(b"x").unwrap();
+            counted += conn.take_peer_bytes();
+        }
+        assert_eq!(counted, 5);
+        assert_eq!(conn.take_peer_bytes(), 0, "taken once");
+    }
+
+    #[test]
+    fn a_peer_that_closed_fails_the_send_with_nothing_written() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut conn =
+            TcpClientInterface::open(&TcpClientConfig::new(listener.local_addr().unwrap()))
+                .unwrap();
+        // The peer closes with nothing unread, so it sends an orderly close;
+        // give that a moment to arrive before the first send.
+        drop(listener.accept().unwrap());
+        std::thread::sleep(Duration::from_millis(200));
+
+        let error = conn.send(b"x").unwrap_err();
+        assert!(error.is::<PeerClosed>(), "{error:#}");
+        assert_eq!(error.to_string(), "the peer closed the connection");
+        assert!(conn.reconnect_required, "the next retry point reconnects");
     }
 
     #[test]

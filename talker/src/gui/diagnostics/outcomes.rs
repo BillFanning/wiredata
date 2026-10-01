@@ -26,6 +26,20 @@ counter readout, timer status, or interface error notice. Sending never waits fo
 Later updates correct the live totals and whether a send failure is still active; final run totals \
 remain exact. Command results use a separate path.";
 
+pub(in crate::gui) const PEER_SENT_TOOLTIP: &str =
+    "Bytes the TCP peer sent to talker during this run. Talker reads and discards them before \
+each write, so the peer never stalls on a full buffer and closing the connection does not reset \
+it. They are counted, not shown: viewing them is listener's job.";
+
+/// The peer-reply readout (§4.5): "peer sent N bytes".
+pub(in crate::gui) fn peer_sent_words(bytes: u64) -> String {
+    format!(
+        "Peer sent {} byte{}",
+        thousands(bytes),
+        if bytes == 1 { "" } else { "s" }
+    )
+}
+
 /// The run's counted send outcomes as one always-visible line.
 ///
 /// Written as visible arithmetic — the schedule's own cadence points, less each
@@ -173,6 +187,13 @@ mod tests {
              missed = 98 sent"
         );
         assert_eq!(partial.tone, SignalTone::Fault);
+    }
+
+    #[test]
+    fn a_tcp_peer_s_replies_read_as_bytes_it_sent() {
+        assert_eq!(peer_sent_words(0), "Peer sent 0 bytes");
+        assert_eq!(peer_sent_words(1), "Peer sent 1 byte");
+        assert_eq!(peer_sent_words(12_345), "Peer sent 12,345 bytes");
     }
 
     #[test]
