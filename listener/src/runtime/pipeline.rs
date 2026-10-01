@@ -381,6 +381,10 @@ impl DisplayRecordingSettings {
     }
 }
 
+/// How long a begin waits for detached predecessor stops (see
+/// `land_retiring_before_begin`).
+const RETIRE_WAIT: Duration = Duration::from_secs(2);
+
 /// Bound on the retained recent-match log (§165) — generous but constant (§124).
 const RECENT_MATCHES_CAP: usize = 256;
 static NEXT_STREAM_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -1109,9 +1113,7 @@ impl ChannelPipeline {
     /// cannot work (e.g. an existing file under a Refuse policy) arrives as a
     /// report, without faulting the Channel (§55).
     async fn begin_recording(&mut self) {
-        // A predecessor's detached stop must fully land first: a begin to the
-        // same destination would otherwise race the closing file.
-        self.drain_retiring().await;
+        self.land_retiring_before_begin().await;
         match self.raw_recorder.as_ref().map(|r| r.state()) {
             // Already on — writing, opening or in a gap — so `Begin` is idempotent.
             Some(state) if state != RecordingState::Faulted => return,
@@ -1202,11 +1204,22 @@ impl ChannelPipeline {
         }
     }
 
-    /// Await every in-flight retirement and report each outcome. Runs before a
-    /// `begin_*` (a new file must never open while its predecessor is still
-    /// closing — same-destination restarts would collide on the open file) and
-    /// in `finish` (a channel stop reports every outcome before returning,
-    /// §56.1).
+    /// Land detached predecessor stops before a begin, for at most
+    /// [`RETIRE_WAIT`]: a begin to the same destination should not race a
+    /// file still closing, but a stop stuck on a drive that stopped answering
+    /// must not hold up the receive loop either (§100). If one is still
+    /// closing when the wait ends, the new recording meets its destination
+    /// lock and reports that it could not begin (§55, §121).
+    async fn land_retiring_before_begin(&mut self) {
+        // `JoinSet::join_next` is cancel-safe, so a timed-out wait loses no
+        // outcome: the rest are reaped on later passes.
+        let _ = tokio::time::timeout(RETIRE_WAIT, self.drain_retiring()).await;
+    }
+
+    /// Await every in-flight retirement and report each outcome. Runs, bounded,
+    /// before a `begin_*` (see `land_retiring_before_begin`), and in `finish`,
+    /// so a channel stop reports every outcome before returning (§56.1); the
+    /// Listener bounds the stop as a whole.
     async fn drain_retiring(&mut self) {
         while let Some(retired) = self.retiring.join_next().await {
             self.note_retired_recording(retired);
@@ -1278,9 +1291,7 @@ impl ChannelPipeline {
     /// is already on; no destination reports a fault rather than a silent
     /// no-op; the first file opens in the recorder's task, as for Raw.
     async fn begin_display_recording(&mut self) {
-        // Same rule as the Raw begin: land any detached predecessor stop
-        // before opening a file it might still hold.
-        self.drain_retiring().await;
+        self.land_retiring_before_begin().await;
         match self
             .display_views
             .first()
@@ -3038,6 +3049,48 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_begin_does_not_wait_forever_for_a_stuck_stop() {
+        // §100: a stop stuck on a drive that stopped answering must not hold
+        // up the receive loop when recording is begun again.
+        use crate::record::RawRecorder;
+        struct StuckRecorder;
+        #[async_trait::async_trait]
+        impl RawRecorder for StuckRecorder {
+            async fn write_chunk(
+                &mut self,
+                _chunk: &ReceivedData,
+            ) -> Result<(), crate::core::RecordError> {
+                std::future::pending().await
+            }
+            async fn flush(&mut self) -> Result<(), crate::core::RecordError> {
+                Ok(())
+            }
+            async fn finalize(
+                &mut self,
+                _reason: RecordingStopReason,
+            ) -> Result<(), crate::core::RecordError> {
+                Ok(())
+            }
+        }
+        let cid = ChannelId::new();
+        let path = temp_path("after-stuck");
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_raw_recorder(start_raw_recording(StuckRecorder, DEFAULT_QUEUE_BUDGET));
+        p.ingest(bytes_chunk(cid, b"data")); // its write never returns
+        p.set_recording(false, None).await; // so its detached stop never lands
+
+        let started = Instant::now();
+        p.set_recording(true, Some(raw_settings(&path, None))).await;
+        assert!(
+            started.elapsed() < RETIRE_WAIT + Duration::from_secs(2),
+            "the begin waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]

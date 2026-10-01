@@ -832,11 +832,31 @@ impl Listener {
     /// shutdown (the only part that can hang), and `finish_stop` lands the channel in
     /// Stopped and announces it. `shutdown` uses the phases directly so a timed-out
     /// drain still runs `finish_stop`; everyone else uses this convenience wrapper.
+    ///
+    /// Bounded by [`STOP_GRACE`](Self::STOP_GRACE): a stop stuck on a drive that
+    /// stopped answering is abandoned, logged as "finalization incomplete", and
+    /// the Channel still lands in Stopped — so no caller, the GUI's driver
+    /// included, waits on it indefinitely.
     pub async fn stop(&mut self, id: ChannelId) -> Result<(), OrchestratorError> {
         let handle = self.begin_stop(id)?;
-        let final_snapshot = drain_handle(handle).await;
-        self.finish_stop(id, final_snapshot);
+        for (id, drained) in drain_all(vec![(id, drain_handle(handle))], Self::STOP_GRACE).await {
+            self.finish_drained(id, drained);
+        }
         Ok(())
+    }
+
+    /// Land a drained Channel in Stopped (see [`drain_all`]); `None` marks a
+    /// drain abandoned at the grace period, which is logged as "finalization
+    /// incomplete". Returns the Channel's name when it was abandoned.
+    fn finish_drained(
+        &mut self,
+        id: ChannelId,
+        drained: Option<Option<ChannelSnapshot>>,
+    ) -> Option<String> {
+        // A timed-out drain has no final snapshot.
+        let finished = drained.is_some();
+        self.finish_stop(id, drained.flatten());
+        (!finished).then(|| self.note_finalization_incomplete(id))
     }
 
     /// Phase 1 of [`stop`](Self::stop): validate the transition, mark a Running
@@ -1064,14 +1084,15 @@ impl Listener {
         Ok(())
     }
 
-    /// The grace period for [`shutdown`](Self::shutdown) (§113): generous, since a
-    /// normal graceful stop drains the small bounded ingest queue and finalizes
-    /// files in milliseconds — this only guards against a stuck finalize, such
-    /// as a write to a drive that stopped answering, holding up process exit.
-    pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+    /// The grace period for every stop, application exit included (§110,
+    /// §113): generous, since a normal graceful stop drains the small bounded
+    /// ingest queue and finalizes files in milliseconds — this only guards
+    /// against a stuck finalize, such as a write to a drive that stopped
+    /// answering, holding up the caller.
+    pub const STOP_GRACE: Duration = Duration::from_secs(3);
 
     /// Stop every live Channel (§113, application exit), each independently and
-    /// all at once, within [`SHUTDOWN_GRACE`](Self::SHUTDOWN_GRACE). Includes
+    /// all at once, within [`STOP_GRACE`](Self::STOP_GRACE). Includes
     /// spontaneously faulted channels so their tasks and Display Views are
     /// cleaned up too.
     ///
@@ -1107,16 +1128,8 @@ impl Listener {
             .filter_map(|id| Some((id, drain_handle(self.begin_stop(id).ok()?))))
             .collect();
         let mut outcome = ShutdownOutcome::default();
-        for (id, drained) in drain_all(drains, Self::SHUTDOWN_GRACE).await {
-            // A timed-out drain has no final snapshot (and the app is exiting,
-            // so there is no GUI to deliver it to anyway).
-            let finished = drained.is_some();
-            self.finish_stop(id, drained.flatten());
-            if !finished {
-                outcome
-                    .incomplete
-                    .push(self.note_finalization_incomplete(id));
-            }
+        for (id, drained) in drain_all(drains, Self::STOP_GRACE).await {
+            outcome.incomplete.extend(self.finish_drained(id, drained));
         }
         outcome
     }
@@ -1135,7 +1148,7 @@ impl Listener {
         let diagnostic = crate::diagnostics::Diagnostic::error(format!(
             "finalization incomplete on channel {name}: its stop did not finish within {} s, \
              so the end of its recordings may be missing",
-            Self::SHUTDOWN_GRACE.as_secs()
+            Self::STOP_GRACE.as_secs()
         ));
         crate::diagnostics::emit_to_event_log(&name, id, &diagnostic);
         if let Some(channel) = self.channels.get_mut(&id) {
