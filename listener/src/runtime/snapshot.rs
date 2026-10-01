@@ -16,10 +16,13 @@
 //! requests a snapshot/stream-delta when it needs the actual retained content.
 //! Observers never own or block the pipeline.
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use tokio::sync::oneshot;
 
+use crate::config::DiskGuard;
 use crate::core::{ChannelId, ChannelState, DisplayViewId, MatchRuleId, RecordingState};
 use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 
@@ -105,6 +108,40 @@ pub struct QueueDepth {
     pub capacity: usize,
 }
 
+/// What status shows about one running recording (§56.2): where it is writing,
+/// how much, how much room is left, and its lasting faults.
+///
+/// The sizes come from a poll every few seconds, so they lag the file by up to
+/// one poll; `None` until the first poll lands or while checks are failing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RecordingStatus {
+    /// The file being written; `None` while opening or in a gap.
+    pub current_file: Option<PathBuf>,
+    /// Bytes in the current file.
+    pub bytes_written: u64,
+    /// Total size of this recording's files at its destination.
+    pub total_size: Option<u64>,
+    /// Free space on the destination's filesystem.
+    pub free_space: Option<u64>,
+    /// When the next rotation is due, when the recording rotates (§59).
+    pub next_rotation: Option<SystemTime>,
+    /// The disk guard, when one is configured (§56.2).
+    pub guard: Option<DiskGuard>,
+    /// Lasting fault: free space is below the guard's threshold. It clears
+    /// once free space is 10% above the threshold (§56.2).
+    pub low_disk: bool,
+    /// Lasting fault: faults keep repeating, so retries have slowed. It
+    /// clears when the recording is stopped (§56.1).
+    pub unstable: bool,
+}
+
+impl RecordingStatus {
+    /// Whether a lasting fault is active — the ones that stay on screen.
+    pub fn has_lasting_fault(&self) -> bool {
+        self.low_disk || self.unstable
+    }
+}
+
 /// Cheap, O(1) health counters for a Channel — everything a multi-channel
 /// overview needs per tab without cloning the stream scrollback (the expensive
 /// part of a full [`ChannelSnapshot`]).
@@ -132,6 +169,11 @@ pub struct ChannelStats {
     pub raw_recording: Option<RecordingState>,
     /// Display-recording state (§54), or `None` when it isn't attached.
     pub display_recording: Option<RecordingState>,
+    /// What status shows about the running Raw recording (§56.2), or `None`
+    /// when none is running.
+    pub raw_recording_status: Option<RecordingStatus>,
+    /// The Display sibling of `raw_recording_status`.
+    pub display_recording_status: Option<RecordingStatus>,
     /// How many `BytePattern` matches were recovered only because a pattern spanned
     /// a read-chunk boundary (§50.2) — the cross-chunk-carry measurement. A nonzero,
     /// rising count tells an operator that read boundaries are routinely splitting
@@ -194,6 +236,11 @@ pub struct ChannelSnapshot {
     pub raw_recording: Option<RecordingState>,
     /// Display-recording state (§54), or `None` when it isn't attached.
     pub display_recording: Option<RecordingState>,
+    /// What status shows about the running Raw recording (§56.2), or `None`
+    /// when none is running.
+    pub raw_recording_status: Option<RecordingStatus>,
+    /// The Display sibling of `raw_recording_status`.
+    pub display_recording_status: Option<RecordingStatus>,
     /// Liveness facts: rolling throughput + last-data time (§91.1, §166).
     pub activity: ChannelActivity,
     /// Recent Match Rule firings, oldest → newest, bounded (§50.2, §165) — a

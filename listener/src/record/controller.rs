@@ -25,7 +25,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -230,6 +230,9 @@ struct Shared {
     state: Mutex<RecordingState>,
     unstable: AtomicBool,
     reports: Mutex<VecDeque<RecorderReport>>,
+    /// The file being written and its length, for status (§56.2).
+    file: Mutex<Option<PathBuf>>,
+    file_len: AtomicU64,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -276,6 +279,16 @@ pub struct Recording<I: RecordItem> {
 impl<I: RecordItem> Recording<I> {
     pub fn state(&self) -> RecordingState {
         self.shared.state()
+    }
+
+    /// The file being written; `None` while opening or in a gap (§56.2).
+    pub fn current_file(&self) -> Option<PathBuf> {
+        lock(&self.shared.file).clone()
+    }
+
+    /// Bytes in the file being written (§56.2).
+    pub fn bytes_written(&self) -> u64 {
+        self.shared.file_len.load(Ordering::Relaxed)
     }
 
     /// Whether faults have repeated enough to slow retries (ADR-043). Stays
@@ -372,6 +385,8 @@ where
         state: Mutex::new(RecordingState::Enabled),
         unstable: AtomicBool::new(false),
         reports: Mutex::new(VecDeque::new()),
+        file: Mutex::new(None),
+        file_len: AtomicU64::new(0),
     });
     let controller = Controller {
         source,
@@ -500,6 +515,10 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
         match self.source.open(request).await {
             Ok(segment) => {
                 let path = segment.path().map(PathBuf::from);
+                *lock(&self.shared.file) = path.clone();
+                self.shared
+                    .file_len
+                    .store(segment.bytes_written(), Ordering::Relaxed);
                 self.segment = Some(segment);
                 self.period = period.or(self.period.take());
                 self.ever_opened = true;
@@ -590,6 +609,9 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
         };
         match segment.write(&queued.item).await {
             Ok(()) => {
+                self.shared
+                    .file_len
+                    .store(segment.bytes_written(), Ordering::Relaxed);
                 self.unflushed_since.get_or_insert(queued.pos);
                 if self.closing_gap {
                     self.closing_gap = false;
@@ -684,6 +706,8 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
             let _ = segment.finalize(RecordingStopReason::ChannelStopped).await;
         }
         self.unflushed_since = None;
+        *lock(&self.shared.file) = None;
+        self.shared.file_len.store(0, Ordering::Relaxed);
     }
 
     /// A fault: open a gap, count the fault, and schedule the retry.
@@ -832,6 +856,7 @@ mod tests {
     }
 
     struct ScriptedSegment {
+        path: PathBuf,
         log: Arc<SegmentLog>,
         len: u64,
         fail_write_at: Option<usize>,
@@ -860,6 +885,9 @@ mod tests {
         }
         fn bytes_written(&self) -> u64 {
             self.len
+        }
+        fn path(&self) -> Option<&std::path::Path> {
+            Some(&self.path)
         }
     }
 
@@ -901,6 +929,7 @@ mod tests {
             let log = Arc::new(SegmentLog::default());
             lock(&self.segments).push(Arc::clone(&log));
             Ok(Box::new(ScriptedSegment {
+                path: PathBuf::from(format!("segment-{attempt}")),
                 log,
                 len: 0,
                 fail_write_at,
@@ -979,6 +1008,25 @@ mod tests {
             written(&segments),
             vec![vec![b"AB".to_vec()], vec![b"GH".to_vec()]]
         );
+    }
+
+    #[tokio::test]
+    async fn the_handle_shows_the_current_file_and_its_length_until_a_gap() {
+        // §56.2: status shows the file being written and how much is in it.
+        let source = ScriptedSource::new(|attempt| Ok((attempt == 1).then_some(2)));
+        let mut recording = start_recording(source, DEFAULT_QUEUE_BUDGET, fast());
+        recording.try_record(chunk(b"ABC"), pos(0));
+        wait_for("the first write", || recording.bytes_written() == 3).await;
+        assert_eq!(recording.current_file(), Some(PathBuf::from("segment-1")));
+
+        recording.try_record(chunk(b"DE"), pos(3)); // this write fails
+        wait_for("the gap", || {
+            matches!(recording.state(), RecordingState::Gap(_))
+        })
+        .await;
+        assert_eq!(recording.current_file(), None);
+        assert_eq!(recording.bytes_written(), 0);
+        let _ = recording.finalize(RecordingStopReason::Disabled).await;
     }
 
     #[tokio::test]

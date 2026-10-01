@@ -80,6 +80,42 @@ impl SegmentPlan {
         period_key(self.rotation, at)
     }
 
+    /// The total size of this recording's files — its segments and their
+    /// indexes — for status (§56.2). Other channels' and other taps' files in the
+    /// same folder are not counted. Blocking — run it off the async runtime.
+    pub fn files_size(&self) -> std::io::Result<u64> {
+        let mut total = 0;
+        for entry in std::fs::read_dir(self.folder())?.flatten() {
+            if self.is_recording_file(&entry.file_name().to_string_lossy()) {
+                // A file removed mid-scan is simply not counted.
+                total += entry.metadata().map_or(0, |meta| meta.len());
+            }
+        }
+        Ok(total)
+    }
+
+    /// Whether `name` is one of this recording's segments or their indexes.
+    fn is_recording_file(&self, name: &str) -> bool {
+        let name = name.strip_suffix(".idx").unwrap_or(name);
+        match self.rotation {
+            FileRotationPolicy::None => {
+                let (stem, ext) = split_name(&self.destination);
+                let Some(rest) = name.strip_suffix(ext.as_str()) else {
+                    return false;
+                };
+                rest == stem
+                    || rest
+                        .strip_prefix(&format!("{stem}_"))
+                        .and_then(|n| n.parse::<u32>().ok())
+                        .is_some_and(|n| n >= 2)
+            }
+            FileRotationPolicy::Hourly | FileRotationPolicy::Daily => name
+                .strip_suffix(self.ext.as_str())
+                .and_then(|rest| rest.strip_prefix(&format!("{}_", self.channel)))
+                .is_some_and(is_period_and_segment),
+        }
+    }
+
     /// Segment 1's path: the destination itself, or the period's base file.
     fn base(&self, period: Option<&str>) -> PathBuf {
         match (self.rotation, period) {
@@ -90,6 +126,22 @@ impl SegmentPlan {
             }
         }
     }
+}
+
+/// A period key and optional segment number: `YYYY-MM-DD`, then at most two
+/// `_<digits>` groups (an hour, a segment number). The date's fixed shape is what
+/// keeps channel `GPS_2`'s files out of channel `GPS`'s.
+fn is_period_and_segment(rest: &str) -> bool {
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = rest.split('_');
+    let date: Vec<&str> = parts.next().unwrap_or_default().split('-').collect();
+    let date_ok = date.len() == 3
+        && date
+            .iter()
+            .zip([4, 2, 2])
+            .all(|(part, len)| part.len() == len && digits(part));
+    let tail: Vec<&str> = parts.collect();
+    date_ok && tail.len() <= 2 && tail.iter().all(|part| digits(part))
 }
 
 /// Segment `n`'s path: `n == 1` is the base itself; later segments add `_n`
@@ -412,6 +464,46 @@ mod tests {
             numbered(Path::new("run.raw"), 2),
             PathBuf::from("run_2.raw")
         );
+    }
+
+    #[test]
+    fn a_recording_s_size_counts_only_its_own_segments_and_indexes() {
+        let dir = temp_dir("size");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, len) in [
+            ("GPS_2026-06-03_08.raw", 5),
+            ("GPS_2026-06-03_08.raw.idx", 3),
+            ("GPS_2026-06-03_08_2.raw", 4),
+            ("GPS_2_2026-06-03_08.raw", 100), // another channel
+            ("GPS_2026-06-03_08.disp", 50),   // the other tap
+            ("GPS.raw.lock", 7),
+            (DESTINATION_MARKER, 9),
+            ("notes.txt", 11),
+        ] {
+            std::fs::write(dir.join(name), vec![b'x'; len]).unwrap();
+        }
+        assert_eq!(
+            plan(&dir, FileRotationPolicy::Hourly).files_size().unwrap(),
+            12
+        );
+
+        let single = dir.join("run.raw");
+        for (name, len) in [
+            ("run.raw", 2),
+            ("run_2.raw", 3),
+            ("run_2.raw.idx", 1),
+            ("run_x.raw", 13),
+            ("runner.raw", 17),
+        ] {
+            std::fs::write(dir.join(name), vec![b'x'; len]).unwrap();
+        }
+        assert_eq!(
+            plan(&single, FileRotationPolicy::None)
+                .files_size()
+                .unwrap(),
+            6
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

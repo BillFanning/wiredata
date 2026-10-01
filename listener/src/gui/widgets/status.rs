@@ -69,6 +69,46 @@ pub(crate) fn recording_indicator(
     }
 }
 
+/// One line of facts about a running recording (§56.2): the file it is writing
+/// and how much is in it, the size of all its files, free space, and the time
+/// to the next file when it rotates. Pure, unit-tested.
+pub(crate) fn recording_facts(
+    status: &crate::runtime::RecordingStatus,
+    now: std::time::SystemTime,
+) -> String {
+    use wiredata_ui::format::human_bytes;
+    let mut parts = Vec::new();
+    match &status.current_file {
+        Some(path) => {
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            parts.push(format!("Writing {name}"));
+            parts.push(format!(
+                "{} in this file",
+                human_bytes(status.bytes_written)
+            ));
+        }
+        None => parts.push("No file open".to_owned()),
+    }
+    if let Some(total) = status.total_size {
+        parts.push(format!("{} in all its files", human_bytes(total)));
+    }
+    if let Some(free) = status.free_space {
+        parts.push(format!("{} free", human_bytes(free)));
+    }
+    if let Some(next) = status.next_rotation {
+        let left = next.duration_since(now).unwrap_or_default().as_secs();
+        parts.push(match (left / 3600, (left % 3600) / 60) {
+            (0, 0) => "next file in under a minute".to_owned(),
+            (0, minutes) => format!("next file in {minutes} min"),
+            (hours, minutes) => format!("next file in {hours} h {minutes} min"),
+        });
+    }
+    parts.join(" · ")
+}
+
 /// A short status word for the detail pane.
 pub(crate) fn status_label(status: ChannelStatus) -> &'static str {
     match status {

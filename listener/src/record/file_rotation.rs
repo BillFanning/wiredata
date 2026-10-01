@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveTime, TimeDelta, TimeZone, Timelike};
 
 use crate::core::RecordError;
 
@@ -56,6 +56,30 @@ pub(crate) fn period_key(policy: FileRotationPolicy, at: SystemTime) -> Option<S
         FileRotationPolicy::Hourly => Some(dt.format("%Y-%m-%d_%H").to_string()),
         FileRotationPolicy::Daily => Some(dt.format("%Y-%m-%d").to_string()),
     }
+}
+
+/// When the period after the one holding `now` begins, in local time — for the
+/// rotation countdown in status (§56.2). `None` when the recording does not
+/// rotate.
+pub(crate) fn next_period_start(policy: FileRotationPolicy, now: SystemTime) -> Option<SystemTime> {
+    let local: DateTime<Local> = now.into();
+    let next = match policy {
+        FileRotationPolicy::None => return None,
+        FileRotationPolicy::Hourly => {
+            local.with_minute(0)?.with_second(0)?.with_nanosecond(0)? + TimeDelta::hours(1)
+        }
+        FileRotationPolicy::Daily => {
+            let tomorrow = local.date_naive().succ_opt()?;
+            // A few zones skip midnight at a DST change; the day then starts
+            // at the first hour that exists.
+            (0..3).find_map(|hour| {
+                Local
+                    .from_local_datetime(&tomorrow.and_time(NaiveTime::from_hms_opt(hour, 0, 0)?))
+                    .earliest()
+            })?
+        }
+    };
+    Some(next.into())
 }
 
 /// `<channel>_<key><ext>` (§59), e.g. `GPS_2026-06-03_08.raw`.
@@ -134,6 +158,20 @@ mod tests {
             Some("2026-06-03")
         );
         assert_eq!(period_key(FileRotationPolicy::None, at), None);
+    }
+
+    #[test]
+    fn the_next_period_starts_at_the_next_local_hour_or_midnight() {
+        let at = local(2026, 6, 3, 8, 30);
+        assert_eq!(
+            next_period_start(FileRotationPolicy::Hourly, at),
+            Some(local(2026, 6, 3, 9, 0))
+        );
+        assert_eq!(
+            next_period_start(FileRotationPolicy::Daily, at),
+            Some(local(2026, 6, 4, 0, 0))
+        );
+        assert_eq!(next_period_start(FileRotationPolicy::None, at), None);
     }
 
     #[test]

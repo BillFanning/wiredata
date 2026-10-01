@@ -82,6 +82,8 @@ fn retained_snapshot(id: ChannelId, channel: &ManagedChannel) -> ChannelSnapshot
         stream_end_offset: 0,
         ingest_queue: crate::runtime::QueueDepth::default(),
         raw_recording_queue: None,
+        raw_recording_status: None,
+        display_recording_status: None,
     }
 }
 
@@ -120,6 +122,8 @@ fn retained_stats(channel: &ManagedChannel) -> ChannelStats {
         idle_deadline_timer: channel.retained_idle_deadline_timer,
         ingest_queue: crate::runtime::QueueDepth::default(),
         raw_recording_queue: None,
+        raw_recording_status: None,
+        display_recording_status: None,
     }
 }
 
@@ -625,6 +629,7 @@ impl Listener {
                 file_rotation: display.file_rotation,
                 queue_budget: self.caps.recording_queue_budget,
                 size_cap: display.size_cap(),
+                disk_guard: display.disk_guard,
                 renderer,
             })
     }
@@ -1318,13 +1323,8 @@ impl Listener {
             None,
             None,
             // One runtime Display View per configured view (§48); at least one.
+            // Each recording's disk guard travels in its settings (§56.2).
             view_count(config),
-            // Disk-space guard (§56.2, §168): only when both a guard and a Raw
-            // recording destination are configured (the guard protects Raw, §168).
-            config
-                .raw_recording
-                .disk_guard
-                .zip(config.raw_recording.destination.clone()),
             // Match Rules (§50.2, §165) plus the Raw recording settings a match-
             // triggered `Record` needs (lazy-create from the destination — nothing
             // until a match fires).
@@ -1402,6 +1402,7 @@ impl Listener {
                 file_rotation: raw.file_rotation,
                 queue_budget: self.caps.recording_queue_budget,
                 size_cap: raw.size_cap(),
+                disk_guard: raw.disk_guard,
             })
     }
 }

@@ -401,6 +401,25 @@ impl ListenerApp {
             });
     }
 
+    /// Lasting recording faults (§56.1, §56.2): low disk and "recording
+    /// unstable" stay on screen until they clear, whichever Channel is
+    /// selected, rather than scrolling away in the log. The glyph and the words
+    /// carry the fault; the colour only reinforces them.
+    fn show_recording_faults_banner(&mut self, ui: &mut egui::Ui) {
+        let lines = self.state.lasting_recording_faults();
+        if lines.is_empty() {
+            return;
+        }
+        egui::Panel::top("recording_faults_notice")
+            .resizable(false)
+            .show_inside(ui, |ui| {
+                let fault = wiredata_ui::palette::active(ui).fault;
+                for line in lines {
+                    ui.colored_label(fault, format!("\u{26A0} {line}"));
+                }
+            });
+    }
+
     /// The dropped-command banner (see [`Self::send`]): a top strip in the
     /// warning color, dismissable, auto-expiring after
     /// [`COMMAND_DROP_NOTICE_TTL`]. Drawn before the panels so it pushes the
@@ -621,6 +640,7 @@ impl eframe::App for ListenerApp {
         self.handle_tab_keys(ui.ctx());
         self.show_command_drop_banner(ui);
         self.show_event_log_banner(ui);
+        self.show_recording_faults_banner(ui);
         let channels_collapsed = self.channels_collapsed;
         let channel_panel = if channels_collapsed {
             // Collapsed: a thin strip — an expand button plus mini tabs (a status dot

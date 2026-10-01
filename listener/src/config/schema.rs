@@ -356,6 +356,9 @@ pub struct DisplayRecordingConfig {
     /// The soft size cap per file, in bytes (§59); `None` is the default cap.
     #[serde(default)]
     pub size_cap: Option<u64>,
+    /// Disk-space guard on the Display destination (§56.2); `None` = off.
+    #[serde(default)]
+    pub disk_guard: Option<DiskGuard>,
 }
 
 impl DisplayRecordingConfig {
@@ -376,13 +379,15 @@ impl Default for DisplayRecordingConfig {
             overwrite_policy: OverwritePolicy::AppendIfExists,
             file_rotation: FileRotationPolicy::Hourly,
             size_cap: None,
+            disk_guard: None,
         }
     }
 }
 
 /// Disk-space guard for a recording (§56.2, §168). When free space on the
-/// destination filesystem falls below `min_free`, Listener warns and, if
-/// `on_low` is `StopRecording`, finalizes the recording cleanly and stops it while
+/// destination filesystem falls below `min_free`, Listener raises a lasting
+/// low-disk fault and, if `on_low` is `StopRecording`, ends the current file
+/// cleanly and waits in a gap until free space is 10% above the threshold, while
 /// reception continues. Free space is polled periodically, not per write.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiskGuard {
@@ -404,7 +409,8 @@ pub enum LowDiskAction {
     /// Warn only; recording continues.
     #[default]
     Warn,
-    /// Finalize and stop the recording cleanly; reception continues (§96).
+    /// End the current file cleanly and wait in a gap until space returns;
+    /// reception continues (§96).
     StopRecording,
 }
 

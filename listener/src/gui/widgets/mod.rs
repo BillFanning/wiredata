@@ -11,8 +11,8 @@ mod status;
 pub(super) use match_rule_editor::edit_mark_rules;
 pub(super) use recording_editor::{edit_display_recording, edit_raw_recording};
 pub(super) use status::{
-    line_indicator, line_toggle, paint_glyph, recording_glyph_size, recording_indicator,
-    start_button, status_color, status_glyph, status_label, stop_enabled,
+    line_indicator, line_toggle, paint_glyph, recording_facts, recording_glyph_size,
+    recording_indicator, start_button, status_color, status_glyph, status_label, stop_enabled,
 };
 pub(super) use wiredata_ui::format::human_bytes;
 
@@ -597,6 +597,34 @@ mod tests {
             "off"
         );
         assert_eq!(recording_indicator(None, pal).2, "off");
+    }
+
+    #[test]
+    fn recording_facts_name_the_file_its_size_the_disk_and_the_next_rotation() {
+        use crate::runtime::RecordingStatus;
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::now();
+        let status = RecordingStatus {
+            current_file: Some(std::path::PathBuf::from("rec").join("GPS_2026-09-30_08.raw")),
+            bytes_written: 1_500,
+            total_size: Some(2_000_000),
+            free_space: Some(3_000_000_000),
+            next_rotation: Some(now + Duration::from_secs(23 * 60 + 30)),
+            ..RecordingStatus::default()
+        };
+        assert_eq!(
+            recording_facts(&status, now),
+            "Writing GPS_2026-09-30_08.raw · 1.500 kB in this file · 2.000 MB in all its \
+             files · 3.000 GB free · next file in 23 min"
+        );
+        // Before the first disk check lands, and in a gap, it says what it knows.
+        let gap = RecordingStatus::default();
+        assert_eq!(recording_facts(&gap, now), "No file open");
+        let daily = RecordingStatus {
+            next_rotation: Some(now + Duration::from_secs(5 * 3600 + 7 * 60)),
+            ..RecordingStatus::default()
+        };
+        assert!(recording_facts(&daily, now).ends_with("next file in 5 h 7 min"));
     }
 
     #[test]

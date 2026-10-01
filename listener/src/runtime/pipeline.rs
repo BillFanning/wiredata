@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use super::activity::ActivityMeter;
 use super::snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
-    QueueDepth, StreamDelta,
+    QueueDepth, RecordingStatus, StreamDelta,
 };
 use super::telemetry::{
     ChunkShape, CounterAvailability, DurationHistogram, IdleDeadlineTimerMode,
@@ -45,12 +45,14 @@ use crate::diagnostics::{Diagnostic, DiagnosticLog};
 use crate::display::{
     AnnotationPlacement, DisplayView, RenderAnnotation, RenderedOutput, StreamRenderer,
 };
+use crate::record::file_rotation::next_period_start;
 use crate::record::{
     start_recording, DisplaySegments, FileRotationPolicy, Finalized, OpenKind, OverwritePolicy,
     RawSegments, RecorderReport, Recording, RecordingStopReason, SegmentPlan, StreamPos, Timings,
     DEFAULT_QUEUE_BUDGET,
 };
 use crate::transport::{ReceivedData, SerialStallState, TransportNotice};
+use wiredata_ui::format::human_bytes;
 
 use super::queue::DropOldestQueue;
 
@@ -233,11 +235,10 @@ pub struct ChannelPipeline {
     /// Display-recording sibling of `recording_settings`: the settings a live
     /// Display begin uses (§54). `None` = no destination set, so a begin faults.
     display_recording_settings: Option<DisplayRecordingSettings>,
-    /// Disk-space guard for recording (§56.2, §168): the policy and the path whose
-    /// filesystem free space is polled. `None` = no guard.
-    disk_guard: Option<(DiskGuard, PathBuf)>,
-    /// Whether the low-disk condition has already been reported (debounce).
-    disk_low_reported: bool,
+    /// Each running recording's destination as the disk check last saw it
+    /// (§56.2): free space, the recording's size, and the lasting low-disk fault.
+    raw_disk: DiskWatch,
+    display_disk: DiskWatch,
     /// Per-Channel liveness facts (§91.1): rolling throughput + last-data time.
     activity: ActivityMeter,
     /// Post-read capture to pipeline-start delay, accumulated without retaining
@@ -331,6 +332,8 @@ pub struct RawRecordingSettings {
     pub queue_budget: usize,
     /// The soft size cap per file, in bytes (§59).
     pub size_cap: u64,
+    /// The disk guard on this recording's destination (§56.2).
+    pub disk_guard: Option<DiskGuard>,
 }
 
 impl RawRecordingSettings {
@@ -360,6 +363,8 @@ pub struct DisplayRecordingSettings {
     pub queue_budget: usize,
     /// The soft size cap per file, in bytes (§59).
     pub size_cap: u64,
+    /// The disk guard on this recording's destination (§56.2).
+    pub disk_guard: Option<DiskGuard>,
     pub renderer: DisplayView,
 }
 
@@ -401,8 +406,8 @@ impl ChannelPipeline {
             begin_faulted: false,
             display_begin_faulted: false,
             display_recording_settings: None,
-            disk_guard: None,
-            disk_low_reported: false,
+            raw_disk: DiskWatch::default(),
+            display_disk: DiskWatch::default(),
             activity: ActivityMeter::new(),
             ingest_delay: DurationHistogram::default(),
             recent_ingest_delay: RecentDurationHistogram::default(),
@@ -507,14 +512,6 @@ impl ChannelPipeline {
     /// finalizes it.
     pub fn with_raw_recorder(mut self, recorder: Recording<Arc<ReceivedData>>) -> Self {
         self.raw_recorder = Some(recorder);
-        self
-    }
-
-    /// Attach a disk-space guard (§56.2, §168): `path`'s filesystem free space is
-    /// polled, and on a low condition the guard warns and, per its policy, stops
-    /// recording.
-    pub fn with_disk_guard(mut self, guard: DiskGuard, path: PathBuf) -> Self {
-        self.disk_guard = Some((guard, path));
         self
     }
 
@@ -1142,7 +1139,7 @@ impl ChannelPipeline {
             settings.queue_budget,
             Timings::default(),
         );
-        if self.low_disk_holds_recording() {
+        if self.low_disk_holds_recording(RecordingTap::Raw) {
             recording.set_low_disk(true);
         }
         self.raw_recorder = Some(recording);
@@ -1285,11 +1282,7 @@ impl ChannelPipeline {
             // Could not begin: Begin is the retry — drop it first (the Raw
             // sibling's rule).
             Some(_) => {
-                if let Some(rec) = self
-                    .display_views
-                    .first_mut()
-                    .and_then(|v| v.recorder.take())
-                {
+                if let Some(rec) = self.take_display_recorder() {
                     let end = self.stream_pos_now();
                     let finalized = finalize_view_recorder(
                         self.channel_id,
@@ -1322,7 +1315,7 @@ impl ChannelPipeline {
             settings.queue_budget,
             Timings::default(),
         );
-        if self.low_disk_holds_recording() {
+        if self.low_disk_holds_recording(RecordingTap::Display) {
             recording.set_low_disk(true);
         }
         self.set_display_recorder(settings.renderer.clone(), recording);
@@ -1335,11 +1328,7 @@ impl ChannelPipeline {
     /// prior begin-fault so the state reads "off" again, not ⚠.
     async fn stop_display_recording(&mut self) {
         self.display_begin_faulted = false;
-        let taken = self
-            .display_views
-            .first_mut()
-            .and_then(|v| v.recorder.take());
-        if let Some(rec) = taken {
+        if let Some(rec) = self.take_display_recorder() {
             let channel_id = self.channel_id;
             let end = self.stream_pos_now();
             self.retiring.spawn(async move {
@@ -1422,92 +1411,225 @@ impl ChannelPipeline {
         health
     }
 
-    /// Poll the recording filesystem's free space and act on a low condition
-    /// (§56.2, §168). Called periodically (not per write). Warns once per low
-    /// episode and, if the policy is `StopRecording`, gaps the recordings —
-    /// each finalizes its file — while reception continues (§96). They resume
-    /// in new files once free space is 10% above the threshold. A failed space
-    /// query is ignored.
-    pub async fn check_disk_guard(&mut self) {
-        let Some((guard, path)) = self.disk_guard.clone() else {
-            return;
-        };
-        // Only meaningful while a recording is active.
-        if self.raw_recorder.is_none() && !self.display_views.iter().any(|v| v.recorder.is_some()) {
-            return;
+    /// Start a free-space and size check for each running recording that has
+    /// none in flight (§56.2). Called periodically, not per write. The check runs
+    /// detached — a hung drive or share must not hold up reception (§96) — and
+    /// [`reap_disk_checks`](Self::reap_disk_checks) applies what it finds. A
+    /// check that never returns is not joined by another.
+    pub fn check_recording_disks(&mut self) {
+        if let Some(settings) = self
+            .raw_recorder
+            .as_ref()
+            .and(self.recording_settings.as_ref())
+        {
+            self.raw_disk.start_check(settings.plan());
         }
-        // Filesystem space queries are synchronous syscalls — off the
-        // acquisition task (a hung network share would otherwise stall
-        // reception), and bounded so even the blocking pool handoff can't
-        // wedge the loop for more than a beat.
-        let query_path = path.clone();
-        let query = tokio::task::spawn_blocking(move || {
-            (
-                fs4::available_space(&query_path),
-                fs4::total_space(&query_path),
-            )
-        });
-        let Ok(Ok((Ok(free), Ok(total)))) =
-            tokio::time::timeout(Duration::from_secs(2), query).await
-        else {
-            return; // cannot determine free space (or the query hung); do not act
+        let display_running = self
+            .display_views
+            .first()
+            .is_some_and(|v| v.recorder.is_some());
+        if let Some(settings) = self
+            .display_recording_settings
+            .as_ref()
+            .filter(|_| display_running)
+        {
+            self.display_disk.start_check(settings.plan());
+        }
+    }
+
+    /// Apply each disk check that has finished, and report one that has run past
+    /// its limit (§56.2). Awaits only checks that have already finished, so it
+    /// never holds up the loop.
+    pub async fn reap_disk_checks(&mut self) {
+        for tap in [RecordingTap::Raw, RecordingTap::Display] {
+            let watch = self.disk_watch_mut(tap);
+            let Some(check) = watch.check.as_mut() else {
+                continue;
+            };
+            let result = if check.handle.is_finished() {
+                let check = watch.check.take().expect("a check is in flight");
+                match check.handle.await {
+                    Ok(Ok(found)) => Ok(found),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(join) => Err(format!("the check failed: {join}")),
+                }
+            } else if !check.overdue && check.started.elapsed() >= DISK_CHECK_LIMIT {
+                check.overdue = true;
+                Err(format!(
+                    "the check has not finished after {} s",
+                    DISK_CHECK_LIMIT.as_secs()
+                ))
+            } else {
+                continue;
+            };
+            self.apply_disk_check(tap, result);
+        }
+    }
+
+    /// Act on one disk check (§56.2): keep the sizes for status, report a failed
+    /// check once, and raise or clear the lasting low-disk fault. With
+    /// `StopRecording` a low disk gaps the recording, which resumes in a new file
+    /// once free space is 10% above the threshold.
+    fn apply_disk_check(&mut self, tap: RecordingTap, result: Result<DiskFound, String>) {
+        let what = format!("{} recording", tap.label());
+        let channel = self.channel_name.clone();
+        let guard = self.tap_guard(tap);
+        let watch = self.disk_watch_mut(tap);
+        let found = match result {
+            Ok(found) => found,
+            Err(error) => {
+                watch.free_space = None;
+                watch.total_size = None;
+                if !std::mem::replace(&mut watch.check_failing, true) {
+                    self.diagnostics.record(Diagnostic::warning(format!(
+                        "could not check free disk space for {what} on channel {channel}: {error}"
+                    )));
+                }
+                return;
+            }
         };
-        if self.disk_low_reported {
+        let check_recovered = std::mem::replace(&mut watch.check_failing, false);
+        watch.free_space = Some(found.free);
+        watch.total_size = Some(found.files);
+        let was_low = watch.low;
+        if check_recovered {
+            self.diagnostics.record(Diagnostic::event(format!(
+                "free disk space for {what} on channel {channel} can be checked again"
+            )));
+        }
+        let Some(guard) = guard else {
+            return;
+        };
+        let pauses = guard.on_low == LowDiskAction::StopRecording;
+        let free = human_bytes(found.free);
+        if was_low {
             // Hysteresis: a low episode ends only 10% above the threshold, so
             // free space hovering at the line cannot churn files (§56.2).
-            if disk_has_recovered(free, total, guard.min_free) {
-                self.disk_low_reported = false;
+            if disk_has_recovered(found.free, found.total, guard.min_free) {
+                self.disk_watch_mut(tap).low = false;
                 self.diagnostics.record(Diagnostic::event(format!(
-                    "free disk space for recording on channel {} has recovered: {free} bytes free",
-                    self.channel_name
+                    "free disk space for {what} on channel {channel} has recovered: {free} free"
                 )));
-                if guard.on_low == LowDiskAction::StopRecording {
-                    self.set_low_disk(false);
+                if pauses {
+                    self.set_low_disk(tap, false);
                 }
             }
             return;
         }
-        if !disk_is_low(free, total, guard.min_free) {
+        if !disk_is_low(found.free, found.total, guard.min_free) {
             return;
         }
-        self.disk_low_reported = true;
+        self.disk_watch_mut(tap).low = true;
+        let consequence = if pauses {
+            format!(
+                "the recording waits in a gap until {} is free",
+                describe_threshold(guard.min_free, true)
+            )
+        } else {
+            "the recording continues".to_owned()
+        };
         self.diagnostics.record(Diagnostic::warning(format!(
-            "low disk for recording on channel {}: {free} bytes free",
-            self.channel_name
+            "low disk for {what} on channel {channel}: {free} free, below the guard's {}; \
+             {consequence}",
+            describe_threshold(guard.min_free, false)
         )));
         if let Some(events) = &self.events {
             let _ = events.try_send(RuntimeEvent::DiskSpaceLow(self.channel_id));
         }
-        if guard.on_low == LowDiskAction::StopRecording {
-            self.set_low_disk(true);
+        if pauses {
+            self.set_low_disk(tap, true);
             if let Some(events) = &self.events {
                 let _ = events.try_send(RuntimeEvent::RecordingStoppedLowDisk(self.channel_id));
             }
         }
     }
 
-    /// Whether a low-disk episode is holding recordings in a gap (§56.2), so a
-    /// recording begun during it starts in that gap too.
-    fn low_disk_holds_recording(&self) -> bool {
-        self.disk_low_reported
-            && self
-                .disk_guard
-                .as_ref()
-                .is_some_and(|(guard, _)| guard.on_low == LowDiskAction::StopRecording)
+    fn disk_watch_mut(&mut self, tap: RecordingTap) -> &mut DiskWatch {
+        match tap {
+            RecordingTap::Raw => &mut self.raw_disk,
+            RecordingTap::Display => &mut self.display_disk,
+        }
     }
 
-    /// Tell every recording on this Channel that free space is low, or has
-    /// recovered (§56.2). Each recorder handles it in its own task, so this
-    /// never waits on a file (§96).
-    fn set_low_disk(&self, low: bool) {
-        if let Some(recorder) = &self.raw_recorder {
-            recorder.set_low_disk(low);
+    /// The disk guard of `tap`'s recording, from its settings (§56.2).
+    fn tap_guard(&self, tap: RecordingTap) -> Option<DiskGuard> {
+        match tap {
+            RecordingTap::Raw => self.recording_settings.as_ref()?.disk_guard,
+            RecordingTap::Display => self.display_recording_settings.as_ref()?.disk_guard,
         }
-        for view in &self.display_views {
-            if let Some(rec) = &view.recorder {
-                rec.recording.set_low_disk(low);
+    }
+
+    /// Whether a low-disk episode is holding `tap` in a gap (§56.2), so a
+    /// recording begun during it starts in that gap too.
+    fn low_disk_holds_recording(&self, tap: RecordingTap) -> bool {
+        let low = match tap {
+            RecordingTap::Raw => self.raw_disk.low,
+            RecordingTap::Display => self.display_disk.low,
+        };
+        low && self
+            .tap_guard(tap)
+            .is_some_and(|guard| guard.on_low == LowDiskAction::StopRecording)
+    }
+
+    /// Tell `tap`'s recording that free space is low, or has recovered (§56.2).
+    /// The recorder handles it in its own task, so this never waits on a file
+    /// (§96).
+    fn set_low_disk(&self, tap: RecordingTap, low: bool) {
+        match tap {
+            RecordingTap::Raw => {
+                if let Some(recorder) = &self.raw_recorder {
+                    recorder.set_low_disk(low);
+                }
+            }
+            RecordingTap::Display => {
+                for view in &self.display_views {
+                    if let Some(rec) = &view.recorder {
+                        rec.recording.set_low_disk(low);
+                    }
+                }
             }
         }
+    }
+
+    /// What status shows about the running `tap` recording (§56.2).
+    fn recording_status(&self, tap: RecordingTap) -> Option<RecordingStatus> {
+        let (current_file, bytes_written, unstable, rotation, guard, watch) = match tap {
+            RecordingTap::Raw => {
+                let recorder = self.raw_recorder.as_ref()?;
+                let settings = self.recording_settings.as_ref();
+                (
+                    recorder.current_file(),
+                    recorder.bytes_written(),
+                    recorder.is_unstable(),
+                    settings.map(|s| s.file_rotation),
+                    settings.and_then(|s| s.disk_guard),
+                    &self.raw_disk,
+                )
+            }
+            RecordingTap::Display => {
+                let recording = &self.display_views.first()?.recorder.as_ref()?.recording;
+                let settings = self.display_recording_settings.as_ref();
+                (
+                    recording.current_file(),
+                    recording.bytes_written(),
+                    recording.is_unstable(),
+                    settings.map(|s| s.file_rotation),
+                    settings.and_then(|s| s.disk_guard),
+                    &self.display_disk,
+                )
+            }
+        };
+        Some(RecordingStatus {
+            current_file,
+            bytes_written,
+            total_size: watch.total_size,
+            free_space: watch.free_space,
+            next_rotation: rotation
+                .and_then(|policy| next_period_start(policy, std::time::SystemTime::now())),
+            guard,
+            low_disk: watch.low,
+            unstable,
+        })
     }
 
     /// Record an INFO diagnostic (§88) — a lifecycle note for the diagnostics log.
@@ -1529,6 +1651,7 @@ impl ChannelPipeline {
         }
         let end = self.stream_pos_now();
         let mut display_stops = Vec::new();
+        self.display_disk = DiskWatch::default();
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
                 display_stops.push(
@@ -1632,6 +1755,8 @@ impl ChannelPipeline {
             error_count: self.diagnostics.errors().count(),
             raw_recording: self.raw_recording_state(),
             display_recording: self.display_recording_state(),
+            raw_recording_status: self.recording_status(RecordingTap::Raw),
+            display_recording_status: self.recording_status(RecordingTap::Display),
             match_boundary_saves: self.match_rules.boundary_saves(),
             ingest_delay: self.ingest_delay,
             recent_ingest_delay: self.recent_ingest_delay.snapshot_at(now),
@@ -1665,7 +1790,16 @@ impl ChannelPipeline {
             retained.capacity = retained.capacity.max(capacity);
             retained.current = 0;
         }
+        self.raw_disk = DiskWatch::default();
         self.raw_recorder.take()
+    }
+
+    /// Take the primary view's Display recorder, forgetting its disk watch.
+    fn take_display_recorder(&mut self) -> Option<ViewRecorder> {
+        self.display_disk = DiskWatch::default();
+        self.display_views
+            .first_mut()
+            .and_then(|v| v.recorder.take())
     }
 
     /// Raw-recording queue occupancy, retaining the run peak after a recorder is
@@ -1739,6 +1873,8 @@ impl ChannelPipeline {
             diagnostics,
             raw_recording: self.raw_recording_state(),
             display_recording: self.display_recording_state(),
+            raw_recording_status: self.recording_status(RecordingTap::Raw),
+            display_recording_status: self.recording_status(RecordingTap::Display),
             activity: self.activity.snapshot(now),
             matches: self.recent_matches.iter().cloned().collect(),
             match_boundary_saves: self.match_rules.boundary_saves(),
@@ -1840,6 +1976,84 @@ async fn finalize_view_recorder(
     rec.recording.finalize(reason).await
 }
 
+/// How long a disk check may run before it is reported as failing (§56.2).
+const DISK_CHECK_LIMIT: Duration = Duration::from_secs(2);
+
+/// What one disk check found (§56.2).
+#[derive(Clone, Copy, Debug)]
+struct DiskFound {
+    /// Free and total bytes on the destination's filesystem.
+    free: u64,
+    total: u64,
+    /// The total size of the recording's files.
+    files: u64,
+}
+
+/// A disk check running on the blocking pool.
+struct DiskCheck {
+    started: Instant,
+    /// Whether this check has already been reported as running too long.
+    overdue: bool,
+    handle: tokio::task::JoinHandle<std::io::Result<DiskFound>>,
+}
+
+/// A running recording's destination as the disk check last saw it (§56.2).
+#[derive(Default)]
+struct DiskWatch {
+    free_space: Option<u64>,
+    total_size: Option<u64>,
+    /// The lasting low-disk fault: below the guard's threshold, until free
+    /// space is 10% above it.
+    low: bool,
+    /// A failed check has been reported; the next success notes the recovery.
+    check_failing: bool,
+    check: Option<DiskCheck>,
+}
+
+impl DiskWatch {
+    /// Start a check of `plan`'s destination, unless one is still in flight.
+    fn start_check(&mut self, plan: SegmentPlan) {
+        if self.check.is_some() {
+            return;
+        }
+        let handle = tokio::task::spawn_blocking(move || {
+            let folder = plan.folder();
+            Ok(DiskFound {
+                free: fs4::available_space(&folder)?,
+                total: fs4::total_space(&folder)?,
+                files: plan.files_size()?,
+            })
+        });
+        self.check = Some(DiskCheck {
+            started: Instant::now(),
+            overdue: false,
+            handle,
+        });
+    }
+}
+
+/// A disk-guard threshold in words; `resume` gives the point 10% above it,
+/// where a low episode ends (§56.2).
+fn describe_threshold(threshold: DiskThreshold, resume: bool) -> String {
+    match threshold {
+        DiskThreshold::Bytes { bytes } => {
+            let bytes = if resume {
+                bytes.saturating_add(bytes.div_ceil(10))
+            } else {
+                bytes
+            };
+            human_bytes(bytes)
+        }
+        DiskThreshold::Percent { percent } => {
+            let tenths = u32::from(percent) * if resume { 11 } else { 10 };
+            match tenths % 10 {
+                0 => format!("{}% of the disk", tenths / 10),
+                frac => format!("{}.{frac}% of the disk", tenths / 10),
+            }
+        }
+    }
+}
+
 /// Whether `free` bytes is below the disk-guard threshold (§168).
 fn disk_is_low(free: u64, total: u64, threshold: DiskThreshold) -> bool {
     match threshold {
@@ -1929,6 +2143,7 @@ pub async fn run_channel(
         // since the last pass. Non-blocking — reception never waits on a
         // file close; the recorder-maintenance tick guarantees a pass on quiet input.
         pipeline.reap_retired_recordings();
+        pipeline.reap_disk_checks().await;
         let idle_deadline = pipeline.next_idle_deadline(Instant::now());
         tokio::select! {
             biased;
@@ -1962,7 +2177,7 @@ pub async fn run_channel(
                     }
                 }
             },
-            _ = disk_check.tick() => pipeline.check_disk_guard().await,
+            _ = disk_check.tick() => pipeline.check_recording_disks(),
             _ = recorder_check.tick() => pipeline.poll_recorders(),
             timer_mode = wait_for_idle_deadline(idle_deadline) => {
                 pipeline.idle_deadline_timer.record(timer_mode);
@@ -2765,51 +2980,264 @@ mod tests {
         assert!(!disk_has_recovered(0, 0, percent));
     }
 
+    /// Raw settings recording to `path` with `guard`.
+    fn raw_settings(path: &std::path::Path, guard: Option<DiskGuard>) -> RawRecordingSettings {
+        RawRecordingSettings {
+            destination: path.to_path_buf(),
+            channel_name: "guarded".to_string(),
+            overwrite: OverwritePolicy::Overwrite,
+            timestamps: false,
+            file_rotation: FileRotationPolicy::None,
+            queue_budget: DEFAULT_QUEUE_BUDGET,
+            size_cap: DEFAULT_SIZE_CAP,
+            disk_guard: guard,
+        }
+    }
+
+    /// A threshold no disk can meet, so the guard always finds it low.
+    fn impossible_guard() -> Option<DiskGuard> {
+        Some(DiskGuard {
+            min_free: DiskThreshold::Bytes { bytes: u64::MAX },
+            on_low: LowDiskAction::StopRecording,
+        })
+    }
+
+    fn raw_status(p: &ChannelPipeline) -> Option<RecordingStatus> {
+        p.stats().raw_recording_status
+    }
+
+    fn display_status(p: &ChannelPipeline) -> Option<RecordingStatus> {
+        p.stats().display_recording_status
+    }
+
+    /// Run disk checks until `done` holds: each check runs on the blocking pool
+    /// and lands on a later pass, as it does in `run_channel`.
+    async fn settle_disks(
+        p: &mut ChannelPipeline,
+        what: &str,
+        done: impl Fn(&ChannelPipeline) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            p.check_recording_disks();
+            p.reap_disk_checks().await;
+            p.poll_recorders();
+            if done(p) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test]
     async fn the_disk_guard_gaps_recording_once_and_emits_events() {
         // §56.2/§168: an impossible byte threshold (u64::MAX) is always "low", so
-        // the guard warns, ends the file cleanly in a low-disk gap, and debounces
-        // the report. The recording stays on, waiting for space.
+        // the guard warns, ends the file cleanly in a low-disk gap, raises the
+        // lasting fault, and does not report the same episode twice.
         let cid = ChannelId::new();
         let path = temp_path("guard");
-        let recorder = RawFileRecorder::create(&path, OverwritePolicy::Refuse, false)
-            .await
-            .unwrap();
-        let recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
-        let mut p = pipeline(cid, PipelineCapacities::default())
-            .with_raw_recorder(recording)
-            .with_disk_guard(
-                DiskGuard {
-                    min_free: DiskThreshold::Bytes { bytes: u64::MAX },
-                    on_low: LowDiskAction::StopRecording,
-                },
-                std::env::temp_dir(),
-            )
-            .with_event_sender(event_tx);
-
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_event_sender(event_tx);
+        p.set_recording(true, Some(raw_settings(&path, impossible_guard())))
+            .await;
         p.ingest(bytes_chunk(cid, b"data"));
-        p.check_disk_guard().await;
-        // The file ended and the recording waits in a gap; reception continues.
+        settle(&mut p, "the first write", |p| {
+            raw_status(p).is_some_and(|s| s.bytes_written == 4)
+        })
+        .await;
+
+        settle_disks(&mut p, "the low-disk gap", |p| {
+            p.raw_recording_state() == Some(RecordingState::Gap(crate::core::GapReason::LowDisk))
+        })
+        .await;
+        assert!(raw_status(&p).unwrap().low_disk, "the fault is lasting");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"data");
+        let count = |rx: &mut tokio::sync::mpsc::Receiver<RuntimeEvent>| {
+            let (mut low, mut gapped) = (0, 0);
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    RuntimeEvent::DiskSpaceLow(id) if id == cid => low += 1,
+                    RuntimeEvent::RecordingStoppedLowDisk(id) if id == cid => gapped += 1,
+                    _ => {}
+                }
+            }
+            (low, gapped)
+        };
+        assert_eq!(count(&mut event_rx), (1, 1));
+
+        // Another check in the same episode reports nothing new.
+        p.check_recording_disks();
+        settle_disks(&mut p, "the second check", |p| p.raw_disk.check.is_none()).await;
+        assert_eq!(count(&mut event_rx), (0, 0));
+        p.finish().await;
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn a_display_only_recording_is_guarded_too() {
+        // §56.2: each recording has its own guard, on its own destination.
+        let cid = ChannelId::new();
+        let path = temp_path("guard-disp");
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        let settings = DisplayRecordingSettings {
+            destination: path.clone(),
+            channel_name: "guarded".to_string(),
+            overwrite: OverwritePolicy::Overwrite,
+            file_rotation: FileRotationPolicy::None,
+            queue_budget: DEFAULT_QUEUE_BUDGET,
+            size_cap: DEFAULT_SIZE_CAP,
+            disk_guard: impossible_guard(),
+            renderer: DisplayView::default(),
+        };
+        p.set_display_recording(true, Some(settings)).await;
+        settle_disks(&mut p, "the Display low-disk gap", |p| {
+            p.display_recording_state()
+                == Some(RecordingState::Gap(crate::core::GapReason::LowDisk))
+        })
+        .await;
+        assert!(display_status(&p).unwrap().low_disk);
+        assert!(p.raw_recording_state().is_none(), "Raw is not involved");
+        p.finish().await;
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn a_low_disk_fault_lasts_until_space_is_ten_percent_above_the_threshold() {
+        // §56.2: the fault stays until free space recovers, and the recording
+        // resumes in a new file only once it is 10% above the threshold.
+        let cid = ChannelId::new();
+        let path = temp_path("guard-lasting");
+        let guard = DiskGuard {
+            min_free: DiskThreshold::Bytes { bytes: 1000 },
+            on_low: LowDiskAction::StopRecording,
+        };
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.set_recording(true, Some(raw_settings(&path, Some(guard))))
+            .await;
+        let found = |free| {
+            Ok(DiskFound {
+                free,
+                total: 1_000_000,
+                files: 0,
+            })
+        };
+
+        p.apply_disk_check(RecordingTap::Raw, found(900));
+        assert!(raw_status(&p).unwrap().low_disk);
         settle(&mut p, "the low-disk gap", |p| {
             p.raw_recording_state() == Some(RecordingState::Gap(crate::core::GapReason::LowDisk))
         })
         .await;
-        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"data");
-        let mut low = 0;
-        let mut stopped = 0;
-        while let Ok(ev) = event_rx.try_recv() {
-            match ev {
-                RuntimeEvent::DiskSpaceLow(id) if id == cid => low += 1,
-                RuntimeEvent::RecordingStoppedLowDisk(id) if id == cid => stopped += 1,
-                _ => {}
-            }
-        }
-        assert_eq!((low, stopped), (1, 1));
-        // Debounced: a second poll in the same low episode does not re-report.
-        p.check_disk_guard().await;
-        assert!(event_rx.try_recv().is_err());
+        let warning = p.diagnostics().warnings().last().unwrap().message.clone();
+        assert!(
+            warning.contains("below the guard's 1.000 kB") && warning.contains("until 1.100 kB"),
+            "the warning says where it resumes: {warning}"
+        );
+
+        p.apply_disk_check(RecordingTap::Raw, found(1050));
+        assert!(
+            raw_status(&p).unwrap().low_disk,
+            "above the threshold is not enough"
+        );
+
+        p.apply_disk_check(RecordingTap::Raw, found(1100));
+        assert!(!raw_status(&p).unwrap().low_disk);
+        settle(&mut p, "the recording to resume", |p| {
+            p.raw_recording_state() == Some(RecordingState::Enabled)
+        })
+        .await;
+        p.finish().await;
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_disk_check_is_reported_once_naming_the_channel() {
+        // §56.2: a failed free-space check is itself reported, naming the Channel.
+        let cid = ChannelId::new();
+        let path = temp_path("guard-failing");
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_channel_name("GPS");
+        p.set_recording(true, Some(raw_settings(&path, None))).await;
+
+        for _ in 0..2 {
+            p.apply_disk_check(RecordingTap::Raw, Err("the device is not ready".to_owned()));
+        }
+        let failures: Vec<_> = p
+            .diagnostics()
+            .warnings()
+            .filter(|d| d.message.contains("could not check free disk space"))
+            .collect();
+        assert_eq!(failures.len(), 1, "one report per failing episode");
+        assert!(
+            failures[0].message.contains("channel GPS")
+                && failures[0].message.contains("the device is not ready"),
+            "{}",
+            failures[0].message
+        );
+        assert_eq!(raw_status(&p).unwrap().free_space, None);
+
+        p.apply_disk_check(
+            RecordingTap::Raw,
+            Ok(DiskFound {
+                free: 5,
+                total: 10,
+                files: 3,
+            }),
+        );
+        assert!(p
+            .diagnostics()
+            .events()
+            .any(|d| d.message.contains("can be checked again")));
+        let status = raw_status(&p).unwrap();
+        assert_eq!((status.free_space, status.total_size), (Some(5), Some(3)));
+        p.finish().await;
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn status_shows_the_current_file_its_length_and_the_disk_facts() {
+        // §56.2: status shows the current file, bytes written, the recording's
+        // total size, free space and, when it rotates, the next rotation.
+        let cid = ChannelId::new();
+        let path = temp_path("status");
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.set_recording(true, Some(raw_settings(&path, None))).await;
+        p.ingest(bytes_chunk(cid, b"abc"));
+        settle(&mut p, "the first write", |p| {
+            raw_status(p).is_some_and(|s| s.bytes_written == 3)
+        })
+        .await;
+        let status = raw_status(&p).unwrap();
+        assert_eq!(status.current_file.as_deref(), Some(path.as_path()));
+        assert_eq!(status.next_rotation, None, "a single file does not rotate");
+        assert!(!status.has_lasting_fault());
+
+        settle_disks(&mut p, "the disk facts", |p| {
+            raw_status(p).is_some_and(|s| s.free_space.is_some())
+        })
+        .await;
+        assert!(raw_status(&p).unwrap().total_size.is_some());
+        p.finish().await;
+        assert!(
+            p.stats().raw_recording_status.is_none(),
+            "nothing is recording"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let dir = temp_path("status-rotating");
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        let rotating = RawRecordingSettings {
+            file_rotation: FileRotationPolicy::Hourly,
+            ..raw_settings(&dir, None)
+        };
+        p.set_recording(true, Some(rotating)).await;
+        let next = raw_status(&p)
+            .unwrap()
+            .next_rotation
+            .expect("an hourly recording rotates");
+        assert!(next > std::time::SystemTime::now());
+        p.finish().await;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     // --- Find & Triggers (§50.2, §165) ---
@@ -3205,6 +3633,7 @@ mod tests {
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
+                disk_guard: None,
             });
 
         // Before the match: nothing on disk, nothing recorded.
@@ -3265,6 +3694,7 @@ mod tests {
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
                 renderer: DisplayView::default(),
+                disk_guard: None,
             });
 
         p.ingest(bytes_chunk(cid, b"before "));
@@ -3326,6 +3756,7 @@ mod tests {
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
+                disk_guard: None,
             })
             .with_display_recording_settings(DisplayRecordingSettings {
                 destination: disp_path.clone(),
@@ -3335,6 +3766,7 @@ mod tests {
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
                 renderer: DisplayView::default(),
+                disk_guard: None,
             });
 
         p.ingest(bytes_chunk(cid, b"BEGIN"));
@@ -3376,6 +3808,7 @@ mod tests {
             file_rotation: FileRotationPolicy::None,
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
+            disk_guard: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
         let mut p = pipeline(cid, PipelineCapacities::default()).with_event_sender(event_tx);
@@ -3431,6 +3864,7 @@ mod tests {
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
+                disk_guard: None,
             },
         );
 
@@ -3477,6 +3911,7 @@ mod tests {
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
+                disk_guard: None,
             },
         );
         p.set_recording(true, None).await;
@@ -3677,6 +4112,7 @@ mod tests {
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
             renderer: DisplayView::default(),
+            disk_guard: None,
         };
         p.set_display_recording(true, Some(settings)).await;
         assert_eq!(p.display_recording_state(), Some(RecordingState::Enabled));
@@ -3737,6 +4173,7 @@ mod tests {
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
             renderer: DisplayView::default(),
+            disk_guard: None,
         };
         let mut p = pipeline(cid, PipelineCapacities::default());
         p.set_display_recording(true, Some(first_settings.clone()))

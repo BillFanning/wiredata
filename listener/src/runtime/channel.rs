@@ -28,9 +28,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use std::path::PathBuf;
-
-use crate::config::{DiskGuard, MatchRule};
+use crate::config::MatchRule;
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
 use crate::record::Recording;
@@ -138,7 +136,6 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_count: usize,
-    disk_guard: Option<(DiskGuard, PathBuf)>,
     match_setup: MatchSetup,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
@@ -187,9 +184,6 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     }
     if let Some((renderer, recording)) = display_recorder {
         pipeline.set_display_recorder(renderer, recording);
-    }
-    if let Some((guard, path)) = disk_guard {
-        pipeline = pipeline.with_disk_guard(guard, path);
     }
     let display_handles = pipeline.display_view_handles();
 
@@ -360,7 +354,6 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_count: usize,
-    disk_guard: Option<(DiskGuard, PathBuf)>,
     match_setup: MatchSetup,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
@@ -387,7 +380,6 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         raw_recorder,
         display_recorder,
         view_count,
-        disk_guard,
         match_setup,
         caps,
         events,
@@ -509,7 +501,6 @@ pub fn start_data_channel<R: DataTransportRunner>(
         raw_recorder,
         None,               // no display recording on a standalone channel
         1,                  // a single default Display View
-        None,               // no disk guard on a standalone channel
         MatchSetup::none(), // no Match Rules on a standalone channel
         caps,
         event_tx,

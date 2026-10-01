@@ -17,12 +17,6 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 The spec states these; the code does not do them yet.
 
-- [ ] **Lasting recording faults and disk status (§56.1, §56.2).** "Recording
-  unstable" and low disk are diagnostics that scroll away, not lasting faults;
-  `Recording::is_unstable` is not surfaced. Display-only recordings are
-  unguarded, and a failed `check_disk_guard` is silent. Status does not show the
-  current file, the recordings' total size, free space, or the time to the next
-  rotation.
 - [ ] **Append repair (§57).** Reopening a `.raw` to append does not trim index
   entries past its end, repair a half-written last line, or report an unindexed
   tail.
@@ -254,7 +248,8 @@ Message-model removal). Everything below this block is verified done:
 
 ## Carried over (still valid under v2)
 
-- [ ] Disk-guard GUI exposure (§56.2)
+- [ ] Disk-guard GUI exposure (§56.2): neither recording editor sets
+      `disk_guard` yet, so a guard comes only from a profile.
 - [ ] **TCP connection channels are currently unobservable** — now NORMATIVE
       deferred scope (spec v2.1 §16.2 / ADR-024, 2026-07-16; parked by user
       decision 2026-07-11 — stays deferred until a real TCP-inspection need

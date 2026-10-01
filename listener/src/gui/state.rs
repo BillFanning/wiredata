@@ -9,12 +9,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::config::ChannelConfig;
+use crate::config::LowDiskAction;
 use crate::core::{
     ChannelId, ChannelState, MatchRuleId, RecordingState, RecordingTap, RuntimeEvent,
 };
 use crate::diagnostics::Diagnostic;
-use crate::runtime::{ChannelSnapshot, TriggeredMatch};
+use crate::runtime::{ChannelSnapshot, RecordingStatus, TriggeredMatch};
 use crate::transport::SerialControlLines;
+use wiredata_ui::format::human_bytes;
 
 use super::bridge::UiUpdate;
 
@@ -118,6 +120,10 @@ pub struct ChannelView {
     pub idle_deadline_timer: crate::runtime::IdleDeadlineTimerSummary,
     pub ingest_queue: crate::runtime::QueueDepth,
     pub raw_recording_queue: Option<crate::runtime::QueueDepth>,
+    /// What status shows about each running recording (§56.2), including its
+    /// lasting faults; `None` when that recording is not running.
+    pub raw_recording_status: Option<RecordingStatus>,
+    pub display_recording_status: Option<RecordingStatus>,
     /// Accumulated stream scrollback bytes for the live viewer (§87, ADR-009),
     /// grown incrementally from [`UiUpdate::StreamDelta`] so the driver never
     /// re-ships the whole buffer each poll. Capped (oldest dropped) at this channel's
@@ -183,6 +189,8 @@ impl ChannelView {
             idle_deadline_timer: crate::runtime::IdleDeadlineTimerSummary::default(),
             ingest_queue: crate::runtime::QueueDepth::default(),
             raw_recording_queue: None,
+            raw_recording_status: None,
+            display_recording_status: None,
             stream_bytes: std::collections::VecDeque::new(),
             marks: Vec::new(),
             marks_version: 0,
@@ -351,6 +359,24 @@ impl AppState {
         self.order.iter().filter_map(|id| self.views.get(id))
     }
 
+    /// Every lasting recording fault, in list order, one line each (§56.1,
+    /// §56.2). They stay on screen until they clear, whichever Channel is
+    /// selected, instead of scrolling away in the log.
+    pub fn lasting_recording_faults(&self) -> Vec<String> {
+        self.channels()
+            .flat_map(|view| {
+                [
+                    (RecordingTap::Raw, &view.raw_recording_status),
+                    (RecordingTap::Display, &view.display_recording_status),
+                ]
+                .into_iter()
+                .filter_map(|(tap, status)| Some((tap, status.as_ref()?)))
+                .flat_map(|(tap, status)| lasting_fault_lines(&view.name, tap, status))
+                .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Look up one Channel's view-model.
     pub fn channel(&self, id: ChannelId) -> Option<&ChannelView> {
         self.views.get(&id)
@@ -478,6 +504,8 @@ impl AppState {
                     view.idle_deadline_timer = snapshot.idle_deadline_timer;
                     view.ingest_queue = snapshot.ingest_queue;
                     view.raw_recording_queue = snapshot.raw_recording_queue;
+                    view.raw_recording_status = snapshot.raw_recording_status.clone();
+                    view.display_recording_status = snapshot.display_recording_status.clone();
                     // Pin this window's Mark annotations before the snapshot is
                     // replaced — the snapshot's matches roll over, the pins stay.
                     view.merge_marks(&snapshot.matches);
@@ -509,6 +537,8 @@ impl AppState {
                     view.idle_deadline_timer = stats.idle_deadline_timer;
                     view.ingest_queue = stats.ingest_queue;
                     view.raw_recording_queue = stats.raw_recording_queue;
+                    view.raw_recording_status = stats.raw_recording_status.clone();
+                    view.display_recording_status = stats.display_recording_status.clone();
                     clear_error_if_recording_ok(view);
                 }
             }
@@ -712,6 +742,33 @@ fn clear_live_pipeline_state(view: &mut ChannelView) {
     view.display_recording = None;
     view.ingest_queue = crate::runtime::QueueDepth::default();
     view.raw_recording_queue = None;
+    view.raw_recording_status = None;
+    view.display_recording_status = None;
+}
+
+/// One recording's lasting faults, a line each, naming the Channel and the
+/// recording (§56.1, §56.2).
+fn lasting_fault_lines(channel: &str, tap: RecordingTap, status: &RecordingStatus) -> Vec<String> {
+    let what = format!("{channel} {} recording", tap.label());
+    let mut lines = Vec::new();
+    if status.low_disk {
+        let free = status
+            .free_space
+            .map_or_else(String::new, |free| format!(" ({} free)", human_bytes(free)));
+        let effect = match status.guard.map(|guard| guard.on_low) {
+            Some(LowDiskAction::StopRecording) => {
+                "is paused until free space recovers; reception continues"
+            }
+            _ => "continues, but the disk may fill",
+        };
+        lines.push(format!("Low disk{free}: {what} {effect}"));
+    }
+    if status.unstable {
+        lines.push(format!(
+            "Recording unstable: {what} keeps failing, so it retries less often until you stop it"
+        ));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -769,6 +826,8 @@ mod tests {
             stream_end_offset: total_bytes,
             ingest_queue: crate::runtime::QueueDepth::default(),
             raw_recording_queue: None,
+            raw_recording_status: None,
+            display_recording_status: None,
         }
     }
 
@@ -963,6 +1022,8 @@ mod tests {
                 idle_deadline_timer: crate::runtime::IdleDeadlineTimerSummary::default(),
                 ingest_queue: crate::runtime::QueueDepth::default(),
                 raw_recording_queue: None,
+                raw_recording_status: None,
+                display_recording_status: None,
             }),
         )
     }
@@ -1022,6 +1083,48 @@ mod tests {
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
         state.apply(stats_with_state(id, ChannelState::Starting, false));
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
+    }
+
+    #[test]
+    fn lasting_recording_faults_name_the_channel_and_stay_until_they_clear() {
+        // §56.1/§56.2: low disk and instability stay listed, whichever channel
+        // is selected, until a poll shows them gone.
+        use crate::config::{DiskGuard, DiskThreshold};
+        let mut state = AppState::default();
+        let (gps, ais) = (ChannelId::new(), ChannelId::new());
+        state.apply(added(gps, "GPS", "UDP · test"));
+        state.apply(added(ais, "AIS", "UDP · test"));
+        assert!(state.lasting_recording_faults().is_empty());
+
+        let mut snap = snapshot_with(gps, 0, 0.0, 0);
+        snap.raw_recording_status = Some(RecordingStatus {
+            free_space: Some(500_000),
+            guard: Some(DiskGuard {
+                min_free: DiskThreshold::Bytes { bytes: 1_000_000 },
+                on_low: LowDiskAction::StopRecording,
+            }),
+            low_disk: true,
+            ..RecordingStatus::default()
+        });
+        snap.display_recording_status = Some(RecordingStatus {
+            unstable: true,
+            ..RecordingStatus::default()
+        });
+        state.apply(UiUpdate::Snapshot(gps, Box::new(snap)));
+        assert_eq!(
+            state.lasting_recording_faults(),
+            [
+                "Low disk (500.000 kB free): GPS Raw recording is paused until free space \
+                 recovers; reception continues",
+                "Recording unstable: GPS Display recording keeps failing, so it retries \
+                 less often until you stop it",
+            ]
+        );
+
+        let mut snap = snapshot_with(gps, 0, 0.0, 0);
+        snap.raw_recording_status = Some(RecordingStatus::default());
+        state.apply(UiUpdate::Snapshot(gps, Box::new(snap)));
+        assert!(state.lasting_recording_faults().is_empty());
     }
 
     #[test]

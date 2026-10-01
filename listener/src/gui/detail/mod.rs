@@ -14,8 +14,8 @@ use super::bridge::{self, UiCommand};
 use super::state::ChannelStatus;
 use super::widgets::{
     config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
-    line_indicator, line_toggle, paint_glyph, recording_glyph_size, recording_indicator,
-    start_button, status_color, status_glyph, status_label, stop_enabled,
+    line_indicator, line_toggle, paint_glyph, recording_facts, recording_glyph_size,
+    recording_indicator, start_button, status_color, status_glyph, status_label, stop_enabled,
 };
 use super::ListenerApp;
 use wiredata_ui::fonts::bold;
@@ -553,6 +553,11 @@ impl ListenerApp {
             }
             self.record_button(ui, id, status, recording, RecTap::Raw);
         });
+        let raw_status = self
+            .state
+            .channel(id)
+            .and_then(|v| v.raw_recording_status.clone());
+        show_recording_facts(ui, raw_status.as_ref());
         if self.edit_draft.as_ref().map(|(eid, _)| *eid) != Some(id) {
             ui.label(egui::RichText::new("(select the channel to edit)").weak());
             return;
@@ -581,6 +586,11 @@ impl ListenerApp {
             }
             self.record_button(ui, id, status, display_recording, RecTap::Display);
         });
+        let display_status = self
+            .state
+            .channel(id)
+            .and_then(|v| v.display_recording_status.clone());
+        show_recording_facts(ui, display_status.as_ref());
         if let Some((_, config)) = &mut self.edit_draft {
             let summary = {
                 let rec = &config.display_recording;
@@ -735,6 +745,19 @@ fn headline_phrase(message: &str) -> String {
         }
     }
     head[..cut].trim_end().to_string()
+}
+
+/// The facts line under a running recording's header (§56.2); nothing when it
+/// is not running. Hovering shows the full path of the file being written.
+fn show_recording_facts(ui: &mut egui::Ui, status: Option<&crate::runtime::RecordingStatus>) {
+    let Some(status) = status else {
+        return;
+    };
+    let line = recording_facts(status, std::time::SystemTime::now());
+    let label = ui.label(egui::RichText::new(line).weak());
+    if let Some(path) = &status.current_file {
+        label.on_hover_text(path.display().to_string());
+    }
 }
 
 /// A collapsible "Setup" section for one recording (collapsed by default): the

@@ -126,7 +126,6 @@ pub fn start_tcp_listener(
                             None,
                             // One default Display View per connection.
                             1,
-                            None, // per-connection recording (and its guard) deferred
                             // Per-connection Match Rules are deferred (§50.2): rules
                             // are per-listener config; wiring them per accepted
                             // connection follows the per-connection recording work.
