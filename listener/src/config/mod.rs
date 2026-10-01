@@ -680,6 +680,40 @@ mod tests {
         assert_eq!(profile.defaults, DefaultConfig::default());
     }
 
+    /// The example profile the spec points readers to (§72) must load, every
+    /// Channel in it must be valid, and nothing it says may be dropped on the
+    /// way into the profile types.
+    #[test]
+    fn the_example_profile_loads_and_says_only_what_the_schema_has() {
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/profiles/profile.example.toml"
+        ));
+        let profile = Profile::load(path).expect("profile.example.toml loads");
+        assert!(!profile.channels.is_empty());
+        for (name, result) in profile.validate() {
+            assert_eq!(result, Ok(()), "{name}");
+        }
+
+        fn contained(written: &toml::Value, read_back: &toml::Value) -> bool {
+            match (written, read_back) {
+                (toml::Value::Table(w), toml::Value::Table(r)) => w
+                    .iter()
+                    .all(|(key, value)| r.get(key).is_some_and(|back| contained(value, back))),
+                (toml::Value::Array(w), toml::Value::Array(r)) => {
+                    w.len() == r.len() && w.iter().zip(r).all(|(a, b)| contained(a, b))
+                }
+                _ => written == read_back,
+            }
+        }
+        let written: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let read_back: toml::Value = toml::from_str(&profile.to_toml().unwrap()).unwrap();
+        assert!(
+            contained(&written, &read_back),
+            "profile.example.toml holds a value the profile types drop"
+        );
+    }
+
     /// ADR-048: a profile without `schema_version` is not taken to be current.
     #[test]
     fn a_missing_schema_version_is_refused() {

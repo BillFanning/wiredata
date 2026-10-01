@@ -1,0 +1,99 @@
+# Example Listener profile (schema 3).
+#
+# Two Channels for long-running logging: a GPS on a serial port, recorded to
+# hourly files with a disk guard and automatic reconnect, and an AIS feed on a
+# UDP broadcast port that another program can share.
+#
+# Copy this file, change the port, address and destination for your setup, and
+# load it with `listener --profile <file>` or the GUI's Profile menu. Every key
+# here is one the schema has: a misspelled key is refused with its line, and a
+# key left out takes its default.
+
+schema_version = 3
+name = "example"
+
+# ── GPS on a serial port ──────────────────────────────────────────────────────
+
+[[channels]]
+name = "GPS"                  # rotated files are named after it, so filename-safe
+kind = "Serial"
+
+[channels.interface]
+type = "Serial"
+port = "COM3"                 # e.g. "/dev/ttyUSB0" on Linux
+baud_rate = 4800
+data_bits = "Eight"
+parity = "None"
+stop_bits = "One"
+flow_control = "None"
+
+[[channels.display.views]]
+mode = "Raw"
+encoding = "Ascii"
+character_rendering = "Token" # control bytes shown as [CR], [LF] and so on
+wrapping = "NoWrap"
+
+[channels.raw_recording]
+enabled = true                # begin when the Channel starts
+destination = "recordings"    # a folder: one GPS_<period>.raw file per hour
+timestamp_enabled = true
+overwrite_policy = "AppendIfExists"
+file_rotation = "Hourly"
+
+# Below 5% free space, end the file and wait in a gap until space returns.
+# Reception continues throughout.
+[channels.raw_recording.disk_guard]
+on_low = "StopRecording"
+min_free = { kind = "Percent", percent = 5 }
+
+[channels.retention]
+byte_limit = 65536            # scrollback kept for the display; at most 16 MiB
+
+# After a fault, reopen the port: 1 s, then doubling to 30 s between attempts.
+[channels.reconnect]
+enabled = true
+initial_backoff_ms = 1000
+max_backoff_ms = 30000
+multiplier = 2.0
+
+# Before each $GPRMC, put a ZDA sentence carrying its arrival time into the
+# display and the display recording. The raw recording is never changed.
+[[channels.match_rules]]
+name = "RMC"
+condition = { kind = "BytePattern", pattern = [36, 71, 80, 82, 77, 67] } # "$GPRMC"
+
+[[channels.match_rules.actions]]
+kind = "Mark"
+
+[channels.match_rules.actions.timestamp]
+position = "Before"
+separator = " "
+style = { kind = "nmea_zda", talker = "GP" }
+
+# ── AIS on a UDP broadcast port ───────────────────────────────────────────────
+
+[[channels]]
+name = "AIS"
+kind = "Udp"
+
+[channels.interface]
+type = "Udp"
+bind_address = "0.0.0.0"      # all interfaces (reachable from the network)
+port = 10110
+mode = "Broadcast"
+shared_port = true            # another program may bind port 10110 too
+
+[[channels.display.views]]
+mode = "Raw"
+encoding = "Ascii"
+character_rendering = "Token"
+wrapping = "NoWrap"
+
+[channels.retention]
+byte_limit = 65536
+
+# Warn when nothing has arrived for 30 seconds.
+[[channels.match_rules]]
+name = "Quiet"
+condition = { kind = "Idle", timeout_ms = 30000 }
+actions = [{ kind = "Notify", severity = "Warning" }]

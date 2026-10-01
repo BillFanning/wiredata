@@ -10,6 +10,31 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-09-30) — requirements for unattended, weeks-long logging:
+
+- **Recording continuity (ADR-043), §56.1, §56.2, §57, §59.** A recording fault
+  is no longer terminal. The recording records a gap and continues in a new,
+  numbered segment. Recovery never recreates a vanished folder, and files have a
+  soft size cap. Rotation only moves forward in time, and Listener never deletes
+  recordings.
+- **Persistent event log (ADR-044), §118.** Every diagnostic also goes to a daily
+  log file, kept 30 days.
+- **Unattended GUI (ADR-045), §9.1, §70, §159.** Reconnect is a visible,
+  confirmed choice, and one profile can be registered to resume on launch after
+  a cancellable countdown.
+- **Headless CLI (ADR-046, talker ADR-060), §3.1, §113.** The CLI starts what it
+  can, warns loudly, stops on every OS stop signal, and exits with defined codes.
+- **Network (ADR-047).** The TCP Listener is disabled until its data can be shown
+  and recorded (§4.1, §16 and the sections that offer it). UDP states its bind
+  scope in words and can request a shared port (§15, §75).
+- **Strict profiles and bounded capacities (ADR-048), §71, §72.1, §80, §88,
+  §124.** Unknown keys and a missing `schema_version` are refused, and every
+  capacity has a limit.
+- **§50.2 matching** reaches across any number of short reads, and a boundary
+  split is noted once per run.
+- **Drift corrected.** Export (§60–§64) and live network adjustment (§76.1,
+  §167) were never implemented and move to Appendix A. §156 now agrees with §48.
+
 Revision note (2026-08-08) — a Mark takes a row of its own in Hex:
 
 - **§45 Hex Mark placement (ADR-042).** A `Mark` is a row, not a cell in a byte
