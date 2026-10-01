@@ -149,7 +149,7 @@ clippy and fmt checks; the `nmea0183` serde build only guards what `nmea0183` ca
 break; the rustdoc check matters when doc comments change; `cargo deny check`
 matters when dependencies change.
 
-MSRV is **1.97**, raised to current stable with each Rust release (talker ADR-008) —
+MSRV is **1.99**, raised to current stable with each Rust release (talker ADR-008) —
 run `rustup update stable` if the build rejects your toolchain.
 
 ---
