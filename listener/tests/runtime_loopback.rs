@@ -383,7 +383,15 @@ async fn udp_channel_match_rule_fires_an_action_and_is_observable() {
         .expect("a running channel snapshot");
     assert_eq!(snap.matches.len(), 1);
     assert_eq!(snap.matches[0].byte_offset, Some(5));
-    assert_eq!(snap.diagnostics.warnings.len(), 1);
+    // Only the rule's own warning counts: the UDP Channel may also warn that the
+    // OS granted less receive buffer than it asked for (§75), as stock Linux does.
+    let fired = snap
+        .diagnostics
+        .warnings
+        .iter()
+        .filter(|w| w.message.starts_with("match rule fired"))
+        .count();
+    assert_eq!(fired, 1, "{:#?}", snap.diagnostics.warnings);
 
     stop(&mut listener, id).await;
 }
