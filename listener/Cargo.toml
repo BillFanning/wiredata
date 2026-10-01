@@ -53,8 +53,9 @@ serialport = { workspace = true }
 # keys, so rotated filenames match the operator's wall clock
 chrono = { workspace = true }
 
-# Raw socket options: SO_RCVBUF to mitigate kernel UDP drops (§167, §101)
-socket2 = { workspace = true }
+# Raw socket options: SO_RCVBUF to mitigate kernel UDP drops (§167, §101), and
+# address reuse for a shared UDP port (§15); `all` adds SO_REUSEPORT on Unix
+socket2 = { workspace = true, features = ["all"] }
 
 # The host's local addresses, listed in the UDP bind choice (§15, ADR-047)
 if-addrs = { workspace = true }

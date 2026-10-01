@@ -40,6 +40,18 @@ pub enum UdpMode {
     Multicast,
 }
 
+/// Whether a UDP Channel's port is shared with other programs (§15, ADR-047).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SharedPortStatus {
+    /// Not requested.
+    #[default]
+    NotRequested,
+    /// Requested, and the OS applied address reuse before the bind.
+    Applied,
+    /// Requested, but the OS did not apply address reuse: the port is not shared.
+    NotApplied,
+}
+
 /// An unbound UDP transport description (§15, §75). Call [`bind`](Self::bind) at
 /// Channel Start to acquire the socket.
 #[derive(Clone, Debug)]
@@ -51,6 +63,7 @@ pub struct UdpTransport {
     multicast_interface: Option<Ipv4Addr>,
     recv_buffer: Option<usize>,
     kernel_timestamps: bool,
+    shared_port: bool,
 }
 
 impl UdpTransport {
@@ -63,6 +76,7 @@ impl UdpTransport {
             multicast_interface: None,
             recv_buffer: None,
             kernel_timestamps: false,
+            shared_port: false,
         }
     }
 
@@ -92,11 +106,24 @@ impl UdpTransport {
         self
     }
 
+    /// Request a shared port (§15, ADR-047): set address reuse before the bind,
+    /// so another program can bind the same port. Meant for broadcast and
+    /// multicast; profile validation refuses it for unicast, where the OS
+    /// delivers each datagram to only one of the sharing sockets.
+    pub fn with_shared_port(mut self) -> Self {
+        self.shared_port = true;
+        self
+    }
+
     /// Bind the socket and apply mode-specific setup (§8.2). Fallible so the
     /// runtime can take Starting → Faulted on failure (§9, §71).
     pub async fn bind(self) -> io::Result<BoundUdpTransport> {
-        let (std_socket, drop_counter_supported, kernel_timestamps_active) =
-            build_udp_socket(self.bind_addr, self.recv_buffer, self.kernel_timestamps)?;
+        let BuiltSocket {
+            socket: std_socket,
+            drop_counter_supported,
+            kernel_timestamps_active,
+            shared_port,
+        } = build_udp_socket(&self)?;
         std_socket.set_nonblocking(true)?;
         let socket = UdpSocket::from_std(std_socket)?;
         match self.mode {
@@ -125,36 +152,68 @@ impl UdpTransport {
             drop_counter_supported,
             kernel_timestamps_requested: self.kernel_timestamps,
             kernel_timestamps_active,
+            shared_port,
         })
     }
 }
 
-/// Build and bind a std UDP socket, optionally setting SO_RCVBUF *before* bind
-/// (§167) — the point most platforms honor. Built via `socket2` so the option can
-/// be set on the raw socket before it is handed to Tokio.
-fn build_udp_socket(
-    addr: SocketAddr,
-    recv_buffer: Option<usize>,
-    kernel_timestamps: bool,
-) -> io::Result<(std::net::UdpSocket, bool, bool)> {
+/// A bound std socket and what the OS applied while building it.
+struct BuiltSocket {
+    socket: std::net::UdpSocket,
+    drop_counter_supported: bool,
+    kernel_timestamps_active: bool,
+    shared_port: SharedPortStatus,
+}
+
+/// Build and bind a std UDP socket, setting SO_RCVBUF (§167) and address reuse
+/// (§15) *before* bind — the point most platforms honor. Built via `socket2` so
+/// the options can be set on the raw socket before it is handed to Tokio.
+fn build_udp_socket(transport: &UdpTransport) -> io::Result<BuiltSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
+    let addr = transport.bind_addr;
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
         Domain::IPV6
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    if let Some(bytes) = recv_buffer {
+    if let Some(bytes) = transport.recv_buffer {
         socket.set_recv_buffer_size(bytes)?;
     }
     let drop_counter_supported = enable_udp_drop_counter(&socket);
-    let kernel_timestamps_active = enable_udp_kernel_timestamps(&socket, kernel_timestamps);
+    let kernel_timestamps_active =
+        enable_udp_kernel_timestamps(&socket, transport.kernel_timestamps);
+    let shared_port = if transport.shared_port {
+        share_port(&socket)
+    } else {
+        SharedPortStatus::NotRequested
+    };
     socket.bind(&addr.into())?;
-    Ok((
-        socket.into(),
+    Ok(BuiltSocket {
+        socket: socket.into(),
         drop_counter_supported,
         kernel_timestamps_active,
-    ))
+        shared_port,
+    })
+}
+
+/// Set address reuse before the bind (§15, ADR-047): SO_REUSEADDR, and on Unix
+/// SO_REUSEPORT as well. macOS needs it to share a port bound to an address
+/// that is not multicast, and with both set Linux shares the port with a
+/// program that set either. Each option is read back, so the status reports
+/// what the OS applied rather than what was asked.
+fn share_port(socket: &socket2::Socket) -> SharedPortStatus {
+    let reuse_address =
+        socket.set_reuse_address(true).is_ok() && socket.reuse_address().unwrap_or(false);
+    #[cfg(unix)]
+    let reuse_port = socket.set_reuse_port(true).is_ok() && socket.reuse_port().unwrap_or(false);
+    #[cfg(not(unix))]
+    let reuse_port = true;
+    if reuse_address && reuse_port {
+        SharedPortStatus::Applied
+    } else {
+        SharedPortStatus::NotApplied
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -215,6 +274,7 @@ pub struct BoundUdpTransport {
     drop_counter_supported: bool,
     kernel_timestamps_requested: bool,
     kernel_timestamps_active: bool,
+    shared_port: SharedPortStatus,
 }
 
 impl BoundUdpTransport {
@@ -242,6 +302,7 @@ impl DataTransportRunner for BoundUdpTransport {
             drop_counter_supported,
             kernel_timestamps_requested,
             kernel_timestamps_active,
+            shared_port,
         } = self;
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_DATAGRAM];
@@ -261,6 +322,12 @@ impl DataTransportRunner for BoundUdpTransport {
                 };
                 let _ =
                     notices.try_send(TransportNotice::UdpArrivalTimestamps { channel_id, status });
+                if shared_port != SharedPortStatus::NotRequested {
+                    let _ = notices.try_send(TransportNotice::UdpSharedPort {
+                        channel_id,
+                        status: shared_port,
+                    });
+                }
             }
             loop {
                 tokio::select! {
@@ -408,12 +475,81 @@ mod tests {
         // doubles), so the effective size is at least what we requested.
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let requested = 512 * 1024;
-        let (socket, _, _) = build_udp_socket(addr, Some(requested), false).unwrap();
-        let actual = socket2::SockRef::from(&socket).recv_buffer_size().unwrap();
+        let transport =
+            UdpTransport::new(ChannelId::new(), addr, UdpMode::Unicast).with_recv_buffer(requested);
+        let built = build_udp_socket(&transport).unwrap();
+        let actual = socket2::SockRef::from(&built.socket)
+            .recv_buffer_size()
+            .unwrap();
         assert!(
             actual >= requested,
             "recv buffer {actual} should be >= requested {requested}"
         );
+    }
+
+    fn broadcast(addr: SocketAddr) -> UdpTransport {
+        UdpTransport::new(ChannelId::new(), addr, UdpMode::Broadcast)
+    }
+
+    #[tokio::test]
+    async fn sockets_that_request_a_shared_port_bind_the_same_port() {
+        // §15, ADR-047: another program can bind the port too. Both request
+        // sharing, as the other program must on Linux and macOS.
+        let first = broadcast("127.0.0.1:0".parse().unwrap())
+            .with_shared_port()
+            .bind()
+            .await
+            .unwrap();
+        let addr = first.local_addr().unwrap();
+        let second = broadcast(addr)
+            .with_shared_port()
+            .bind()
+            .await
+            .expect("the shared port binds a second time");
+        assert_eq!(second.local_addr().unwrap(), addr);
+        assert_eq!(first.shared_port, SharedPortStatus::Applied);
+        assert_eq!(second.shared_port, SharedPortStatus::Applied);
+    }
+
+    #[tokio::test]
+    async fn without_sharing_a_second_bind_of_the_port_is_refused() {
+        let first = broadcast("127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .unwrap();
+        let err = broadcast(first.local_addr().unwrap())
+            .bind()
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(first.shared_port, SharedPortStatus::NotRequested);
+    }
+
+    #[tokio::test]
+    async fn a_shared_port_reports_whether_the_os_applied_it() {
+        let cid = ChannelId::new();
+        let bound = UdpTransport::new(cid, "127.0.0.1:0".parse().unwrap(), UdpMode::Broadcast)
+            .with_shared_port()
+            .bind()
+            .await
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(2);
+        let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let handle = bound.with_notice_sender(notice_tx).run(tx, cancel.clone());
+
+        let _drop_status = notice_rx.recv().await.unwrap();
+        let _arrival_status = notice_rx.recv().await.unwrap();
+        assert_eq!(
+            notice_rx.recv().await.unwrap(),
+            TransportNotice::UdpSharedPort {
+                channel_id: cid,
+                status: SharedPortStatus::Applied,
+            }
+        );
+
+        cancel.cancel();
+        assert!(matches!(handle.join().await, TransportOutcome::Cancelled));
     }
 
     #[tokio::test]

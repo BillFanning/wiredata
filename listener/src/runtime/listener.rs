@@ -2409,6 +2409,40 @@ mod tests {
         let _ = tokio::fs::remove_file(&path).await;
     }
 
+    /// A requested shared port reaches the Channel's status (§15, ADR-047).
+    #[tokio::test]
+    async fn a_shared_port_is_reported_in_the_channel_stats() {
+        use crate::transport::udp::{SharedPortStatus, UdpMode};
+
+        let port = crate::test_ports::reserve_udp_port();
+        let mut listener = Listener::with_default_capacities();
+        let mut config = udp_channel();
+        if let InterfaceConfig::Udp(udp) = &mut config.interface {
+            udp.bind_address = "127.0.0.1".to_string();
+            udp.port = port;
+            udp.mode = UdpMode::Broadcast;
+            udp.shared_port = true;
+        }
+        let id = listener.add_channel(config);
+        listener.start(id).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            let stats = listener.channel_stats(id).await.expect("stats");
+            let status = stats.transport_health.udp_shared_port;
+            if status != SharedPortStatus::NotRequested {
+                break status;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the shared-port status never arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(status, SharedPortStatus::Applied);
+        listener.stop(id).await.unwrap();
+    }
+
     /// The at-rest cross-check that surfaced the retained-totals gap: after
     /// Stop, the channel's snapshot must still read the run's exact byte
     /// total (rate zeroed) — previously the stopped-channel snapshot served

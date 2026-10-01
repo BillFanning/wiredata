@@ -148,6 +148,9 @@ pub fn build_udp(channel_id: ChannelId, config: &UdpConfig) -> Result<UdpTranspo
     if config.kernel_timestamps {
         transport = transport.with_kernel_timestamps();
     }
+    if config.shared_port {
+        transport = transport.with_shared_port();
+    }
     Ok(transport)
 }
 
@@ -194,6 +197,7 @@ mod tests {
             multicast_interface: None,
             recv_buffer_bytes: None,
             kernel_timestamps: false,
+            shared_port: false,
         };
         assert!(build_udp(ChannelId::new(), &good).is_ok());
 
@@ -205,6 +209,7 @@ mod tests {
             multicast_interface: None,
             recv_buffer_bytes: None,
             kernel_timestamps: false,
+            shared_port: false,
         };
         assert!(matches!(
             build_udp(ChannelId::new(), &bad),

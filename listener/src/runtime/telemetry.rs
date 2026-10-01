@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::core::{ArrivalTimestampSource, ArrivalTimestampStatus};
+use crate::transport::udp::SharedPortStatus;
 pub(crate) use wiredata_telemetry::RecentDurationHistogram;
 pub use wiredata_telemetry::{DurationHistogram, RECENT_WINDOW};
 
@@ -168,6 +169,8 @@ pub struct TransportHealth {
     pub serial_stalls: Option<SerialStallSummary>,
     pub udp_kernel_drops: CounterAvailability,
     pub arrival_timestamps: ArrivalTimestampSummary,
+    /// Whether a requested shared UDP port was applied (§15, ADR-047).
+    pub udp_shared_port: SharedPortStatus,
 }
 
 impl ChunkShape {

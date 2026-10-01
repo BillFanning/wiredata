@@ -182,6 +182,11 @@ pub struct UdpConfig {
     /// the normal post-read timestamp. Disabled by default for profile compatibility.
     #[serde(default)]
     pub kernel_timestamps: bool,
+    /// "Request shared port" (§15, ADR-047): set the platform's address-reuse
+    /// option before binding, so another program can bind the same port.
+    /// Broadcast and multicast only. Off by default.
+    #[serde(default)]
+    pub shared_port: bool,
 }
 
 /// TCP listener interface configuration (§76).

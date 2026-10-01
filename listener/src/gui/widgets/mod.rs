@@ -346,6 +346,25 @@ pub(super) fn edit_interface(
                         ui.end_row();
                     }
 
+                    // Not offered for unicast (§15, ADR-047), so switching to it
+                    // clears the request rather than leaving a profile that fails
+                    // validation.
+                    if udp.mode == UdpMode::Unicast {
+                        udp.shared_port = false;
+                    } else {
+                        const SHARED_HINT: &str = "Let another program bind this port \
+                            too, and receive the same broadcast or multicast datagrams. \
+                            Listener sets the OS's address-reuse option before binding; \
+                            Diagnostics says whether the OS applied it. The other program \
+                            usually has to request sharing as well. Not offered for \
+                            unicast, where the OS delivers each datagram to only one of \
+                            the programs sharing a port.";
+                        ui.label("Port sharing").on_hover_text(SHARED_HINT);
+                        ui.checkbox(&mut udp.shared_port, "Request shared port")
+                            .on_hover_text(SHARED_HINT);
+                        ui.end_row();
+                    }
+
                     ui.label("Arrival timing").on_hover_text(
                         "Choose whether UDP arrival wall-clock timestamps are captured after the read or requested from the OS receive path.",
                     );

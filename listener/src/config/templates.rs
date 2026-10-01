@@ -77,6 +77,7 @@ pub fn udp_template() -> ChannelConfig {
             multicast_interface: None,
             recv_buffer_bytes: None,
             kernel_timestamps: false,
+            shared_port: false,
         }),
         display: raw_and_hex(),
         raw_recording: RawRecordingConfig::default(),

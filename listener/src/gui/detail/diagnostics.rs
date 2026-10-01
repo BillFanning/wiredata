@@ -14,6 +14,7 @@ use crate::core::{ArrivalTimestampStatus, ChannelId, RecordingState};
 use crate::runtime::{
     ByteHistogram, CounterAvailability, DurationHistogram, QueueDepth, TransportHealth,
 };
+use crate::transport::udp::SharedPortStatus;
 
 use super::super::state::{ChannelStatus, ChannelView};
 use super::super::widgets::human_bytes;
@@ -202,6 +203,24 @@ fn queue_level_reaches_half(level: usize, capacity: usize) -> bool {
     // Keep the established >= 50% reference without multiplying `level`
     // (and therefore without a theoretical usize overflow).
     capacity > 0 && level >= capacity.div_ceil(2)
+}
+
+const SHARED_PORT_TOOLTIP: &str = concat!(
+    "Request shared port sets the operating system's address-reuse option before the ",
+    "bind, so another program that also requests sharing can bind this port and ",
+    "receive the same broadcast or multicast datagrams. This line says whether the ",
+    "operating system applied it; it cannot say whether another program is bound."
+);
+
+/// The shared-port line (§15, ADR-047), or `None` when sharing was not requested.
+fn shared_port_words(status: SharedPortStatus) -> Option<&'static str> {
+    match status {
+        SharedPortStatus::NotRequested => None,
+        SharedPortStatus::Applied => Some("Shared port: applied · other programs can bind it"),
+        SharedPortStatus::NotApplied => {
+            Some("Shared port: requested · the OS did not apply it · not shared")
+        }
+    }
 }
 
 fn reported_udp_drops(dropped: u64) -> String {
@@ -668,6 +687,17 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
     ui.label(egui::RichText::new(arrival_text).weak())
         .on_hover_text(ARRIVAL_TIMESTAMP_TOOLTIP);
 
+    let shared_port = view.transport_health.udp_shared_port;
+    if let Some(words) = shared_port_words(shared_port) {
+        let text = egui::RichText::new(words);
+        ui.label(if shared_port == SharedPortStatus::NotApplied {
+            text.color(palette(ui).warning)
+        } else {
+            text.weak()
+        })
+        .on_hover_text(SHARED_PORT_TOOLTIP);
+    }
+
     match view.transport_health.udp_kernel_drops {
         CounterAvailability::NotApplicable => {
             ui.label(egui::RichText::new("UDP kernel drops: not applicable").weak())
@@ -808,12 +838,13 @@ mod tests {
 
     use super::{
         card_tone, compact_timing, counted, detail_timing, diagnostics_badge, pressure_signal,
-        queue_level_reaches_half, size_figures, timing_figures, timing_window, transport_signal,
-        ChannelStatus, ARRIVAL_TIMESTAMP_TOOLTIP, CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP,
-        IDLE_RULE_TIMING_TOOLTIP, IDLE_TIMER_TOOLTIP, PIPELINE_TOOLTIP, PRESSURE_TOOLTIP,
-        PROCESSING_TOOLTIP, RAW_QUEUE_ACTIVE_TOOLTIP, RAW_QUEUE_FAULTED_TOOLTIP,
-        RAW_QUEUE_GAP_TOOLTIP, RECEIVE_DETAILS_TOOLTIP, SERIAL_BACKPRESSURE_TOOLTIP,
-        TRANSPORT_TOOLTIP, UDP_AVAILABLE_TOOLTIP, UDP_UNAVAILABLE_TOOLTIP,
+        queue_level_reaches_half, shared_port_words, size_figures, timing_figures, timing_window,
+        transport_signal, ChannelStatus, SharedPortStatus, ARRIVAL_TIMESTAMP_TOOLTIP,
+        CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP, IDLE_RULE_TIMING_TOOLTIP, IDLE_TIMER_TOOLTIP,
+        PIPELINE_TOOLTIP, PRESSURE_TOOLTIP, PROCESSING_TOOLTIP, RAW_QUEUE_ACTIVE_TOOLTIP,
+        RAW_QUEUE_FAULTED_TOOLTIP, RAW_QUEUE_GAP_TOOLTIP, RECEIVE_DETAILS_TOOLTIP,
+        SERIAL_BACKPRESSURE_TOOLTIP, SHARED_PORT_TOOLTIP, TRANSPORT_TOOLTIP, UDP_AVAILABLE_TOOLTIP,
+        UDP_UNAVAILABLE_TOOLTIP,
     };
     use crate::core::RecordingState;
     use crate::runtime::{
@@ -1165,6 +1196,21 @@ mod tests {
         assert_eq!(counted(1, "chunk"), "1 chunk");
         assert_eq!(counted(0, "chunk"), "0 chunks");
         assert_eq!(counted(12_500, "firing"), "12,500 firings");
+    }
+
+    #[test]
+    fn the_shared_port_line_says_what_the_os_applied() {
+        assert_eq!(shared_port_words(SharedPortStatus::NotRequested), None);
+        assert_eq!(
+            shared_port_words(SharedPortStatus::Applied),
+            Some("Shared port: applied · other programs can bind it")
+        );
+        assert_eq!(
+            shared_port_words(SharedPortStatus::NotApplied),
+            Some("Shared port: requested · the OS did not apply it · not shared")
+        );
+        // It reports the option, not whether anyone else is bound.
+        assert!(SHARED_PORT_TOOLTIP.contains("cannot say whether another program is bound"));
     }
 
     /// Nothing in the panel may teach the state Listener no longer has.

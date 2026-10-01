@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::core::{ArrivalTimestampStatus, ChannelId};
+use crate::transport::udp::SharedPortStatus;
 
 use super::snapshot::{ChannelSnapshot, QueueDepth};
 use super::telemetry::{
@@ -273,6 +274,12 @@ fn write_transport_health(out: &mut String, health: TransportHealth) {
         "arrival_post_read_samples={}",
         arrival.post_read_samples
     );
+    let shared_port = match health.udp_shared_port {
+        SharedPortStatus::NotRequested => "not_requested",
+        SharedPortStatus::Applied => "applied",
+        SharedPortStatus::NotApplied => "not_applied",
+    };
+    let _ = writeln!(out, "udp_shared_port={shared_port}");
     match health.udp_kernel_drops {
         CounterAvailability::NotApplicable => {
             let _ = writeln!(out, "udp_kernel_drops=not_applicable");
@@ -361,6 +368,7 @@ mod tests {
                 }),
                 udp_kernel_drops: CounterAvailability::Available(4),
                 arrival_timestamps: arrivals,
+                udp_shared_port: SharedPortStatus::Applied,
             },
             ingest_queue: QueueDepth {
                 current: 0,
@@ -381,6 +389,7 @@ mod tests {
         assert!(report.contains("received_chunks=1\n"));
         assert!(report.contains("ingest_handoff_p99_upper_us=250\n"));
         assert!(report.contains("arrival_timestamp_status=kernel_software\n"));
+        assert!(report.contains("udp_shared_port=applied\n"));
         assert!(report.contains("udp_kernel_drops=4\n"));
         assert!(report.contains("ingest_queue_peak=8\n"));
     }

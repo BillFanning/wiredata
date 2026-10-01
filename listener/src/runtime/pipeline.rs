@@ -51,6 +51,7 @@ use crate::record::{
     RawSegments, RecorderReport, Recording, RecordingStopReason, SegmentPlan, StreamPos, Timings,
     DEFAULT_QUEUE_BUDGET,
 };
+use crate::transport::udp::SharedPortStatus;
 use crate::transport::{ReceivedData, SerialStallState, TransportNotice};
 use wiredata_ui::format::human_bytes;
 
@@ -1399,6 +1400,19 @@ impl ChannelPipeline {
                 status,
             } => {
                 self.transport_health.arrival_timestamps.status = status;
+            }
+            TransportNotice::UdpSharedPort {
+                channel_id: _,
+                status,
+            } => {
+                self.transport_health.udp_shared_port = status;
+                if status == SharedPortStatus::NotApplied {
+                    self.diagnostics.record(Diagnostic::warning(format!(
+                        "shared port requested on channel {}, but the OS did not apply \
+                         address reuse: the port is not shared",
+                        self.channel_name
+                    )));
+                }
             }
             TransportNotice::TransportFaulted {
                 channel_id: _,

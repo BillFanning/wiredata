@@ -127,6 +127,12 @@ pub enum TransportNotice {
         channel_id: ChannelId,
         status: ArrivalTimestampStatus,
     },
+    /// Whether the OS applied a requested shared port (§15, ADR-047). Sent
+    /// only when sharing was requested.
+    UdpSharedPort {
+        channel_id: ChannelId,
+        status: udp::SharedPortStatus,
+    },
     /// The transport ended on a spontaneous fault (§94). Sent by the channel's
     /// fault monitor so the **cause** reaches the pipeline's diagnostics log —
     /// the paired `ChannelFaulted` lifecycle event (§137) carries only the id,

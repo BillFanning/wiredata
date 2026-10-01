@@ -17,9 +17,8 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 The spec states these; the code does not do them yet.
 
-- [ ] **UDP shared port and receive buffer (ADR-047, §15, §75).** No
-  `shared_port` field. `recv_buffer_bytes` has no 4 MiB default, and the granted
-  size is not reported.
+- [ ] **UDP receive buffer (§75).** `recv_buffer_bytes` has no 4 MiB default,
+  and the granted size is not reported.
 - [ ] **Strict profiles and limits (ADR-048, §71, §72.1).** Unknown keys are
   ignored, and a missing `schema_version` loads as current. There are no upper
   limits, and `PipelineCapacities` is not validated.

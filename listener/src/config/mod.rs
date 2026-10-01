@@ -181,6 +181,10 @@ pub fn validate_channel(
         {
             errors.push(ChannelConfigError::MissingMulticastGroup);
         }
+        // Not offered for unicast (§15, ADR-047).
+        if udp.shared_port && udp.mode == UdpMode::Unicast {
+            errors.push(ChannelConfigError::SharedPortUnicast);
+        }
     }
 
     // When a recording rotates, the channel name becomes part of generated filenames
@@ -307,6 +311,11 @@ pub enum ChannelConfigError {
     TcpListenerUnavailable,
     #[error("multicast UDP requires a multicast group address")]
     MissingMulticastGroup,
+    #[error(
+        "a shared port is offered for broadcast and multicast only: in unicast the OS \
+         delivers each datagram to only one of the programs sharing the port"
+    )]
+    SharedPortUnicast,
     #[error("retention is unbounded: set a limit on the channel or in defaults")]
     UnboundedRetention,
     #[error(
@@ -442,6 +451,34 @@ mod tests {
         let toml = profile.to_toml().expect("serialize");
         let parsed = Profile::from_toml(&toml).expect("round trip");
         assert_eq!(parsed, profile);
+    }
+
+    #[test]
+    fn a_shared_port_is_offered_for_broadcast_and_multicast_only() {
+        let old: UdpConfig =
+            toml::from_str("bind_address = '0.0.0.0'\nport = 9000\nmode = 'Broadcast'\n").unwrap();
+        assert!(!old.shared_port, "off by default");
+
+        let mut channel = templates::udp_template();
+        let InterfaceConfig::Udp(udp) = &mut channel.interface else {
+            unreachable!("the UDP template is UDP")
+        };
+        udp.port = 9000;
+        udp.shared_port = true;
+        udp.mode = UdpMode::Broadcast;
+        assert_eq!(
+            validate_channel(&channel, &DefaultConfig::default()),
+            Ok(())
+        );
+
+        let InterfaceConfig::Udp(udp) = &mut channel.interface else {
+            unreachable!("the UDP template is UDP")
+        };
+        udp.mode = UdpMode::Unicast;
+        assert_eq!(
+            validate_channel(&channel, &DefaultConfig::default()),
+            Err(vec![ChannelConfigError::SharedPortUnicast])
+        );
     }
 
     #[test]
