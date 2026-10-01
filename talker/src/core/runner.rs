@@ -410,6 +410,108 @@ impl RunnerObserver {
     }
 }
 
+/// How long the first retry of a failed open waits; each failure doubles the
+/// wait, up to [`OPEN_RETRY_MAX`] (talker ADR-060).
+pub const OPEN_RETRY_FIRST: Duration = Duration::from_secs(1);
+/// The longest wait between retries of a failed open.
+pub const OPEN_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Open `cfg`'s interface, retrying a failed open — 1 s, doubling to 30 s —
+/// until it opens or Stop arrives, then run the send loop. For the unattended
+/// CLI (talker ADR-060): a channel whose port is not there yet starts once it
+/// is, while the others send.
+///
+/// Each failed attempt is reported as [`TalkerStatus::OpenFailed`], and the
+/// open as [`RunnerControlStatus::InterfaceOpened`]. Commands other than Stop
+/// have nothing to act on until the channel opens, and are ignored. Call it on
+/// the channel's own thread.
+pub fn open_retrying_and_run(
+    who: RunnerIdentity,
+    cfg: InterfaceConfig,
+    schedule: Schedule,
+    cmd_rx: Receiver<TalkerCommand>,
+    observer: RunnerObserver,
+) {
+    open_retrying_and_run_with(
+        who,
+        cfg,
+        schedule,
+        cmd_rx,
+        observer,
+        OPEN_RETRY_FIRST,
+        OPEN_RETRY_MAX,
+    );
+}
+
+fn open_retrying_and_run_with(
+    who: RunnerIdentity,
+    cfg: InterfaceConfig,
+    schedule: Schedule,
+    cmd_rx: Receiver<TalkerCommand>,
+    observer: RunnerObserver,
+    first: Duration,
+    max: Duration,
+) {
+    let mut wait = first;
+    let mut failures = 0u64;
+    loop {
+        match cfg.open() {
+            Ok(interface) => {
+                emit_control(
+                    &observer.control_tx,
+                    &observer.notify,
+                    RunnerControlStatus::InterfaceOpened {
+                        channel: who.id,
+                        config: cfg.clone(),
+                    },
+                );
+                run(who, interface, Some(cfg), schedule, cmd_rx, observer);
+                return;
+            }
+            Err(e) => {
+                let message = format!("{e:#}");
+                failures += 1;
+                // The first failure is the news; the retries that follow
+                // are the caller's to summarize, not the log's to repeat.
+                if failures == 1 {
+                    tracing::warn!(
+                        channel = who.id.as_u64(),
+                        "channel {} did not open: {message}; retrying",
+                        who.label
+                    );
+                } else {
+                    tracing::debug!(
+                        channel = who.id.as_u64(),
+                        "channel {} still did not open (attempt {failures}): {message}",
+                        who.label
+                    );
+                }
+                if observer
+                    .status_tx
+                    .try_send(TalkerStatus::OpenFailed {
+                        channel: who.id,
+                        message,
+                    })
+                    .is_ok()
+                {
+                    if let Some(n) = &observer.notify {
+                        n();
+                    }
+                }
+                let deadline = Instant::now() + wait;
+                loop {
+                    match cmd_rx.recv_deadline(deadline) {
+                        Ok(TalkerCommand::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+                        Ok(_) => continue,
+                        Err(RecvTimeoutError::Timeout) => break,
+                    }
+                }
+                wait = (wait * 2).min(max);
+            }
+        }
+    }
+}
+
 /// Open `cfg`'s interface, then run the send loop.
 ///
 /// Meant to be called *on the channel's own thread* (the GUI path), so the
@@ -2837,6 +2939,103 @@ mod tests {
 
         handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
         join_within(handle, Duration::from_secs(2));
+    }
+
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn a_channel_that_cannot_open_starts_once_its_port_appears() {
+        // ADR-060: start what can start. The open is retried until the peer
+        // is there, then the channel runs.
+        let port = free_tcp_port();
+        let cfg = InterfaceConfig::TcpClient(TcpClientConfig::new(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+        ));
+        let schedule = Schedule::compile(&[msg("AB", 100)], Instant::now()).unwrap();
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<TalkerCommand>(8);
+        let (status_tx, status_rx) = crossbeam_channel::bounded(64);
+        let (control_tx, control_rx) = crossbeam_channel::bounded(8);
+        let who = RunnerIdentity {
+            id: ChannelId::mint(),
+            label: "1".into(),
+            run_id: RunId::mint(),
+        };
+        let runner = std::thread::spawn(move || {
+            open_retrying_and_run_with(
+                who,
+                cfg,
+                schedule,
+                cmd_rx,
+                RunnerObserver::new(status_tx, ObserverPolicy::every_send())
+                    .with_control(control_tx),
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+            )
+        });
+        match status_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(TalkerStatus::OpenFailed { .. }) => {}
+            other => panic!("expected OpenFailed, got {:?}", other.is_ok()),
+        }
+
+        let peer = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let opened = loop {
+            match control_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(RunnerControlStatus::InterfaceOpened { .. }) => break true,
+                Ok(_) => continue,
+                Err(_) => break false,
+            }
+        };
+        assert!(
+            opened,
+            "the retry opened the channel once the peer was there"
+        );
+        cmd_tx.send(TalkerCommand::Stop).unwrap();
+        runner.join().unwrap();
+        drop(peer);
+    }
+
+    #[test]
+    fn stop_ends_a_channel_still_waiting_to_open() {
+        let port = free_tcp_port();
+        let cfg = InterfaceConfig::TcpClient(TcpClientConfig::new(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+        ));
+        let schedule = Schedule::compile(&[msg("AB", 100)], Instant::now()).unwrap();
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<TalkerCommand>(8);
+        let (status_tx, status_rx) = crossbeam_channel::bounded(64);
+        let who = RunnerIdentity {
+            id: ChannelId::mint(),
+            label: "1".into(),
+            run_id: RunId::mint(),
+        };
+        let runner = std::thread::spawn(move || {
+            open_retrying_and_run_with(
+                who,
+                cfg,
+                schedule,
+                cmd_rx,
+                RunnerObserver::new(status_tx, ObserverPolicy::every_send()),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+        });
+        assert!(matches!(
+            status_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(TalkerStatus::OpenFailed { .. })
+        ));
+        let started = Instant::now();
+        cmd_tx.send(TalkerCommand::Stop).unwrap();
+        runner.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "Stop does not wait out the retry"
+        );
     }
 
     #[test]

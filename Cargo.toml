@@ -8,6 +8,7 @@ members = [
     "wiredata-telemetry",
     "wiredata-log",
     "wiredata-stop",
+    "wiredata-cli",
 ]
 resolver = "2"
 

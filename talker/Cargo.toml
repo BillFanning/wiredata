@@ -32,6 +32,7 @@ wiredata-timing = { path = "../wiredata-timing" }
 wiredata-telemetry = { path = "../wiredata-telemetry" }
 wiredata-log = { path = "../wiredata-log" }         # bounded log-file worker (ADR-061)
 wiredata-stop = { path = "../wiredata-stop" }       # Windows stop requests (ADR-060)
+wiredata-cli = { path = "../wiredata-cli" }         # unattended-run reporting (ADR-060)
 
 # Serial
 serialport = { workspace = true }

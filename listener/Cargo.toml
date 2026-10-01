@@ -27,6 +27,7 @@ wiredata-timing = { path = "../wiredata-timing" }
 wiredata-telemetry = { path = "../wiredata-telemetry" }
 wiredata-log = { path = "../wiredata-log" }         # persistent event log worker (ADR-044)
 wiredata-stop = { path = "../wiredata-stop", features = ["tokio"] }  # every OS stop request (ADR-049)
+wiredata-cli = { path = "../wiredata-cli" }         # unattended-run reporting (ADR-050)
 
 # Presentation-only construction of inline NMEA ZDA Mark annotations (ADR-025).
 # Listener remains stream-only: received bytes are never decoded as NMEA.

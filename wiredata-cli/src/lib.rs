@@ -1,28 +1,53 @@
-//! What the CLI tells an operator about Channel health during an unattended run
-//! (§3.1; listener ADR-046, talker ADR-060).
+//! What both command-line applications tell an operator during an unattended
+//! run, and the exit code it ends with (talker ADR-060, listener ADR-046 and
+//! ADR-050).
 //!
-//! - A WARNING when a Channel does not start or goes down, naming it and why.
-//! - A reminder every five minutes while any Channel stays down, with how long
+//! - A WARNING when a channel does not start or goes down, naming it and why.
+//! - A reminder every five minutes while any channel stays down, with how long
 //!   it has been down and the latest reason.
-//! - A line when a Channel recovers, and one when its retries run out.
-//! - A summary at the end naming every Channel's outcome, which also decides
+//! - A line when a channel recovers, and one when its retries run out.
+//! - A summary at the end naming every channel's outcome, which also decides
 //!   whether the run was degraded (exit code 3).
 //!
-//! Pure bookkeeping: the caller observes the runtime and prints the lines.
+//! Pure bookkeeping, generic over each application's channel id: the caller
+//! observes its own runtime, prints the lines, and adds to the summary what
+//! only it knows.
 
 use std::time::{Duration, Instant};
 
-use crate::core::{ChannelId, RecordingTap};
+/// Exit code: an invalid profile, nothing could start, or `--require-all`
+/// failed.
+pub const EXIT_CANNOT_START: u8 = 2;
+/// Exit code: a channel never started, its retries ran out, or it was down at
+/// the stop.
+pub const EXIT_DEGRADED: u8 = 3;
+/// Exit code: the stop did not finish within its time limit, so the end of
+/// what the run wrote may be missing.
+pub const EXIT_STOP_INCOMPLETE: u8 = 4;
 
-/// How often a reminder repeats while any Channel is down.
-pub(crate) const REMINDER_EVERY: Duration = Duration::from_secs(5 * 60);
+/// The exit code for how a run ended. 0 is healthy, or every outage
+/// recovered; 1, an internal error, is the application's to report. An
+/// incomplete stop wins over degraded: it is the one that says data written
+/// at the end may be missing.
+pub fn exit_status(stop_incomplete: bool, degraded: bool) -> u8 {
+    if stop_incomplete {
+        EXIT_STOP_INCOMPLETE
+    } else if degraded {
+        EXIT_DEGRADED
+    } else {
+        0
+    }
+}
 
-/// One Channel's health over the run.
+/// How often a reminder repeats while any channel is down.
+pub const REMINDER_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// One channel's health over the run.
 #[derive(Debug)]
-struct Watched {
-    id: ChannelId,
+struct Watched<K> {
+    id: K,
     name: String,
-    /// Whether its reconnect policy retries it (§9.1).
+    /// Whether it is retried while down.
     retries: bool,
     /// Whether it has run at all this session.
     ever_up: bool,
@@ -35,22 +60,34 @@ struct Watched {
     /// Outages it recovered from, and their total length.
     recovered: u32,
     recovered_for: Duration,
-    /// Recording faults and gaps seen, Raw then Display.
-    recording_faults: [u32; 2],
 }
 
-/// The health of every Channel in the run, in the order they were added.
-#[derive(Debug, Default)]
-pub(crate) struct HealthWatch {
-    channels: Vec<Watched>,
+/// The health of every channel in the run, in the order they were added.
+#[derive(Debug)]
+pub struct HealthWatch<K> {
+    channels: Vec<Watched<K>>,
     /// When the last reminder went out; reminders start five minutes after
     /// the first outage.
     reminded_at: Option<Instant>,
+    /// What happens to a channel that is down, in the application's words.
+    retrying: &'static str,
+    not_retrying: &'static str,
 }
 
-impl HealthWatch {
-    /// Watch a Channel. `retries` is whether its reconnect policy is on.
-    pub fn add(&mut self, id: ChannelId, name: &str, retries: bool) {
+impl<K: Copy + PartialEq> HealthWatch<K> {
+    /// A watch whose warnings end with `retrying` for a channel that is
+    /// retried while down, and `not_retrying` for one that is not.
+    pub fn new(retrying: &'static str, not_retrying: &'static str) -> Self {
+        Self {
+            channels: Vec::new(),
+            reminded_at: None,
+            retrying,
+            not_retrying,
+        }
+    }
+
+    /// Watch a channel. `retries` is whether it is retried while down.
+    pub fn add(&mut self, id: K, name: &str, retries: bool) {
         self.channels.push(Watched {
             id,
             name: name.to_owned(),
@@ -61,16 +98,15 @@ impl HealthWatch {
             gave_up: false,
             recovered: 0,
             recovered_for: Duration::ZERO,
-            recording_faults: [0; 2],
         });
     }
 
-    fn get(&mut self, id: ChannelId) -> Option<&mut Watched> {
+    fn get(&mut self, id: K) -> Option<&mut Watched<K>> {
         self.channels.iter_mut().find(|c| c.id == id)
     }
 
-    /// The Channel is running. Returns the recovery line when it was down.
-    pub fn up(&mut self, id: ChannelId, now: Instant) -> Option<String> {
+    /// The channel is running. Returns the recovery line when it was down.
+    pub fn up(&mut self, id: K, now: Instant) -> Option<String> {
         let channel = self.get(id)?;
         let first_start = !channel.ever_up;
         channel.ever_up = true;
@@ -89,9 +125,10 @@ impl HealthWatch {
         })
     }
 
-    /// The Channel did not start, or went down. Returns the warning for a new
-    /// outage; a Channel already down only takes the newer reason.
-    pub fn down(&mut self, id: ChannelId, reason: &str, now: Instant) -> Option<String> {
+    /// The channel did not start, or went down. Returns the warning for a new
+    /// outage; a channel already down only takes the newer reason.
+    pub fn down(&mut self, id: K, reason: &str, now: Instant) -> Option<String> {
+        let (retrying, not_retrying) = (self.retrying, self.not_retrying);
         let channel = self.get(id)?;
         channel.reason = reason.to_owned();
         if channel.down_since.is_some() {
@@ -104,9 +141,9 @@ impl HealthWatch {
             "did not start"
         };
         let next = if channel.retries {
-            "retrying under its reconnect policy"
+            retrying
         } else {
-            "reconnect is off, so it stays down"
+            not_retrying
         };
         Some(format!(
             "WARNING: [{}] {what}: {reason} — {next}",
@@ -114,8 +151,8 @@ impl HealthWatch {
         ))
     }
 
-    /// The Channel's retries ran out. Returns the warning, once.
-    pub fn gave_up(&mut self, id: ChannelId) -> Option<String> {
+    /// The channel's retries ran out. Returns the warning, once.
+    pub fn gave_up(&mut self, id: K) -> Option<String> {
         let channel = self.get(id)?;
         if channel.gave_up {
             return None;
@@ -127,18 +164,7 @@ impl HealthWatch {
         ))
     }
 
-    /// A recording on the Channel faulted or opened a gap (§56.1).
-    pub fn recording_fault(&mut self, id: ChannelId, tap: RecordingTap) {
-        if let Some(channel) = self.get(id) {
-            let slot = match tap {
-                RecordingTap::Raw => 0,
-                RecordingTap::Display => 1,
-            };
-            channel.recording_faults[slot] += 1;
-        }
-    }
-
-    /// Whether a reminder is due: some Channel is down, and five minutes have
+    /// Whether a reminder is due: some channel is down, and five minutes have
     /// passed since the last reminder or, before the first, since the earliest
     /// outage began.
     pub fn reminder_due(&self, now: Instant) -> bool {
@@ -150,7 +176,7 @@ impl HealthWatch {
         now.saturating_duration_since(from) >= REMINDER_EVERY
     }
 
-    /// One reminder line per Channel that is down, when one is due.
+    /// One reminder line per channel that is down, when one is due.
     pub fn reminders(&mut self, now: Instant) -> Vec<String> {
         if !self.reminder_due(now) {
             return Vec::new();
@@ -172,33 +198,34 @@ impl HealthWatch {
     }
 
     /// Whether nothing is running and nothing will retry — the run cannot do
-    /// anything (§3.1, exit code 2).
+    /// anything (exit code 2).
     pub fn nothing_can_run(&self) -> bool {
         self.channels
             .iter()
             .all(|c| c.down_since.is_some() && !c.retries)
     }
 
-    /// Whether the run is degraded (§3.1, exit code 3): a Channel never
-    /// started, its retries ran out, or it is down now.
+    /// Whether the run is degraded (exit code 3): a channel never started, its
+    /// retries ran out, or it is down now.
     pub fn degraded(&self) -> bool {
         self.channels
             .iter()
             .any(|c| !c.ever_up || c.gave_up || c.down_since.is_some())
     }
 
-    /// The final summary, one line per Channel (§3.1).
-    pub fn summary(&self, now: Instant) -> Vec<String> {
+    /// The final summary, one line per channel in the order added, with its id
+    /// so the application can add what only it knows.
+    pub fn summary(&self, now: Instant) -> Vec<(K, String)> {
         self.channels
             .iter()
             .map(|c| {
-                let mut line = match (c.down_since, c.ever_up) {
+                let line = match (c.down_since, c.ever_up) {
                     (Some(_), false) => format!("[{}] never started: {}", c.name, c.reason),
                     (Some(_), true) if c.gave_up => {
                         format!("[{}] ran out of retries: {}", c.name, c.reason)
                     }
                     (Some(since), true) => format!(
-                        "[{}] down at shutdown, for {}: {}",
+                        "[{}] down at the stop, for {}: {}",
                         c.name,
                         describe(now.saturating_duration_since(since)),
                         c.reason
@@ -212,19 +239,7 @@ impl HealthWatch {
                         describe(c.recovered_for)
                     ),
                 };
-                for (tap, count) in [
-                    ("Raw", c.recording_faults[0]),
-                    ("Display", c.recording_faults[1]),
-                ] {
-                    if count > 0 {
-                        line.push_str(&format!(
-                            "; {tap} recording: {count} fault{} or gap{} (see the event log)",
-                            if count == 1 { "" } else { "s" },
-                            if count == 1 { "" } else { "s" },
-                        ));
-                    }
-                }
-                line
+                (c.id, line)
             })
             .collect()
     }
@@ -244,14 +259,25 @@ fn describe(span: Duration) -> String {
 mod tests {
     use super::*;
 
-    fn watch_one(retries: bool) -> (HealthWatch, ChannelId, Instant) {
-        let mut watch = HealthWatch::default();
-        let id = ChannelId::new();
-        watch.add(id, "GPS", retries);
-        (watch, id, Instant::now())
+    const MIN: Duration = Duration::from_secs(60);
+
+    fn watch_one(retries: bool) -> (HealthWatch<u32>, u32, Instant) {
+        let mut watch = HealthWatch::new("retrying", "not retrying, so it stays down");
+        watch.add(1, "GPS", retries);
+        (watch, 1, Instant::now())
     }
 
-    const MIN: Duration = Duration::from_secs(60);
+    fn lines(summary: Vec<(u32, String)>) -> Vec<String> {
+        summary.into_iter().map(|(_, line)| line).collect()
+    }
+
+    #[test]
+    fn the_exit_code_says_how_the_run_ended() {
+        assert_eq!(exit_status(false, false), 0);
+        assert_eq!(exit_status(false, true), EXIT_DEGRADED);
+        assert_eq!(exit_status(true, false), EXIT_STOP_INCOMPLETE);
+        assert_eq!(exit_status(true, true), EXIT_STOP_INCOMPLETE, "4 wins");
+    }
 
     #[test]
     fn a_channel_that_starts_late_is_warned_about_then_recovers() {
@@ -259,7 +285,7 @@ mod tests {
         let (mut watch, id, t0) = watch_one(true);
         assert_eq!(
             watch.down(id, "COM3 not found", t0).as_deref(),
-            Some("WARNING: [GPS] did not start: COM3 not found — retrying under its reconnect policy")
+            Some("WARNING: [GPS] did not start: COM3 not found — retrying")
         );
         assert_eq!(
             watch.down(id, "COM3 still not found", t0 + MIN),
@@ -273,22 +299,8 @@ mod tests {
         );
         assert!(!watch.degraded(), "every outage recovered");
         assert_eq!(
-            watch.summary(t0 + 3 * MIN),
+            lines(watch.summary(t0 + 3 * MIN)),
             ["[GPS] recovered from 1 outage, 2 min down in all"]
-        );
-    }
-
-    #[test]
-    fn a_run_with_nothing_running_and_nothing_retrying_cannot_do_anything() {
-        let (mut watch, id, t0) = watch_one(false);
-        watch.down(id, "COM3 not found", t0);
-        assert!(watch.nothing_can_run());
-
-        let (mut watch, id, t0) = watch_one(true);
-        watch.down(id, "COM3 not found", t0);
-        assert!(
-            !watch.nothing_can_run(),
-            "a retrying channel may still start"
         );
     }
 
@@ -297,12 +309,13 @@ mod tests {
         let (mut watch, id, t0) = watch_one(false);
         assert_eq!(
             watch.down(id, "COM3 not found", t0).as_deref(),
-            Some(
-                "WARNING: [GPS] did not start: COM3 not found — reconnect is off, so it stays down"
-            )
+            Some("WARNING: [GPS] did not start: COM3 not found — not retrying, so it stays down")
         );
         assert!(watch.degraded());
-        assert_eq!(watch.summary(t0), ["[GPS] never started: COM3 not found"]);
+        assert_eq!(
+            lines(watch.summary(t0)),
+            ["[GPS] never started: COM3 not found"]
+        );
     }
 
     #[test]
@@ -311,14 +324,14 @@ mod tests {
         assert_eq!(watch.up(id, t0), None, "starting is not a recovery");
         assert_eq!(
             watch.down(id, "device removed", t0).as_deref(),
-            Some("WARNING: [GPS] is down: device removed — retrying under its reconnect policy")
+            Some("WARNING: [GPS] is down: device removed — retrying")
         );
         assert_eq!(
             watch.up(id, t0 + 90 * Duration::from_secs(1)).as_deref(),
             Some("RECOVERED: [GPS] is running again after 1 min down")
         );
         assert_eq!(
-            watch.summary(t0 + MIN),
+            lines(watch.summary(t0 + MIN)),
             ["[GPS] recovered from 1 outage, 1 min down in all"]
         );
     }
@@ -359,33 +372,47 @@ mod tests {
         assert_eq!(watch.gave_up(id), None);
         assert!(watch.degraded());
         assert_eq!(
-            watch.summary(t0),
+            lines(watch.summary(t0)),
             ["[GPS] ran out of retries: device removed"]
         );
     }
 
     #[test]
-    fn the_summary_names_each_channel_and_its_recording_faults() {
-        let mut watch = HealthWatch::default();
-        let (gps, ais) = (ChannelId::new(), ChannelId::new());
+    fn a_run_with_nothing_running_and_nothing_retrying_cannot_do_anything() {
+        let (mut watch, id, t0) = watch_one(false);
+        watch.down(id, "COM3 not found", t0);
+        assert!(watch.nothing_can_run());
+
+        let (mut watch, id, t0) = watch_one(true);
+        watch.down(id, "COM3 not found", t0);
+        assert!(
+            !watch.nothing_can_run(),
+            "a retrying channel may still start"
+        );
+    }
+
+    #[test]
+    fn the_summary_names_each_channel_by_id_in_order() {
+        let mut watch = HealthWatch::new("retrying", "stays down");
         let t0 = Instant::now();
-        watch.add(gps, "GPS", true);
-        watch.add(ais, "AIS", true);
-        watch.up(gps, t0);
-        watch.up(ais, t0);
-        watch.recording_fault(gps, RecordingTap::Raw);
-        watch.recording_fault(gps, RecordingTap::Raw);
-        watch.down(ais, "device removed", t0);
+        watch.add(7, "GPS", true);
+        watch.add(9, "AIS", true);
+        watch.up(7, t0);
+        watch.up(9, t0);
+        watch.down(9, "device removed", t0);
         assert_eq!(
             watch.summary(t0 + 12 * MIN),
             [
-                "[GPS] ran throughout; Raw recording: 2 faults or gaps (see the event log)",
-                "[AIS] down at shutdown, for 12 min: device removed",
+                (7, "[GPS] ran throughout".to_owned()),
+                (
+                    9,
+                    "[AIS] down at the stop, for 12 min: device removed".to_owned()
+                ),
             ]
         );
         assert!(
             watch.degraded(),
-            "a channel down at shutdown degrades the run"
+            "a channel down at the stop degrades the run"
         );
     }
 }

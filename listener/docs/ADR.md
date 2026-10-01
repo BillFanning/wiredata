@@ -1952,6 +1952,40 @@ SIGTERM and SIGHUP, on Unix.
 **Consequences:** A Windows logoff or shutdown gets the same graceful stop as
 Ctrl-C, within whatever time Windows allows.
 
+## ADR-050 — Both CLIs share their unattended-run reporting in `wiredata-cli`
+
+**Status:** Accepted 2026-10-01. Implements the reporting half of ADR-046 and
+talker ADR-060.
+
+**Context:** ADR-046 and talker ADR-060 give both CLIs one contract: a WARNING
+when a channel does not start or goes down, a reminder every five minutes, a
+line on recovery, a final summary, and exit codes 0, 2, 3 and 4. Listener built
+that reporting first. Talker needs the same lines and the same rule for when a
+run is degraded. Two copies would drift on exactly what an operator, or a
+supervisor reading the exit code, depends on.
+
+**Decision:** A new internal crate, `wiredata-cli` (`publish = false`, no
+dependencies), holds the health tracker and the exit-code rule.
+
+- The tracker is generic over each application's channel id. The application
+  supplies, in its own words, what happens to a channel that is down, and adds
+  to each summary line what only it knows: listener its recording faults and
+  gaps, talker its send counters and dropped echo lines.
+- The exit-code rule: an incomplete stop (4) wins over degraded (3), which wins
+  over healthy (0). Exit code 2 is the application's to decide before the run
+  starts; 1, an internal error, is reported by `main`.
+
+**Boundary:** The crate does no I/O. Each application observes its own
+runtime, prints the lines, and owns its retry policy and stop limits.
+
+**Alternatives considered:**
+
+- **A copy in each CLI:** Rejected, for the drift above, which ADR-044 and
+  talker ADR-061 already rejected for the log worker.
+
+**Consequences:** Both CLIs word the same events the same way, and agree on
+when a run is degraded.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

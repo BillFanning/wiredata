@@ -1,0 +1,11 @@
+[package]
+name = "wiredata-cli"
+description = "Internal unattended-run reporting shared by the wiredata command-line applications"
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

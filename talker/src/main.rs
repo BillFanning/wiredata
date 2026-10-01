@@ -85,8 +85,13 @@ fn main() {
         return;
     }
 
-    if let Err(e) = cli::run(args.cli) {
-        eprintln!("\nerror: {e:#}");
-        std::process::exit(1);
+    // The exit code says how the run ended (ADR-060); an internal error is 1.
+    match cli::run(args.cli) {
+        Ok(0) => {}
+        Ok(code) => std::process::exit(i32::from(code)),
+        Err(e) => {
+            eprintln!("\nerror: {e:#}");
+            std::process::exit(1);
+        }
     }
 }

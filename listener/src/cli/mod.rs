@@ -6,8 +6,6 @@
 //! down gracefully on every OS stop request. It contains no business logic —
 //! channel construction lives in `runtime`/`config` (§3, §128).
 
-mod health;
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -20,7 +18,7 @@ use crate::config::{templates, ChannelConfig, InterfaceConfig, Profile};
 use crate::core::{ChannelId, ChannelState, RuntimeEvent};
 use crate::diagnostics::EventLogStatus;
 use crate::runtime::{Listener, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT};
-use health::HealthWatch;
+use wiredata_cli::{exit_status, HealthWatch, EXIT_CANNOT_START};
 use wiredata_stop::StopRequests;
 
 /// Receive and inspect byte-oriented data from serial and network sources.
@@ -97,22 +95,34 @@ pub fn parse() -> Cli {
     Cli::parse()
 }
 
-/// Exit codes (§3.1, talker ADR-060). 0 is healthy, or every outage
-/// recovered; 1 is an internal error, which `main` reports.
-const EXIT_CANNOT_START: u8 = 2;
-const EXIT_DEGRADED: u8 = 3;
-const EXIT_FINALIZATION_INCOMPLETE: u8 = 4;
+/// A listener Channel's health, in listener's words for what happens while
+/// it is down (§3.1).
+fn health_watch() -> HealthWatch<ChannelId> {
+    HealthWatch::new(
+        "retrying under its reconnect policy",
+        "reconnect is off, so it stays down",
+    )
+}
 
-/// The exit code for how the run ended (§3.1). Finalization incomplete wins
-/// over degraded: it is the one that says recorded data may be missing.
-fn exit_status(outcome: &ShutdownOutcome, degraded: bool) -> u8 {
-    if !outcome.is_complete() {
-        EXIT_FINALIZATION_INCOMPLETE
-    } else if degraded {
-        EXIT_DEGRADED
-    } else {
-        0
+/// The exit code for how the run ended (§3.1): a finalization abandoned at
+/// the stop is exit code 4 (§113).
+fn run_exit_status(outcome: &ShutdownOutcome, degraded: bool) -> u8 {
+    exit_status(!outcome.is_complete(), degraded)
+}
+
+/// The summary's note on a Channel's recording faults and gaps, Raw then
+/// Display; empty when there were none.
+fn recording_note(faults: [u32; 2]) -> String {
+    let mut note = String::new();
+    for (tap, count) in [("Raw", faults[0]), ("Display", faults[1])] {
+        if count > 0 {
+            let s = if count == 1 { "" } else { "s" };
+            note.push_str(&format!(
+                "; {tap} recording: {count} fault{s} or gap{s} (see the event log)"
+            ));
+        }
     }
+    note
 }
 
 /// Headless CLI entry point: build a Tokio runtime and run the event loop over the
@@ -170,7 +180,8 @@ async fn run_cli(
         .take_events()
         .expect("the event stream is available exactly once");
 
-    let mut health = HealthWatch::default();
+    let mut health = health_watch();
+    let mut recording_faults: HashMap<ChannelId, [u32; 2]> = HashMap::new();
     let (run, stop_early) =
         start_channels(&mut listener, configs, cli.require_all, &mut health).await;
     if let Some(why) = stop_early {
@@ -214,7 +225,11 @@ async fn run_cli(
             maybe = events.recv() => match maybe {
                 Some(event) => {
                     if let RuntimeEvent::RecordingFaulted(id, tap) = event {
-                        health.recording_fault(id, tap);
+                        let slot = match tap {
+                            crate::core::RecordingTap::Raw => 0,
+                            crate::core::RecordingTap::Display => 1,
+                        };
+                        recording_faults.entry(id).or_default()[slot] += 1;
                     }
                     if let Some(line) = format_event(&event, &names) {
                         println!("{line}");
@@ -241,14 +256,15 @@ async fn run_cli(
     }
     println!("stopped");
     println!("summary:");
-    for line in health.summary(Instant::now()) {
-        println!("  {line}");
+    for (id, line) in health.summary(Instant::now()) {
+        let note = recording_note(recording_faults.get(&id).copied().unwrap_or_default());
+        println!("  {line}{note}");
     }
     let lost = event_log.lost_entries();
     if lost > 0 {
         eprintln!("WARNING: {lost} event log lines were not saved; the log marks where");
     }
-    Ok(ExitCode::from(exit_status(&outcome, health.degraded())))
+    Ok(ExitCode::from(run_exit_status(&outcome, health.degraded())))
 }
 
 /// The Channels of a run once their first start has been tried.
@@ -268,7 +284,7 @@ async fn start_channels(
     listener: &mut Listener,
     configs: Vec<ChannelConfig>,
     require_all: bool,
-    health: &mut HealthWatch,
+    health: &mut HealthWatch<ChannelId>,
 ) -> (StartedRun, Option<&'static str>) {
     let mut run = StartedRun {
         names: HashMap::new(),
@@ -339,7 +355,7 @@ fn describe_error(err: &anyhow::Error) -> String {
 /// events, so a dropped event cannot leave a Channel's health wrong.
 async fn observe_health(
     listener: &Listener,
-    health: &mut HealthWatch,
+    health: &mut HealthWatch<ChannelId>,
     ids: &[ChannelId],
     names: &HashMap<ChannelId, String>,
 ) {
@@ -512,7 +528,7 @@ mod tests {
         let mut listener = Listener::with_default_capacities();
         let _events = listener.take_events();
         let (late, _blocker) = blocked_udp_channel("GPS", true);
-        let mut health = HealthWatch::default();
+        let mut health = health_watch();
         let (run, stop) = start_channels(
             &mut listener,
             vec![late, free_udp_channel("AIS")],
@@ -531,7 +547,7 @@ mod tests {
         let mut listener = Listener::with_default_capacities();
         let _events = listener.take_events();
         let (down, _blocker) = blocked_udp_channel("GPS", false);
-        let mut health = HealthWatch::default();
+        let mut health = health_watch();
         let (_, stop) = start_channels(&mut listener, vec![down], false, &mut health).await;
         assert_eq!(stop, Some("no channel started, and none will retry"));
         listener.shutdown().await;
@@ -542,7 +558,7 @@ mod tests {
         let mut listener = Listener::with_default_capacities();
         let _events = listener.take_events();
         let (late, _blocker) = blocked_udp_channel("GPS", true);
-        let mut health = HealthWatch::default();
+        let mut health = health_watch();
         let (_, stop) = start_channels(
             &mut listener,
             vec![late, free_udp_channel("AIS")],
@@ -592,10 +608,20 @@ mod tests {
         let incomplete = ShutdownOutcome {
             incomplete: vec!["GPS".to_owned()],
         };
-        assert_eq!(exit_status(&complete, false), 0);
-        assert_eq!(exit_status(&complete, true), 3);
-        assert_eq!(exit_status(&incomplete, false), 4);
-        assert_eq!(exit_status(&incomplete, true), 4);
+        assert_eq!(run_exit_status(&complete, false), 0);
+        assert_eq!(run_exit_status(&complete, true), 3);
+        assert_eq!(run_exit_status(&incomplete, false), 4);
+        assert_eq!(run_exit_status(&incomplete, true), 4);
+    }
+
+    #[test]
+    fn the_summary_notes_recording_faults_and_gaps() {
+        assert_eq!(recording_note([0, 0]), "");
+        assert_eq!(
+            recording_note([2, 1]),
+            "; Raw recording: 2 faults or gaps (see the event log); Display recording: \
+             1 fault or gap (see the event log)"
+        );
     }
 
     #[test]
