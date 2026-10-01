@@ -160,6 +160,11 @@ pub enum RecorderReport {
     },
     /// The first open failed in a way retrying cannot fix (§55).
     CouldNotBegin { detail: String },
+    /// Opening a file to append repaired its timestamp index (§57).
+    IndexRepaired {
+        path: Option<PathBuf>,
+        detail: String,
+    },
 }
 
 /// How the controller paces retries and flushes. Tests shorten them.
@@ -513,7 +518,8 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
             period: period.clone(),
         };
         match self.source.open(request).await {
-            Ok(segment) => {
+            Ok(mut segment) => {
+                let repaired = segment.take_open_note();
                 let path = segment.path().map(PathBuf::from);
                 *lock(&self.shared.file) = path.clone();
                 self.shared
@@ -523,8 +529,14 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
                 self.period = period.or(self.period.take());
                 self.ever_opened = true;
                 self.backoff = self.timings.first_retry;
-                self.shared
-                    .report(RecorderReport::SegmentOpened { path, kind });
+                self.shared.report(RecorderReport::SegmentOpened {
+                    path: path.clone(),
+                    kind,
+                });
+                if let Some(detail) = repaired {
+                    self.shared
+                        .report(RecorderReport::IndexRepaired { path, detail });
+                }
                 if self.gap.is_some() {
                     self.closing_gap = true;
                 }

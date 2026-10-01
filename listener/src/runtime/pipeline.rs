@@ -786,6 +786,16 @@ impl ChannelPipeline {
                 ))),
                 None,
             ),
+            RecorderReport::IndexRepaired { path, detail } => {
+                let file = path.map_or_else(|| "its file".to_owned(), |p| p.display().to_string());
+                (
+                    Some(Diagnostic::warning(format!(
+                        "{what} on channel {channel} repaired the timestamp index of {file}: \
+                         {detail}"
+                    ))),
+                    None,
+                )
+            }
             RecorderReport::CouldNotBegin { detail } => {
                 let target = match tap {
                     RecordingTap::Raw => self
@@ -3149,6 +3159,28 @@ mod tests {
         .await;
         p.finish().await;
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[test]
+    fn a_repaired_index_is_reported_naming_the_channel_and_the_file() {
+        // §57: what reopening an index repaired reaches the diagnostics and,
+        // through them, the event log.
+        let mut p =
+            pipeline(ChannelId::new(), PipelineCapacities::default()).with_channel_name("GPS");
+        p.note_recorder_report(
+            RecordingTap::Raw,
+            RecorderReport::IndexRepaired {
+                path: Some(PathBuf::from("GPS_2026-09-30_08.raw")),
+                detail: "5 bytes at the end have no timestamp".to_owned(),
+            },
+        );
+        let warning = &p.diagnostics().warnings().last().unwrap().message;
+        assert!(
+            warning.contains("channel GPS")
+                && warning.contains("GPS_2026-09-30_08.raw")
+                && warning.contains("5 bytes at the end have no timestamp"),
+            "{warning}"
+        );
     }
 
     #[tokio::test]

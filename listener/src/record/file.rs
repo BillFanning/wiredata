@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom};
 
 use crate::core::RecordError;
 use crate::display::RenderedOutput;
@@ -92,6 +92,143 @@ pub(crate) fn sidecar_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// What reopening an index to append found and removed (§57).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct IndexRepair {
+    /// Bytes of the index to keep: its whole, increasing entries that point
+    /// inside the `.raw`.
+    pub keep: usize,
+    /// Whole entries removed: past the end of the `.raw`, or not increasing.
+    pub dropped_entries: usize,
+    /// A half-written last line was removed.
+    pub partial_line: bool,
+    /// Bytes at the end of the `.raw` known to have no timestamp: a removed
+    /// line showed where their block began.
+    pub unindexed_tail: u64,
+}
+
+impl IndexRepair {
+    /// What was repaired, in words; `None` when the index was whole.
+    pub fn describe(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        match self.dropped_entries {
+            0 => {}
+            1 => parts.push("removed 1 entry past the end of the .raw or out of order".to_owned()),
+            n => parts.push(format!(
+                "removed {n} entries past the end of the .raw or out of order"
+            )),
+        }
+        if self.partial_line {
+            parts.push("removed a half-written last line".to_owned());
+        }
+        if self.unindexed_tail > 0 {
+            parts.push(format!(
+                "{} bytes at the end have no timestamp",
+                self.unindexed_tail
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+}
+
+/// Plan the repair of an index's lines against a `.raw` of `raw_len` bytes
+/// (§57). The `.raw` is authoritative: the index keeps its leading run of whole
+/// `<offset>,<nanos>` lines whose offsets increase and lie inside the `.raw`,
+/// and everything from the first line that does not is removed.
+pub(crate) fn plan_index_repair(index: &[u8], raw_len: u64) -> IndexRepair {
+    let mut repair = IndexRepair::default();
+    let mut last: Option<u64> = None;
+    let mut pos = 0;
+    let mut cut = false;
+    while pos < index.len() {
+        let rest = &index[pos..];
+        let (line, complete) = match rest.iter().position(|&b| b == b'\n') {
+            Some(end) => (&rest[..end], true),
+            None => (rest, false),
+        };
+        let text = std::str::from_utf8(line).unwrap_or_default();
+        // An offset counts only once its comma was written, so a line cut
+        // inside its offset is not mistaken for a smaller one.
+        let (offset, nanos) = match text.split_once(',') {
+            Some((offset, nanos)) => (offset.parse::<u64>().ok(), nanos.parse::<u128>().ok()),
+            None => (None, None),
+        };
+        let increases = offset.is_some_and(|o| o < raw_len && last.is_none_or(|l| o > l));
+        if !cut && complete && nanos.is_some() && increases {
+            last = offset;
+            pos += line.len() + 1;
+            repair.keep = pos;
+            continue;
+        }
+        if !cut {
+            cut = true;
+            // The block this line timed began inside the `.raw` and lost its
+            // timestamp, so the bytes from there on have none.
+            if let Some(offset) = offset.filter(|_| increases) {
+                repair.unindexed_tail = raw_len - offset;
+            }
+        }
+        if complete {
+            repair.dropped_entries += 1;
+            pos += line.len() + 1;
+        } else {
+            repair.partial_line = true;
+            pos = index.len();
+        }
+    }
+    repair
+}
+
+/// How much of an index's end the repair reads first. Damage is only ever at
+/// the end, so it reads backwards, quadrupling the window until it reaches a
+/// whole entry it keeps — an index can be far larger than memory should hold.
+const INDEX_REPAIR_WINDOW: u64 = 64 * 1024;
+
+/// Repair the index at `index` before appending to it (§57), against the `.raw`
+/// at `raw`. Returns what was repaired, in words.
+async fn repair_index(
+    index: &Path,
+    raw: &Path,
+    window: u64,
+) -> Result<Option<String>, RecordError> {
+    let mut file = match OpenOptions::new().read(true).write(true).open(index).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let raw_len = match tokio::fs::metadata(raw).await {
+        Ok(meta) => meta.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    let len = file.metadata().await?.len();
+    let mut window = window.max(1).min(len);
+    loop {
+        let start = len - window;
+        file.seek(SeekFrom::Start(start)).await?;
+        let mut tail = vec![0; window as usize];
+        file.read_exact(&mut tail).await?;
+        // A window that starts mid-file may start mid-line: begin after the
+        // first line break.
+        let skip = if start == 0 {
+            0
+        } else {
+            tail.iter()
+                .position(|&b| b == b'\n')
+                .map_or(tail.len(), |n| n + 1)
+        };
+        let repair = plan_index_repair(&tail[skip..], raw_len);
+        if repair.keep > 0 || start == 0 {
+            let keep = start + (skip + repair.keep) as u64;
+            if keep < len {
+                file.set_len(keep).await?;
+            }
+            return Ok(repair.describe());
+        }
+        window = window.saturating_mul(4).min(len);
+    }
+}
+
 fn wall_clock_nanos(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -118,6 +255,8 @@ pub struct RawFileRecorder {
     /// for a segment, whose recording holds one lock for all its files.
     _lock: Option<std::fs::File>,
     path: PathBuf,
+    /// What reopening the index repaired, until the controller reports it.
+    open_note: Option<String>,
 }
 
 impl RawFileRecorder {
@@ -152,10 +291,15 @@ impl RawFileRecorder {
         // failed begin must never have modified the main recording (the
         // precious one). The inverse edge (main open fails after the sidecar
         // truncated) only costs the derived `.idx`.
+        let mut open_note = None;
         let sidecar = if timestamps {
-            Some(BufWriter::new(
-                open_recording_file(&sidecar_path(path), policy).await?,
-            ))
+            let index = sidecar_path(path);
+            // Appending continues an index an interrupted run may have left
+            // damaged; repair it against the `.raw` first (§57).
+            if policy == OverwritePolicy::AppendIfExists {
+                open_note = repair_index(&index, path, INDEX_REPAIR_WINDOW).await?;
+            }
+            Some(BufWriter::new(open_recording_file(&index, policy).await?))
         } else {
             None
         };
@@ -178,6 +322,7 @@ impl RawFileRecorder {
             stream_offset,
             _lock: None,
             path: path.to_path_buf(),
+            open_note,
         })
     }
 
@@ -232,6 +377,10 @@ impl RawRecorder for RawFileRecorder {
 
     fn file_path(&self) -> Option<&Path> {
         Some(&self.path)
+    }
+
+    fn take_open_note(&mut self) -> Option<String> {
+        self.open_note.take()
     }
 }
 
@@ -571,5 +720,120 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[test]
+    fn a_whole_index_needs_no_repair() {
+        let index = b"0,10\n3,20\n";
+        let repair = plan_index_repair(index, 5);
+        assert_eq!(
+            repair,
+            IndexRepair {
+                keep: index.len(),
+                ..IndexRepair::default()
+            }
+        );
+        assert_eq!(repair.describe(), None);
+    }
+
+    #[test]
+    fn index_entries_past_the_end_of_the_raw_are_removed() {
+        // The index reached the disk ahead of the bytes it timed (§57).
+        let repair = plan_index_repair(b"0,10\n3,20\n5,30\n9,40\n", 5);
+        assert_eq!(repair.keep, 10);
+        assert_eq!(repair.dropped_entries, 2);
+        assert_eq!(
+            repair.unindexed_tail, 0,
+            "those blocks never reached the .raw"
+        );
+    }
+
+    #[test]
+    fn a_half_written_line_is_removed_and_its_block_has_no_timestamp() {
+        let repair = plan_index_repair(b"0,10\n3,2", 8);
+        assert_eq!(repair.keep, 5);
+        assert!(repair.partial_line);
+        assert_eq!(repair.unindexed_tail, 5, "the block began at offset 3 of 8");
+        assert_eq!(
+            repair.describe().as_deref(),
+            Some("removed a half-written last line; 5 bytes at the end have no timestamp")
+        );
+        // Cut inside its offset, a line does not say where its block began.
+        let cut = plan_index_repair(b"0,10\n3", 8);
+        assert!(cut.partial_line);
+        assert_eq!(cut.unindexed_tail, 0);
+    }
+
+    #[test]
+    fn index_offsets_that_do_not_increase_are_removed_with_what_follows() {
+        let repair = plan_index_repair(b"0,10\n3,20\n3,30\n4,40\n", 8);
+        assert_eq!(repair.keep, 10);
+        assert_eq!(repair.dropped_entries, 2);
+    }
+
+    #[tokio::test]
+    async fn reopening_to_append_repairs_the_index_before_adding_to_it() {
+        // §57: the .raw is authoritative, so the index is cut back to it and
+        // the new entries continue from its end.
+        let path = temp_path("repair");
+        tokio::fs::write(&path, b"ABCDE").await.unwrap();
+        tokio::fs::write(sidecar_path(&path), b"0,1\n3,2\n9,3\n12,4")
+            .await
+            .unwrap();
+        let mut recorder = RawFileRecorder::open(&path, OverwritePolicy::AppendIfExists, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorder.take_open_note().as_deref(),
+            Some(
+                "removed 1 entry past the end of the .raw or out of order; removed a \
+                 half-written last line"
+            )
+        );
+        assert_eq!(recorder.take_open_note(), None, "reported once");
+        recorder.write_chunk(&chunk(b"FG")).await.unwrap();
+        recorder
+            .finalize(RecordingStopReason::Disabled)
+            .await
+            .unwrap();
+        drop(recorder);
+
+        let index = tokio::fs::read_to_string(sidecar_path(&path))
+            .await
+            .unwrap();
+        let offsets: Vec<&str> = index
+            .lines()
+            .map(|line| line.split(',').next().unwrap())
+            .collect();
+        assert_eq!(offsets, ["0", "3", "5"]);
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(sidecar_path(&path)).await;
+    }
+
+    #[tokio::test]
+    async fn the_repair_reads_back_from_the_end_until_it_finds_an_entry_to_keep() {
+        // A long run of damage, read through a tiny window, still cuts the index
+        // back to its last good entry without reading it all at once.
+        let raw = temp_path("repair-window");
+        tokio::fs::write(&raw, b"ABCDE").await.unwrap();
+        let index = sidecar_path(&raw);
+        let mut damaged = b"0,1\n".to_vec();
+        for _ in 0..50 {
+            damaged.extend_from_slice(b"9,2\n");
+        }
+        damaged.push(b'1');
+        tokio::fs::write(&index, &damaged).await.unwrap();
+
+        let note = repair_index(&index, &raw, 8).await.unwrap();
+        assert_eq!(tokio::fs::read(&index).await.unwrap(), b"0,1\n");
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "removed 50 entries past the end of the .raw or out of order; removed a \
+                 half-written last line"
+            )
+        );
+        let _ = tokio::fs::remove_file(&raw).await;
+        let _ = tokio::fs::remove_file(&index).await;
     }
 }

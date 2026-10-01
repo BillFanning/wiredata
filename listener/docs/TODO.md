@@ -17,9 +17,6 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 The spec states these; the code does not do them yet.
 
-- [ ] **Append repair (§57).** Reopening a `.raw` to append does not trim index
-  entries past its end, repair a half-written last line, or report an unindexed
-  tail.
 - [ ] **Unattended GUI (ADR-045, §9.1, §70).** No reconnect checkbox or prompt,
   and no resume registration.
 - [ ] **Unattended CLI (ADR-046, §3.1, §113).** The CLI still bails with "no

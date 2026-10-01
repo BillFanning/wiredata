@@ -103,6 +103,10 @@ pub trait RawRecorder: Send {
     fn file_path(&self) -> Option<&Path> {
         None
     }
+    /// What opening the file repaired, taken once (§57).
+    fn take_open_note(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Writes a display view's rendered output, after rendering (§54, §142).
@@ -136,6 +140,10 @@ pub trait RecorderWriter<I: Send>: Send {
     fn path(&self) -> Option<&Path> {
         None
     }
+    /// What opening the file repaired, taken once (§57).
+    fn take_open_note(&mut self) -> Option<String> {
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -154,6 +162,9 @@ impl<R: RawRecorder> RecorderWriter<Arc<ReceivedData>> for R {
     }
     fn path(&self) -> Option<&Path> {
         self.file_path()
+    }
+    fn take_open_note(&mut self) -> Option<String> {
+        RawRecorder::take_open_note(self)
     }
 }
 
