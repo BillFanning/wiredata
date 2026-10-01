@@ -53,6 +53,7 @@ impl fmt::Display for StopRequest {
 /// How long the Windows session-end window holds the session open waiting for
 /// [`StopRequests::finish`]. Windows may end the process sooner; this only
 /// keeps a stop that never finishes from holding the window thread forever.
+#[cfg(windows)]
 const SESSION_END_WAIT: Duration = Duration::from_secs(30);
 
 /// Set once the application's graceful stop has finished.
