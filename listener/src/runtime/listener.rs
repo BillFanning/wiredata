@@ -27,6 +27,9 @@ use crate::config::schema::InterfaceConfig;
 use crate::config::ChannelConfig;
 use crate::core::{lock_recover, ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::display::DisplayView;
+use crate::transport::serial::{OpenSerialTransport, SerialTransport};
+use crate::transport::tcp::{BoundTcpListenerTransport, TcpListenerTransport};
+use crate::transport::udp::{BoundUdpTransport, UdpTransport};
 use crate::transport::{
     DataTransportRunner, SerialControlCommand, SerialControlHooks, SerialControlLines,
     SerialStallState, TransportNotice,
@@ -183,6 +186,147 @@ struct ActiveRun {
     id: RunId,
     started_at: SystemTime,
     started_monotonic: Instant,
+}
+
+/// An interface built for a start but not yet opened or bound.
+enum UnopenedInterface {
+    Serial(SerialTransport),
+    Udp(UdpTransport),
+    TcpListener(TcpListenerTransport),
+}
+
+/// An opened or bound interface, ready to be wired into a pipeline.
+enum OpenedInterface {
+    Serial(OpenSerialTransport),
+    Udp(BoundUdpTransport),
+    TcpListener(BoundTcpListenerTransport),
+}
+
+/// A Channel's start, begun by [`Listener::begin_start`] (ADR-052). It owns
+/// what the slow part needs, so [`open`](Self::open) can run off the
+/// caller's loop; [`Listener::finish_start`] lands the result.
+pub struct StartTicket {
+    id: ChannelId,
+    run: ActiveRun,
+    /// The checked capacities and the built interface, or why the start
+    /// failed before anything opened.
+    prepared: Result<(PipelineCapacities, UnopenedInterface), OrchestratorError>,
+    /// Tests stand in for an interface that is slow to open.
+    #[cfg(test)]
+    open_delay: Option<Duration>,
+}
+
+/// A start whose interface opened, or failed to, for
+/// [`Listener::finish_start`].
+pub struct OpenedStart {
+    id: ChannelId,
+    run: ActiveRun,
+    opened: Result<(PipelineCapacities, OpenedInterface), OrchestratorError>,
+}
+
+impl StartTicket {
+    pub fn id(&self) -> ChannelId {
+        self.id
+    }
+
+    /// Open or bind the interface (§8.2): the one part of a start that can
+    /// take a while, such as a serial port whose device is slow to answer.
+    pub async fn open(self) -> OpenedStart {
+        #[cfg(test)]
+        if let Some(delay) = self.open_delay {
+            tokio::time::sleep(delay).await;
+        }
+        let opened = match self.prepared {
+            Err(err) => Err(err),
+            Ok((caps, interface)) => match interface {
+                UnopenedInterface::Serial(transport) => transport
+                    .open()
+                    .await
+                    .map(OpenedInterface::Serial)
+                    .map_err(OrchestratorError::SerialOpen),
+                UnopenedInterface::Udp(transport) => transport
+                    .bind()
+                    .await
+                    .map(OpenedInterface::Udp)
+                    .map_err(OrchestratorError::Bind),
+                UnopenedInterface::TcpListener(transport) => transport
+                    .bind()
+                    .await
+                    .map(OpenedInterface::TcpListener)
+                    .map_err(OrchestratorError::Bind),
+            }
+            .map(|interface| (caps, interface)),
+        };
+        OpenedStart {
+            id: self.id,
+            run: self.run,
+            opened,
+        }
+    }
+}
+
+impl OpenedStart {
+    pub fn id(&self) -> ChannelId {
+        self.id
+    }
+}
+
+/// A Channel's stop, begun by [`Listener::begin_stop`] (ADR-052): its tasks,
+/// taken out of the runtime, so [`drain`](Self::drain) can run off the
+/// caller's loop; [`Listener::finish_stop`] lands the result.
+pub struct StopTicket {
+    id: ChannelId,
+    handle: Option<ChannelHandle>,
+}
+
+/// A stop whose drain finished, or was abandoned at the grace period, for
+/// [`Listener::finish_stop`].
+pub struct DrainedStop {
+    id: ChannelId,
+    drained: Option<Option<ChannelSnapshot>>,
+}
+
+impl StopTicket {
+    pub fn id(&self) -> ChannelId {
+        self.id
+    }
+
+    /// Drain the Channel's tasks gracefully (§110), within
+    /// [`Listener::STOP_GRACE`].
+    pub async fn drain(self) -> DrainedStop {
+        let drained = drain_all(
+            vec![(self.id, drain_handle(self.handle))],
+            Listener::STOP_GRACE,
+        )
+        .await
+        .into_iter()
+        .next()
+        .and_then(|(_, drained)| drained);
+        DrainedStop {
+            id: self.id,
+            drained,
+        }
+    }
+}
+
+impl DrainedStop {
+    pub fn id(&self) -> ChannelId {
+        self.id
+    }
+}
+
+/// A reconnect attempt that is due (§9.1, ADR-052): run it as a stop then a
+/// start, and report how it went with [`Listener::finish_reconnect`].
+pub struct ReconnectAttempt {
+    id: ChannelId,
+    attempt: u32,
+    previous: ReconnectState,
+}
+
+impl ReconnectAttempt {
+    pub fn id(&self) -> ChannelId {
+        self.id
+    }
 }
 
 impl ActiveRun {
@@ -391,6 +535,10 @@ pub struct Listener {
     events_tx: mpsc::Sender<RuntimeEvent>,
     events_rx: Option<mpsc::Receiver<RuntimeEvent>>,
     caps: PipelineCapacities,
+    /// Tests stand in for an interface that is slow to open, such as a
+    /// Bluetooth serial port whose device is off.
+    #[cfg(test)]
+    open_delay: Option<Duration>,
 }
 
 impl Listener {
@@ -402,7 +550,15 @@ impl Listener {
             events_tx,
             events_rx: Some(events_rx),
             caps,
+            #[cfg(test)]
+            open_delay: None,
         }
+    }
+
+    /// Make every interface open take `delay` first (tests only).
+    #[cfg(test)]
+    pub(crate) fn delay_opens_for_test(&mut self, delay: Duration) {
+        self.open_delay = Some(delay);
     }
 
     pub fn with_default_capacities() -> Self {
@@ -793,7 +949,20 @@ impl Listener {
 
     /// Start a Channel (§10.1): Stopped → Starting → Running, opening the
     /// interface. A resource failure takes Starting → Faulted (§8.2, §71).
+    /// The three phases run back to back; a caller that must keep serving
+    /// others while an interface opens runs them itself (ADR-052).
     pub async fn start(&mut self, id: ChannelId) -> Result<(), OrchestratorError> {
+        let ticket = self.begin_start(id)?;
+        let opened = ticket.open().await;
+        self.finish_start(opened)
+    }
+
+    /// Begin a start (ADR-052): check the transition, mark the Channel
+    /// Starting and build its interface. Nothing opens here:
+    /// [`StartTicket::open`] does that, and [`finish_start`](Self::finish_start)
+    /// lands it. A Channel that cannot be built still gets a ticket, whose open
+    /// fails, so every start fault lands the same way.
+    pub fn begin_start(&mut self, id: ChannelId) -> Result<StartTicket, OrchestratorError> {
         let config = {
             let channel = self
                 .channels
@@ -818,18 +987,46 @@ impl Listener {
 
         // Install a fresh fault flag for this run (ADR-006); the monitor flips it
         // on a spontaneous fault and `state()`/validation read it back.
-        let faulted = Arc::new(AtomicBool::new(false));
         if let Some(channel) = self.channels.get_mut(&id) {
-            channel.faulted = faulted.clone();
+            channel.faulted = Arc::new(AtomicBool::new(false));
             channel.state = ChannelState::Starting;
             // `retained_diagnostics` is left in place: `spawn_data` reads it to seed the
             // new pipeline (§88). While Running, the live pipeline snapshot is served
             // instead (the handle exists), so this stale copy is never shown; the next
             // stop replaces it with the new run's log.
         }
-        let active_run = ActiveRun::begin();
-        match self.spawn_channel(id, &config, faulted).await {
-            Ok((handle, serial_control)) => {
+        let prepared = Self::check_limits(&config)
+            .and_then(|()| self.channel_caps(&config))
+            .and_then(|caps| Ok((caps, Self::build_interface(id, &config.interface)?)));
+        Ok(StartTicket {
+            id,
+            run: ActiveRun::begin(),
+            prepared,
+            #[cfg(test)]
+            open_delay: self.open_delay,
+        })
+    }
+
+    /// Land a start (ADR-052): wire the opened interface into its pipeline and
+    /// take the Channel to Running, or take it to Faulted with the reason
+    /// retained (§8.2, §71). A Channel no longer Starting drops what opened.
+    pub fn finish_start(&mut self, opened: OpenedStart) -> Result<(), OrchestratorError> {
+        let OpenedStart { id, run, opened } = opened;
+        let channel = self
+            .channels
+            .get(&id)
+            .ok_or(OrchestratorError::UnknownChannel(id))?;
+        if channel.state != ChannelState::Starting {
+            return Err(OrchestratorError::IllegalTransition {
+                from: channel.effective_state(),
+                to: ChannelState::Running,
+            });
+        }
+        let config = channel.config.clone();
+        let faulted = channel.faulted.clone();
+        match opened {
+            Ok((caps, interface)) => {
+                let (handle, serial_control) = self.wire(id, &config, interface, caps, faulted);
                 let display_handles = match &handle {
                     ChannelHandle::Data(tasks) => tasks.display_handles().to_vec(),
                     // A TCP listener has no display itself; its connections do.
@@ -840,7 +1037,7 @@ impl Listener {
                     channel.display_handles = display_handles;
                     channel.serial_control = serial_control;
                     channel.state = ChannelState::Running;
-                    channel.active_run = Some(active_run);
+                    channel.active_run = Some(run);
                 }
                 let _ = self.events_tx.try_send(RuntimeEvent::ChannelStarted(id));
                 Ok(())
@@ -883,11 +1080,26 @@ impl Listener {
     /// the Channel still lands in Stopped — so no caller, the GUI's driver
     /// included, waits on it indefinitely.
     pub async fn stop(&mut self, id: ChannelId) -> Result<(), OrchestratorError> {
-        let handle = self.begin_stop(id)?;
-        for (id, drained) in drain_all(vec![(id, drain_handle(handle))], Self::STOP_GRACE).await {
-            self.finish_drained(id, drained);
-        }
+        let ticket = self.begin_stop(id)?;
+        let drained = ticket.drain().await;
+        self.finish_stop(drained);
         Ok(())
+    }
+
+    /// Begin a stop (ADR-052): mark a Running Channel Stopping and take its
+    /// tasks out, so [`StopTicket::drain`] can run off the caller's loop.
+    /// Illegal from any state but Running or Faulted.
+    pub fn begin_stop(&mut self, id: ChannelId) -> Result<StopTicket, OrchestratorError> {
+        Ok(StopTicket {
+            id,
+            handle: self.take_for_stop(id)?,
+        })
+    }
+
+    /// Land a drained stop in Stopped (ADR-052). Returns the Channel's name
+    /// when its drain was abandoned at the grace period.
+    pub fn finish_stop(&mut self, drained: DrainedStop) -> Option<String> {
+        self.finish_drained(drained.id, drained.drained)
     }
 
     /// Land a drained Channel in Stopped (see [`drain_all`]); `None` marks a
@@ -900,7 +1112,7 @@ impl Listener {
     ) -> Option<String> {
         // A timed-out drain has no final snapshot.
         let finished = drained.is_some();
-        self.finish_stop(id, drained.flatten());
+        self.land_stopped(id, drained.flatten());
         (!finished).then(|| self.note_finalization_incomplete(id))
     }
 
@@ -908,7 +1120,7 @@ impl Listener {
     /// channel Stopping, and take its handle out (so the slow drain in `drain_handle`
     /// owns no `&mut self`). Returns the handle to drain (or `None` if there was none,
     /// e.g. a start-time fault). Illegal from any state but Running/Faulted.
-    fn begin_stop(&mut self, id: ChannelId) -> Result<Option<ChannelHandle>, OrchestratorError> {
+    fn take_for_stop(&mut self, id: ChannelId) -> Result<Option<ChannelHandle>, OrchestratorError> {
         let state = self
             .state(id)
             .ok_or(OrchestratorError::UnknownChannel(id))?;
@@ -932,7 +1144,7 @@ impl Listener {
     /// Land a Channel in Stopped: clear its Display Views, reset the fault flag
     /// (so a previously-faulted Channel reads Stopped, not Faulted), and announce
     /// the stop (§110).
-    fn finish_stop(&mut self, id: ChannelId, final_snapshot: Option<ChannelSnapshot>) {
+    fn land_stopped(&mut self, id: ChannelId, final_snapshot: Option<ChannelSnapshot>) {
         if let Some(channel) = self.channels.get_mut(&id) {
             let ended_by_fault =
                 channel.faulted.load(Ordering::Relaxed) || channel.state == ChannelState::Faulted;
@@ -1077,10 +1289,7 @@ impl Listener {
         if let Some(config) = config {
             // Stop a live channel so it comes back up on the new config; then swap it in.
             self.stop_if_live(id).await?;
-            if let Some(channel) = self.channels.get_mut(&id) {
-                channel.pending = None; // the explicit config supersedes any queued one
-                channel.config = config;
-            }
+            self.commit_config(id, config)?;
         }
         if start {
             // Normalize Faulted/Reconnecting → Stopped so Start is a legal
@@ -1090,6 +1299,23 @@ impl Listener {
                 self.start(id).await?;
             }
         }
+        Ok(())
+    }
+
+    /// Make `config` the Channel's configuration (§13), superseding any
+    /// pending one. Meant for a Channel that is not live: stop a live one
+    /// first, so it restarts onto `config`.
+    pub fn commit_config(
+        &mut self,
+        id: ChannelId,
+        config: ChannelConfig,
+    ) -> Result<(), OrchestratorError> {
+        let channel = self
+            .channels
+            .get_mut(&id)
+            .ok_or(OrchestratorError::UnknownChannel(id))?;
+        channel.pending = None;
+        channel.config = config;
         Ok(())
     }
 
@@ -1170,7 +1396,7 @@ impl Listener {
         let drains = live
             .into_iter()
             // Not stoppable shouldn't happen — we filtered to live.
-            .filter_map(|id| Some((id, drain_handle(self.begin_stop(id).ok()?))))
+            .filter_map(|id| Some((id, drain_handle(self.take_for_stop(id).ok()?))))
             .collect();
         let mut outcome = ShutdownOutcome::default();
         for (id, drained) in drain_all(drains, Self::STOP_GRACE).await {
@@ -1209,15 +1435,35 @@ impl Listener {
     /// Starting → Running), so the events also include the intermediate
     /// `ChannelStopped`/`ChannelStarted`.
     pub async fn reconnect_tick(&mut self) {
-        let now = Instant::now();
+        for attempt in self.reconnects_due(Instant::now(), |_| false) {
+            let _ = self.stop(attempt.id).await;
+            let started = self.start(attempt.id).await.is_ok();
+            self.finish_reconnect(attempt, started);
+        }
+    }
+
+    /// The reconnect bookkeeping of [`reconnect_tick`](Self::reconnect_tick)
+    /// without the stop and start, for a caller that runs those off its loop
+    /// (ADR-052). Arms backoff on a newly faulted Channel, gives up after
+    /// `max_attempts`, and returns the attempts now due, each announced with
+    /// `ChannelReconnecting`. A Channel `busy` says is mid-operation is left
+    /// for a later tick.
+    pub fn reconnects_due(
+        &mut self,
+        now: Instant,
+        busy: impl Fn(ChannelId) -> bool,
+    ) -> Vec<ReconnectAttempt> {
         let candidates: Vec<ChannelId> = self
             .channels
             .iter()
-            .filter(|(_, c)| {
-                c.effective_state() == ChannelState::Faulted && c.config.reconnect.enabled
+            .filter(|(id, c)| {
+                c.effective_state() == ChannelState::Faulted
+                    && c.config.reconnect.enabled
+                    && !busy(**id)
             })
             .map(|(id, _)| *id)
             .collect();
+        let mut due = Vec::new();
 
         for id in candidates {
             let Some(policy) = self.channels.get(&id).map(|c| c.config.reconnect) else {
@@ -1261,29 +1507,46 @@ impl Listener {
                     let _ = self
                         .events_tx
                         .try_send(RuntimeEvent::ChannelReconnecting(id, attempt));
-                    // stop() clears reconnect_state; we re-establish it on failure.
-                    let _ = self.stop(id).await;
-                    if self.start(id).await.is_ok() {
-                        let _ = self
-                            .events_tx
-                            .try_send(RuntimeEvent::ChannelReconnected(id));
-                    } else {
-                        let next_ms = (s.backoff.as_millis() as f64 * policy.multiplier) as u64;
-                        let backoff =
-                            Duration::from_millis(next_ms.min(policy.max_backoff_ms).max(1));
-                        self.set_reconnect_state(
-                            id,
-                            ReconnectState {
-                                attempts: attempt,
-                                backoff,
-                                next_attempt_at: Instant::now() + backoff,
-                                gave_up: false,
-                            },
-                        );
-                    }
+                    due.push(ReconnectAttempt {
+                        id,
+                        attempt,
+                        previous: s,
+                    });
                 }
             }
         }
+        due
+    }
+
+    /// Record how a reconnect attempt's stop and start went (§9.1): announce
+    /// the reconnect, or back off for the next attempt. Stopping cleared the
+    /// reconnect state, so a failure re-establishes it.
+    pub fn finish_reconnect(&mut self, attempt: ReconnectAttempt, started: bool) {
+        let ReconnectAttempt {
+            id,
+            attempt,
+            previous,
+        } = attempt;
+        if started {
+            let _ = self
+                .events_tx
+                .try_send(RuntimeEvent::ChannelReconnected(id));
+            return;
+        }
+        let Some(policy) = self.channels.get(&id).map(|c| c.config.reconnect) else {
+            return;
+        };
+        let next_ms = (previous.backoff.as_millis() as f64 * policy.multiplier) as u64;
+        let backoff = Duration::from_millis(next_ms.min(policy.max_backoff_ms).max(1));
+        self.set_reconnect_state(
+            id,
+            ReconnectState {
+                attempts: attempt,
+                backoff,
+                next_attempt_at: Instant::now() + backoff,
+                gave_up: false,
+            },
+        );
     }
 
     fn set_reconnect_state(&mut self, id: ChannelId, state: ReconnectState) {
@@ -1324,18 +1587,33 @@ impl Listener {
         }
     }
 
-    /// Build, open/bind, and wire a Channel's runtime tasks (§8.2). `faulted` is
-    /// the run's shared fault flag (ADR-006), handed to the data-channel monitor.
-    async fn spawn_channel(
+    /// Build a Channel's interface for a start (§8.2), without opening it.
+    fn build_interface(
+        id: ChannelId,
+        interface: &InterfaceConfig,
+    ) -> Result<UnopenedInterface, OrchestratorError> {
+        Ok(match interface {
+            InterfaceConfig::Serial(serial) => UnopenedInterface::Serial(build_serial(id, serial)?),
+            InterfaceConfig::Udp(udp) => UnopenedInterface::Udp(build_udp(id, udp)?),
+            InterfaceConfig::TcpListener(tcp) => {
+                UnopenedInterface::TcpListener(build_tcp_listener(id, tcp)?)
+            }
+        })
+    }
+
+    /// Wire an opened interface into a Channel's runtime tasks (§8.2). `faulted`
+    /// is the run's shared fault flag (ADR-006), handed to the data-channel
+    /// monitor.
+    fn wire(
         &self,
         id: ChannelId,
         config: &ChannelConfig,
+        interface: OpenedInterface,
+        caps: PipelineCapacities,
         faulted: Arc<AtomicBool>,
-    ) -> Result<(ChannelHandle, Option<SerialControl>), OrchestratorError> {
-        Self::check_limits(config)?;
-        let caps = self.channel_caps(config)?;
-        match &config.interface {
-            InterfaceConfig::Serial(serial) => {
+    ) -> (ChannelHandle, Option<SerialControl>) {
+        match interface {
+            OpenedInterface::Serial(opened) => {
                 // Serial is the one transport whose reader can stall (§97.1); give
                 // it a notice sender so a sustained stall becomes a retained
                 // diagnostic + warning in the pipeline (§101, ADR-007).
@@ -1349,10 +1627,7 @@ impl Listener {
                     state: state.clone(),
                     events: self.events_tx.clone(),
                 };
-                let opened = build_serial(id, serial)?
-                    .open()
-                    .await
-                    .map_err(OrchestratorError::SerialOpen)?
+                let opened = opened
                     .with_notice_sender(notice_tx.clone())
                     .with_control(hooks);
                 let serial_stall_state = opened.stall_state();
@@ -1367,21 +1642,17 @@ impl Listener {
                         notices: (notice_tx, notice_rx),
                     },
                 ));
-                Ok((
+                (
                     handle,
                     Some(SerialControl {
                         commands: cmd_tx,
                         state,
                     }),
-                ))
+                )
             }
-            InterfaceConfig::Udp(udp) => {
+            OpenedInterface::Udp(bound) => {
                 let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
-                let bound = build_udp(id, udp)?
-                    .bind()
-                    .await
-                    .map_err(OrchestratorError::Bind)?
-                    .with_notice_sender(notice_tx.clone());
+                let bound = bound.with_notice_sender(notice_tx.clone());
                 // UDP is async and never stalls the reader. On Linux the transport
                 // also publishes its cumulative SO_RXQ_OVFL socket-drop counter;
                 // other platforms explicitly report that counter unsupported.
@@ -1396,27 +1667,27 @@ impl Listener {
                         notices: (notice_tx, notice_rx),
                     },
                 ));
-                Ok((handle, None))
+                (handle, None)
             }
             // Per-connection faults stay supervised inside the listener task;
             // a spontaneous *acceptor* fault sets `faulted` like any other
             // transport, so polled state reads Faulted and reconnect can
             // engage (§162).
-            InterfaceConfig::TcpListener(tcp) => {
-                let bound = build_tcp_listener(id, tcp)?
-                    .bind()
-                    .await
-                    .map_err(OrchestratorError::Bind)?;
+            OpenedInterface::TcpListener(bound) => {
+                let max_connections = match &config.interface {
+                    InterfaceConfig::TcpListener(tcp) => tcp.max_connections,
+                    _ => None,
+                };
                 // Per-connection recording is deferred (§59).
                 let handle = start_tcp_listener(
                     bound.channel_id(),
                     bound,
                     caps,
-                    tcp.max_connections,
+                    max_connections,
                     faulted,
                     self.events_tx.clone(),
                 );
-                Ok((ChannelHandle::TcpListener(handle), None))
+                (ChannelHandle::TcpListener(handle), None)
             }
         }
     }

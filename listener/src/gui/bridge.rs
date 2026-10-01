@@ -11,16 +11,20 @@
 //! coupling to the UI is an opaque `repaint` callback the driver invokes after
 //! pushing an update (the App passes `egui::Context::request_repaint`).
 
-use std::{collections::HashMap, time::Duration};
+use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::config::{
     ChannelConfig, DataBits, DisplayConfig, DisplayRecordingConfig, FlowControl, InterfaceConfig,
     Parity, Profile, RawRecordingConfig, ReconnectPolicy, RetentionConfig, StopBits,
 };
-use crate::core::{ChannelId, ChannelName, DisplayViewId, RuntimeEvent};
-use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities, StreamDelta};
+use crate::core::{ChannelId, ChannelName, ChannelState, DisplayViewId, RuntimeEvent};
+use crate::runtime::{
+    ChannelSnapshot, ChannelStats, DrainedStop, Listener, OpenedStart, PipelineCapacities,
+    ReconnectAttempt, StreamDelta,
+};
 use crate::transport::udp::UdpMode;
 use crate::transport::SerialControlLines;
 
@@ -320,6 +324,57 @@ fn profile_name_from_path(path: &std::path::Path) -> String {
 /// The background driver: owns the `Listener`, drains commands, forwards events,
 /// and polls snapshots. Built by [`spawn`]; runs until `Shutdown` or the command
 /// channel closes (the App dropped its sender).
+/// One step of a Channel's lifecycle work in the driver (ADR-052). A Channel
+/// runs its steps one at a time, in order; an interface open or a stop's drain
+/// runs off the loop, so every other readout keeps updating meanwhile.
+enum Step {
+    /// Start; `report` says whether a failure is shown on the Channel. A
+    /// reconnect attempt's is not: its reconnect status says it.
+    Start {
+        report: bool,
+    },
+    Stop,
+    /// Stop a Running or Faulted Channel; nothing otherwise.
+    StopIfLive,
+    /// Bring the Channel up unless it is Running, stopping a Faulted one
+    /// first (§8.5).
+    StartIfDown,
+    /// Adopt a configuration (§13) and echo it to the UI.
+    Commit(Box<ChannelConfig>),
+    /// Drop the Channel from the runtime and the UI.
+    Remove,
+    /// Record how a reconnect attempt went (§9.1).
+    Reconnected(Box<ReconnectAttempt>),
+}
+
+/// A Channel's queued steps, and how its last step off the loop went.
+#[derive(Default)]
+struct ChannelSteps {
+    queue: VecDeque<Step>,
+    /// A step is running off the loop; the queue waits for it.
+    running: bool,
+    /// Whether the running start's failure is shown on the Channel.
+    report: bool,
+    /// Whether the last start reached Running.
+    started: bool,
+}
+
+/// What a step running off the loop sends back when it finishes.
+enum StepDone {
+    Opened(Box<OpenedStart>),
+    Drained(Box<DrainedStop>),
+}
+
+/// A workspace change, made once no Channel has steps left (ADR-052).
+enum WorkspaceStep {
+    /// Forget the selection and the stream cursors.
+    Clear,
+    /// Register a profile's Channels, and start them for a resume.
+    Load { profile: Box<Profile>, start: bool },
+    /// Announce a resume, after the runtime events of its starts.
+    Resumed(String),
+}
+
 pub struct Driver {
     listener: Listener,
     events: Receiver<RuntimeEvent>,
@@ -335,6 +390,14 @@ pub struct Driver {
     /// selection changes avoids re-shipping the retained window whenever the user
     /// revisits a tab. Generation changes still force a reliable run reset.
     stream_cursors: HashMap<ChannelId, StreamPollCursor>,
+    /// Each Channel's queued lifecycle steps (ADR-052).
+    steps: HashMap<ChannelId, ChannelSteps>,
+    /// Workspace changes waiting for every Channel's steps to finish.
+    workspace: VecDeque<WorkspaceStep>,
+    /// Steps running off the loop report here. Unbounded, because each Channel
+    /// has at most one step running.
+    done_tx: mpsc::UnboundedSender<StepDone>,
+    done_rx: mpsc::UnboundedReceiver<StepDone>,
 }
 
 impl Driver {
@@ -347,6 +410,7 @@ impl Driver {
         updates: Sender<UiUpdate>,
         repaint: Box<dyn Fn() + Send>,
     ) -> Self {
+        let (done_tx, done_rx) = mpsc::unbounded_channel();
         Self {
             listener,
             events,
@@ -356,6 +420,10 @@ impl Driver {
             channels: Vec::new(),
             selected: None,
             stream_cursors: HashMap::new(),
+            steps: HashMap::new(),
+            workspace: VecDeque::new(),
+            done_tx,
+            done_rx,
         }
     }
 
@@ -382,13 +450,241 @@ impl Driver {
                     Some(ev) => self.forward_event(ev),
                     None => events_open = false, // stream closed; keep serving commands
                 },
+                Some(done) = self.done_rx.recv() => self.on_done(done),
                 _ = snapshot_tick.tick() => self.poll_snapshots().await,
-                _ = reconnect_tick.tick() => self.listener.reconnect_tick().await,
+                _ = reconnect_tick.tick() => self.queue_reconnects(),
             }
+            self.pump().await;
         }
 
-        // The App is gone (or asked to shut down): stop every channel cleanly.
+        // The App is gone (or asked to shut down): let what is opening or
+        // draining land, then stop every channel cleanly.
+        self.finish_in_flight().await;
         self.listener.shutdown().await;
+    }
+
+    /// Queue `steps` for a Channel, after any it already has (ADR-052).
+    fn queue(&mut self, id: ChannelId, steps: impl IntoIterator<Item = Step>) {
+        self.steps.entry(id).or_default().queue.extend(steps);
+    }
+
+    /// The steps of "optionally adopt `config`, optionally start" (§13): a live
+    /// Channel stops first, so it comes back up on the new configuration.
+    fn commit_steps(config: Option<Box<ChannelConfig>>, start: bool) -> Vec<Step> {
+        let mut steps = Vec::new();
+        if let Some(config) = config {
+            steps.extend([Step::StopIfLive, Step::Commit(config)]);
+        }
+        if start {
+            steps.push(Step::StartIfDown);
+        }
+        steps
+    }
+
+    /// Stop and remove every Channel.
+    fn queue_removal_of_all(&mut self) {
+        for id in self.channels.clone() {
+            self.queue(id, [Step::StopIfLive, Step::Remove]);
+        }
+    }
+
+    /// Run every step that can run now and, once no Channel has steps left,
+    /// the next workspace change (ADR-052).
+    async fn pump(&mut self) {
+        loop {
+            let ready: Vec<ChannelId> = self
+                .steps
+                .iter()
+                .filter(|(_, steps)| !steps.running && !steps.queue.is_empty())
+                .map(|(id, _)| *id)
+                .collect();
+            for id in ready {
+                while let Some(step) = self.next_step(id) {
+                    self.run_step(id, step).await;
+                }
+            }
+            self.steps
+                .retain(|_, steps| steps.running || !steps.queue.is_empty());
+            if !self.steps.is_empty() {
+                break;
+            }
+            match self.workspace.pop_front() {
+                Some(change) => self.run_workspace(change),
+                None => break,
+            }
+        }
+    }
+
+    /// A Channel's next step, unless one is still running off the loop.
+    fn next_step(&mut self, id: ChannelId) -> Option<Step> {
+        let steps = self.steps.get_mut(&id)?;
+        if steps.running {
+            None
+        } else {
+            steps.queue.pop_front()
+        }
+    }
+
+    async fn run_step(&mut self, id: ChannelId, step: Step) {
+        match step {
+            Step::Start { report } => self.start_step(id, report),
+            Step::Stop => self.stop_step(id),
+            Step::StopIfLive => {
+                if matches!(
+                    self.listener.state(id),
+                    Some(ChannelState::Running | ChannelState::Faulted)
+                ) {
+                    self.stop_step(id);
+                }
+            }
+            Step::StartIfDown => {
+                let state = self.listener.state(id);
+                if state != Some(ChannelState::Running) {
+                    self.steps
+                        .entry(id)
+                        .or_default()
+                        .queue
+                        .push_front(Step::Start { report: true });
+                    if state == Some(ChannelState::Faulted) {
+                        self.stop_step(id);
+                    }
+                }
+            }
+            Step::Commit(config) => {
+                let details = describe_interface(&config);
+                match self.listener.commit_config(id, (*config).clone()) {
+                    Ok(()) => {
+                        self.push(UiUpdate::ChannelReconfigured(id, details, config));
+                    }
+                    Err(err) => self.push_channel_error(id, err),
+                }
+            }
+            Step::Remove => {
+                // Already stopped by the step before, so this does not wait.
+                let _ = self.listener.remove_channel(id).await;
+                self.channels.retain(|c| *c != id);
+                self.stream_cursors.remove(&id);
+                self.push(UiUpdate::ChannelRemoved(id));
+            }
+            Step::Reconnected(attempt) => {
+                let started = self.steps.get(&id).is_some_and(|steps| steps.started);
+                self.listener.finish_reconnect(*attempt, started);
+            }
+        }
+    }
+
+    /// Begin a start, and open its interface off the loop (ADR-052).
+    fn start_step(&mut self, id: ChannelId, report: bool) {
+        match self.listener.begin_start(id) {
+            Ok(ticket) => {
+                let steps = self.steps.entry(id).or_default();
+                steps.running = true;
+                steps.report = report;
+                let done = self.done_tx.clone();
+                tokio::spawn(async move {
+                    let _ = done.send(StepDone::Opened(Box::new(ticket.open().await)));
+                });
+            }
+            Err(err) => {
+                self.steps.entry(id).or_default().started = false;
+                if report {
+                    self.push_channel_error(id, err);
+                }
+            }
+        }
+    }
+
+    /// Begin a stop, and drain it off the loop (ADR-052).
+    fn stop_step(&mut self, id: ChannelId) {
+        match self.listener.begin_stop(id) {
+            Ok(ticket) => {
+                self.steps.entry(id).or_default().running = true;
+                let done = self.done_tx.clone();
+                tokio::spawn(async move {
+                    let _ = done.send(StepDone::Drained(Box::new(ticket.drain().await)));
+                });
+            }
+            Err(err) => self.push_channel_error(id, err),
+        }
+    }
+
+    /// Land a step that ran off the loop (ADR-052).
+    fn on_done(&mut self, done: StepDone) {
+        match done {
+            StepDone::Opened(opened) => {
+                let id = opened.id();
+                let result = self.listener.finish_start(*opened);
+                let steps = self.steps.entry(id).or_default();
+                steps.running = false;
+                steps.started = result.is_ok();
+                let report = steps.report;
+                if let Err(err) = result {
+                    if report {
+                        self.push_channel_error(id, err);
+                    }
+                }
+            }
+            StepDone::Drained(drained) => {
+                let id = drained.id();
+                self.listener.finish_stop(*drained);
+                self.steps.entry(id).or_default().running = false;
+            }
+        }
+    }
+
+    /// Queue the reconnect attempts now due (§9.1): each a stop and a start,
+    /// off the loop like any other (ADR-052). A Channel mid-step waits.
+    fn queue_reconnects(&mut self) {
+        let attempts = self
+            .listener
+            .reconnects_due(std::time::Instant::now(), |id| self.steps.contains_key(&id));
+        for attempt in attempts {
+            let id = attempt.id();
+            self.queue(
+                id,
+                [
+                    Step::StopIfLive,
+                    Step::Start { report: false },
+                    Step::Reconnected(Box::new(attempt)),
+                ],
+            );
+        }
+    }
+
+    fn run_workspace(&mut self, change: WorkspaceStep) {
+        match change {
+            WorkspaceStep::Clear => {
+                self.selected = None;
+                self.stream_cursors.clear();
+            }
+            WorkspaceStep::Load { profile, start } => {
+                let added = self.register_profile(*profile);
+                if start {
+                    for id in added {
+                        self.queue(id, [Step::Start { report: true }]);
+                    }
+                }
+            }
+            WorkspaceStep::Resumed(name) => {
+                self.drain_events();
+                self.push(UiUpdate::Resumed(name, std::time::SystemTime::now()));
+            }
+        }
+    }
+
+    /// Land every step still running off the loop, starting no more, within
+    /// the stop grace: an open still hanging then is abandoned.
+    async fn finish_in_flight(&mut self) {
+        for steps in self.steps.values_mut() {
+            steps.queue.clear();
+        }
+        let deadline = tokio::time::Instant::now() + Listener::STOP_GRACE;
+        while self.steps.values().any(|steps| steps.running) {
+            match tokio::time::timeout_at(deadline, self.done_rx.recv()).await {
+                Ok(Some(done)) => self.on_done(done),
+                _ => break,
+            }
+        }
     }
 
     /// Forward one runtime event to the GUI, applying the stream-cursor reset a
@@ -416,30 +712,6 @@ impl Driver {
         }
     }
 
-    /// The single-channel lifecycle path shared by `CommitAndStart` and each entry of
-    /// `StartAll`: optionally commit `config`, optionally `start`, via the runtime's
-    /// `commit_and_start` (which owns the Faulted→Stopped→Starting recovery). Echoes
-    /// `ChannelReconfigured` when a config was committed so the UI refreshes its editor
-    /// and connection details; reports any failure as a `ChannelError`.
-    async fn commit_and_start_one(
-        &mut self,
-        id: ChannelId,
-        config: Option<ChannelConfig>,
-        start: bool,
-    ) {
-        let echo = config.as_ref().map(|c| (describe_interface(c), c.clone()));
-        match self.listener.commit_and_start(id, config, start).await {
-            Ok(()) => {
-                if let Some((details, config)) = echo {
-                    self.push(UiUpdate::ChannelReconfigured(id, details, Box::new(config)));
-                }
-            }
-            Err(err) => {
-                self.push_channel_error(id, err);
-            }
-        }
-    }
-
     /// Apply one command. Returns `false` only for `Shutdown` (end the loop).
     async fn handle(&mut self, cmd: UiCommand) -> bool {
         match cmd {
@@ -451,51 +723,28 @@ impl Driver {
                 self.channels.push(id);
                 self.push(UiUpdate::ChannelAdded(id, name, details, echo));
             }
-            UiCommand::Start(id) => {
-                // Surface the reason on failure (e.g. a bind "address in use"),
-                // instead of leaving the channel Faulted with no explanation.
-                if let Err(err) = self.listener.start(id).await {
-                    self.push_channel_error(id, err);
-                }
-            }
-            UiCommand::Stop(id) => {
-                if let Err(err) = self.listener.stop(id).await {
-                    self.push_channel_error(id, err);
-                }
-            }
+            // Lifecycle commands queue steps (ADR-052): each Channel runs its
+            // own in order, and opens and drains run off this loop. A failure is
+            // surfaced on the Channel (e.g. a bind "address in use"), rather than
+            // leaving it Faulted with no explanation.
+            UiCommand::Start(id) => self.queue(id, [Step::Start { report: true }]),
+            UiCommand::Stop(id) => self.queue(id, [Step::Stop]),
             UiCommand::CommitAndStart { id, config, start } => {
-                self.commit_and_start_one(id, config.map(|c| *c), start)
-                    .await;
+                self.queue(id, Self::commit_steps(config, start));
             }
             UiCommand::StartAll(batch) => {
-                // Run each channel through the same single-channel commit_and_start
-                // path, draining the runtime's lifecycle events after each so a large
-                // batch can't pile them up undrained in the bounded event channel (the
-                // `select!` arm that normally drains them doesn't run while we're here).
                 for (id, config) in batch {
-                    self.commit_and_start_one(id, Some(*config), true).await;
-                    self.drain_events();
+                    self.queue(id, Self::commit_steps(Some(config), true));
                 }
             }
+            // A Channel already Stopped is skipped, so only a genuine problem
+            // surfaces as an error.
             UiCommand::StopAll => {
-                // Stop each *live* channel server-side, off the UI thread. `stop_if_live`
-                // skips an already-Stopped channel (no IllegalTransition to swallow), so
-                // a genuine illegal transition still surfaces as an error instead of
-                // disappearing. Drain events after each so the batch can't overflow the
-                // bounded event channel and lose a ChannelStopped.
                 for id in self.channels.clone() {
-                    if let Err(err) = self.listener.stop_if_live(id).await {
-                        self.push_channel_error(id, err);
-                    }
-                    self.drain_events();
+                    self.queue(id, [Step::StopIfLive]);
                 }
             }
-            UiCommand::RemoveChannel(id) => {
-                let _ = self.listener.remove_channel(id).await;
-                self.channels.retain(|c| *c != id);
-                self.stream_cursors.remove(&id);
-                self.push(UiUpdate::ChannelRemoved(id));
-            }
+            UiCommand::RemoveChannel(id) => self.queue(id, [Step::StopIfLive, Step::Remove]),
             UiCommand::Rename(id, name) => {
                 if self.listener.rename(id, name.clone()).is_ok() {
                     self.push(UiUpdate::ChannelRenamed(id, name.as_str().to_string()));
@@ -563,16 +812,16 @@ impl Driver {
                 self.selected = id;
             }
             UiCommand::SaveProfile(path) => self.save_profile(path),
-            UiCommand::LoadProfile(path) => self.load_profile(path).await,
+            UiCommand::LoadProfile(path) => self.load_profile(path),
             UiCommand::CheckResume(path) => {
                 let checked = resume_check(&path).map(|profile| profile.name);
                 self.push(UiUpdate::ResumeChecked(path, checked));
             }
-            UiCommand::Resume(path) => self.resume(path).await,
+            UiCommand::Resume(path) => self.resume(path),
             UiCommand::ListLocalAddresses => {
                 self.push(UiUpdate::LocalAddresses(local_addresses()));
             }
-            UiCommand::NewProfile => self.new_profile().await,
+            UiCommand::NewProfile => self.new_profile(),
             UiCommand::Shutdown => return false,
         }
         true
@@ -599,45 +848,38 @@ impl Driver {
         }
     }
 
-    /// Replace the workspace with a loaded profile (§70). Parse + schema-check
-    /// first, so a bad file leaves the current channels untouched; only on success
-    /// do we stop/remove every existing channel and register the loaded ones
-    /// (Stopped — load never starts a channel). Each removal/addition emits the
-    /// usual update so the App folds the swap with no special-casing.
-    /// Tear the workspace down and leave it empty. Shares `load_profile`'s
-    /// teardown so a new profile and a loaded one start from the same state —
-    /// live channels stopped first (§8.5), selection and cursors cleared.
-    async fn new_profile(&mut self) {
-        for id in std::mem::take(&mut self.channels) {
-            let _ = self.listener.remove_channel(id).await;
-            self.push(UiUpdate::ChannelRemoved(id));
-        }
-        self.selected = None;
-        self.stream_cursors.clear();
+    /// Tear the workspace down and leave it empty: every Channel is stopped
+    /// (§8.5) and removed, then the selection and cursors are cleared.
+    fn new_profile(&mut self) {
+        self.queue_removal_of_all();
+        self.workspace.push_back(WorkspaceStep::Clear);
     }
 
     /// Resume a registered profile (ADR-045): check it again — the countdown
     /// gave a drive time to go — then load it and start every channel. A
     /// channel that cannot start is reported and left to its reconnect policy.
-    async fn resume(&mut self, path: std::path::PathBuf) {
-        let name = match resume_check(&path) {
-            Ok(profile) => profile.name,
+    fn resume(&mut self, path: std::path::PathBuf) {
+        let profile = match resume_check(&path) {
+            Ok(profile) => profile,
             Err(why) => {
                 self.push(UiUpdate::ResumeChecked(path, Err(why)));
                 return;
             }
         };
-        self.load_profile(path).await;
-        for id in self.channels.clone() {
-            if let Err(err) = self.listener.start(id).await {
-                self.push_channel_error(id, err);
-            }
-            self.drain_events();
-        }
-        self.push(UiUpdate::Resumed(name, std::time::SystemTime::now()));
+        let name = profile.name.clone();
+        self.queue_removal_of_all();
+        self.workspace.push_back(WorkspaceStep::Clear);
+        self.workspace.push_back(WorkspaceStep::Load {
+            profile: Box::new(profile),
+            start: true,
+        });
+        self.workspace.push_back(WorkspaceStep::Resumed(name));
     }
 
-    async fn load_profile(&mut self, path: std::path::PathBuf) {
+    /// Replace the workspace with the profile at `path` (§70): every Channel
+    /// is stopped and removed first, and the profile's Channels are registered
+    /// Stopped (load never starts a channel).
+    fn load_profile(&mut self, path: std::path::PathBuf) {
         let profile = match Profile::load(&path) {
             Ok(p) => p,
             Err(err) => {
@@ -645,20 +887,25 @@ impl Driver {
                 return;
             }
         };
-        // Tear down the old workspace (stops live channels first, §8.5).
-        for id in std::mem::take(&mut self.channels) {
-            let _ = self.listener.remove_channel(id).await;
-            self.push(UiUpdate::ChannelRemoved(id));
-        }
-        self.selected = None;
-        self.stream_cursors.clear();
+        self.queue_removal_of_all();
+        self.workspace.push_back(WorkspaceStep::Clear);
+        self.workspace.push_back(WorkspaceStep::Load {
+            profile: Box::new(profile),
+            start: false,
+        });
+    }
+
+    /// Register a profile's Channels Stopped, and return their ids. Each
+    /// addition emits the usual update, so the App folds the swap with no
+    /// special-casing.
+    fn register_profile(&mut self, profile: Profile) -> Vec<ChannelId> {
         // Validate before registering (§71, ADR-014): a hand-edited profile can carry an
         // invalid channel (e.g. a duplicate name) — skip those and load the rest, like
         // the CLI. Validation is workspace-level (`Profile::validate`), so duplicate
         // names flag every carrier.
         let results = profile.validate();
         let mut skipped: Vec<String> = Vec::new();
-        // Register the loaded channels Stopped.
+        let mut added = Vec::new();
         for (config, (name, result)) in profile.channels.into_iter().zip(results) {
             if let Err(errors) = result {
                 skipped.push(format!("\"{name}\": {errors:?}"));
@@ -669,6 +916,7 @@ impl Driver {
             let echo = config.clone();
             let id = self.listener.add_channel(config);
             self.channels.push(id);
+            added.push(id);
             self.push(UiUpdate::ChannelAdded(id, name, details, Box::new(echo)));
         }
         if !skipped.is_empty() {
@@ -679,6 +927,7 @@ impl Driver {
             )));
         }
         self.push(UiUpdate::ProfileLoaded(profile.name));
+        added
     }
 
     /// Poll channels for the UI's pull surface. Every channel gets cheap **stats**
@@ -867,6 +1116,147 @@ mod tests {
             describe_interface(&udp_config(10110)),
             "UDP unicast · bind 127.0.0.1:10110 · this computer only"
         );
+    }
+
+    /// PLAN 7.6: the GUI's status keeps updating at least once a second while
+    /// one Channel's start blocks for 10 s — a serial port slow to open must
+    /// not freeze every other readout.
+    #[tokio::test(start_paused = true)]
+    async fn status_keeps_updating_while_a_start_blocks() {
+        const OPEN_TAKES: Duration = Duration::from_secs(10);
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        listener.delay_opens_for_test(OPEN_TAKES);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(4096);
+        let handle =
+            tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
+
+        cmd_tx
+            .send(UiCommand::AddChannel(Box::new(udp_config(free_udp_port()))))
+            .await
+            .unwrap();
+        let id = loop {
+            if let Some(UiUpdate::ChannelAdded(id, ..)) = upd_rx.recv().await {
+                break id;
+            }
+        };
+        let asked = tokio::time::Instant::now();
+        cmd_tx.send(UiCommand::Start(id)).await.unwrap();
+
+        // Seconds of the start in which a snapshot reached the UI.
+        let mut seconds_with_an_update = std::collections::BTreeSet::new();
+        loop {
+            match upd_rx.recv().await.expect("the driver keeps running") {
+                // An unselected Channel's readouts come as stats, a selected
+                // one's as a snapshot: either is the status updating.
+                UiUpdate::Snapshot(..) | UiUpdate::Stats(..) => {
+                    let at = asked.elapsed();
+                    if at < OPEN_TAKES {
+                        seconds_with_an_update.insert(at.as_secs());
+                    }
+                }
+                UiUpdate::Event(RuntimeEvent::ChannelStarted(_)) => break,
+                _ => {}
+            }
+        }
+        assert!(asked.elapsed() >= OPEN_TAKES, "the start did block");
+        assert_eq!(
+            seconds_with_an_update.len(),
+            OPEN_TAKES.as_secs() as usize,
+            "status updated in only these seconds of the start: {seconds_with_an_update:?}"
+        );
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A driver whose every interface open takes `open_takes`, with `n` UDP
+    /// Channels added. Returns the command sender, the update receiver, the
+    /// Channel ids and the driver task.
+    async fn slow_driver(
+        open_takes: Duration,
+        n: usize,
+    ) -> (
+        Sender<UiCommand>,
+        Receiver<UiUpdate>,
+        Vec<ChannelId>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        listener.delay_opens_for_test(open_takes);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(4096);
+        let handle =
+            tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            cmd_tx
+                .send(UiCommand::AddChannel(Box::new(udp_config(free_udp_port()))))
+                .await
+                .unwrap();
+            ids.push(loop {
+                if let Some(UiUpdate::ChannelAdded(id, ..)) = upd_rx.recv().await {
+                    break id;
+                }
+            });
+        }
+        (cmd_tx, upd_rx, ids, handle)
+    }
+
+    /// ADR-052: a Stop sent while the Channel is still starting waits its
+    /// turn, then runs, so the Channel ends Stopped rather than refusing it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_a_slow_start_runs_once_the_start_lands() {
+        let (cmd_tx, mut upd_rx, ids, handle) = slow_driver(Duration::from_secs(10), 1).await;
+        let id = ids[0];
+        cmd_tx.send(UiCommand::Start(id)).await.unwrap();
+        cmd_tx.send(UiCommand::Stop(id)).await.unwrap();
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            match upd_rx.recv().await.expect("the driver keeps running") {
+                UiUpdate::Event(RuntimeEvent::ChannelStarted(_)) => seen.push("started"),
+                UiUpdate::Event(RuntimeEvent::ChannelStopped(_)) => seen.push("stopped"),
+                UiUpdate::ChannelError(_, why) => panic!("the stop was refused: {why}"),
+                _ => {}
+            }
+        }
+        assert_eq!(seen, ["started", "stopped"]);
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    /// ADR-052: Channels do not wait on each other. Two starts that each take
+    /// 10 s both land at 10 s, not one at 10 s and the other at 20 s.
+    #[tokio::test(start_paused = true)]
+    async fn slow_starts_on_two_channels_overlap() {
+        const OPEN_TAKES: Duration = Duration::from_secs(10);
+        let (cmd_tx, mut upd_rx, ids, handle) = slow_driver(OPEN_TAKES, 2).await;
+        let asked = tokio::time::Instant::now();
+        cmd_tx
+            .send(UiCommand::StartAll(
+                ids.iter()
+                    .map(|id| (*id, Box::new(udp_config(free_udp_port()))))
+                    .collect(),
+            ))
+            .await
+            .unwrap();
+        let mut started = 0;
+        while started < 2 {
+            if let UiUpdate::Event(RuntimeEvent::ChannelStarted(_)) =
+                upd_rx.recv().await.expect("the driver keeps running")
+            {
+                started += 1;
+            }
+        }
+        assert!(
+            asked.elapsed() < OPEN_TAKES * 2,
+            "the second start waited for the first: {:?}",
+            asked.elapsed()
+        );
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        handle.await.unwrap();
     }
 
     #[tokio::test]

@@ -2027,6 +2027,48 @@ runs stay out of CI.
 **Consequences:** A soak run ends in a pass or a list of exactly which numbers
 are missing, repeated or out of order, and where.
 
+## ADR-052 — The GUI driver starts and stops Channels off its loop, one step at a time per Channel
+
+**Status:** Accepted 2026-10-01. Follows from a latency test: the status must keep
+updating at least once a second while one Channel's start blocks for 10 s.
+
+**Context:** The GUI's driver awaited every start and stop inside the loop that
+also sends the status. A serial port can take 10 s to open, as a Bluetooth port
+whose device is off does, and that froze every readout for those 10 s. A stop
+could hold the loop for its 3 s grace. The test saw no status update at all
+during a 10 s start.
+
+**Decision:**
+
+- **Start and stop come in three phases.** First a synchronous begin: check the
+  transition, mark the Channel Starting or Stopping, and build the interface
+  or take the tasks out. Then an owned future: open or bind, or drain within
+  the stop grace. Last a synchronous finish: wire the pipeline and land Running
+  or Faulted, or land Stopped. `start` and `stop` still run the three back to
+  back, as the CLI does.
+- **The driver runs the future as a task** and lands its result when the task
+  reports back, so the loop keeps sending status meanwhile.
+- **Each Channel runs its lifecycle steps one at a time, in order.** A command
+  for a Channel mid-step waits its turn: a Stop sent during a slow start runs
+  when the start lands. Other Channels carry on, and two slow starts overlap.
+  Reconnect attempts are steps too.
+- **A workspace change waits for every Channel's steps.** This covers loading a
+  profile, a new profile and a resume. It then removes, registers and starts
+  as before.
+
+**Boundary:** The CLI keeps awaiting. An interface open still cannot be cancelled,
+so a Stop waits for the open to land. At exit the driver lands opens and drains
+in flight, within the stop grace, before stopping what is live.
+
+**Alternatives considered:**
+
+- **Refuse a command for a Channel mid-step:** Rejected. A Stop sent during a
+  10 s open would have to be sent again.
+- **Cancel the open:** Not possible for a blocking serial open.
+
+**Consequences:** The status keeps updating while any Channel starts or stops,
+and a slow Channel delays only its own commands.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_
