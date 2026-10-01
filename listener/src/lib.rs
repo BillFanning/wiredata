@@ -22,11 +22,11 @@ use anyhow::Result;
 /// directly. Process-wide startup that *both* binaries need belongs HERE (or in
 /// [`gui::run`] for GUI-only startup), never inline in a `main`, so the two thin
 /// launchers cannot drift.
-pub fn run() -> Result<()> {
+pub fn run() -> Result<std::process::ExitCode> {
     let cli = cli::parse();
     if cli.wants_gui() {
         match gui::run() {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(std::process::ExitCode::SUCCESS),
             // A bare launch on a headless box can't open a window — guide toward
             // headless mode instead of surfacing a cryptic windowing error.
             Err(e) if cli.is_bare_launch() => Err(anyhow::anyhow!(

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -14,7 +15,7 @@ use clap::Parser;
 use crate::config::{templates, ChannelConfig, InterfaceConfig, Profile};
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::diagnostics::EventLogStatus;
-use crate::runtime::Listener;
+use crate::runtime::{Listener, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT};
 
 /// Receive and inspect byte-oriented data from serial and network sources.
 #[derive(Parser, Debug)]
@@ -84,9 +85,21 @@ pub fn parse() -> Cli {
     Cli::parse()
 }
 
+/// Exit code: finalization incomplete at shutdown (§3.1, §113).
+const EXIT_FINALIZATION_INCOMPLETE: u8 = 4;
+
+/// The exit code for how shutdown went (§3.1).
+fn exit_status(outcome: &ShutdownOutcome) -> u8 {
+    if outcome.is_complete() {
+        0
+    } else {
+        EXIT_FINALIZATION_INCOMPLETE
+    }
+}
+
 /// Headless CLI entry point: build a Tokio runtime and run the event loop over the
 /// already-parsed arguments (§3). The GUI path is dispatched in [`crate::run`].
-pub fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Cli) -> Result<ExitCode> {
     // §114, §118; non-fatal (§117). Declared first so it is dropped last: the
     // event log drains and flushes after the runtime has stopped every Channel.
     let event_log = crate::diagnostics::init_logging();
@@ -97,10 +110,14 @@ pub fn run(cli: Cli) -> Result<()> {
         (None, None) => {}
     }
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    runtime.block_on(run_cli(cli, status))
+    let result = runtime.block_on(run_cli(cli, status));
+    // A file operation stuck in the blocking pool would otherwise keep the
+    // process alive after every Channel has been stopped (§113).
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_LIMIT);
+    result
 }
 
-async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<()> {
+async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<ExitCode> {
     let configs = build_channel_configs(&cli)?;
 
     let mut listener = Listener::with_default_capacities();
@@ -153,12 +170,24 @@ async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<()> {
     }
 
     println!("stopping…");
-    listener.shutdown().await;
+    let outcome = listener.shutdown().await;
+    if !outcome.is_complete() {
+        eprintln!(
+            "WARNING: finalization incomplete for {}: the end of their recordings may be \
+             missing (see the event log)",
+            outcome
+                .incomplete
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let lost = event_log.lost_entries();
     if lost > 0 {
         eprintln!("WARNING: {lost} event log lines were not saved; the log marks where");
     }
-    Ok(())
+    Ok(ExitCode::from(exit_status(&outcome)))
 }
 
 /// Build the channels to run from the profile or the quick-start flags. Per §71,
@@ -255,6 +284,16 @@ mod tests {
             gui: false,
             cli: false,
         }
+    }
+
+    #[test]
+    fn an_incomplete_finalization_exits_with_4() {
+        // §3.1, §113.
+        assert_eq!(exit_status(&ShutdownOutcome::default()), 0);
+        let incomplete = ShutdownOutcome {
+            incomplete: vec!["GPS".to_owned()],
+        };
+        assert_eq!(exit_status(&incomplete), 4);
     }
 
     #[test]

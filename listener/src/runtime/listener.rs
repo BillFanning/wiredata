@@ -1056,15 +1056,21 @@ impl Listener {
         Ok(())
     }
 
-    /// Stop every live Channel (§113, application exit). Includes spontaneously
-    /// faulted channels so their tasks and Display Views are cleaned up too.
-    /// Per-channel grace window for [`shutdown`](Self::shutdown): generous, since a
+    /// The grace period for [`shutdown`](Self::shutdown) (§113): generous, since a
     /// normal graceful stop drains the small bounded ingest queue and finalizes
-    /// files in milliseconds — this only guards against a pathologically stuck
-    /// finalize hanging process exit.
-    const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+    /// files in milliseconds — this only guards against a stuck finalize, such
+    /// as a write to a drive that stopped answering, holding up process exit.
+    pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
-    pub async fn shutdown(&mut self) {
+    /// Stop every live Channel (§113, application exit), each independently and
+    /// all at once, within [`SHUTDOWN_GRACE`](Self::SHUTDOWN_GRACE). Includes
+    /// spontaneously faulted channels so their tasks and Display Views are
+    /// cleaned up too.
+    ///
+    /// A blocked file operation cannot be cancelled, so a Channel whose stop has
+    /// not finished when the grace expires is abandoned: it is logged as
+    /// "finalization incomplete" (§118) and named in the outcome.
+    pub async fn shutdown(&mut self) -> ShutdownOutcome {
         let live: Vec<ChannelId> = self
             .channels
             .iter()
@@ -1076,29 +1082,58 @@ impl Listener {
             })
             .map(|(id, _)| *id)
             .collect();
-        for id in live {
-            // Graceful stop (§110) preserves the accepted backlog — it drains the
-            // bounded ingest queue into recordings before finalizing — so we prefer
-            // it over a forced abort, which would abandon up to `caps.ingest`
-            // buffered chunks. But it is *bounded*: should a recorder's finalize hang,
-            // the timeout abandons the *wait* so process exit can't deadlock.
-            //
-            // Crucially we time out only the drain, not the bookkeeping: `begin_stop`
-            // takes the handle out (cancelling the transport, so detached tasks wind
-            // down on their own), and `finish_stop` always runs afterward — so even a
-            // timed-out channel lands in Stopped, clears its handles, and emits
-            // ChannelStopped, rather than being abandoned mid-`Stopping`.
-            let Ok(handle) = self.begin_stop(id) else {
-                continue; // not stoppable (shouldn't happen — we filtered to live)
-            };
-            // On a timed-out drain there's no final snapshot (and the app is exiting, so
-            // no GUI to deliver it to anyway) — `Err` flattens to `None`.
-            let final_snapshot = tokio::time::timeout(Self::SHUTDOWN_GRACE, drain_handle(handle))
-                .await
-                .ok()
-                .flatten();
-            self.finish_stop(id, final_snapshot);
+        // Graceful stop (§110) preserves the accepted backlog — it drains the
+        // bounded ingest queue into recordings before finalizing — so we prefer
+        // it over a forced abort, which would abandon up to `caps.ingest`
+        // buffered chunks. But it is *bounded*: should a recorder's finalize
+        // hang, the timeout abandons the *wait* so process exit can't deadlock.
+        //
+        // Crucially we time out only the drain, not the bookkeeping: `begin_stop`
+        // takes the handle out (cancelling the transport, so detached tasks wind
+        // down on their own), and `finish_stop` always runs afterward — so even
+        // a timed-out channel lands in Stopped, clears its handles, and emits
+        // ChannelStopped, rather than being abandoned mid-`Stopping`.
+        let drains = live
+            .into_iter()
+            // Not stoppable shouldn't happen — we filtered to live.
+            .filter_map(|id| Some((id, drain_handle(self.begin_stop(id).ok()?))))
+            .collect();
+        let mut outcome = ShutdownOutcome::default();
+        for (id, drained) in drain_all(drains, Self::SHUTDOWN_GRACE).await {
+            // A timed-out drain has no final snapshot (and the app is exiting,
+            // so there is no GUI to deliver it to anyway).
+            let finished = drained.is_some();
+            self.finish_stop(id, drained.flatten());
+            if !finished {
+                outcome
+                    .incomplete
+                    .push(self.note_finalization_incomplete(id));
+            }
         }
+        outcome
+    }
+
+    /// Log that `id`'s stop did not finish within the grace period (§113,
+    /// §118), and return its name.
+    fn note_finalization_incomplete(&mut self, id: ChannelId) -> String {
+        let Some(channel) = self.channels.get(&id) else {
+            return id.to_string();
+        };
+        let name = channel.config.name.as_str().to_owned();
+        let limit = self
+            .channel_caps(&channel.config)
+            .error_retention
+            .unwrap_or(crate::retention::DEFAULT_BACKSTOP);
+        let diagnostic = crate::diagnostics::Diagnostic::error(format!(
+            "finalization incomplete on channel {name}: its stop did not finish within {} s, \
+             so the end of its recordings may be missing",
+            Self::SHUTDOWN_GRACE.as_secs()
+        ));
+        crate::diagnostics::emit_to_event_log(&name, id, &diagnostic);
+        if let Some(channel) = self.channels.get_mut(&id) {
+            channel.retain_diagnostic(diagnostic, limit);
+        }
+        name
     }
 
     /// Drive auto-reconnect (§9.1, §162). The application calls this periodically;
@@ -1407,15 +1442,54 @@ impl Listener {
     }
 }
 
-/// Phase 2 of [`Listener::stop`]: await the taken-out handle's graceful shutdown.
-/// Owns the handle (no `&mut Listener`), so a caller can wrap *this* in a timeout
-/// and, if it fires, still run `Listener::finish_stop` — the cleanup never depends
-/// on the drain completing.
-/// Drain a Channel's handle to a stop and return one **final snapshot** taken from the
-/// returned pipeline *after* it finalized (so its last diagnostics — "Channel stopped",
-/// "Raw recording stopped" — are included). Stashed by `finish_stop` so the GUI's next
-/// poll delivers it even though the 5 Hz poll never fired during the synchronous stop.
-/// `None` for a TCP listener or a start-time fault (no pipeline).
+/// What application exit could not finish (§113).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ShutdownOutcome {
+    /// The Channels, by name, whose stop did not finish within the grace
+    /// period: the end of their recordings may be missing.
+    pub incomplete: Vec<String>,
+}
+
+impl ShutdownOutcome {
+    /// Whether every Channel finished stopping.
+    pub fn is_complete(&self) -> bool {
+        self.incomplete.is_empty()
+    }
+}
+
+/// How long dropping an async runtime may wait for its tasks (§113). A file
+/// operation stuck in the blocking pool cannot be cancelled, so after
+/// [`Listener::shutdown`] the runtime is shut down with this limit rather than
+/// left to wait for it, which would keep the process alive.
+pub const RUNTIME_SHUTDOWN_LIMIT: Duration = Duration::from_secs(2);
+
+/// Drain every Channel at once, each bounded by `grace` (§113: each Channel
+/// shuts down independently). `None` marks a drain that did not finish in
+/// time; it is abandoned. A drain that panicked counts as finished, without a
+/// final snapshot.
+async fn drain_all<F>(
+    drains: Vec<(ChannelId, F)>,
+    grace: Duration,
+) -> Vec<(ChannelId, Option<Option<ChannelSnapshot>>)>
+where
+    F: std::future::Future<Output = Option<ChannelSnapshot>> + Send + 'static,
+{
+    let mut set = tokio::task::JoinSet::new();
+    let mut ids = HashMap::new();
+    for (id, drain) in drains {
+        let task = set.spawn(async move { tokio::time::timeout(grace, drain).await.ok() });
+        ids.insert(task.id(), id);
+    }
+    let mut drained = Vec::new();
+    while let Some(joined) = set.join_next_with_id().await {
+        match joined {
+            Ok((task, result)) => drained.push((ids[&task], result)),
+            Err(error) => drained.push((ids[&error.id()], Some(None))),
+        }
+    }
+    drained
+}
+
 /// The renderer a Channel's `.disp` records with (§54): its stored primary
 /// display view (kept current by `set_view_config`), or the default view.
 fn display_renderer(config: &ChannelConfig) -> DisplayView {
@@ -1427,6 +1501,13 @@ fn display_renderer(config: &ChannelConfig) -> DisplayView {
         .unwrap_or_default()
 }
 
+/// Phase 2 of [`Listener::stop`]: drain a Channel's handle to a stop and return
+/// one **final snapshot** taken from the returned pipeline *after* it finalized
+/// (so its last diagnostics — "Channel stopped", "Raw recording stopped" — are
+/// included). Owns the handle (no `&mut Listener`), so a caller can wrap *this*
+/// in a timeout and, if it fires, still run `Listener::finish_stop` — the
+/// cleanup never depends on the drain completing. `None` for a TCP listener or a
+/// start-time fault (no pipeline).
 async fn drain_handle(handle: Option<ChannelHandle>) -> Option<ChannelSnapshot> {
     match handle {
         Some(ChannelHandle::Data(tasks)) => {
@@ -1451,6 +1532,47 @@ mod tests {
     fn udp_channel() -> ChannelConfig {
         // Template binds 0.0.0.0:0 (ephemeral) — binds cleanly in tests.
         templates::udp_template()
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_every_channel_at_once_and_abandons_a_stuck_one() {
+        // §113: each Channel shuts down independently, and a drain that cannot
+        // finish is abandoned at the grace period instead of holding up exit.
+        type Drain =
+            std::pin::Pin<Box<dyn std::future::Future<Output = Option<ChannelSnapshot>> + Send>>;
+        let (stuck, quick) = (ChannelId::new(), ChannelId::new());
+        let drains: Vec<(ChannelId, Drain)> = vec![
+            (stuck, Box::pin(std::future::pending())),
+            (quick, Box::pin(async { None })),
+        ];
+        let started = std::time::Instant::now();
+        let mut finished: Vec<(ChannelId, bool)> = drain_all(drains, Duration::from_millis(200))
+            .await
+            .into_iter()
+            .map(|(id, drained)| (id, drained.is_some()))
+            .collect();
+        finished.sort_by_key(|(id, _)| *id != stuck);
+        assert_eq!(finished, vec![(stuck, false), (quick, true)]);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the grace bounds the whole shutdown, not each channel in turn"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_finalization_is_logged_naming_the_channel() {
+        let mut listener = Listener::with_default_capacities();
+        let mut config = udp_channel();
+        config.name = crate::core::ChannelName::new("GPS");
+        let id = listener.add_channel(config);
+        assert_eq!(listener.note_finalization_incomplete(id), "GPS");
+        let retained = &listener.channels[&id].retained_diagnostics;
+        assert!(
+            retained.iter().any(|d| d.message.starts_with(
+                "finalization incomplete on channel GPS: its stop did not finish within 3 s"
+            )),
+            "{retained:?}"
+        );
     }
 
     #[test]

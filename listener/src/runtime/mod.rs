@@ -34,7 +34,7 @@ pub mod telemetry;
 pub use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 pub use activity::{ActivityMeter, ChannelActivity};
 pub use build::BuildError;
-pub use listener::{Listener, OrchestratorError};
+pub use listener::{Listener, OrchestratorError, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT};
 pub use matchrule::{FiredRule, MatchRuleSet};
 pub use pipeline::{run_channel, ChannelPipeline, PipelineCapacities};
 pub use queue::DropOldestQueue;

@@ -707,6 +707,10 @@ pub fn spawn(repaint: impl Fn() + Send + 'static) -> anyhow::Result<BridgeHandle
                     .run()
                     .await;
             });
+            // The window waits on this thread to exit; a file operation stuck
+            // in the blocking pool must not keep it, or the process, alive
+            // (§113).
+            runtime.shutdown_timeout(crate::runtime::RUNTIME_SHUTDOWN_LIMIT);
         })?;
 
     Ok(BridgeHandle {

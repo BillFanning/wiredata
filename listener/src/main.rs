@@ -34,7 +34,7 @@
 
 use anyhow::Result;
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     // Keep this to a single call. CLI-vs-GUI dispatch lives in `listener::run`
     // so the GUI launcher (and any future entry point) share it, not this file.
     // (See the two-binary invariant above.)
