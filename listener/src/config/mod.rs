@@ -372,6 +372,16 @@ pub enum ChannelConfigError {
     Limit(LimitError),
 }
 
+/// A Channel's problems as one line for a person to read: each message, joined
+/// with "; ". The CLI and GUI print it when they skip a Channel (§71).
+pub fn describe_channel_errors(errors: &[ChannelConfigError]) -> String {
+    errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// A non-fatal configuration warning (§71): the channel runs, but this is likely
 /// not what the user intended. Currently empty — the v1 decoded-field-without-
 /// decoder warning went with the decoder (ADR-010).
@@ -925,6 +935,21 @@ mod tests {
         assert_eq!(
             ChannelConfigError::Limit(limits[2].clone()).to_string(),
             "reconnect multiplier 20 is outside 1.0–10"
+        );
+    }
+
+    #[test]
+    fn channel_errors_read_as_their_messages() {
+        let errors = vec![
+            ChannelConfigError::DuplicateChannelName,
+            ChannelConfigError::Limit(LimitError::BackoffMultiplier {
+                found: "20".to_owned(),
+            }),
+        ];
+        assert_eq!(
+            describe_channel_errors(&errors),
+            "channel name duplicates another channel's — names must be unique (§6, §71); \
+             reconnect multiplier 20 is outside 1.0–10"
         );
     }
 

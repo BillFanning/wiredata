@@ -17,8 +17,9 @@ use std::time::Duration;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::config::{
-    ChannelConfig, DataBits, DisplayConfig, DisplayRecordingConfig, FlowControl, InterfaceConfig,
-    Parity, Profile, RawRecordingConfig, ReconnectPolicy, RetentionConfig, StopBits,
+    describe_channel_errors, ChannelConfig, DataBits, DisplayConfig, DisplayRecordingConfig,
+    FlowControl, InterfaceConfig, Parity, Profile, RawRecordingConfig, ReconnectPolicy,
+    RetentionConfig, StopBits,
 };
 use crate::core::{ChannelId, ChannelName, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::runtime::{
@@ -217,13 +218,17 @@ pub(crate) fn resume_check(path: &std::path::Path) -> Result<Profile, String> {
     let invalid: Vec<String> = profile
         .validate()
         .into_iter()
-        .filter_map(|(name, result)| result.err().map(|errors| format!("\"{name}\": {errors:?}")))
+        .filter_map(|(name, result)| {
+            result
+                .err()
+                .map(|errors| format!("\"{name}\": {}", describe_channel_errors(&errors)))
+        })
         .collect();
     if !invalid.is_empty() {
         return Err(format!(
-            "{} has invalid channels: {}",
+            "{} has invalid channels:\n{}",
             path.display(),
-            invalid.join("; ")
+            invalid.join("\n")
         ));
     }
     for channel in &profile.channels {
@@ -908,7 +913,7 @@ impl Driver {
         let mut added = Vec::new();
         for (config, (name, result)) in profile.channels.into_iter().zip(results) {
             if let Err(errors) = result {
-                skipped.push(format!("\"{name}\": {errors:?}"));
+                skipped.push(format!("\"{name}\": {}", describe_channel_errors(&errors)));
                 continue;
             }
             let name = config.name.as_str().to_string();
@@ -921,9 +926,9 @@ impl Driver {
         }
         if !skipped.is_empty() {
             self.push(UiUpdate::ProfileError(format!(
-                "loaded with {} channel(s) skipped (invalid): {}",
+                "loaded with {} channel(s) skipped (invalid):\n{}",
                 skipped.len(),
-                skipped.join("; ")
+                skipped.join("\n")
             )));
         }
         self.push(UiUpdate::ProfileLoaded(profile.name));
@@ -1614,6 +1619,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&recordings);
     }
 
+    #[test]
+    fn a_profile_that_cannot_resume_says_why_in_words() {
+        let mut profile = Profile::new("Dupes");
+        for _ in 0..2 {
+            let mut config = udp_config(free_udp_port());
+            config.name = crate::core::ChannelName::new("Dup");
+            profile.channels.push(config);
+        }
+        let path = temp_profile_path();
+        profile.save(&path).unwrap();
+
+        let refused = resume_check(&path).unwrap_err();
+        let reasons: Vec<&str> = refused
+            .lines()
+            .filter(|line| line.starts_with("\"Dup\": "))
+            .collect();
+        assert_eq!(reasons.len(), 2, "one line per Channel: {refused}");
+        for reason in reasons {
+            assert!(reason.contains("names must be unique"), "{refused}");
+            assert!(!reason.contains("DuplicateChannelName"), "{refused}");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn resume_loads_the_profile_and_starts_its_channels() {
         async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
@@ -1746,6 +1776,17 @@ mod tests {
                 UiUpdate::ChannelAdded(_, name, _, _) => added.push(name),
                 UiUpdate::ProfileError(msg) => {
                     assert!(msg.contains("skipped"), "skip notice expected, got: {msg}");
+                    // Each skipped Channel on its own line, its reason in words
+                    // rather than Rust's debug form.
+                    let reasons: Vec<&str> = msg
+                        .lines()
+                        .filter(|line| line.starts_with("\"Dup\": "))
+                        .collect();
+                    assert_eq!(reasons.len(), 2, "{msg}");
+                    for reason in reasons {
+                        assert!(reason.contains("names must be unique"), "{msg}");
+                        assert!(!reason.contains("DuplicateChannelName"), "{msg}");
+                    }
                     saw_skip_error = true;
                 }
                 UiUpdate::ProfileLoaded(_) => break,

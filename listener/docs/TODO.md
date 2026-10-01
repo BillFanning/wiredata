@@ -40,9 +40,10 @@ again. Remove an item when it is done: the commit says what changed.
     multicast only;
   - the Name-field warning (`rename_problem`) for a name that can't be a file
     name;
-  - a Channel that is skipped on load because it exceeds a limit (ADR-048).
-    `register_profile` lists skipped Channels using their errors' Debug form, so
-    check whether that reads clearly.
+  - a Channel skipped on load, say for exceeding a limit (ADR-048):
+    `register_profile` lists each skipped Channel and its reasons on a line of
+    its own, under the Channel list. A profile that can't resume is listed the
+    same way, in the resume banner.
 
 ## Soak
 

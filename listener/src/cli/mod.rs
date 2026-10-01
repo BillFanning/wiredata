@@ -14,7 +14,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use crate::config::{templates, ChannelConfig, InterfaceConfig, Profile};
+use crate::config::{describe_channel_errors, templates, ChannelConfig, InterfaceConfig, Profile};
 use crate::core::{ChannelId, ChannelState, RuntimeEvent};
 use crate::diagnostics::EventLogStatus;
 use crate::runtime::{Listener, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT};
@@ -405,7 +405,10 @@ fn build_channel_configs(cli: &Cli) -> Result<Vec<ChannelConfig>> {
         for (config, (name, result)) in profile.channels.iter().zip(profile.validate()) {
             match result {
                 Ok(()) => valid.push(config.clone()),
-                Err(errors) => eprintln!("skipping invalid channel \"{name}\": {errors:?}"),
+                Err(errors) => eprintln!(
+                    "skipping invalid channel \"{name}\": {}",
+                    describe_channel_errors(&errors)
+                ),
             }
         }
         return Ok(valid);
