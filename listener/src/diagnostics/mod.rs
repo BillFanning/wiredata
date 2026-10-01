@@ -35,6 +35,12 @@ pub enum DiagnosticSeverity {
 pub struct Diagnostic {
     pub severity: DiagnosticSeverity,
     pub message: String,
+    /// Wall-clock time only. On a coarse clock (Windows, about 15 ms) two
+    /// entries can share a timestamp, and the newest is then chosen by
+    /// severity rather than by order of recording. Lifecycle and recording
+    /// entries are separated by I/O far longer than a tick, so this has not
+    /// been seen; if it ever matters, add a per-Channel sequence number and
+    /// order by that.
     pub timestamp: SystemTime,
 }
 

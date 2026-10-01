@@ -1,14 +1,15 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.23
+**Version:** 1.24
 **Date:** 2026-10-01
 **Status:** Accepted
 
-Revision note (2026-10-01) — a TCP peer that has closed:
+Revision note (2026-10-01) — measured costs recorded:
 
-- **ADR-059 (amended)** — a reply drain that finds the peer has closed the
-  connection fails that send with nothing written, and the client reconnects at
-  the next retry point.
+- **ADR-063** records the send-path and GUI optimizations that were measured
+  and not built, with the thresholds that would change that. They were kept in
+  TODO.md until now.
+- **ADR-049** no longer points at a TODO section that has been closed.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -1861,8 +1862,8 @@ because the failure it fixes is invisible to anyone who does not share the
 deficiency — a future contributor "correcting" the colour would be undoing a fix
 they cannot see.
 
-Two known defects are recorded rather than fixed here (`talker/docs/TODO.md`,
-"Colour accessibility"): serial control lines distinguish asserted from low by
+Two known defects were recorded rather than fixed here, in talker's TODO:
+serial control lines distinguish asserted from low by
 colour alone, which is a functional failure in a readout whose only job is
 telling those apart; and `running` against `warning` is unchecked. `line_high`
 carries a doc comment naming its own defect.
@@ -2581,6 +2582,55 @@ schema 3 (ADR-057).
 
 **Consequences:** A profile either means what it says or does not load, with a
 message that points at the line to fix.
+
+---
+
+## ADR-063 — Measured send-path costs that stay as they are
+
+**Status:** Accepted 2026-10-01. Records investigations from the external reviews
+of 2026-07-11 to 2026-08-01, which were kept in TODO.md until now.
+
+**Context:** Reviews proposed optimizations to the send path and the GUI. Each was
+measured with talker's criterion benches before anything was built, against one
+rule: act only above about 1% of a core at 100 Hz to 1 kHz. Absolute numbers swing
+about threefold with load on the machine, so only comparisons within one run count.
+
+**Decision:** None of these is built.
+
+- **Scheduler polling** is linear at about 1.7 ns a message: 19 ns with 8
+  messages, 874 ns with 512. 512 messages at 1 kHz take 0.09% of a core, so the
+  schedule needs no heap.
+- **The per-send payload clone** is a memcpy: a due send costs 130 ns at 64 bytes
+  and 136 ns at 1 KiB. No reusable send buffer.
+- **The shortest-interval scan** behind `active_cadence` costs 761 ns at 512
+  messages and about 25 ns at realistic counts, 0.08% of a core at 1 kHz. No cache.
+- **A timestamp and a CRC** cost about 2.1 µs a send against about 126 ns for a
+  static 64-byte payload: 17 times as much, mostly three chrono formatting
+  temporaries, yet 0.2% of a core at 1 kHz. A preformatted timestamp buffer is
+  worth building only near 5 kHz of rendered sends.
+- **Live NMEA** costs about 2.21 µs a send against about 140 ns static, 0.22% of a
+  core at 1 kHz. Rendering from borrowed fields is worth building only near
+  4.5 to 5 kHz of live-NMEA sends.
+- **The Output pane** stays one memoized selectable label. Virtualizing it, as
+  listener's stream view is, measured no frame-time gain at the 200-message cap
+  (about 0.7 ms steady and 1.25 ms at peak for the whole UI) and broke selection:
+  soft wraps became separate labels, so copied text gained newlines. Listener
+  keeps virtualization; its window is about 1 MB and it owns logical offsets.
+
+**Boundary:**
+
+- Missed-send blame (ADR-051) charges a point to the message inside `send` when
+  it passed, so time spent rendering is charged to nobody. That holds while
+  rendering takes 1 to 3 µs, below the histogram's first bucket. If a payload
+  format ever makes rendering expensive, widen the recorded window to include it.
+- Rounded figures carry no "approximately": the maxima are exact, and a
+  qualifier on every figure would bury the readout. Revisit only if a rounded
+  figure is shown next to a threshold read off it.
+
+**Alternatives considered:** Each optimization above, rejected on its measurement.
+
+**Consequences:** None of these is built until a new same-run measurement crosses
+its threshold.
 
 ---
 

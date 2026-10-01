@@ -2069,6 +2069,41 @@ in flight, within the stop grace, before stopping what is live.
 **Consequences:** The status keeps updating while any Channel starts or stops,
 and a slow Channel delays only its own commands.
 
+## ADR-053 — Three hot paths stay as they are, on measurement
+
+**Status:** Accepted 2026-10-01. Records investigations from the external reviews
+of 2026-07-11 and 2026-07-12, which were kept in TODO.md until now.
+
+**Context:** Reviews suggested three optimizations. Each was measured with the
+criterion benches in `listener/benches` before anything was built. Absolute
+numbers swing about threefold with load on the machine, so only comparisons
+within one run count.
+
+**Decision:** None of the three is built.
+
+- **Scrollback eviction.** A 64-byte chunk cost 460 ns below the scrollback
+  cap and 436 ns at it, with overlapping confidence intervals, in the same run.
+  Eviction is free. (A first measurement compared the capped state with itself;
+  the second review caught that, and this is the corrected one.)
+- **Match scanning.** Scanning is linear: about 195 ns per rule per chunk, from
+  400 ns with one rule to 6.4 µs with 32, on 64-byte chunks. 32 rules at 1,000
+  chunks a second take 0.6% of a core. Firing adds the same order again: about
+  85 ns a firing with one rule, 40 ns amortized with eight, and a `Notify`
+  about 330 ns for its diagnostic. A multi-pattern scanner such as Aho–Corasick
+  is worth building only past about 50 rules or 2,000 chunks a second sustained.
+- **The selected Channel's diagnostics.** At the retained cap, a snapshot costs
+  about 82 µs and the GUI's clone and sort of the list about 18 µs. At the 5 Hz
+  poll that is about 0.05% of a core, twenty times under the 1% at which the
+  reviews proposed acting. Sequence numbers or deltas are not justified.
+
+**Boundary:** The thresholds are measurements, not limits. The ADR-048 cap of 64
+rules sits just past the scanning threshold, and the ADR-048 headroom target
+is 1,000 chunks a second: 64 rules then cost about 1.3% of a core. Measure again,
+same run against the current code, before building any of these.
+
+**Consequences:** No multi-pattern scanner, no eviction rework and no
+diagnostics deltas, until a new measurement crosses its threshold.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

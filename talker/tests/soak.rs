@@ -1,6 +1,5 @@
-//! Long-running soak scenarios (TODO "Soak tests" — the benchmark harness's
-//! second half): sustained multi-channel sending over real sockets and a
-//! failed-send storm, at durations criterion can't express.
+//! Long-running soak scenarios: sustained multi-channel sending over real
+//! sockets and a failed-send storm, at durations criterion can't express.
 //!
 //! All tests are `#[ignore]`d — they are for manual / nightly invocation, not
 //! the per-push CI gate:

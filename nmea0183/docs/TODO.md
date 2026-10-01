@@ -1,10 +1,10 @@
 # TODO — nmea0183
 
-Implementation reminders specific to the `nmea0183` library crate. Workspace- and
-`talker`-level tasks live in [`talker/docs/TODO.md`](../../talker/docs/TODO.md).
-Not architectural decisions (those go in the ADR's Open questions section).
+Work the `nmea0183` library does not do yet. Decisions go in [ADR.md](ADR.md);
+workspace- and `talker`-level tasks live in
+[`talker/docs/TODO.md`](../../talker/docs/TODO.md).
 
-Cross off items as they are completed. Add new ones inline as they come up.
+Remove an item when it is done: the commit says what changed.
 
 ---
 
@@ -18,19 +18,12 @@ Cross off items as they are completed. Add new ones inline as they come up.
   - `categories = ["parser-implementations", "encoding"]` (must match crates.io category slugs)
 - [ ] Write `nmea0183/README.md`.
 - [ ] Resolve OQ-4 (library MSRV policy) in a new ADR.
-- [ ] Update `talker/Cargo.toml`: `nmea0183 = { path = "../nmea0183", version = "0.1" }` (per OQ-1), so downstream builds against the published crate resolve while in-workspace builds use the local source.
-- [ ] Flesh out `nmea0183_specification.md` — it is still a **placeholder** that defers
-      behavior to rustdoc/tests/ADRs. AGENTS §1 ranks a crate's spec **above** its ADR,
-      so an empty spec weakens that precedence for this crate. Either write the spec
-      (sentence set, checksum, talker-id, armoring rules) or amend AGENTS §1 to note
-      nmea0183's behavior is rustdoc/test-defined by design.
-
-`#[non_exhaustive]` on `NmeaError` and the public enums (per ADR-004 / ADR-009) is already done.
-
----
-
-## Completed during the spec v2.0 upgrade
-
-Kept here so the history is not lost.
-
-- **`nmea0183` source** — serde derives on all public types are gated behind the `serde` feature, and verified to compile both with and without it (`cargo build -p nmea0183` / `--features serde`).
+- [ ] Update `talker/Cargo.toml`: `nmea0183 = { path = "../nmea0183", version = "0.1" }`
+  (per OQ-1), so downstream builds against the published crate resolve while
+  in-workspace builds use the local source.
+- [ ] Flesh out `nmea0183_specification.md`. It is still a **placeholder** that
+  defers behaviour to rustdoc, tests and ADRs. AGENTS §1 ranks a crate's spec
+  **above** its ADR, so an empty spec weakens that precedence for this crate.
+  Either write the spec (sentence set, checksum, talker IDs, armoring rules) or
+  amend AGENTS §1 to say nmea0183's behaviour is defined by rustdoc and tests by
+  design.

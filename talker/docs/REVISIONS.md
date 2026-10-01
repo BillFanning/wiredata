@@ -424,6 +424,12 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 
 ## Architecture Decision Record
 
+Revision note (2026-10-01) — a TCP peer that has closed:
+
+- **ADR-059 (amended)** — a reply drain that finds the peer has closed the
+  connection fails that send with nothing written, and the client reconnects at
+  the next retry point.
+
 Revision note (2026-09-30) — decisions for unattended operation:
 
 - **ADR-059** gives the TCP client reconnect at retry points, counts a write that

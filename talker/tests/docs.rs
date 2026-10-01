@@ -21,11 +21,6 @@ use std::path::{Path, PathBuf};
 /// absent. Checked for still being needed, below.
 const REMOVED_ON_PURPOSE: &[(&str, &str)] = &[
     (
-        "min_active_interval",
-        "talker TODO names the old symbol beside the one that replaced it \
-         (`active_cadence`); the sentence is about the rename",
-    ),
-    (
         "build_raw_recorder",
         "listener ADR-013 records what the Raw/Display split changed at the time; \
          both taps now begin in the pipeline (ADR-043)",

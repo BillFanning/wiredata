@@ -1,4 +1,5 @@
-//! Long-running soak scenario (talker TODO "Soak tests", listener half):
+//! Long-running soak scenario, in process (listener ADR-051 has the harness
+//! for runs across processes):
 //! sustained reception with Raw recording to a real file, at durations the
 //! unit tests can't express. `#[ignore]`d — manual / nightly, not the
 //! per-push CI gate:

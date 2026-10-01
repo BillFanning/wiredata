@@ -943,6 +943,9 @@ impl Driver {
     async fn poll_snapshots(&mut self) {
         for id in self.channels.clone() {
             if Some(id) == self.selected {
+                // Two requests to the pipeline per poll, the snapshot and the
+                // stream delta, where one would do. Not worth changing on its
+                // own: fold them together when `PipelineRequest` next changes.
                 if let Some(snap) = self.listener.snapshot(id).await {
                     self.push(UiUpdate::Snapshot(id, Box::new(snap)));
                 }

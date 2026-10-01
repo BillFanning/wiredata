@@ -1,5 +1,5 @@
-//! Pipeline hot-path benchmarks (workspace benchmark harness — talker TODO,
-//! external review 2026-07-11). The scenarios from the filed list:
+//! Pipeline hot-path benchmarks, from the external review of 2026-07-11; what
+//! they measured and decided is listener ADR-053. The scenarios:
 //!
 //! - per-chunk ingest cost at the typical 64-byte serial read size (the floor:
 //!   activity meter + scrollback append, no rules, no recorders);
