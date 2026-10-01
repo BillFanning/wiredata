@@ -6,9 +6,11 @@
 //! validated config to live transports is the runtime's job (§128),
 //! not config's.
 
+pub mod limits;
 pub mod schema;
 pub mod templates;
 
+pub use limits::LimitError;
 pub use schema::*;
 
 use std::path::Path;
@@ -234,6 +236,22 @@ pub fn validate_channel(
         errors.push(ChannelConfigError::UnboundedRetention);
     }
 
+    // Limits (ADR-048, §71): the runtime refuses the same values at Start.
+    let limits = effective
+        .limit_errors()
+        .into_iter()
+        .chain(limits::match_rule_errors(&channel.match_rules))
+        .chain(channel.reconnect.limit_errors())
+        .chain(limits::size_cap_error(
+            "raw",
+            channel.raw_recording.size_cap,
+        ))
+        .chain(limits::size_cap_error(
+            "display",
+            channel.display_recording.size_cap,
+        ));
+    errors.extend(limits.map(ChannelConfigError::Limit));
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -346,6 +364,9 @@ pub enum ChannelConfigError {
     EmptyMatchPattern,
     #[error("invalid NMEA ZDA Mark talker ID: {0}")]
     InvalidZdaTalkerId(crate::core::ZdaTalkerIdError),
+    /// A setting outside its limit (ADR-048, §71).
+    #[error(transparent)]
+    Limit(LimitError),
 }
 
 /// A non-fatal configuration warning (§71): the channel runs, but this is likely
@@ -821,6 +842,53 @@ mod tests {
             );
             assert!(err.contains(" at line "), "{kind}: no line in {err}");
         }
+    }
+
+    /// ADR-048, §71: a profile holding a value past a limit names it.
+    #[test]
+    fn a_setting_past_its_limit_is_rejected_with_the_limit() {
+        let mut channel = templates::udp_template();
+        channel.retention.byte_limit = Some(limits::MAX_SCROLLBACK_BYTES + 1);
+        channel.reconnect.multiplier = 20.0;
+        channel.raw_recording.size_cap = Some(1024);
+        channel.match_rules = vec![MatchRule {
+            name: "long".to_owned(),
+            condition: MatchCondition::BytePattern {
+                pattern: vec![b'x'; limits::MAX_MATCH_PATTERN_BYTES + 1],
+            },
+            actions: Vec::new(),
+            enabled: true,
+        }];
+        let errors = validate_channel(&channel, &DefaultConfig::default()).unwrap_err();
+        let limits: Vec<&LimitError> = errors
+            .iter()
+            .filter_map(|error| match error {
+                ChannelConfigError::Limit(limit) => Some(limit),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(limits[0], LimitError::Scrollback { .. }),
+            "{errors:?}"
+        );
+        assert!(
+            matches!(limits[1], LimitError::MatchPattern { .. }),
+            "{errors:?}"
+        );
+        assert!(
+            matches!(limits[2], LimitError::BackoffMultiplier { .. }),
+            "{errors:?}"
+        );
+        assert!(
+            matches!(limits[3], LimitError::SizeCap { .. }),
+            "{errors:?}"
+        );
+        assert_eq!(limits.len(), 4, "{errors:?}");
+        // The message is the limit's own: it says what to change.
+        assert_eq!(
+            ChannelConfigError::Limit(limits[2].clone()).to_string(),
+            "reconnect multiplier 20 is outside 1.0–10"
+        );
     }
 
     #[test]

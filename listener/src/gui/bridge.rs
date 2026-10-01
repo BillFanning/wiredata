@@ -547,7 +547,9 @@ impl Driver {
                 self.listener.set_display_recording_config(id, *display);
             }
             UiCommand::SetReconnect(id, policy) => {
-                self.listener.set_reconnect_policy(id, policy);
+                if let Err(err) = self.listener.set_reconnect_policy(id, policy) {
+                    self.push_channel_error(id, err);
+                }
             }
             UiCommand::SetViewConfig(id, display, retention) => {
                 // View settings render GUI-side and the scroll buffer is capped GUI-side

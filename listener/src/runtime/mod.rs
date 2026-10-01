@@ -36,7 +36,7 @@ pub use activity::{ActivityMeter, ChannelActivity};
 pub use build::BuildError;
 pub use listener::{Listener, OrchestratorError, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT};
 pub use matchrule::{FiredRule, MatchRuleSet};
-pub use pipeline::{run_channel, ChannelPipeline, PipelineCapacities};
+pub use pipeline::{run_channel, CapacityRequest, ChannelPipeline, PipelineCapacities};
 pub use queue::DropOldestQueue;
 pub use run_summary::{ListenerRunSummary, RunEndReason, RunId};
 pub use snapshot::{

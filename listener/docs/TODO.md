@@ -19,8 +19,6 @@ The spec states these; the code does not do them yet.
 
 - [ ] **UDP receive buffer (§75).** `recv_buffer_bytes` has no 4 MiB default,
   and the granted size is not reported.
-- [ ] **Profile and runtime limits (ADR-048, §71).** There are no upper limits,
-  and `PipelineCapacities` is not validated.
 
 ## v1 → v2 strip (ADR-010) — DONE
 

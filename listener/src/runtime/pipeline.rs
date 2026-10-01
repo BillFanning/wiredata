@@ -32,9 +32,12 @@ use super::telemetry::{
     ChunkShape, CounterAvailability, DurationHistogram, IdleDeadlineTimerMode,
     IdleDeadlineTimerSummary, RecentDurationHistogram, SerialStallSummary, TransportHealth,
 };
+use crate::config::limits::{
+    capacity_error, MAX_INGEST_CHUNKS, MAX_RECORDING_QUEUE_BYTES, MAX_UI_EVENTS,
+};
 use crate::config::{
-    DiskGuard, DiskThreshold, LowDiskAction, MarkPosition, MarkTimestampStyle, MatchAction,
-    MatchRule, RecordControl, RecordTarget,
+    DiskGuard, DiskThreshold, LimitError, LowDiskAction, MarkPosition, MarkTimestampStyle,
+    MatchAction, MatchRule, RecordControl, RecordTarget, RetentionConfig,
 };
 
 use crate::core::{
@@ -96,9 +99,17 @@ fn render_annotations_for_chunk(
         .collect()
 }
 
-/// Bounded capacities for a Channel's fan-out edges (§99, §124).
-#[derive(Clone, Copy, Debug)]
-pub struct PipelineCapacities {
+/// Bounded capacities for a Channel's fan-out edges (§99, §124), within the
+/// limits (ADR-048). Built only by [`PipelineCapacities::new`] or `Default`, so
+/// a pipeline never runs with a zero-sized queue or past its stated worst
+/// case. Reads go through to the checked [`CapacityRequest`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PipelineCapacities(CapacityRequest);
+
+/// Pipeline capacities as requested, before [`PipelineCapacities::new`] checks
+/// them against the limits (ADR-048).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapacityRequest {
     /// The bounded Transport→Pipeline queue — the only edge that may stall the
     /// reader (§97.1, §99).
     pub ingest: usize,
@@ -108,13 +119,12 @@ pub struct PipelineCapacities {
     /// Each recording's queue to its recorder, in bytes (ADR-043).
     pub recording_queue_budget: usize,
     /// Per-type retained-diagnostic limits (§88): events, warnings, errors.
-    /// `None` falls back to the retention backstop (~1 M entries) — the defaults
-    /// below set real limits instead, because a recurring diagnostic (a flapping
-    /// warning, a per-occurrence `Notify` rule) would otherwise grow the log —
-    /// and the full-log snapshot clone (§137, 5 Hz) — for weeks (§124).
-    pub event_retention: Option<usize>,
-    pub warning_retention: Option<usize>,
-    pub error_retention: Option<usize>,
+    /// Always set, because a recurring diagnostic (a flapping warning, a
+    /// per-occurrence `Notify` rule) would otherwise grow the log — and the
+    /// full-log snapshot clone (§137, 5 Hz) — for weeks (§124).
+    pub event_retention: usize,
+    pub warning_retention: usize,
+    pub error_retention: usize,
     /// Runtime→UI event stream ([`RuntimeEvent`], §137).
     pub events: usize,
 }
@@ -123,17 +133,71 @@ pub struct PipelineCapacities {
 /// review, small enough that the 5 Hz full-log snapshot clone stays cheap.
 const DIAGNOSTIC_RETENTION: usize = 500;
 
-impl Default for PipelineCapacities {
+impl Default for CapacityRequest {
     fn default() -> Self {
         Self {
             ingest: 256,
             stream_display: 128 * 1024,
             recording_queue_budget: DEFAULT_QUEUE_BUDGET,
-            event_retention: Some(DIAGNOSTIC_RETENTION),
-            warning_retention: Some(DIAGNOSTIC_RETENTION),
-            error_retention: Some(DIAGNOSTIC_RETENTION),
+            event_retention: DIAGNOSTIC_RETENTION,
+            warning_retention: DIAGNOSTIC_RETENTION,
+            error_retention: DIAGNOSTIC_RETENTION,
             events: 256,
         }
+    }
+}
+
+impl std::ops::Deref for PipelineCapacities {
+    type Target = CapacityRequest;
+
+    fn deref(&self) -> &CapacityRequest {
+        &self.0
+    }
+}
+
+impl PipelineCapacities {
+    /// Check `request` against the limits (ADR-048): every queue holds
+    /// something and stays within its bound, and scrollback and diagnostics
+    /// stay within the profile limits (§71). The first value out of bounds is
+    /// the error.
+    pub fn new(request: CapacityRequest) -> Result<Self, LimitError> {
+        let retention = RetentionConfig {
+            byte_limit: Some(request.stream_display),
+            event_limit: Some(request.event_retention),
+            warning_limit: Some(request.warning_retention),
+            error_limit: Some(request.error_retention),
+        };
+        let first = retention
+            .limit_errors()
+            .into_iter()
+            .chain(capacity_error(
+                "receive queue",
+                request.ingest,
+                MAX_INGEST_CHUNKS,
+            ))
+            .chain(capacity_error(
+                "recording queue",
+                request.recording_queue_budget,
+                MAX_RECORDING_QUEUE_BYTES,
+            ))
+            .chain(capacity_error("event queue", request.events, MAX_UI_EVENTS))
+            .next();
+        match first {
+            Some(error) => Err(error),
+            None => Ok(Self(request)),
+        }
+    }
+
+    /// These capacities with a Channel's own retention in place of the
+    /// defaults (§80), checked again.
+    pub fn with_retention(self, retention: &RetentionConfig) -> Result<Self, LimitError> {
+        Self::new(CapacityRequest {
+            stream_display: retention.byte_limit.unwrap_or(self.stream_display),
+            event_retention: retention.event_limit.unwrap_or(self.event_retention),
+            warning_retention: retention.warning_limit.unwrap_or(self.warning_retention),
+            error_retention: retention.error_limit.unwrap_or(self.error_retention),
+            ..self.0
+        })
     }
 }
 
@@ -400,9 +464,9 @@ impl ChannelPipeline {
             stream_generation: NEXT_STREAM_GENERATION.fetch_add(1, Ordering::Relaxed),
             display_views: vec![PipelineDisplayView::new()],
             diagnostics: DiagnosticLog::new(
-                caps.event_retention,
-                caps.warning_retention,
-                caps.error_retention,
+                Some(caps.event_retention),
+                Some(caps.warning_retention),
+                Some(caps.error_retention),
             )
             .for_channel(channel_id.to_string(), channel_id),
             diagnostics_cache: None,
@@ -2409,10 +2473,11 @@ mod tests {
     fn stream_tail_is_verbatim_across_chunks_and_byte_capped() {
         let cid = ChannelId::new();
         // Small cap so trimming is observable.
-        let caps = PipelineCapacities {
+        let caps = PipelineCapacities::new(CapacityRequest {
             stream_display: 8,
-            ..PipelineCapacities::default()
-        };
+            ..CapacityRequest::default()
+        })
+        .unwrap();
         let mut p = pipeline(cid, caps);
         // Reconstructs the wire across read-chunk boundaries.
         p.ingest(bytes_chunk(cid, b"$ABC"));
@@ -2454,10 +2519,11 @@ mod tests {
     #[test]
     fn stream_delta_resets_when_the_cursor_was_evicted() {
         let cid = ChannelId::new();
-        let caps = PipelineCapacities {
+        let caps = PipelineCapacities::new(CapacityRequest {
             stream_display: 4,
-            ..PipelineCapacities::default()
-        };
+            ..CapacityRequest::default()
+        })
+        .unwrap();
         let mut p = pipeline(cid, caps);
         p.ingest(bytes_chunk(cid, b"AB")); // offsets 0..2
         let d0 = p.stream_delta(0); // cursor now 2
@@ -2541,10 +2607,11 @@ mod tests {
         // The retained count is unchanged when a push evicts the oldest entry, so
         // the revision — not the length — is what the cache keys on.
         let cid = ChannelId::new();
-        let caps = PipelineCapacities {
-            warning_retention: Some(1),
-            ..PipelineCapacities::default()
-        };
+        let caps = PipelineCapacities::new(CapacityRequest {
+            warning_retention: 1,
+            ..CapacityRequest::default()
+        })
+        .unwrap();
         let mut p = pipeline(cid, caps);
         p.diagnostics.record(Diagnostic::warning("oldest"));
         let before = p.snapshot().diagnostics;
@@ -2561,10 +2628,11 @@ mod tests {
     fn diagnostic_warning_retention_limit_is_applied() {
         // §88: the per-type diagnostic limit bounds retained warnings.
         let cid = ChannelId::new();
-        let caps = PipelineCapacities {
-            warning_retention: Some(2),
-            ..PipelineCapacities::default()
-        };
+        let caps = PipelineCapacities::new(CapacityRequest {
+            warning_retention: 2,
+            ..CapacityRequest::default()
+        })
+        .unwrap();
         let mut p = pipeline(cid, caps);
         // Four warnings recorded, capped at two retained.
         for i in 0..4 {

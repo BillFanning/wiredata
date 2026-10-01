@@ -152,6 +152,8 @@ struct SerialControl {
 /// Resources assembled while opening a stream transport and consumed together
 /// when its monitored pipeline is spawned.
 struct DataSpawnContext {
+    /// The Channel's capacities, already checked against the limits (ADR-048).
+    caps: PipelineCapacities,
     faulted: Arc<AtomicBool>,
     serial_stall_state: Option<SerialStallState>,
     notices: (
@@ -378,6 +380,9 @@ pub enum OrchestratorError {
     Bind(#[source] std::io::Error),
     #[error("serial control is not available (not a running serial channel)")]
     SerialControlUnavailable(ChannelId),
+    /// A setting outside its limit (ADR-048): the Channel is not built.
+    #[error(transparent)]
+    Limit(#[from] crate::config::LimitError),
 }
 
 /// The runtime orchestrator (§97.1). Owns channels; drives their lifecycle.
@@ -458,13 +463,22 @@ impl Listener {
     /// ADR-045): only [`reconnect_tick`](Self::reconnect_tick) reads it.
     /// Turning it off ends a retry in progress, so the Channel reads Faulted
     /// rather than Reconnecting. Unknown id is ignored.
-    pub fn set_reconnect_policy(&mut self, id: ChannelId, policy: crate::config::ReconnectPolicy) {
+    /// A policy outside its limits (ADR-048) is refused and the old one kept.
+    pub fn set_reconnect_policy(
+        &mut self,
+        id: ChannelId,
+        policy: crate::config::ReconnectPolicy,
+    ) -> Result<(), OrchestratorError> {
+        if let Some(error) = policy.limit_errors().into_iter().next() {
+            return Err(error.into());
+        }
         if let Some(channel) = self.channels.get_mut(&id) {
             if !policy.enabled {
                 channel.reconnect_state = None;
             }
             channel.config.reconnect = policy;
         }
+        Ok(())
     }
 
     /// Whether `id`'s reconnect retries ran out (§9.1).
@@ -838,10 +852,7 @@ impl Listener {
                 // diagnostics list and survives the next restart like the INFO entries.
                 // Named for the channel, matching how the GUI labels it. Bounded by the
                 // same error limit a running pipeline applies.
-                let limit = self
-                    .channel_caps(&config)
-                    .error_retention
-                    .unwrap_or(crate::retention::DEFAULT_BACKSTOP);
+                let limit = self.error_retention(&config);
                 if let Some(channel) = self.channels.get_mut(&id) {
                     let name = channel.config.name.as_str().to_owned();
                     let diagnostic =
@@ -1175,10 +1186,7 @@ impl Listener {
             return id.to_string();
         };
         let name = channel.config.name.as_str().to_owned();
-        let limit = self
-            .channel_caps(&channel.config)
-            .error_retention
-            .unwrap_or(crate::retention::DEFAULT_BACKSTOP);
+        let limit = self.error_retention(&channel.config);
         let diagnostic = crate::diagnostics::Diagnostic::error(format!(
             "finalization incomplete on channel {name}: its stop did not finish within {} s, \
              so the end of its recordings may be missing",
@@ -1288,14 +1296,31 @@ impl Listener {
     /// (§80, §88) on top of the base capacities. A channel that sets no explicit
     /// diagnostic limit gets the base default (bounded), not the raw backstop —
     /// so an unconfigured channel can't grow its log unbounded for weeks (§124).
-    fn channel_caps(&self, config: &ChannelConfig) -> PipelineCapacities {
-        let retention = &config.retention;
-        PipelineCapacities {
-            stream_display: retention.byte_limit.unwrap_or(self.caps.stream_display),
-            event_retention: retention.event_limit.or(self.caps.event_retention),
-            warning_retention: retention.warning_limit.or(self.caps.warning_retention),
-            error_retention: retention.error_limit.or(self.caps.error_retention),
-            ..self.caps
+    fn channel_caps(
+        &self,
+        config: &ChannelConfig,
+    ) -> Result<PipelineCapacities, OrchestratorError> {
+        Ok(self.caps.with_retention(&config.retention)?)
+    }
+
+    /// The error-diagnostic limit for a Channel's retained start faults: its
+    /// own, or the runtime's when its own is outside the limits.
+    fn error_retention(&self, config: &ChannelConfig) -> usize {
+        self.channel_caps(config)
+            .map_or(self.caps.error_retention, |caps| caps.error_retention)
+    }
+
+    /// Refuse to build a Channel whose settings break a limit the runtime
+    /// cannot otherwise hold to (ADR-048, §71): match rules and the reconnect
+    /// policy. Capacities are checked as they are made.
+    fn check_limits(config: &ChannelConfig) -> Result<(), OrchestratorError> {
+        let first = crate::config::limits::match_rule_errors(&config.match_rules)
+            .into_iter()
+            .chain(config.reconnect.limit_errors())
+            .next();
+        match first {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
         }
     }
 
@@ -1307,6 +1332,8 @@ impl Listener {
         config: &ChannelConfig,
         faulted: Arc<AtomicBool>,
     ) -> Result<(ChannelHandle, Option<SerialControl>), OrchestratorError> {
+        Self::check_limits(config)?;
+        let caps = self.channel_caps(config)?;
         match &config.interface {
             InterfaceConfig::Serial(serial) => {
                 // Serial is the one transport whose reader can stall (§97.1); give
@@ -1334,6 +1361,7 @@ impl Listener {
                     opened,
                     config,
                     DataSpawnContext {
+                        caps,
                         faulted,
                         serial_stall_state: Some(serial_stall_state),
                         notices: (notice_tx, notice_rx),
@@ -1362,6 +1390,7 @@ impl Listener {
                     bound,
                     config,
                     DataSpawnContext {
+                        caps,
                         faulted,
                         serial_stall_state: None,
                         notices: (notice_tx, notice_rx),
@@ -1382,7 +1411,7 @@ impl Listener {
                 let handle = start_tcp_listener(
                     bound.channel_id(),
                     bound,
-                    self.channel_caps(config),
+                    caps,
                     tcp.max_connections,
                     faulted,
                     self.events_tx.clone(),
@@ -1400,6 +1429,7 @@ impl Listener {
         context: DataSpawnContext,
     ) -> MonitoredChannel {
         let DataSpawnContext {
+            caps,
             faulted,
             serial_stall_state,
             notices,
@@ -1438,7 +1468,7 @@ impl Listener {
                 prior_diagnostics: self.prior_diagnostics(id),
                 channel_name: Some(config.name.as_str().to_owned()),
             },
-            self.channel_caps(config),
+            caps,
             self.events_tx.clone(),
             faulted,
             serial_stall_state,
@@ -1583,6 +1613,7 @@ mod tests {
     use super::*;
     use crate::config::{schema::InterfaceConfig, templates};
     use crate::record::FileRotationPolicy;
+    use crate::runtime::CapacityRequest;
 
     fn udp_channel() -> ChannelConfig {
         // Template binds 0.0.0.0:0 (ephemeral) — binds cleanly in tests.
@@ -1693,14 +1724,87 @@ mod tests {
         // (the template default) still gets bounded diagnostic retention — the
         // base-caps default, not the ~1 M backstop. An explicit limit wins.
         let listener = Listener::with_default_capacities();
-        let caps = listener.channel_caps(&udp_channel());
-        assert!(caps.event_retention.is_some());
-        assert!(caps.warning_retention.is_some());
-        assert!(caps.error_retention.is_some());
+        let caps = listener.channel_caps(&udp_channel()).unwrap();
+        let defaults = PipelineCapacities::default();
+        assert_eq!(caps.event_retention, defaults.event_retention);
+        assert_eq!(caps.warning_retention, defaults.warning_retention);
+        assert_eq!(caps.error_retention, defaults.error_retention);
 
         let mut config = udp_channel();
         config.retention.warning_limit = Some(7);
-        assert_eq!(listener.channel_caps(&config).warning_retention, Some(7));
+        assert_eq!(listener.channel_caps(&config).unwrap().warning_retention, 7);
+    }
+
+    /// ADR-048: the runtime refuses what validation refuses, so a Channel
+    /// built without a profile cannot run past a limit either.
+    #[tokio::test]
+    async fn a_channel_past_a_limit_is_not_started() {
+        let mut listener = Listener::with_default_capacities();
+        let mut config = udp_channel();
+        config.retention.byte_limit = Some(crate::config::limits::MAX_SCROLLBACK_BYTES + 1);
+        let id = listener.add_channel(config);
+        let err = listener.start(id).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::Limit(crate::config::LimitError::Scrollback { .. })
+            ),
+            "{err}"
+        );
+
+        let mut config = udp_channel();
+        config.reconnect.initial_backoff_ms = 10_000;
+        config.reconnect.max_backoff_ms = 1_000;
+        let id = listener.add_channel(config);
+        assert!(matches!(
+            listener.start(id).await,
+            Err(OrchestratorError::Limit(
+                crate::config::LimitError::BackoffOrder { .. }
+            ))
+        ));
+
+        // A live change is held to the same limits, and the old policy kept.
+        let id = listener.add_channel(udp_channel());
+        let mut policy = crate::config::ReconnectPolicy {
+            enabled: true,
+            ..crate::config::ReconnectPolicy::default()
+        };
+        policy.multiplier = 0.0;
+        assert!(listener.set_reconnect_policy(id, policy).is_err());
+        assert!(!listener.config(id).unwrap().reconnect.enabled);
+    }
+
+    #[test]
+    fn capacities_are_held_to_their_limits() {
+        assert_eq!(
+            PipelineCapacities::new(CapacityRequest::default()),
+            Ok(PipelineCapacities::default()),
+            "the defaults are within the limits"
+        );
+        for request in [
+            CapacityRequest {
+                ingest: 0,
+                ..CapacityRequest::default()
+            },
+            CapacityRequest {
+                ingest: crate::config::limits::MAX_INGEST_CHUNKS + 1,
+                ..CapacityRequest::default()
+            },
+            CapacityRequest {
+                recording_queue_budget: crate::config::limits::MAX_RECORDING_QUEUE_BYTES + 1,
+                ..CapacityRequest::default()
+            },
+            CapacityRequest {
+                events: 0,
+                ..CapacityRequest::default()
+            },
+            CapacityRequest {
+                error_retention: crate::config::limits::MAX_DIAGNOSTICS_PER_SEVERITY + 1,
+                ..CapacityRequest::default()
+            },
+        ] {
+            assert!(PipelineCapacities::new(request).is_err(), "{request:?}");
+        }
     }
 
     #[tokio::test]
@@ -2211,13 +2315,15 @@ mod tests {
             other => panic!("expected a retry, got {other:?}"),
         }
 
-        listener.set_reconnect_policy(
-            id,
-            ReconnectPolicy {
-                enabled: false,
-                ..policy
-            },
-        );
+        listener
+            .set_reconnect_policy(
+                id,
+                ReconnectPolicy {
+                    enabled: false,
+                    ..policy
+                },
+            )
+            .unwrap();
         let stats = listener.channel_stats(id).await.unwrap();
         assert_eq!(stats.reconnect, None, "turning it off ends the retry");
         assert!(!stats.reconnect_pending);
