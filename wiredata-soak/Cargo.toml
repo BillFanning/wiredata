@@ -1,0 +1,21 @@
+[package]
+name = "wiredata-soak"
+description = "Internal soak harness: a sequence-numbered UDP generator and an offline verifier of listener recordings"
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Millisecond sleeps on Windows, so the generator's pace is even (talker ADR-038).
+wiredata-timing = { path = "../wiredata-timing" }
+
+[[bin]]
+name = "soak-gen"
+path = "src/bin/soak_gen.rs"
+
+[[bin]]
+name = "soak-verify"
+path = "src/bin/soak_verify.rs"

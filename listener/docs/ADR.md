@@ -1986,6 +1986,47 @@ runtime, prints the lines, and owns its retry policy and stop limits.
 **Consequences:** Both CLIs word the same events the same way, and agree on
 when a run is degraded.
 
+## ADR-051 — A soak harness that shares no code with Listener checks its recordings
+
+**Status:** Accepted 2026-10-01. Serves the ADR-048 headroom target and the
+recording guarantees of §56.1 and §59.
+
+**Context:** A soak run must show that Listener records every datagram it
+receives, for days, across rotations, size caps, gaps and recoveries. Counting
+bytes shows that some data arrived, not which. A checker built on Listener's
+own reader could share the fault it is meant to find.
+
+**Decision:** A new internal crate, `wiredata-soak`, with two programs:
+
+- **`soak-gen`** sends 64-byte datagrams, one series per stream, each carrying
+  a marker, its stream, its sequence number, a filler and a checksum. A
+  sequence number advances only when its send succeeds, so a refused send is
+  not counted as Listener's loss. A manifest of what was sent is rewritten
+  every second.
+- **`soak-verify`** reads a Channel's `.raw` files and the event log as an
+  operator would, and holds them to these rules:
+  - A segment is contiguous: nothing missing, repeated or out of order.
+  - Between segments, sequence numbers may jump only where a segment opened
+    after a logged gap.
+  - The run covers what was sent, unless it began after a gap or stopped
+    during one.
+  - Nothing appears twice or goes backwards, and every record is intact.
+
+**Boundary:** The harness depends on neither application. It reads Listener's
+gap lines by their wording, so a change to that wording must change the
+harness too. It verifies `.raw` only: a `.disp` file is rendered text. Soak
+runs stay out of CI.
+
+**Alternatives considered:**
+
+- **Talker as the generator:** Rejected. Talker carries no sequence numbers,
+  and the harness would then test both applications at once.
+- **Byte counts alone:** Rejected. They cannot tell a gap from reordering or
+  from a duplicate.
+
+**Consequences:** A soak run ends in a pass or a list of exactly which numbers
+are missing, repeated or out of order, and where.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

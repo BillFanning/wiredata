@@ -1,9 +1,9 @@
 # AGENTS.md
 
 Working agreement and codebase guide for the **wiredata** workspace. Applies to all
-nine crates (`talker`, `nmea0183`, `listener`, `wiredata-ui`, `wiredata-timing`,
-`wiredata-telemetry`, `wiredata-log`, `wiredata-stop`, `wiredata-cli`) and to **any**
-contributor — human or coding agent (Claude Code, Codex, or otherwise). This is the tool-neutral source of truth; tool-specific files
+ten crates (`talker`, `nmea0183`, `listener`, `wiredata-ui`, `wiredata-timing`,
+`wiredata-telemetry`, `wiredata-log`, `wiredata-stop`, `wiredata-cli`,
+`wiredata-soak`) and to **any** contributor — human or coding agent (Claude Code, Codex, or otherwise). This is the tool-neutral source of truth; tool-specific files
 (e.g. `CLAUDE.md`) should import it rather than duplicate it.
 
 ---
@@ -35,10 +35,10 @@ Each crate owns a `docs/` folder:
   and small by design. Its decisions live in the app ADR series — talker ADR-016 and
   listener ADR-019 — and any chrome change that alters both apps' look should reference
   them.
-- `wiredata-timing`, `wiredata-telemetry`, `wiredata-log`, `wiredata-stop` and
-  `wiredata-cli` likewise have **no** `docs/` folders. Their narrow cross-app scope is
-  governed by the owning app ADRs (talker ADR-038/039/061 and listener
-  ADR-030/032/044/049/050).
+- `wiredata-timing`, `wiredata-telemetry`, `wiredata-log`, `wiredata-stop`,
+  `wiredata-cli` and `wiredata-soak` likewise have **no** `docs/` folders. Their
+  narrow scope is governed by the owning app ADRs (talker ADR-038/039/061 and
+  listener ADR-030/032/044/049/050/051).
 - Record any non-trivial design choice as a **new ADR entry** in the owning crate's
   `ADR.md` (talker and nmea0183 share one ADR number series; listener has its own).
 - Track concrete implementation reminders in the owning crate's `TODO.md`.
@@ -158,7 +158,7 @@ run `rustup update stable` if the build rejects your toolchain.
 
 ### Workspace layout
 
-Nine crates in a Cargo workspace:
+Ten crates in a Cargo workspace:
 
 - **`nmea0183/`** — library crate; no dependency on `talker` or `listener`; intended for
   independent crates.io publication. Handles NMEA 0183 sentence construction, parsing,
@@ -217,6 +217,10 @@ Nine crates in a Cargo workspace:
   WARNING, reminder, recovery and summary lines, generic over the channel id, and
   the exit-code rule. Retry policy, stop limits, I/O and what each app adds to the
   summary stay in the apps.
+- **`wiredata-soak/`** — internal (`publish = false`) soak harness for listener
+  (listener ADR-051): `soak-gen` sends sequence-numbered 64-byte datagrams, and
+  `soak-verify` checks the `.raw` files and event log listener wrote against what
+  was sent. Test tooling only; neither app uses it.
 
 ```
 talker/src/
@@ -272,6 +276,8 @@ I/O shape (see talker ADR-002 vs listener ADR-001):
   `talker`, `listener` or GUI crates.
 - `wiredata-cli` owns only the health bookkeeping and the exit-code rule. It has no
   dependencies and does no I/O.
+- `wiredata-soak` never depends on `talker` or `listener`: it reads their output as
+  an operator would, so a fault cannot hide in code the two share.
 - UI threads never perform I/O and never block.
 - `cli/` and `gui/` are thin layers; business logic lives in `core/` (or the equivalent
   internal modules).

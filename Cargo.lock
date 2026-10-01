@@ -4634,6 +4634,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wiredata-soak"
+version = "0.1.0"
+dependencies = [
+ "wiredata-timing",
+]
+
+[[package]]
 name = "wiredata-stop"
 version = "0.1.0"
 dependencies = [

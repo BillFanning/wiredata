@@ -3340,6 +3340,48 @@ mod tests {
         );
     }
 
+    /// ADR-051: the soak verifier finds gaps by these phrases in the event
+    /// log, so they are fixed here. Changing one means changing
+    /// `wiredata-soak` with it.
+    #[test]
+    fn the_gap_lines_the_soak_verifier_reads_keep_their_wording() {
+        let mut p =
+            pipeline(ChannelId::new(), PipelineCapacities::default()).with_channel_name("ch00");
+        p.note_recorder_report(
+            RecordingTap::Raw,
+            RecorderReport::SegmentOpened {
+                path: Some(PathBuf::from("rec/ch00_2026-10-01_08_2.raw")),
+                kind: OpenKind::Recovery,
+            },
+        );
+        p.note_recorder_report(
+            RecordingTap::Raw,
+            RecorderReport::GapEndedByStop {
+                reason: crate::core::GapReason::WriteFailed,
+                start: None,
+            },
+        );
+        let messages: Vec<&str> = p
+            .diagnostics()
+            .events()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            messages.iter().any(|m| {
+                m.starts_with(
+                "Raw recording on channel ch00 resumed in a new file → rec/ch00_2026-10-01_08_2.raw"
+            )
+            }),
+            "{messages:#?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("Raw recording on channel ch00 stopped during a gap")),
+            "{messages:#?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_disk_check_is_reported_once_naming_the_channel() {
         // §56.2: a failed free-space check is itself reported, naming the Channel.

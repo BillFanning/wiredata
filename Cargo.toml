@@ -9,6 +9,7 @@ members = [
     "wiredata-log",
     "wiredata-stop",
     "wiredata-cli",
+    "wiredata-soak",
 ]
 resolver = "2"
 
