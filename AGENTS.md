@@ -296,8 +296,7 @@ I/O shape (see talker ADR-002 vs listener ADR-001):
   `core::profile`; ADR-057). `Profile::load` refuses any profile whose version differs:
   a newer version is unsupported, and an older one is rejected with a "recreate the
   profile" error. This is a deliberate clean break — there is no `migration` module
-  (ADR-013 update). ADR-062 decides that unknown keys and a missing `version` are also
-  refused; until that lands, unknown keys are still ignored.
+  (ADR-013 update). Unknown keys and a missing `version` are refused too (ADR-062).
 - An NMEA payload is stored as plain strings (`PayloadConfig::Nmea { talker,
   sentence_type, fields }`), not `nmea0183` types; the `nmea0183` dependency does not
   enable the `serde` feature (OQ-3 resolved).

@@ -147,6 +147,7 @@ impl From<NmeaChecksumMode> for nmea0183::NmeaChecksumMode {
 /// timestamp and checksum.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageConfig {
     pub payload: PayloadConfig,
     pub interval_ms: u64,
@@ -271,7 +272,7 @@ impl CompiledMessage {
 /// NMEA templates so their known UTC fields can advance on every send.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PayloadConfig {
     /// Raw bytes as a hex string (spaces and hyphens are stripped).
     /// Example: `"DE AD BE EF"` or `"DEADBEEF"`.

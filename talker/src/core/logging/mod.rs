@@ -39,6 +39,7 @@ pub(crate) fn with_gui_test_subscriber<T>(
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default)]
     pub level: LogLevel,
@@ -74,6 +75,7 @@ impl LoggingConfig {
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileLogConfig {
     pub directory: PathBuf,
     #[serde(default = "default_prefix")]

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 /// [`MessageConfig::timestamp`]: super::MessageConfig
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimestampConfig {
     #[serde(default)]
     pub include_date: bool,

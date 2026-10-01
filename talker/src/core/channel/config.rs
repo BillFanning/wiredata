@@ -12,6 +12,7 @@ use crate::core::timing::CadenceAlignment;
 /// checksum).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelConfig {
     /// Display name shown in the GUI channel list. Cosmetic only — channels
     /// are identified by position, so the name carries no uniqueness
@@ -89,6 +90,7 @@ impl InterfaceConfig {
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SerialConfig {
     pub port: String,
     #[serde(default = "default_baud")]
@@ -164,6 +166,7 @@ pub enum FlowControl {
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UdpConfig {
     pub mode: UdpMode,
     /// Local port to bind; `None` lets the OS choose an ephemeral port.
@@ -240,7 +243,7 @@ impl UdpConfig {
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UdpMode {
     Unicast {
         destination: SocketAddr,
@@ -267,6 +270,7 @@ pub enum UdpMode {
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcpClientConfig {
     pub address: SocketAddr,
 }

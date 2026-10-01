@@ -13,8 +13,6 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 The spec states these; the code does not do them yet.
 
-- [ ] **Strict profiles (ADR-062, §8.2).** Unknown keys are ignored, and
-  `extract_version` treats a missing version as current.
 
 ## Profiles
 

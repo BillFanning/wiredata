@@ -15,6 +15,7 @@ use crate::core::logging::LoggingConfig;
 pub const CURRENT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
     /// Schema version. A profile whose version differs from
     /// [`CURRENT_VERSION`] is rejected at load time.
@@ -22,8 +23,8 @@ pub struct Profile {
     pub version: u32,
     /// In-memory display name. **Not serialized** — the file root is
     /// the authoritative name, so the GUI overlays this from
-    /// `path.file_stem()` on load and save. Old TOMLs that still
-    /// contain `name = "..."` parse cleanly; the field is ignored.
+    /// `path.file_stem()` on load and save. A `name` key in a file is
+    /// refused like any other unknown key (ADR-062).
     #[serde(skip)]
     pub name: String,
     /// The channels defined by this profile. Each channel has one interface
@@ -64,7 +65,9 @@ impl Profile {
     /// Load a profile from a TOML file.
     ///
     /// A profile whose version is newer than [`CURRENT_VERSION`] is rejected,
-    /// and so is an older one — earlier schemas are not migrated.
+    /// and so is an older one — earlier schemas are not migrated. So is one
+    /// with no `version`, or with a key the schema does not have (ADR-062):
+    /// a misspelled key must not pass for a default.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("reading profile {:?}", path))?;
@@ -87,7 +90,9 @@ impl Profile {
             );
         }
 
-        let profile: Self = serde::Deserialize::deserialize(doc)
+        // From the text, not the parsed value, so an unknown key is reported
+        // with its line.
+        let profile: Self = toml::from_str(&content)
             .with_context(|| format!("deserializing profile {:?}", path))?;
 
         Ok(profile)
@@ -176,7 +181,7 @@ pub fn default_dir() -> Option<PathBuf> {
 
 fn extract_version(doc: &toml::Value) -> anyhow::Result<u32> {
     match doc.get("version") {
-        None => Ok(CURRENT_VERSION),
+        None => anyhow::bail!("the profile has no version: add `version = {CURRENT_VERSION}`"),
         Some(toml::Value::Integer(v)) => {
             u32::try_from(*v).context("profile version field is out of range")
         }
@@ -418,14 +423,125 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// ADR-062: a file without `version` is not taken to be current.
     #[test]
-    fn load_missing_version_defaults_to_current() {
+    fn load_refuses_a_missing_version() {
         let path = temp_path("noversion");
-        // Old-style file with a `name` key — silently ignored by the
-        // skipped `Profile::name`, so this still parses cleanly.
-        std::fs::write(&path, "name = \"no-version\"\n").unwrap();
-        let loaded = Profile::load(&path).unwrap();
-        assert_eq!(loaded.version, CURRENT_VERSION);
+        std::fs::write(&path, "[logging]\nlevel = \"info\"\n").unwrap();
+        let err = Profile::load(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("add `version = 3`"), "{err:#}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every profile type in use, each once, so a misspelled key can be put
+    /// in each of them.
+    const EVERY_TYPE: &str = r#"version = 3
+
+[[channels]]
+name = "serial"
+[channels.interface]
+type = "serial"
+port = "COM9"
+[[channels.messages]]
+interval_ms = 100
+[channels.messages.payload]
+type = "utf8"
+text = "utf8 text"
+
+[[channels]]
+name = "udp"
+[channels.interface]
+type = "udp"
+local_port = 5000
+[channels.interface.mode]
+type = "multicast"
+group = "239.0.0.1"
+port = 6000
+[[channels.messages]]
+interval_ms = 200
+[channels.messages.payload]
+type = "utf16"
+text = "utf16 text"
+[[channels.messages]]
+interval_ms = 300
+[channels.messages.payload]
+type = "ascii"
+text = "ascii text"
+
+[[channels]]
+name = "tcp"
+[channels.interface]
+type = "tcp_client"
+address = "127.0.0.1:4000"
+[[channels.messages]]
+interval_ms = 400
+[channels.messages.payload]
+type = "nmea"
+talker = "GP"
+sentence_type = "GGA"
+[channels.messages.timestamp]
+include_millis = true
+[channels.messages.checksum]
+algorithm = "crc8"
+[[channels.messages]]
+interval_ms = 500
+[channels.messages.payload]
+type = "raw_hex"
+data = "AA"
+
+[logging]
+level = "info"
+[logging.file]
+directory = "logs"
+"#;
+
+    /// ADR-062: an unknown key is refused in every profile type, and the
+    /// message names it and its line. Serde's deny-unknown-fields support is
+    /// partial for internally tagged enums, so each type is tried, not one.
+    #[test]
+    fn a_misspelled_key_is_refused_wherever_it_is() {
+        let path = temp_path(&format!("strict_{}", std::process::id()));
+        std::fs::write(&path, EVERY_TYPE).unwrap();
+        Profile::load(&path).expect("the profile without a misspelling loads");
+
+        // (type, the line the misspelling follows, the misspelled key)
+        let cases = [
+            ("Profile", "version = 3", "verison"),
+            ("ChannelConfig", "name = \"serial\"", "nmae"),
+            ("SerialConfig", "port = \"COM9\"", "baud"),
+            ("UdpConfig", "local_port = 5000", "local_prot"),
+            ("UdpMode", "port = 6000", "tll"),
+            ("TcpClientConfig", "address = \"127.0.0.1:4000\"", "adress"),
+            ("MessageConfig", "interval_ms = 100", "interval"),
+            ("PayloadConfig::Utf8", "text = \"utf8 text\"", "txt"),
+            ("PayloadConfig::Utf16", "text = \"utf16 text\"", "byteorder"),
+            ("PayloadConfig::Ascii", "text = \"ascii text\"", "codepage"),
+            ("PayloadConfig::Nmea", "sentence_type = \"GGA\"", "feilds"),
+            ("PayloadConfig::RawHex", "data = \"AA\"", "dat"),
+            ("TimestampConfig", "include_millis = true", "include_ms"),
+            ("ChecksumConfig", "algorithm = \"crc8\"", "algoritm"),
+            ("LoggingConfig", "level = \"info\"", "stdot"),
+            ("FileLogConfig", "directory = \"logs\"", "prefx"),
+        ];
+        for (kind, after, key) in cases {
+            let line = format!("{after}\n");
+            assert_eq!(
+                EVERY_TYPE.matches(&line).count(),
+                1,
+                "{kind}: anchor {after:?}"
+            );
+            std::fs::write(
+                &path,
+                EVERY_TYPE.replacen(&line, &format!("{line}{key} = 1\n"), 1),
+            )
+            .unwrap();
+            let err = format!("{:#}", Profile::load(&path).unwrap_err());
+            assert!(
+                err.contains(&format!("unknown field `{key}`")),
+                "{kind} did not refuse `{key}`: {err}"
+            );
+            assert!(err.contains(" at line "), "{kind}: no line in {err}");
+        }
         let _ = std::fs::remove_file(&path);
     }
 

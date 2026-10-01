@@ -35,6 +35,7 @@ pub enum ChecksumAlgorithm {
 /// [`MessageConfig::checksum`]: super::MessageConfig
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChecksumConfig {
     #[serde(default)]
     pub algorithm: ChecksumAlgorithm,
