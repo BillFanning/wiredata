@@ -1,0 +1,31 @@
+# Example systemd unit for an unattended listener (listener spec §3.1).
+# See deploy/README.md. Adjust the paths and the user, then:
+#   sudo cp listener.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now listener
+
+[Unit]
+Description=wiredata listener: record serial and network data streams
+Wants=network-online.target
+After=network-online.target
+# If recordings go to a removable drive, wait for it to be mounted, so the
+# first recording is not made on the system disk under the empty mount point.
+#RequiresMountsFor=/media/recordings
+
+[Service]
+Type=simple
+User=listener
+# Serial adapters belong to the dialout group on Debian and Ubuntu (uucp on Arch).
+SupplementaryGroups=dialout
+ExecStart=/usr/local/bin/listener --profile /etc/listener/profile.toml
+# SIGTERM is the graceful stop. Listener needs at most about 5 s for it.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# Restart after a crash or an internal error. Exit code 2 means the profile is
+# invalid or nothing can start: fix that rather than restart in a loop.
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target
