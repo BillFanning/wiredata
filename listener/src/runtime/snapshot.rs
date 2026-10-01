@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::oneshot;
 
@@ -108,6 +108,17 @@ pub struct QueueDepth {
     pub capacity: usize,
 }
 
+/// Where an automatic reconnect stands (§9.1, ADR-045), so status can say it
+/// in words: "Reconnecting — attempt 3, next try in 8 s", "Gave up after 10
+/// attempts".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconnectProgress {
+    /// Waiting to make attempt number `attempt`, due in `next_try_in`.
+    Retrying { attempt: u32, next_try_in: Duration },
+    /// The policy's `max_attempts` ran out after `attempts` attempts.
+    GaveUp { attempts: u32 },
+}
+
 /// What status shows about one running recording (§56.2): where it is writing,
 /// how much, how much room is left, and its lasting faults.
 ///
@@ -159,6 +170,9 @@ pub struct ChannelStats {
     /// backoff gives up (that is a plain `Faulted`). Orchestrator-stamped, like
     /// `state`.
     pub reconnect_pending: bool,
+    /// Where an automatic reconnect stands, for status in words (§9.1);
+    /// `None` when none is armed. Orchestrator-stamped.
+    pub reconnect: Option<ReconnectProgress>,
     /// Liveness facts: rolling throughput, total bytes + last-data time (§91.1, §166).
     pub activity: ChannelActivity,
     /// Retained-diagnostic counts by severity (§88) — for per-tab health.
@@ -223,6 +237,8 @@ pub struct ChannelSnapshot {
     pub state: ChannelState,
     /// Auto-reconnect armed/in progress — see [`ChannelStats::reconnect_pending`].
     pub reconnect_pending: bool,
+    /// See [`ChannelStats::reconnect`].
+    pub reconnect: Option<ReconnectProgress>,
     /// Newest completed run for this stable Channel, retained across restarts.
     pub last_run_summary: Option<ListenerRunSummary>,
     /// One entry per Display View (§48), in creation order (default view first).

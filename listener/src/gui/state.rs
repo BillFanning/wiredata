@@ -14,7 +14,7 @@ use crate::core::{
     ChannelId, ChannelState, MatchRuleId, RecordingState, RecordingTap, RuntimeEvent,
 };
 use crate::diagnostics::Diagnostic;
-use crate::runtime::{ChannelSnapshot, RecordingStatus, TriggeredMatch};
+use crate::runtime::{ChannelSnapshot, ReconnectProgress, RecordingStatus, TriggeredMatch};
 use crate::transport::SerialControlLines;
 use wiredata_ui::format::human_bytes;
 
@@ -124,6 +124,10 @@ pub struct ChannelView {
     /// lasting faults; `None` when that recording is not running.
     pub raw_recording_status: Option<RecordingStatus>,
     pub display_recording_status: Option<RecordingStatus>,
+    /// Where an automatic reconnect stands, for the status line (§9.1).
+    pub reconnect: Option<ReconnectProgress>,
+    /// The one-time reconnect choice for a recording Channel (ADR-045).
+    pub reconnect_prompt: ReconnectPrompt,
     /// Accumulated stream scrollback bytes for the live viewer (§87, ADR-009),
     /// grown incrementally from [`UiUpdate::StreamDelta`] so the driver never
     /// re-ships the whole buffer each poll. Capped (oldest dropped) at this channel's
@@ -191,6 +195,8 @@ impl ChannelView {
             raw_recording_queue: None,
             raw_recording_status: None,
             display_recording_status: None,
+            reconnect: None,
+            reconnect_prompt: ReconnectPrompt::default(),
             stream_bytes: std::collections::VecDeque::new(),
             marks: Vec::new(),
             marks_version: 0,
@@ -505,6 +511,7 @@ impl AppState {
                     view.ingest_queue = snapshot.ingest_queue;
                     view.raw_recording_queue = snapshot.raw_recording_queue;
                     view.raw_recording_status = snapshot.raw_recording_status.clone();
+                    view.reconnect = snapshot.reconnect;
                     view.display_recording_status = snapshot.display_recording_status.clone();
                     // Pin this window's Mark annotations before the snapshot is
                     // replaced — the snapshot's matches roll over, the pins stay.
@@ -538,6 +545,7 @@ impl AppState {
                     view.ingest_queue = stats.ingest_queue;
                     view.raw_recording_queue = stats.raw_recording_queue;
                     view.raw_recording_status = stats.raw_recording_status.clone();
+                    view.reconnect = stats.reconnect;
                     view.display_recording_status = stats.display_recording_status.clone();
                     clear_error_if_recording_ok(view);
                 }
@@ -746,6 +754,32 @@ fn clear_live_pipeline_state(view: &mut ChannelView) {
     view.display_recording_status = None;
 }
 
+/// The one-time reconnect choice (ADR-045): a recording Channel with reconnect
+/// off is asked once, pre-selected to on, and the user confirms either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReconnectPrompt {
+    /// Not asked yet.
+    #[default]
+    NotAsked,
+    /// Showing, with the current selection.
+    Asking { reconnect: bool },
+    /// Answered; not asked again.
+    Answered,
+}
+
+impl ReconnectPrompt {
+    /// The prompt for this frame. It opens, pre-selected to on, when the
+    /// Channel records — on start, or right now — with reconnect off; it
+    /// closes as answered if reconnect is switched on some other way.
+    pub fn next(self, reconnect_on: bool, records: bool) -> Self {
+        match self {
+            Self::NotAsked if records && !reconnect_on => Self::Asking { reconnect: true },
+            Self::Asking { .. } if reconnect_on => Self::Answered,
+            other => other,
+        }
+    }
+}
+
 /// One recording's lasting faults, a line each, naming the Channel and the
 /// recording (§56.1, §56.2).
 fn lasting_fault_lines(channel: &str, tap: RecordingTap, status: &RecordingStatus) -> Vec<String> {
@@ -799,6 +833,7 @@ mod tests {
             channel_id: id,
             state: ChannelState::Running,
             reconnect_pending: false,
+            reconnect: None,
             last_run_summary: None,
             display_views: vec![],
             diagnostics: std::sync::Arc::new(DiagnosticsSnapshot {
@@ -1000,6 +1035,7 @@ mod tests {
             Box::new(crate::runtime::ChannelStats {
                 state,
                 reconnect_pending,
+                reconnect: None,
                 activity: ChannelActivity {
                     last_data_at: None,
                     bytes_per_sec: 0.0,
@@ -1083,6 +1119,35 @@ mod tests {
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
         state.apply(stats_with_state(id, ChannelState::Starting, false));
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
+    }
+
+    #[test]
+    fn the_reconnect_choice_is_offered_once_for_a_recording_channel() {
+        // ADR-045: asked the first time a Channel records with reconnect off,
+        // pre-selected to on; never again once answered either way.
+        let prompt = ReconnectPrompt::NotAsked;
+        assert_eq!(
+            prompt.next(false, false),
+            ReconnectPrompt::NotAsked,
+            "not recording"
+        );
+        assert_eq!(
+            prompt.next(true, true),
+            ReconnectPrompt::NotAsked,
+            "already on"
+        );
+        let asking = prompt.next(false, true);
+        assert_eq!(asking, ReconnectPrompt::Asking { reconnect: true });
+        assert_eq!(asking.next(false, true), asking, "stays until confirmed");
+        assert_eq!(
+            asking.next(true, true),
+            ReconnectPrompt::Answered,
+            "switched on in the interface settings instead"
+        );
+        assert_eq!(
+            ReconnectPrompt::Answered.next(false, true),
+            ReconnectPrompt::Answered
+        );
     }
 
     #[test]

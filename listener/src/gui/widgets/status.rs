@@ -109,6 +109,34 @@ pub(crate) fn recording_facts(
     parts.join(" · ")
 }
 
+/// The detail pane's status line (§9.1, ADR-045): the status word, or, while
+/// the runtime retries, where the retry stands — in words, since the glyph's
+/// colour alone must not carry it. Pure, unit-tested.
+pub(crate) fn status_words(
+    status: ChannelStatus,
+    reconnect: Option<crate::runtime::ReconnectProgress>,
+) -> String {
+    use crate::runtime::ReconnectProgress;
+    match (status, reconnect) {
+        (
+            ChannelStatus::Reconnecting,
+            Some(ReconnectProgress::Retrying {
+                attempt,
+                next_try_in,
+            }),
+        ) => {
+            // Rounded up: "next try in 0 s" would read as stuck.
+            let secs = next_try_in.as_secs() + u64::from(next_try_in.subsec_nanos() > 0);
+            format!("Reconnecting — attempt {attempt}, next try in {secs} s")
+        }
+        (ChannelStatus::Faulted, Some(ReconnectProgress::GaveUp { attempts })) => format!(
+            "Faulted — gave up after {attempts} attempt{}",
+            if attempts == 1 { "" } else { "s" }
+        ),
+        _ => status_label(status).to_owned(),
+    }
+}
+
 /// A short status word for the detail pane.
 pub(crate) fn status_label(status: ChannelStatus) -> &'static str {
     match status {

@@ -1770,6 +1770,7 @@ impl ChannelPipeline {
             // `Listener::channel_stats` stamps the effective state before serving.
             state: crate::core::ChannelState::Running,
             reconnect_pending: false,
+            reconnect: None,
             activity: self.activity.snapshot(now),
             event_count: self.diagnostics.events().count(),
             warning_count: self.diagnostics.warnings().count(),
@@ -1882,6 +1883,7 @@ impl ChannelPipeline {
             // before serving (see `ChannelStats::state`).
             state: crate::core::ChannelState::Running,
             reconnect_pending: false,
+            reconnect: None,
             last_run_summary: None,
             display_views: self
                 .display_views

@@ -11,11 +11,11 @@ use crate::diagnostics::DiagnosticSeverity;
 use crate::runtime::ListenerRunSummary;
 
 use super::bridge::{self, UiCommand};
-use super::state::ChannelStatus;
+use super::state::{ChannelStatus, ReconnectPrompt};
 use super::widgets::{
     config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
     line_indicator, line_toggle, paint_glyph, recording_facts, recording_glyph_size,
-    recording_indicator, start_button, status_color, status_glyph, status_label, stop_enabled,
+    recording_indicator, start_button, status_color, status_glyph, status_words, stop_enabled,
 };
 use super::ListenerApp;
 use wiredata_ui::fonts::bold;
@@ -220,6 +220,8 @@ impl ListenerApp {
                     refresh = ui
                         .push_id("edit_iface", |ui| edit_interface(ui, id, config, &ports))
                         .inner;
+                    // The reconnect choice inside applies live (§9.1); see
+                    // `persist_reconnect` below.
                     // Display (.disp) recording lives in the recording block on the
                     // right, under Record Raw Data (ADR-013); the inline Mark
                     // timestamp editor lives under Configure display (it shapes what
@@ -227,6 +229,7 @@ impl ListenerApp {
                 });
         }
         self.force_config_open = false;
+        self.persist_reconnect(id);
         if refresh {
             self.refresh_serial_ports();
         }
@@ -483,8 +486,9 @@ impl ListenerApp {
                 );
             }
         });
+        let reconnect = self.state.channel(id).and_then(|v| v.reconnect);
         ui.horizontal(|ui| {
-            ui.label(status_label(status));
+            ui.label(status_words(status, reconnect));
             ui.label("·");
             ui.label(egui::RichText::new(details).weak());
         });
@@ -601,6 +605,68 @@ impl ListenerApp {
             });
         }
         self.persist_recording(id, RecTap::Display);
+        self.show_reconnect_choice(ui, id);
+    }
+
+    /// The one-time reconnect choice for a recording Channel with reconnect off
+    /// (ADR-045): pre-selected to on, confirmed by the user either way. The
+    /// warning glyph and the words carry it, not colour.
+    fn show_reconnect_choice(&mut self, ui: &mut egui::Ui, id: ChannelId) {
+        let Some((eid, config)) = self.edit_draft.as_mut() else {
+            return;
+        };
+        if *eid != id {
+            return;
+        }
+        let Some(view) = self.state.channel_mut(id) else {
+            return;
+        };
+        let recording_now = view.recording.is_some_and(RecordingState::is_on)
+            || view.display_recording.is_some_and(RecordingState::is_on);
+        let records =
+            recording_now || config.raw_recording.enabled || config.display_recording.enabled;
+        view.reconnect_prompt = view
+            .reconnect_prompt
+            .next(config.reconnect.enabled, records);
+        let ReconnectPrompt::Asking { mut reconnect } = view.reconnect_prompt else {
+            return;
+        };
+        let mut confirmed = false;
+        ui.separator();
+        ui.group(|ui| {
+            ui.label(
+                "\u{26A0} This channel records, but reconnect is off: if its port or \
+                 device fails, recording stops until someone starts the channel again.",
+            );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut reconnect, "Reconnect automatically");
+                confirmed = ui.button("Confirm").clicked();
+            });
+        });
+        if confirmed {
+            config.reconnect.enabled = reconnect;
+            view.reconnect_prompt = ReconnectPrompt::Answered;
+        } else {
+            view.reconnect_prompt = ReconnectPrompt::Asking { reconnect };
+        }
+    }
+
+    /// Apply the draft's reconnect choice live (§9.1): it needs no restart, so
+    /// it is sent as soon as it changes, like the recording settings.
+    fn persist_reconnect(&mut self, id: ChannelId) {
+        let Some((eid, cfg)) = self.edit_draft.as_ref() else {
+            return;
+        };
+        if *eid != id {
+            return;
+        }
+        let draft = cfg.reconnect;
+        if let Some(view) = self.state.channel_mut(id) {
+            if view.config.reconnect != draft {
+                view.config.reconnect = draft;
+                self.send(UiCommand::SetReconnect(id, draft));
+            }
+        }
     }
 
     /// The recording controls on a tap's header row: a "Record on start" toggle

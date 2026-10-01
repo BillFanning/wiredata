@@ -39,7 +39,9 @@ use super::pipeline::{
     DisplayRecordingSettings, DisplayViewHandle, PipelineCapacities, RawRecordingSettings,
 };
 use super::run_summary::{ListenerRunSummary, RunEndReason, RunId};
-use super::snapshot::{ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, StreamDelta};
+use super::snapshot::{
+    ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, ReconnectProgress, StreamDelta,
+};
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 use super::telemetry::{ChunkShape, DurationHistogram, IdleDeadlineTimerSummary, TransportHealth};
 
@@ -58,6 +60,7 @@ fn retained_snapshot(id: ChannelId, channel: &ManagedChannel) -> ChannelSnapshot
         // as it does over a live pipeline's snapshot.
         state: ChannelState::Stopped,
         reconnect_pending: false,
+        reconnect: None,
         last_run_summary: None,
         display_views: Vec::new(),
         diagnostics: Arc::clone(&channel.retained_diagnostics_snapshot),
@@ -104,6 +107,7 @@ fn retained_stats(channel: &ManagedChannel) -> ChannelStats {
         // Placeholders — the caller stamps the effective lifecycle state.
         state: ChannelState::Stopped,
         reconnect_pending: false,
+        reconnect: None,
         activity: channel.retained_activity,
         event_count: events,
         warning_count: warnings,
@@ -334,6 +338,21 @@ impl ManagedChannel {
     fn reconnect_pending(&self) -> bool {
         self.reconnect_state.as_ref().is_some_and(|r| !r.gave_up)
     }
+
+    /// Where an automatic reconnect stands at `now`, for status (§9.1).
+    fn reconnect_progress(&self, now: Instant) -> Option<ReconnectProgress> {
+        let state = self.reconnect_state.as_ref()?;
+        Some(if state.gave_up {
+            ReconnectProgress::GaveUp {
+                attempts: state.attempts,
+            }
+        } else {
+            ReconnectProgress::Retrying {
+                attempt: state.attempts + 1,
+                next_try_in: state.next_attempt_at.saturating_duration_since(now),
+            }
+        })
+    }
 }
 
 /// Errors from orchestrating a Channel.
@@ -435,6 +454,19 @@ impl Listener {
         self.channels.get(&id).map(|c| c.effective_state())
     }
 
+    /// Update a Channel's reconnect policy in place, without a restart (§9.1,
+    /// ADR-045): only [`reconnect_tick`](Self::reconnect_tick) reads it.
+    /// Turning it off ends a retry in progress, so the Channel reads Faulted
+    /// rather than Reconnecting. Unknown id is ignored.
+    pub fn set_reconnect_policy(&mut self, id: ChannelId, policy: crate::config::ReconnectPolicy) {
+        if let Some(channel) = self.channels.get_mut(&id) {
+            if !policy.enabled {
+                channel.reconnect_state = None;
+            }
+            channel.config.reconnect = policy;
+        }
+    }
+
     /// Whether `id`'s reconnect retries ran out (§9.1).
     pub fn reconnect_exhausted(&self, id: ChannelId) -> bool {
         self.channels
@@ -520,6 +552,7 @@ impl Listener {
         let mut snap = live.unwrap_or_else(|| retained_snapshot(id, channel));
         snap.state = channel.effective_state();
         snap.reconnect_pending = channel.reconnect_pending();
+        snap.reconnect = channel.reconnect_progress(Instant::now());
         snap.last_run_summary = channel.last_run_summary.clone();
         Some(snap)
     }
@@ -540,6 +573,7 @@ impl Listener {
         let mut stats = live.unwrap_or_else(|| retained_stats(channel));
         stats.state = channel.effective_state();
         stats.reconnect_pending = channel.reconnect_pending();
+        stats.reconnect = channel.reconnect_progress(Instant::now());
         Some(stats)
     }
 
@@ -2138,6 +2172,56 @@ mod tests {
         assert!(gave_up, "expected a ChannelReconnectGaveUp event");
         assert_eq!(listener.state(id), Some(ChannelState::Faulted));
         assert!(listener.reconnect_exhausted(id));
+        assert_eq!(
+            listener.channel_stats(id).await.unwrap().reconnect,
+            Some(ReconnectProgress::GaveUp { attempts: 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_progress_is_served_and_the_policy_changes_live() {
+        // §9.1, ADR-045: status says which attempt is next and when, and the
+        // reconnect choice applies without a restart.
+        use crate::config::ReconnectPolicy;
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let mut config = udp_channel();
+        if let InterfaceConfig::Udp(udp) = &mut config.interface {
+            udp.bind_address = "not-an-ip-address".to_string(); // start always fails
+        }
+        let policy = ReconnectPolicy {
+            enabled: true,
+            initial_backoff_ms: 60_000,
+            max_backoff_ms: 60_000,
+            multiplier: 1.0,
+            max_attempts: None,
+        };
+        config.reconnect = policy;
+        let id = listener.add_channel(config);
+        assert!(listener.start(id).await.is_err());
+        listener.reconnect_tick().await; // arms the first retry
+        match listener.channel_stats(id).await.unwrap().reconnect {
+            Some(ReconnectProgress::Retrying {
+                attempt,
+                next_try_in,
+            }) => {
+                assert_eq!(attempt, 1);
+                assert!(next_try_in > Duration::from_secs(50), "{next_try_in:?}");
+            }
+            other => panic!("expected a retry, got {other:?}"),
+        }
+
+        listener.set_reconnect_policy(
+            id,
+            ReconnectPolicy {
+                enabled: false,
+                ..policy
+            },
+        );
+        let stats = listener.channel_stats(id).await.unwrap();
+        assert_eq!(stats.reconnect, None, "turning it off ends the retry");
+        assert!(!stats.reconnect_pending);
+        assert!(!listener.config(id).unwrap().reconnect.enabled);
     }
 
     #[tokio::test]

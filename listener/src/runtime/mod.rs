@@ -41,7 +41,7 @@ pub use queue::DropOldestQueue;
 pub use run_summary::{ListenerRunSummary, RunEndReason, RunId};
 pub use snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
-    QueueDepth, RecordingStatus, StreamDelta, TriggeredMatch,
+    QueueDepth, ReconnectProgress, RecordingStatus, StreamDelta, TriggeredMatch,
 };
 pub use tcp::{start_tcp_listener, TcpListenerHandle};
 pub use telemetry::{

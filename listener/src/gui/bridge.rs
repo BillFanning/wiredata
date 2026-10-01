@@ -17,7 +17,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::config::{
     ChannelConfig, DataBits, DisplayConfig, DisplayRecordingConfig, FlowControl, InterfaceConfig,
-    Parity, Profile, RawRecordingConfig, RetentionConfig, StopBits,
+    Parity, Profile, RawRecordingConfig, ReconnectPolicy, RetentionConfig, StopBits,
 };
 use crate::core::{ChannelId, ChannelName, DisplayViewId, RuntimeEvent};
 use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities, StreamDelta};
@@ -103,6 +103,8 @@ pub enum UiCommand {
     /// Persist a channel's Display recording settings into the stored config without
     /// a restart — `SetRawRecordingConfig`'s sibling (ADR-012/-013).
     SetDisplayRecordingConfig(ChannelId, Box<DisplayRecordingConfig>),
+    /// Set a channel's reconnect policy live, without a restart (§9.1, ADR-045).
+    SetReconnect(ChannelId, ReconnectPolicy),
     /// Update a channel's per-channel view settings in the stored config without a
     /// restart: the display config (mode, font, colors — §78) and the scroll-buffer
     /// `retention` (§87). The viewer renders these GUI-side and the GUI caps its own
@@ -466,6 +468,9 @@ impl Driver {
             }
             UiCommand::SetDisplayRecordingConfig(id, display) => {
                 self.listener.set_display_recording_config(id, *display);
+            }
+            UiCommand::SetReconnect(id, policy) => {
+                self.listener.set_reconnect_policy(id, policy);
             }
             UiCommand::SetViewConfig(id, display, retention) => {
                 // View settings render GUI-side and the scroll buffer is capped GUI-side

@@ -17,8 +17,8 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 The spec states these; the code does not do them yet.
 
-- [ ] **Unattended GUI (ADR-045, §9.1, §70).** No reconnect checkbox or prompt,
-  and no resume registration.
+- [ ] **Resume on launch (ADR-045, §70).** The GUI cannot register a profile to
+  resume after a restart.
 - [ ] **TCP Listener disabled (ADR-047, §4.1, §16).** `tcp_listener_template` is
   still offered, and validation accepts the kind.
 - [ ] **UDP bind scope and shared port (ADR-047, §15, §75).** No `shared_port`

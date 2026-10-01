@@ -12,7 +12,7 @@ pub(super) use match_rule_editor::edit_mark_rules;
 pub(super) use recording_editor::{edit_display_recording, edit_raw_recording};
 pub(super) use status::{
     line_indicator, line_toggle, paint_glyph, recording_facts, recording_glyph_size,
-    recording_indicator, start_button, status_color, status_glyph, status_label, stop_enabled,
+    recording_indicator, start_button, status_color, status_glyph, status_words, stop_enabled,
 };
 pub(super) use wiredata_ui::format::human_bytes;
 
@@ -443,7 +443,43 @@ pub(super) fn edit_interface(
                 });
         }
     }
+    ui.separator();
+    edit_reconnect(ui, &mut config.reconnect);
     refresh
+}
+
+/// The "Reconnect automatically" choice (§9.1, ADR-045), with what it does in
+/// words. Applied live; it needs no restart.
+pub(super) fn edit_reconnect(ui: &mut egui::Ui, policy: &mut crate::config::ReconnectPolicy) {
+    ui.checkbox(&mut policy.enabled, "Reconnect automatically");
+    ui.label(egui::RichText::new(reconnect_behaviour(policy)).weak());
+}
+
+/// What a reconnect policy does, in words (§9.1). Pure, unit-tested.
+pub(super) fn reconnect_behaviour(policy: &crate::config::ReconnectPolicy) -> String {
+    if !policy.enabled {
+        return "If the port or device fails, the channel stays down until you start it \
+                again."
+            .to_owned();
+    }
+    let wait = |ms: u64| {
+        if ms.is_multiple_of(1000) {
+            format!("{} s", ms / 1000)
+        } else {
+            format!("{ms} ms")
+        }
+    };
+    let until = match policy.max_attempts {
+        None => "until it works".to_owned(),
+        Some(1) => "once, then gives up".to_owned(),
+        Some(n) => format!("up to {n} times, then gives up"),
+    };
+    format!(
+        "If the port or device fails, the channel tries again after {}, waiting longer \
+         each time up to {}, {until}.",
+        wait(policy.initial_backoff_ms),
+        wait(policy.max_backoff_ms)
+    )
 }
 
 /// The available serial port names, sorted (§14.4). Empty if enumeration fails.
@@ -489,13 +525,15 @@ pub(super) fn config_incomplete(config: &ChannelConfig) -> bool {
 /// Fields that are applied **live** (no restart) are neutralized before comparing, so
 /// editing them doesn't flip the lifecycle button:
 /// - `name` — renames live (§6).
-/// - `raw_recording` — the live Record/Stop toggle (ADR-012); destination/rotation/etc.
-///   take effect when recording is (re)started, not via a channel restart.
+/// - `raw_recording` and `display_recording` — the live Record/Stop toggles
+///   (ADR-012/-013); destination/rotation/etc. take effect when recording is
+///   (re)started, not via a channel restart.
 /// - `display` (view settings) and `retention` (scroll buffer) — synced live via
 ///   `SetViewConfig` (§78, §87), no restart.
+/// - `reconnect` — read only by the runtime's retry loop, so set live (§9.1).
 ///
-/// Display **recording** (`display_recording`) and the `interface` still count: those
-/// are applied via a §13 Reconfigure, i.e. a restart.
+/// The `interface` still counts: it is applied via a §13 Reconfigure, i.e. a
+/// restart.
 pub(super) fn config_needs_restart(draft: &ChannelConfig, committed: &ChannelConfig) -> bool {
     let mut a = draft.clone();
     // Neutralize the live-applied fields so only restart-worthy edits register.
@@ -504,6 +542,7 @@ pub(super) fn config_needs_restart(draft: &ChannelConfig, committed: &ChannelCon
     a.display_recording = committed.display_recording.clone();
     a.display = committed.display.clone();
     a.retention = committed.retention.clone();
+    a.reconnect = committed.reconnect;
     &a != committed
 }
 
@@ -597,6 +636,59 @@ mod tests {
             "off"
         );
         assert_eq!(recording_indicator(None, pal).2, "off");
+    }
+
+    #[test]
+    fn reconnect_status_is_stated_in_words() {
+        // ADR-045: "Reconnecting — attempt 3, next try in 8 s", "Gave up after
+        // N attempts" — never colour alone.
+        use crate::runtime::ReconnectProgress;
+        use std::time::Duration;
+        let retrying = ReconnectProgress::Retrying {
+            attempt: 3,
+            next_try_in: Duration::from_millis(7_200),
+        };
+        assert_eq!(
+            status_words(ChannelStatus::Reconnecting, Some(retrying)),
+            "Reconnecting — attempt 3, next try in 8 s"
+        );
+        assert_eq!(
+            status_words(
+                ChannelStatus::Faulted,
+                Some(ReconnectProgress::GaveUp { attempts: 10 })
+            ),
+            "Faulted — gave up after 10 attempts"
+        );
+        assert_eq!(status_words(ChannelStatus::Running, None), "running");
+    }
+
+    #[test]
+    fn the_reconnect_choice_says_what_it_does() {
+        let mut policy = templates::udp_template().reconnect;
+        policy.enabled = false;
+        assert_eq!(
+            reconnect_behaviour(&policy),
+            "If the port or device fails, the channel stays down until you start it again."
+        );
+        policy.enabled = true;
+        policy.initial_backoff_ms = 1_000;
+        policy.max_backoff_ms = 30_000;
+        policy.max_attempts = None;
+        assert_eq!(
+            reconnect_behaviour(&policy),
+            "If the port or device fails, the channel tries again after 1 s, waiting longer \
+             each time up to 30 s, until it works."
+        );
+        policy.max_attempts = Some(10);
+        assert!(reconnect_behaviour(&policy).ends_with("up to 10 times, then gives up."));
+    }
+
+    #[test]
+    fn the_reconnect_choice_applies_without_a_restart() {
+        let committed = templates::udp_template();
+        let mut draft = committed.clone();
+        draft.reconnect.enabled = !committed.reconnect.enabled;
+        assert!(!config_needs_restart(&draft, &committed));
     }
 
     #[test]
