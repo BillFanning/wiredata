@@ -2057,6 +2057,7 @@ dependencies = [
  "uuid",
  "windows-sys 0.59.0",
  "wiredata-log",
+ "wiredata-stop",
  "wiredata-telemetry",
  "wiredata-timing",
  "wiredata-ui",
@@ -4601,6 +4602,14 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "wiredata-stop"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -1896,6 +1896,52 @@ the format.
 **Consequences:** A profile either means what it says or does not load. Process
 memory has a stated worst case that the soak test can check.
 
+## ADR-049 — OS stop requests come from one shared crate, `wiredata-stop`
+
+**Status:** Accepted 2026-09-30. Implements the stop signals of §3.1 and talker
+ADR-060.
+
+**Context:** §3.1 requires Ctrl-C, SIGTERM on Linux, and console close, logoff
+and shutdown on Windows to perform the graceful stop of §113. On Windows,
+console logoff and shutdown events reach only programs that have not loaded
+`user32.dll` or `gdi32.dll`. `listener.exe` loads both: the GUI shares the
+binary, and Windows' `setupapi.dll`, which serial-port enumeration needs, imports
+both itself. A CLI binary without the GUI would still load them. Listening for
+those console events therefore never fires, and a logoff or shutdown would end
+the process without its graceful stop. Talker's CLI is in the same position.
+
+**Decision:** A new internal crate, `wiredata-stop` (`publish = false`), turns
+every OS stop request into one stream for both CLIs.
+
+- It listens for Ctrl-C everywhere, SIGTERM on Unix, and Ctrl-Break and console
+  close on Windows.
+- On Windows a hidden top-level window, on its own thread, receives
+  `WM_QUERYENDSESSION` and `WM_ENDSESSION`. Message-only windows do not receive
+  those broadcasts. On `WM_ENDSESSION` it sends Logoff or Shutdown and holds
+  the session until the application says its graceful stop has finished, up to
+  30 s; Windows may end the process sooner.
+- Every listener is registered before `listen` returns, and one that cannot be
+  registered is reported to the application, which decides how to say so.
+- The application owns the meaning: its graceful stop, its time limits and its
+  output. Listener calls `finish` only after the runtime has stopped and the
+  event log has flushed.
+
+**Boundary:** The crate depends on Tokio and, on Windows, `windows-sys` only. It
+does not install a service or handle service-control requests. The GUI binary
+is not covered; it receives session-end messages through its own window.
+
+**Alternatives considered:**
+
+- **A copy in each CLI:** Rejected. The Win32 window code is subtle, and two
+  copies drift.
+- **A CLI binary without the GUI:** Rejected. `setupapi.dll` loads `user32.dll`
+  regardless.
+- **Accept the gap and amend §3.1:** Rejected. A Windows shutdown is an ordinary
+  way for an unattended run to end.
+
+**Consequences:** A Windows logoff or shutdown gets the same graceful stop as
+Ctrl-C, within whatever time Windows allows.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

@@ -21,6 +21,7 @@ use crate::core::{ChannelId, ChannelState, RuntimeEvent};
 use crate::diagnostics::EventLogStatus;
 use crate::runtime::{Listener, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT};
 use health::HealthWatch;
+use wiredata_stop::StopRequests;
 
 /// Receive and inspect byte-oriented data from serial and network sources.
 #[derive(Parser, Debug)]
@@ -127,14 +128,31 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         (None, None) => {}
     }
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    let result = runtime.block_on(run_cli(cli, status));
+    // Every OS stop request gets the graceful stop (§3.1). Listening starts
+    // before any Channel, so a request during the starts is still graceful.
+    let mut stop_requests = {
+        let _runtime = runtime.enter();
+        wiredata_stop::listen()
+    };
+    for problem in stop_requests.problems() {
+        eprintln!("WARNING: {problem}");
+    }
+    let result = runtime.block_on(run_cli(cli, status, &mut stop_requests));
     // A file operation stuck in the blocking pool would otherwise keep the
     // process alive after every Channel has been stopped (§113).
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_LIMIT);
+    // Only once the event log is flushed may a Windows logoff or shutdown that
+    // is waiting on the stop go ahead: it may end the process straight away.
+    drop(event_log);
+    stop_requests.finish();
     result
 }
 
-async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<ExitCode> {
+async fn run_cli(
+    cli: Cli,
+    event_log: EventLogStatus,
+    stop_requests: &mut StopRequests,
+) -> Result<ExitCode> {
     let configs = match build_channel_configs(&cli) {
         Ok(configs) if configs.is_empty() => {
             eprintln!("ERROR: the profile has no valid channels");
@@ -146,10 +164,6 @@ async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<ExitCode> {
             return Ok(ExitCode::from(EXIT_CANNOT_START));
         }
     };
-
-    // Listen before anything starts, so a stop requested during the starts
-    // is still a graceful one.
-    let mut stop_requests = listen_for_stop();
 
     let mut listener = Listener::with_default_capacities();
     let mut events = listener
@@ -178,11 +192,12 @@ async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<ExitCode> {
     // tick checks the event log, so a failure that starts mid-run is reported.
     let mut reconnect = tokio::time::interval(std::time::Duration::from_millis(500));
     let mut reported_problem = event_log.problem();
-    let mut stop_reason = "the event stream closed";
+    let mut stop_reason = "the event stream closed".to_owned();
     loop {
         tokio::select! {
             request = stop_requests.recv() => {
-                stop_reason = request.unwrap_or("the stop listeners ended");
+                stop_reason = request
+                    .map_or_else(|| "the stop listeners ended".to_owned(), |r| r.to_string());
                 break;
             }
             _ = reconnect.tick() => {
@@ -234,58 +249,6 @@ async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<ExitCode> {
         eprintln!("WARNING: {lost} event log lines were not saved; the log marks where");
     }
     Ok(ExitCode::from(exit_status(&outcome, health.degraded())))
-}
-
-/// Listen for every OS request to stop (§3.1) and send what arrived: Ctrl-C
-/// everywhere, SIGTERM on Unix — what `systemctl stop` sends — and Ctrl-Break,
-/// console close, logoff and shutdown on Windows. Each gets the same graceful
-/// stop (§113). A request that cannot be listened for is warned about, and
-/// the others still work.
-///
-/// On Windows the console-close, logoff and shutdown handlers do not return,
-/// so the system waits for the graceful stop until its own time limit.
-fn listen_for_stop() -> tokio::sync::mpsc::UnboundedReceiver<&'static str> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let ctrl_c = tx.clone();
-    tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                let _ = ctrl_c.send("Ctrl-C");
-            }
-            Err(err) => eprintln!("WARNING: cannot listen for Ctrl-C ({err})"),
-        }
-    });
-    // Each listener is registered here, before this returns, so a request
-    // that arrives straight after is not missed.
-    macro_rules! forward {
-        ($what:literal, $listener:expr) => {
-            match $listener {
-                Ok(mut listener) => {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        if listener.recv().await.is_some() {
-                            let _ = tx.send($what);
-                        }
-                    });
-                }
-                Err(err) => eprintln!("WARNING: cannot listen for {} ({err})", $what),
-            }
-        };
-    }
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        forward!("SIGTERM", signal(SignalKind::terminate()));
-    }
-    #[cfg(windows)]
-    {
-        use tokio::signal::windows;
-        forward!("Ctrl-Break", windows::ctrl_break());
-        forward!("console close", windows::ctrl_close());
-        forward!("logoff", windows::ctrl_logoff());
-        forward!("system shutdown", windows::ctrl_shutdown());
-    }
-    rx
 }
 
 /// The Channels of a run once their first start has been tried.
@@ -592,23 +555,6 @@ mod tests {
             Some("not every channel started, and --require-all is set")
         );
         listener.shutdown().await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn sigterm_asks_for_the_graceful_stop() {
-        // §3.1: `systemctl stop` sends SIGTERM, which must stop the run the way
-        // Ctrl-C does, not end the process where it stands.
-        let mut requests = listen_for_stop();
-        let status = std::process::Command::new("kill")
-            .args(["-TERM", &std::process::id().to_string()])
-            .status()
-            .expect("kill runs");
-        assert!(status.success());
-        let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
-            .await
-            .expect("the request arrives");
-        assert_eq!(request, Some("SIGTERM"));
     }
 
     #[test]
