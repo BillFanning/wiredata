@@ -1,24 +1,39 @@
-//! Every request from the operating system to stop, as one stream, for the
-//! wiredata command-line applications (listener ADR-049; talker ADR-060's
-//! "stop on every OS stop signal").
+//! Requests from the operating system to stop, for the wiredata command-line
+//! applications (listener ADR-049; talker ADR-060's "stop on every OS stop
+//! signal").
 //!
-//! - Ctrl-C everywhere, and SIGTERM on Unix — what `systemctl stop` sends.
-//! - Ctrl-Break and console close on Windows.
-//! - Logoff and shutdown on Windows, through a hidden window. Windows sends its
+//! Windows needs two things the usual signal handling does not give:
+//!
+//! - **Logoff and shutdown** arrive at a hidden window. Windows sends its
 //!   console logoff and shutdown events only to programs that have not loaded
 //!   `user32.dll` or `gdi32.dll`, and these applications always have: their GUI
 //!   shares the binary, and the serial-port support loads `setupapi.dll`, which
-//!   loads both. A window receives `WM_ENDSESSION` instead, and holds the session
-//!   open until the application says its graceful stop has finished.
+//!   loads both. A window receives `WM_ENDSESSION` instead.
+//! - **A held stop.** Windows ends the process as soon as the handler for a
+//!   console close, logoff or shutdown returns, so the handler holds it until
+//!   the application says its graceful stop has finished ([`StopHold`]).
+//!
+//! Two ways in:
+//!
+//! - With the `tokio` feature, [`listen`] gives one async stream of every
+//!   request, Ctrl-C and SIGTERM included (listener).
+//! - Without it, [`on_windows_stop`] calls a function for Ctrl-C, Ctrl-Break,
+//!   console close, logoff and shutdown on Windows, and needs no async runtime
+//!   (talker, ADR-002). On Unix it installs nothing; the application keeps its
+//!   own signal handling there.
 //!
 //! What each request means for the application — its graceful stop, its time
 //! limits, what it prints — stays in the application.
 
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
+#[cfg(windows)]
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+#[cfg(feature = "tokio")]
+mod stream;
+#[cfg(feature = "tokio")]
+pub use stream::{listen, StopRequests};
 
 /// A request from the operating system to stop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,11 +65,15 @@ impl fmt::Display for StopRequest {
     }
 }
 
-/// How long the Windows session-end window holds the session open waiting for
-/// [`StopRequests::finish`]. Windows may end the process sooner; this only
-/// keeps a stop that never finishes from holding the window thread forever.
+/// How long a held Windows stop waits for [`StopHold::finish`]. Windows may end
+/// the process sooner; this only keeps a stop that never finishes from holding
+/// a thread forever.
 #[cfg(windows)]
-const SESSION_END_WAIT: Duration = Duration::from_secs(30);
+const HOLD_LIMIT: Duration = Duration::from_secs(30);
+
+/// A function told about each stop request, on whatever thread received it.
+#[cfg(windows)]
+type OnRequest = Arc<dyn Fn(StopRequest) + Send + Sync>;
 
 /// Set once the application's graceful stop has finished.
 #[derive(Default)]
@@ -70,7 +89,7 @@ impl Finished {
     }
 
     /// Wait until set, or `limit` passes.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg(windows)]
     fn wait(&self, limit: Duration) {
         let done = self.done.lock().unwrap_or_else(|p| p.into_inner());
         let _ = self
@@ -80,103 +99,178 @@ impl Finished {
     }
 }
 
-/// The stream of stop requests. Dropping it, or calling
-/// [`finish`](Self::finish), tells a waiting Windows session end that the
-/// graceful stop is done.
-pub struct StopRequests {
-    requests: mpsc::UnboundedReceiver<StopRequest>,
+/// Holds a Windows console close, logoff or shutdown until the graceful stop
+/// has finished. Call [`finish`](Self::finish) as late as possible — after the
+/// last file is flushed — since Windows may end the process straight away.
+/// Dropping it finishes too, and stops the requests it registered.
+pub struct StopHold {
     finished: Arc<Finished>,
-    problems: Vec<String>,
-    /// The session-end window; it lives on its own thread for the life of the
-    /// process, so the handle is only needed to test it.
+    #[cfg(windows)]
+    console: Option<u64>,
+    /// The session-end window, by handle; it lives on its own thread for the
+    /// life of the process, so the handle is only needed to test it.
     #[cfg(windows)]
     #[cfg_attr(not(test), allow(dead_code))]
-    window: session::Window,
+    window: isize,
 }
 
-impl StopRequests {
-    /// The next request; `None` only if every listener has ended.
-    pub async fn recv(&mut self) -> Option<StopRequest> {
-        self.requests.recv().await
-    }
-
-    /// The requests that could not be listened for, in words. The others
-    /// still work; the application decides how to say so.
-    pub fn problems(&self) -> &[String] {
-        &self.problems
-    }
-
-    /// Say the graceful stop has finished, so a Windows logoff or shutdown
-    /// waiting on it can go ahead. Call it as late as possible — after the
-    /// last file is flushed — since Windows may end the process straight away.
+impl StopHold {
+    /// Say the graceful stop has finished, so a held Windows stop can go ahead.
     pub fn finish(&self) {
         self.finished.set();
     }
 }
 
-impl Drop for StopRequests {
+impl Drop for StopHold {
     fn drop(&mut self) {
         self.finish();
+        #[cfg(windows)]
+        if let Some(id) = self.console.take() {
+            console::unregister(id);
+        }
     }
 }
 
-/// Start listening for every stop request. Each listener is registered before
-/// this returns, so a request that arrives straight afterwards is not missed.
-/// Call it inside a Tokio runtime.
-pub fn listen() -> StopRequests {
-    let (tx, requests) = mpsc::unbounded_channel();
+/// Call `on_request` when Windows ends the session — logoff or shutdown — and
+/// hold the session until the returned [`StopHold`] finishes. On other
+/// platforms it does nothing.
+pub fn on_session_end(
+    on_request: impl Fn(StopRequest) + Send + Sync + 'static,
+) -> std::io::Result<StopHold> {
     let finished = Arc::new(Finished::default());
-    let mut problems = Vec::new();
-
-    let interrupt = tx.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = interrupt.send(StopRequest::Interrupt);
-        }
-    });
-
-    macro_rules! forward {
-        ($request:expr, $listener:expr) => {
-            match $listener {
-                Ok(mut listener) => {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        if listener.recv().await.is_some() {
-                            let _ = tx.send($request);
-                        }
-                    });
-                }
-                Err(error) => problems.push(format!("cannot listen for {} ({error})", $request)),
-            }
-        };
-    }
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        forward!(StopRequest::Terminate, signal(SignalKind::terminate()));
-    }
     #[cfg(windows)]
-    {
-        use tokio::signal::windows;
-        forward!(StopRequest::Break, windows::ctrl_break());
-        forward!(StopRequest::ConsoleClose, windows::ctrl_close());
-    }
-
-    #[cfg(windows)]
-    let window = match session::Window::open(tx, Arc::clone(&finished)) {
-        Ok(window) => window,
-        Err(error) => {
-            problems.push(format!("cannot listen for logoff and shutdown ({error})"));
-            session::Window::none()
-        }
-    };
-
-    StopRequests {
-        requests,
+    let window = session::open(Arc::new(on_request), Arc::clone(&finished))?;
+    #[cfg(not(windows))]
+    let _ = on_request;
+    Ok(StopHold {
         finished,
-        problems,
+        #[cfg(windows)]
+        console: None,
         #[cfg(windows)]
         window,
+    })
+}
+
+/// Call `on_request` for every Windows stop request — Ctrl-C, Ctrl-Break,
+/// console close, logoff and shutdown — holding the last three until the
+/// returned [`StopHold`] finishes. Needs no async runtime. On other platforms
+/// it installs nothing: keep the platform's own signal handling there.
+pub fn on_windows_stop(
+    on_request: impl Fn(StopRequest) + Send + Sync + 'static,
+) -> std::io::Result<StopHold> {
+    #[cfg(windows)]
+    {
+        let on_request: OnRequest = Arc::new(on_request);
+        let finished = Arc::new(Finished::default());
+        let window = session::open(Arc::clone(&on_request), Arc::clone(&finished))?;
+        let console = console::register(on_request, Arc::clone(&finished))?;
+        Ok(StopHold {
+            finished,
+            console: Some(console),
+            window,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = on_request;
+        Ok(StopHold {
+            finished: Arc::new(Finished::default()),
+        })
+    }
+}
+
+/// The Windows console control handler: Ctrl-C and Ctrl-Break are passed on;
+/// a console close, logoff or shutdown is held until the stop finishes.
+#[cfg(windows)]
+mod console {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use windows_sys::Win32::Foundation::BOOL;
+    use windows_sys::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+        CTRL_SHUTDOWN_EVENT,
+    };
+
+    use super::{Finished, OnRequest, StopRequest, HOLD_LIMIT};
+
+    struct Registration {
+        id: u64,
+        on_request: OnRequest,
+        finished: Arc<Finished>,
+    }
+
+    static REGISTRY: Mutex<Vec<Registration>> = Mutex::new(Vec::new());
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    /// Whether the handler is installed: one per process, shared by every
+    /// registration.
+    static INSTALLED: OnceLock<Result<(), i32>> = OnceLock::new();
+
+    pub(super) fn register(on_request: OnRequest, finished: Arc<Finished>) -> std::io::Result<u64> {
+        let installed = INSTALLED.get_or_init(|| {
+            // SAFETY: `handler` is a `'static` function with the signature
+            // Windows expects.
+            if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
+                Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(code) = installed {
+            return Err(std::io::Error::from_raw_os_error(*code));
+        }
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        REGISTRY
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Registration {
+                id,
+                on_request,
+                finished,
+            });
+        Ok(id)
+    }
+
+    pub(super) fn unregister(id: u64) {
+        REGISTRY
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|r| r.id != id);
+    }
+
+    /// Windows calls this on a thread of its own for each console event.
+    pub(super) unsafe extern "system" fn handler(event: u32) -> BOOL {
+        let request = match event {
+            CTRL_C_EVENT => StopRequest::Interrupt,
+            CTRL_BREAK_EVENT => StopRequest::Break,
+            CTRL_CLOSE_EVENT => StopRequest::ConsoleClose,
+            CTRL_LOGOFF_EVENT => StopRequest::Logoff,
+            CTRL_SHUTDOWN_EVENT => StopRequest::Shutdown,
+            _ => return 0,
+        };
+        let registrations: Vec<(OnRequest, Arc<Finished>)> = REGISTRY
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|r| (Arc::clone(&r.on_request), Arc::clone(&r.finished)))
+            .collect();
+        if registrations.is_empty() {
+            // Nobody is listening: let the default handler end the process.
+            return 0;
+        }
+        for (on_request, _) in &registrations {
+            on_request(request);
+        }
+        if matches!(
+            request,
+            StopRequest::ConsoleClose | StopRequest::Logoff | StopRequest::Shutdown
+        ) {
+            // Windows ends the process once this returns.
+            for (_, finished) in &registrations {
+                finished.wait(HOLD_LIMIT);
+            }
+        }
+        1
     }
 }
 
@@ -186,7 +280,6 @@ mod session {
     use std::cell::RefCell;
     use std::sync::Arc;
 
-    use tokio::sync::mpsc;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -195,67 +288,46 @@ mod session {
         WS_OVERLAPPED,
     };
 
-    use super::{Finished, StopRequest, SESSION_END_WAIT};
-
-    /// What the window thread needs when the session ends.
-    struct Session {
-        requests: mpsc::UnboundedSender<StopRequest>,
-        finished: Arc<Finished>,
-    }
+    use super::{Finished, OnRequest, StopRequest, HOLD_LIMIT};
 
     thread_local! {
-        /// The session of the window this thread runs. Messages, including
-        /// those sent from other threads, are handled on the window's own
-        /// thread, so a thread-local reaches the window procedure.
-        static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
+        /// What the window on this thread tells, and waits on. Messages,
+        /// including those sent from other threads, are handled on the
+        /// window's own thread, so a thread-local reaches the procedure.
+        static SESSION: RefCell<Option<(OnRequest, Arc<Finished>)>> = const { RefCell::new(None) };
     }
 
-    /// The window, by handle as a number — `Send`, unlike `HWND`.
-    pub(super) struct Window {
-        #[cfg_attr(not(test), allow(dead_code))]
-        pub(super) handle: isize,
-    }
-
-    impl Window {
-        pub(super) fn none() -> Self {
-            Self { handle: 0 }
-        }
-
-        /// Create the window on a thread of its own, which runs its message
-        /// loop for the life of the process, and wait until it exists.
-        pub(super) fn open(
-            requests: mpsc::UnboundedSender<StopRequest>,
-            finished: Arc<Finished>,
-        ) -> std::io::Result<Self> {
-            let (created_tx, created) = std::sync::mpsc::channel();
-            std::thread::Builder::new()
-                .name("session-end".into())
-                .spawn(move || {
-                    SESSION.with(|s| *s.borrow_mut() = Some(Session { requests, finished }));
-                    // SAFETY: plain Win32 calls with valid, NUL-terminated
-                    // strings that outlive them; the window procedure is a
-                    // `'static` function.
-                    let handle = unsafe { create_window() };
-                    let created = handle.is_ok();
-                    let _ = created_tx.send(handle);
-                    if !created {
-                        return;
+    /// Create the window on a thread of its own, which runs its message loop
+    /// for the life of the process, and wait until it exists. Returns its
+    /// handle as a number.
+    pub(super) fn open(on_request: OnRequest, finished: Arc<Finished>) -> std::io::Result<isize> {
+        let (created_tx, created) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("session-end".into())
+            .spawn(move || {
+                SESSION.with(|s| *s.borrow_mut() = Some((on_request, finished)));
+                // SAFETY: plain Win32 calls with valid, NUL-terminated strings
+                // that outlive them; the window procedure is a `'static`
+                // function.
+                let handle = unsafe { create_window() };
+                let created = handle.is_ok();
+                let _ = created_tx.send(handle);
+                if !created {
+                    return;
+                }
+                // SAFETY: a zeroed MSG is valid; the loop runs on the thread
+                // that created the window.
+                unsafe {
+                    let mut msg: MSG = std::mem::zeroed();
+                    while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
                     }
-                    // SAFETY: a zeroed MSG is valid; the loop runs on the thread
-                    // that created the window.
-                    unsafe {
-                        let mut msg: MSG = std::mem::zeroed();
-                        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-                            TranslateMessage(&msg);
-                            DispatchMessageW(&msg);
-                        }
-                    }
-                })?;
-            let handle = created
-                .recv()
-                .map_err(|_| std::io::Error::other("the window thread ended"))??;
-            Ok(Self { handle })
-        }
+                }
+            })?;
+        created
+            .recv()
+            .map_err(|_| std::io::Error::other("the window thread ended"))?
     }
 
     fn wide(text: &str) -> Vec<u16> {
@@ -312,14 +384,10 @@ mod session {
                 } else {
                     StopRequest::Shutdown
                 };
-                let finished = SESSION.with(|session| {
-                    let session = session.borrow();
-                    let session = session.as_ref()?;
-                    session.requests.send(request).ok()?;
-                    Some(Arc::clone(&session.finished))
-                });
-                if let Some(finished) = finished {
-                    finished.wait(SESSION_END_WAIT);
+                let session = SESSION.with(|s| s.borrow().clone());
+                if let Some((on_request, finished)) = session {
+                    on_request(request);
+                    finished.wait(HOLD_LIMIT);
                 }
                 0
             }
@@ -338,35 +406,22 @@ mod tests {
         assert_eq!(StopRequest::Shutdown.to_string(), "system shutdown");
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn sigterm_is_a_stop_request() {
-        // `systemctl stop` sends SIGTERM, which must reach the application as
-        // a request, not end the process where it stands.
-        let mut requests = listen();
-        assert!(requests.problems().is_empty(), "{:?}", requests.problems());
-        let status = std::process::Command::new("kill")
-            .args(["-TERM", &std::process::id().to_string()])
-            .status()
-            .expect("kill runs");
-        assert!(status.success());
-        let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
-            .await
-            .expect("the request arrives");
-        assert_eq!(request, Some(StopRequest::Terminate));
-    }
-
     #[cfg(windows)]
-    #[tokio::test]
-    async fn a_windows_session_end_waits_for_the_graceful_stop() {
+    #[test]
+    fn a_windows_session_end_waits_for_the_graceful_stop() {
         // Windows ends the process once WM_ENDSESSION returns, so the window
         // must hold it until the application says its stop has finished.
+        use std::time::{Duration, Instant};
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             SendMessageW, ENDSESSION_LOGOFF, WM_ENDSESSION, WM_QUERYENDSESSION,
         };
-        let mut requests = listen();
-        assert!(requests.problems().is_empty(), "{:?}", requests.problems());
-        let hwnd = requests.window.handle;
+        let (tx, requests) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        let hold = on_session_end(move |request| {
+            let _ = tx.lock().unwrap().send(request);
+        })
+        .unwrap();
+        let hwnd = hold.window;
         // SAFETY: the window exists for the life of the process.
         let allowed = unsafe { SendMessageW(hwnd as _, WM_QUERYENDSESSION, 0, 0) };
         assert_eq!(allowed, 1, "the session may end");
@@ -375,19 +430,58 @@ mod tests {
             // SAFETY: as above; SendMessageW blocks until the procedure returns.
             unsafe { SendMessageW(hwnd as _, WM_ENDSESSION, 1, ENDSESSION_LOGOFF as isize) }
         });
-        let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
-            .await
-            .expect("the request arrives");
-        assert_eq!(request, Some(StopRequest::Logoff));
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(request, StopRequest::Logoff);
+        std::thread::sleep(Duration::from_millis(200));
         assert!(!session.is_finished(), "held until the stop finishes");
 
-        requests.finish();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        hold.finish();
+        let deadline = Instant::now() + Duration::from_secs(5);
         while !session.is_finished() {
-            assert!(std::time::Instant::now() < deadline, "never released");
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(Instant::now() < deadline, "never released");
+            std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(session.join().unwrap(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_console_events_pass_on_ctrl_c_and_hold_a_close() {
+        // Windows ends the process once the console handler returns from a
+        // close, so the close is held; Ctrl-C returns straight away.
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::Console::{CTRL_CLOSE_EVENT, CTRL_C_EVENT};
+        let (tx, requests) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        let hold = on_windows_stop(move |request| {
+            let _ = tx.lock().unwrap().send(request);
+        })
+        .unwrap();
+
+        // SAFETY: the handler is what Windows calls; calling it directly
+        // stands in for a console event.
+        assert_eq!(unsafe { console::handler(CTRL_C_EVENT) }, 1);
+        assert_eq!(requests.try_recv(), Ok(StopRequest::Interrupt));
+
+        // SAFETY: as above.
+        let close = std::thread::spawn(|| unsafe { console::handler(CTRL_CLOSE_EVENT) });
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(request, StopRequest::ConsoleClose);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!close.is_finished(), "held until the stop finishes");
+
+        drop(hold);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !close.is_finished() {
+            assert!(Instant::now() < deadline, "never released");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(close.join().unwrap(), 1);
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { console::handler(CTRL_C_EVENT) },
+            0,
+            "with nobody registered, the default handler acts"
+        );
     }
 }

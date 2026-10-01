@@ -19,6 +19,11 @@ path = "src/main.rs"
 name = "talker-gui"
 path = "src/bin/talker-gui.rs"
 
+# Ctrl-C, SIGTERM and SIGHUP on Unix. On Windows, wiredata-stop handles the
+# console events instead: it holds a console close until the stop finishes.
+[target.'cfg(not(windows))'.dependencies]
+ctrlc = { workspace = true }
+
 [dependencies]
 # Workspace crates
 nmea0183 = { path = "../nmea0183" }
@@ -26,6 +31,7 @@ wiredata-ui = { path = "../wiredata-ui" }   # shared GUI chrome (ADR-016)
 wiredata-timing = { path = "../wiredata-timing" }
 wiredata-telemetry = { path = "../wiredata-telemetry" }
 wiredata-log = { path = "../wiredata-log" }         # bounded log-file worker (ADR-061)
+wiredata-stop = { path = "../wiredata-stop" }       # Windows stop requests (ADR-060)
 
 # Serial
 serialport = { workspace = true }
@@ -36,7 +42,6 @@ egui    = { workspace = true }
 
 # CLI
 clap  = { workspace = true }
-ctrlc = { workspace = true }
 
 # Threading
 crossbeam-channel = { workspace = true }

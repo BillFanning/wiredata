@@ -25,8 +25,8 @@ path = "src/bin/listener-gui.rs"
 wiredata-ui = { path = "../wiredata-ui" }
 wiredata-timing = { path = "../wiredata-timing" }
 wiredata-telemetry = { path = "../wiredata-telemetry" }
-wiredata-log = { path = "../wiredata-log" }
-wiredata-stop = { path = "../wiredata-stop" }         # persistent event log worker (ADR-044)
+wiredata-log = { path = "../wiredata-log" }         # persistent event log worker (ADR-044)
+wiredata-stop = { path = "../wiredata-stop", features = ["tokio"] }  # every OS stop request (ADR-049)
 
 # Presentation-only construction of inline NMEA ZDA Mark annotations (ADR-025).
 # Listener remains stream-only: received bytes are never decoded as NMEA.

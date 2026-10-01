@@ -279,15 +279,27 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
     drop(status_tx); // only the runners hold senders now
 
-    {
+    // Every OS stop request gets the same graceful stop (ADR-060). On Unix,
+    // Ctrl-C, SIGTERM and SIGHUP come through `ctrlc`. On Windows,
+    // `wiredata-stop` handles the console events — it holds a console close
+    // until the stop finishes, which `ctrlc` does not — and logoff and
+    // shutdown, which never reach a console handler here.
+    let stop = {
         let cmd_txs = cmd_txs.clone();
-        ctrlc::set_handler(move || {
+        move |_request: wiredata_stop::StopRequest| {
             for tx in &cmd_txs {
                 let _ = tx.send(TalkerCommand::Stop);
             }
-        })
-        .context("installing Ctrl+C handler")?;
+        }
+    };
+    #[cfg(not(windows))]
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || stop(wiredata_stop::StopRequest::Interrupt))
+            .context("installing the stop handler")?;
     }
+    let windows_stop =
+        wiredata_stop::on_windows_stop(stop).context("listening for Windows stop requests")?;
 
     tracing::info!("{} channel(s) started — Ctrl+C to stop", handles.len());
 
@@ -314,6 +326,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let _ = handle.join();
     }
     tracing::info!("stopped");
+    // A held Windows logoff or shutdown goes ahead only once the log has
+    // flushed: Windows may end the process straight away.
+    drop(_log);
+    windows_stop.finish();
     Ok(())
 }
 

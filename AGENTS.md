@@ -205,11 +205,12 @@ Eight crates in a Cargo workspace:
   deletion of log files past a caller-given age. What is logged, levels, formatting,
   the folder and prefix, and presentation stay in their apps.
 - **`wiredata-stop/`** — internal (`publish = false`) OS stop requests for both CLIs
-  (listener ADR-049). It turns Ctrl-C, SIGTERM, Windows console events and Windows
-  logoff and shutdown — through a hidden window, since these binaries load
-  `user32.dll` — into one stream, and holds a Windows session end until the app
-  says its graceful stop has finished. The graceful stop, its time limits and its
-  output stay in the apps.
+  (listener ADR-049). It catches Windows logoff and shutdown through a hidden
+  window, since these binaries load `user32.dll`, and holds a Windows console
+  close, logoff or shutdown until the app says its graceful stop has finished.
+  Its `tokio` feature adds one async stream of every request, Ctrl-C and SIGTERM
+  included (listener); without it, a plain callback serves talker. The graceful
+  stop, its time limits and its output stay in the apps.
 
 ```
 talker/src/
@@ -260,9 +261,9 @@ I/O shape (see talker ADR-002 vs listener ADR-001):
   types, and runtime/configuration policy remain in `talker` and `listener`.
 - `wiredata-log` owns only the log-file mechanism. It must never depend on `talker`,
   `listener` or GUI crates, and it deletes only log files, never recordings.
-- `wiredata-stop` owns only turning OS stop requests into one stream. It depends on
-  Tokio and, on Windows, `windows-sys` only, never on `talker`, `listener` or GUI
-  crates.
+- `wiredata-stop` owns only receiving OS stop requests. It depends on
+  `windows-sys` on Windows and on Tokio only behind its `tokio` feature, never on
+  `talker`, `listener` or GUI crates.
 - UI threads never perform I/O and never block.
 - `cli/` and `gui/` are thin layers; business logic lives in `core/` (or the equivalent
   internal modules).

@@ -19,8 +19,7 @@ The spec states these; the code does not do them yet.
   are not counted apart from whole messages.
 - [ ] **Unattended CLI (ADR-060, §3.1).** `run` still opens every channel or none.
   There is no retry of a failed open, no loud-warning banner or reminder, no
-  `--require-all`, and no defined exit codes. Only Ctrl+C is handled, since
-  `ctrlc` is built without SIGTERM support.
+  `--require-all`, and no defined exit codes.
 - [ ] **Strict profiles (ADR-062, §8.2).** Unknown keys are ignored, and
   `extract_version` treats a missing version as current.
 

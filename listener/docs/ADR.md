@@ -1926,9 +1926,19 @@ every OS stop request into one stream for both CLIs.
   output. Listener calls `finish` only after the runtime has stopped and the
   event log has flushed.
 
-**Boundary:** The crate depends on Tokio and, on Windows, `windows-sys` only. It
-does not install a service or handle service-control requests. The GUI binary
-is not covered; it receives session-end messages through its own window.
+**Boundary:** The crate depends on `windows-sys` on Windows, and on Tokio only
+behind its `tokio` feature. It does not install a service or handle
+service-control requests. The GUI binary is not covered; it receives
+session-end messages through its own window.
+
+**Amended 2026-10-01 for talker:** talker has no async runtime (talker
+ADR-002), so the Tokio stream sits behind the `tokio` feature, which listener
+enables. Without it, `on_windows_stop` calls a function for Ctrl-C,
+Ctrl-Break, console close, logoff and shutdown on Windows. Its console handler
+holds a console close until the stop finishes, because Windows ends the
+process as soon as the handler returns, and `ctrlc` returns at once. Talker
+uses it on Windows and keeps `ctrlc`, with its `termination` feature for
+SIGTERM and SIGHUP, on Unix.
 
 **Alternatives considered:**
 

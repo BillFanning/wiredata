@@ -49,7 +49,8 @@ egui = "0.34"
 clap = { version = "4", features = ["derive"] }
 
 # ── Signal handling ───────────────────────────────────────────────────────────
-ctrlc = "3"
+# `termination` adds SIGTERM and SIGHUP on Unix (talker ADR-060).
+ctrlc = { version = "3", features = ["termination"] }
 
 # ── Inter-thread communication ────────────────────────────────────────────────
 crossbeam-channel = "0.5"
