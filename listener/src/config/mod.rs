@@ -26,15 +26,16 @@ use crate::transport::udp::UdpMode;
 /// are refused with a "recreate the profile" error.
 pub const CURRENT_VERSION: u32 = 3;
 
-fn current_version() -> u32 {
-    CURRENT_VERSION
-}
-
 /// A persisted Listener workspace (§67, §72). A complete set of configured
 /// Channels plus profile-level defaults.
+///
+/// Loads strictly (ADR-048): a key the schema does not have is refused, with
+/// its line, rather than passing for a default. Missing fields still take
+/// their defaults, so an additive change within a schema version still loads
+/// older files.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
-    #[serde(default = "current_version")]
     pub schema_version: u32,
     pub name: String,
     #[serde(default)]
@@ -55,10 +56,23 @@ impl Profile {
     }
 
     /// Parse a profile from TOML text, enforcing schema-version compatibility
-    /// (§72.1).
+    /// (§72.1). The version is checked first, so a profile from another schema
+    /// is refused for that rather than for keys this one does not have.
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
+        let doc: toml::Table = toml::from_str(text)?;
+        match doc.get("schema_version") {
+            None => return Err(ConfigError::MissingSchemaVersion),
+            Some(toml::Value::Integer(found)) => {
+                // Out of range is left to the typed parse, which says so.
+                if let Ok(found) = u32::try_from(*found) {
+                    check_version(found)?;
+                }
+            }
+            // A wrong type is left to the typed parse, which names it.
+            Some(_) => {}
+        }
         let profile: Profile = toml::from_str(text)?;
-        profile.check_version()?;
+        check_version(profile.schema_version)?;
         Ok(profile)
     }
 
@@ -86,23 +100,6 @@ impl Profile {
             return Err(error.into());
         }
         Ok(())
-    }
-
-    /// Schema-version compatibility (§72.1): equal loads; newer is refused;
-    /// older is refused (no migration exists for the v1 series yet).
-    fn check_version(&self) -> Result<(), ConfigError> {
-        use std::cmp::Ordering::*;
-        match self.schema_version.cmp(&CURRENT_VERSION) {
-            Equal => Ok(()),
-            Greater => Err(ConfigError::SchemaTooNew {
-                found: self.schema_version,
-                supported: CURRENT_VERSION,
-            }),
-            Less => Err(ConfigError::SchemaTooOld {
-                found: self.schema_version,
-                supported: CURRENT_VERSION,
-            }),
-        }
     }
 
     /// Validate every channel without starting anything (§71). A channel's
@@ -295,6 +292,27 @@ pub enum ConfigError {
     SchemaTooNew { found: u32, supported: u32 },
     #[error("profile schema version {found} is older than {supported} and has no migration")]
     SchemaTooOld { found: u32, supported: u32 },
+    /// A profile that does not say its schema is not taken to be current
+    /// (ADR-048).
+    #[error("the profile has no schema_version: add `schema_version = {CURRENT_VERSION}`")]
+    MissingSchemaVersion,
+}
+
+/// Schema-version compatibility (§72.1): equal loads; newer is refused;
+/// older is refused (no migration exists for the v1 series yet).
+fn check_version(found: u32) -> Result<(), ConfigError> {
+    use std::cmp::Ordering::*;
+    match found.cmp(&CURRENT_VERSION) {
+        Equal => Ok(()),
+        Greater => Err(ConfigError::SchemaTooNew {
+            found,
+            supported: CURRENT_VERSION,
+        }),
+        Less => Err(ConfigError::SchemaTooOld {
+            found,
+            supported: CURRENT_VERSION,
+        }),
+    }
 }
 
 /// A structural problem in one channel's configuration (§71).
@@ -420,7 +438,7 @@ mod tests {
                 actions: vec![MatchAction::Mark {
                     timestamp: Some(MarkTimestamp {
                         position: MarkPosition::After,
-                        style: MarkTimestampStyle::Plain,
+                        style: MarkTimestampStyle::Plain {},
                         format: crate::core::TimestampConfig {
                             include_date: false,
                             include_millis: true,
@@ -500,7 +518,7 @@ mod tests {
     #[test]
     fn mark_timestamp_without_style_defaults_to_plain() {
         let timestamp: MarkTimestamp = toml::from_str("separator = ' '").unwrap();
-        assert_eq!(timestamp.style, MarkTimestampStyle::Plain);
+        assert_eq!(timestamp.style, MarkTimestampStyle::Plain {});
     }
 
     #[test]
@@ -631,11 +649,178 @@ mod tests {
     #[test]
     fn missing_additive_fields_default_in() {
         // Only the required fields are present; everything else defaults (§72.1).
-        let toml = "name = \"minimal\"\n";
+        let toml = "schema_version = 3\nname = \"minimal\"\n";
         let profile = Profile::from_toml(toml).expect("defaults fill in");
         assert_eq!(profile.schema_version, CURRENT_VERSION);
         assert!(profile.channels.is_empty());
         assert_eq!(profile.defaults, DefaultConfig::default());
+    }
+
+    /// ADR-048: a profile without `schema_version` is not taken to be current.
+    #[test]
+    fn a_missing_schema_version_is_refused() {
+        let err = Profile::from_toml("name = \"x\"\n").unwrap_err();
+        assert!(matches!(err, ConfigError::MissingSchemaVersion));
+        assert_eq!(
+            err.to_string(),
+            "the profile has no schema_version: add `schema_version = 3`"
+        );
+    }
+
+    /// A profile that uses every profile type, so a misspelled key can be put
+    /// in each.
+    fn every_type() -> Profile {
+        use crate::core::ChannelName;
+        use crate::diagnostics::DiagnosticSeverity;
+
+        let mut udp = templates::udp_template();
+        udp.name = ChannelName::new("udp");
+        udp.raw_recording.disk_guard = Some(DiskGuard {
+            min_free: DiskThreshold::Percent { percent: 5 },
+            on_low: LowDiskAction::Warn,
+        });
+        udp.display_recording.disk_guard = Some(DiskGuard {
+            min_free: DiskThreshold::Bytes { bytes: 1 << 30 },
+            on_low: LowDiskAction::StopRecording,
+        });
+        udp.match_rules = vec![
+            MatchRule {
+                name: "gga".to_owned(),
+                condition: MatchCondition::BytePattern {
+                    pattern: b"$GPGGA".to_vec(),
+                },
+                actions: vec![
+                    MatchAction::Record {
+                        target: RecordTarget::Raw,
+                        control: RecordControl::Begin,
+                    },
+                    MatchAction::Mark {
+                        timestamp: Some(MarkTimestamp {
+                            style: MarkTimestampStyle::NmeaZda {
+                                talker: "GP".to_owned(),
+                            },
+                            ..MarkTimestamp::default()
+                        }),
+                    },
+                    MatchAction::Notify {
+                        severity: DiagnosticSeverity::Warning,
+                    },
+                    MatchAction::PauseDisplay { view: Some(0) },
+                    MatchAction::Mark {
+                        timestamp: Some(MarkTimestamp::default()),
+                    },
+                ],
+                enabled: true,
+            },
+            MatchRule {
+                name: "quiet".to_owned(),
+                condition: MatchCondition::Idle { timeout_ms: 1_000 },
+                actions: Vec::new(),
+                enabled: true,
+            },
+        ];
+        let mut serial = templates::serial_template();
+        serial.name = ChannelName::new("serial");
+        let mut tcp = templates::tcp_listener_template();
+        tcp.name = ChannelName::new("tcp");
+
+        let mut profile = Profile::new("every type");
+        profile.channels = vec![udp, serial, tcp];
+        profile.defaults = DefaultConfig {
+            display: Some(DisplayConfig::default()),
+            retention: Some(RetentionConfig::with_byte_limit(1_000)),
+        };
+        profile
+    }
+
+    /// ADR-048: an unknown key is refused in every profile type, and the
+    /// message names it and its line. Serde's deny-unknown-fields support is
+    /// partial for internally tagged enums, so each type is tried, not one.
+    #[test]
+    fn a_misspelled_key_is_refused_wherever_it_is() {
+        let text = every_type().to_toml().unwrap();
+        Profile::from_toml(&text).expect("the profile without a misspelling loads");
+        let doc: toml::Value = toml::from_str(&text).unwrap();
+
+        // (where, the type found there)
+        let cases = [
+            ("", "Profile"),
+            ("channels.0", "ChannelConfig"),
+            ("channels.0.interface", "UdpConfig"),
+            ("channels.1.interface", "SerialConfig"),
+            ("channels.2.interface", "TcpListenerConfig"),
+            ("channels.0.reconnect", "ReconnectPolicy"),
+            ("channels.0.display", "DisplayConfig"),
+            ("channels.0.display.views.0", "DisplayViewConfig"),
+            ("channels.0.display.views.0.hex_grouping", "HexGrouping"),
+            ("channels.0.raw_recording", "RawRecordingConfig"),
+            ("channels.0.raw_recording.disk_guard", "DiskGuard"),
+            (
+                "channels.0.raw_recording.disk_guard.min_free",
+                "DiskThreshold::Percent",
+            ),
+            ("channels.0.display_recording", "DisplayRecordingConfig"),
+            (
+                "channels.0.display_recording.disk_guard.min_free",
+                "DiskThreshold::Bytes",
+            ),
+            ("channels.0.retention", "RetentionConfig"),
+            ("channels.0.match_rules.0", "MatchRule"),
+            (
+                "channels.0.match_rules.0.condition",
+                "MatchCondition::BytePattern",
+            ),
+            ("channels.0.match_rules.1.condition", "MatchCondition::Idle"),
+            ("channels.0.match_rules.0.actions.0", "MatchAction::Record"),
+            ("channels.0.match_rules.0.actions.1", "MatchAction::Mark"),
+            (
+                "channels.0.match_rules.0.actions.1.timestamp",
+                "MarkTimestamp",
+            ),
+            (
+                "channels.0.match_rules.0.actions.1.timestamp.style",
+                "MarkTimestampStyle::NmeaZda",
+            ),
+            (
+                "channels.0.match_rules.0.actions.1.timestamp.format",
+                "TimestampConfig",
+            ),
+            ("channels.0.match_rules.0.actions.2", "MatchAction::Notify"),
+            (
+                "channels.0.match_rules.0.actions.3",
+                "MatchAction::PauseDisplay",
+            ),
+            (
+                "channels.0.match_rules.0.actions.4.timestamp.style",
+                "MarkTimestampStyle::Plain",
+            ),
+            ("defaults", "DefaultConfig"),
+            ("defaults.display", "DisplayConfig in defaults"),
+            ("defaults.retention", "RetentionConfig in defaults"),
+        ];
+        for (path, kind) in cases {
+            let mut misspelled = doc.clone();
+            let mut table = &mut misspelled;
+            for step in path.split('.').filter(|step| !step.is_empty()) {
+                table = match step.parse::<usize>() {
+                    Ok(index) => &mut table[index],
+                    Err(_) => &mut table[step],
+                };
+            }
+            table
+                .as_table_mut()
+                .unwrap_or_else(|| panic!("{kind}: {path} is not a table"))
+                .insert("misspelled_key".to_owned(), toml::Value::Integer(1));
+            let text = toml::to_string(&misspelled).unwrap();
+            let err = Profile::from_toml(&text)
+                .expect_err(&format!("{kind} accepted an unknown key"))
+                .to_string();
+            assert!(
+                err.contains("unknown field `misspelled_key`"),
+                "{kind}: {err}"
+            );
+            assert!(err.contains(" at line "), "{kind}: no line in {err}");
+        }
     }
 
     #[test]

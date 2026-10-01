@@ -19,6 +19,7 @@ use crate::transport::udp::UdpMode;
 /// One configured Channel (§72). Carries only configuration; runtime objects
 /// (live connections, the byte stream, diagnostics) are never stored here (§69).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelConfig {
     #[serde(default)]
     pub id: Option<StableConfigId>,
@@ -51,6 +52,7 @@ pub struct ChannelConfig {
 /// exponential backoff. Applies to Serial/UDP/TCP-Listener Channels, never TCP
 /// Connection Channels (the listener does not dial out).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReconnectPolicy {
     #[serde(default)]
     pub enabled: bool,
@@ -106,6 +108,7 @@ pub enum InterfaceConfig {
 /// (richer than what `serialport` supports); the runtime maps them and rejects
 /// unsupported combinations at Start.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SerialConfig {
     pub port: String,
     pub baud_rate: u32,
@@ -162,6 +165,7 @@ pub enum FlowControl {
 
 /// UDP interface configuration (§75).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UdpConfig {
     pub bind_address: String,
     pub port: u16,
@@ -191,6 +195,7 @@ pub struct UdpConfig {
 
 /// TCP listener interface configuration (§76).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcpListenerConfig {
     pub bind_address: String,
     pub port: u16,
@@ -203,6 +208,7 @@ pub struct TcpListenerConfig {
 
 /// Display configuration: a set of views (§78).
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DisplayConfig {
     #[serde(default)]
     pub views: Vec<DisplayViewConfig>,
@@ -211,6 +217,7 @@ pub struct DisplayConfig {
 /// One display view's configuration (§78). Visual-only fields (font, colors) do
 /// not affect produced text (see `display::DisplayView`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DisplayViewConfig {
     pub mode: DisplayMode,
     pub encoding: DisplayEncoding,
@@ -236,6 +243,7 @@ pub struct DisplayViewConfig {
 /// spaces) and how many groups fill a line. `groups_per_line == 0` means "fit to
 /// the display width" rather than a fixed count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HexGrouping {
     pub bytes_per_group: u8,
     pub groups_per_line: u8,
@@ -257,6 +265,7 @@ impl Default for HexGrouping {
 /// pipeline and were always separate; the v2.0 strip merged them in config only).
 /// Listener ADR-013.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawRecordingConfig {
     /// Whether to begin Raw recording automatically when the Channel starts. The
     /// live Record toggle (ADR-012) can begin/stop it at runtime regardless, as long
@@ -345,6 +354,7 @@ impl Default for RawRecordingConfig {
 /// **rendered view** output (`.disp`) — a separate pipeline tap from Raw recording
 /// (ADR-013), with its own destination and options.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DisplayRecordingConfig {
     /// Whether to begin Display recording automatically when the Channel starts.
     #[serde(default)]
@@ -395,6 +405,7 @@ impl Default for DisplayRecordingConfig {
 /// cleanly and waits in a gap until free space is 10% above the threshold, while
 /// reception continues. Free space is polled periodically, not per write.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiskGuard {
     pub min_free: DiskThreshold,
     pub on_low: LowDiskAction,
@@ -402,7 +413,7 @@ pub struct DiskGuard {
 
 /// A low-disk threshold (§168): absolute bytes or a percentage of the filesystem.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", deny_unknown_fields)]
 pub enum DiskThreshold {
     Bytes { bytes: u64 },
     Percent { percent: u8 },
@@ -425,6 +436,7 @@ pub enum LowDiskAction {
 /// or metadata (§40, §103, §116). Persisted in profiles; identified at runtime by
 /// a minted [`MatchRuleId`](crate::core::MatchRuleId), in config by `name`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatchRule {
     pub name: String,
     pub condition: MatchCondition,
@@ -438,7 +450,7 @@ pub struct MatchRule {
 /// AND/OR/sequence logic is deferred (Appendix A). Internally tagged so every
 /// variant is a uniform TOML table.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", deny_unknown_fields)]
 pub enum MatchCondition {
     /// A byte pattern scanned across the received stream (§50.2), matching across
     /// receive-chunk boundaries.
@@ -451,7 +463,7 @@ pub enum MatchCondition {
 
 /// What a matched rule does (§50.2). Presentation/control only.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", deny_unknown_fields)]
 pub enum MatchAction {
     /// Begin or stop recording **from the match forward** — no pre-match backfill
     /// (§158). Requires the Channel to have a recording destination configured.
@@ -486,6 +498,7 @@ pub enum MatchAction {
 /// `position` places it before/after the complete match in the rendered display
 /// and Display Recording (`.disp`) — never in `.raw`.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MarkTimestamp {
     #[serde(default)]
     pub position: MarkPosition,
@@ -505,18 +518,27 @@ pub struct MarkTimestamp {
 }
 
 /// Text style emitted by a timestamped `Mark` action.
-#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MarkTimestampStyle {
     /// Listener's compact local wall-clock text configured by `format`.
-    #[default]
-    Plain,
+    ///
+    /// An empty struct variant, not a unit one: serde ignores unknown keys
+    /// beside the tag of a unit variant, so `Plain` would let a misspelled key
+    /// through (ADR-048). It is written `{ kind = "plain" }` either way.
+    Plain {},
     /// A checksum-bearing ZDA-shaped sentence carrying UTC date/time and the
     /// local offset. IDs longer than two characters are accepted as custom IDs.
     NmeaZda {
         #[serde(default = "default_zda_talker")]
         talker: String,
     },
+}
+
+impl Default for MarkTimestampStyle {
+    fn default() -> Self {
+        Self::Plain {}
+    }
 }
 
 fn default_zda_talker() -> String {
@@ -552,6 +574,7 @@ pub enum RecordControl {
 /// all-`None` config is rejected by validation (§71) and bounded by the runtime
 /// backstop regardless (§80, retention module).
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
     /// Stream-scrollback byte limit (replaces the v1 message_limit).
     #[serde(default)]
@@ -584,6 +607,7 @@ impl RetentionConfig {
 
 /// Profile-level defaults applied to channels that do not override them (§80.1).
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DefaultConfig {
     #[serde(default)]
     pub display: Option<DisplayConfig>,

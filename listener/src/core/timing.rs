@@ -76,6 +76,7 @@ impl ChunkTime {
 /// offset are independently toggleable. Default = `HH:MM:SS`. NMEA ZDA Mark
 /// style reuses `include_millis` and ignores the other two toggles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimestampConfig {
     #[serde(default)]
     pub include_date: bool,

@@ -912,7 +912,9 @@ impl ChannelPipeline {
                                 offset.checked_add(rule.match_len.saturating_sub(1) as u64)
                             };
                             let rendered = match &ts.style {
-                                MarkTimestampStyle::Plain => ts.format.format(arrival.wall_clock),
+                                MarkTimestampStyle::Plain {} => {
+                                    ts.format.format(arrival.wall_clock)
+                                }
                                 MarkTimestampStyle::NmeaZda { talker } => {
                                     match zda_sentence(
                                         talker,

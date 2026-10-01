@@ -76,7 +76,7 @@ pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
         ui.indent(("mark_options", i), |ui| {
             ui.horizontal(|ui| {
                 match &mut ts.style {
-                    MarkTimestampStyle::Plain => mark_format_toggles(ui, &mut ts.format),
+                    MarkTimestampStyle::Plain {} => mark_format_toggles(ui, &mut ts.format),
                     MarkTimestampStyle::NmeaZda { talker } => {
                         mark_zda_talker_field(ui, talker);
                         ui.checkbox(&mut ts.format.include_millis, "ms")
@@ -232,12 +232,12 @@ fn mark_style_selector(ui: &mut egui::Ui, style: &mut MarkTimestampStyle) {
             ui.selectable_value(&mut zda, false, "Time");
             ui.selectable_value(&mut zda, true, "NMEA ZDA");
         });
-    if zda && matches!(style, MarkTimestampStyle::Plain) {
+    if zda && matches!(style, MarkTimestampStyle::Plain {}) {
         *style = MarkTimestampStyle::NmeaZda {
             talker: "GP".to_string(),
         };
     } else if !zda && matches!(style, MarkTimestampStyle::NmeaZda { .. }) {
-        *style = MarkTimestampStyle::Plain;
+        *style = MarkTimestampStyle::Plain {};
     }
 }
 
