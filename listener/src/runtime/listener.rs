@@ -435,6 +435,14 @@ impl Listener {
         self.channels.get(&id).map(|c| c.effective_state())
     }
 
+    /// Whether `id`'s reconnect retries ran out (§9.1).
+    pub fn reconnect_exhausted(&self, id: ChannelId) -> bool {
+        self.channels
+            .get(&id)
+            .and_then(|c| c.reconnect_state.as_ref())
+            .is_some_and(|s| s.gave_up)
+    }
+
     pub fn config(&self, id: ChannelId) -> Option<&ChannelConfig> {
         self.channels.get(&id).map(|c| &c.config)
     }
@@ -2116,6 +2124,53 @@ mod tests {
         }
         assert!(gave_up, "expected a ChannelReconnectGaveUp event");
         assert_eq!(listener.state(id), Some(ChannelState::Faulted));
+        assert!(listener.reconnect_exhausted(id));
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_cannot_start_starts_once_its_resource_appears() {
+        // §3.1: start what can start. The boot case — a port in use (or an
+        // adapter not yet enumerated) — fails the first start, and the
+        // reconnect policy starts the Channel once the resource is free.
+        use crate::config::ReconnectPolicy;
+        let port = crate::test_ports::reserve_udp_port();
+        let blocker = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let mut config = udp_channel();
+        if let InterfaceConfig::Udp(udp) = &mut config.interface {
+            udp.bind_address = "127.0.0.1".to_string();
+            udp.port = port;
+        }
+        config.reconnect = ReconnectPolicy {
+            enabled: true,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 5,
+            multiplier: 1.0,
+            max_attempts: None,
+        };
+        let id = listener.add_channel(config);
+        assert!(listener.start(id).await.is_err(), "the port is taken");
+        assert_eq!(listener.state(id), Some(ChannelState::Faulted));
+        for _ in 0..3 {
+            listener.reconnect_tick().await;
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        assert_eq!(
+            listener.state(id),
+            Some(ChannelState::Faulted),
+            "still taken"
+        );
+
+        drop(blocker);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while listener.state(id) != Some(ChannelState::Running) {
+            assert!(tokio::time::Instant::now() < deadline, "never started");
+            listener.reconnect_tick().await;
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        assert!(!listener.reconnect_exhausted(id));
+        listener.stop(id).await.unwrap();
     }
 
     #[tokio::test]

@@ -19,10 +19,9 @@ The spec states these; the code does not do them yet.
 
 - [ ] **Unattended GUI (ADR-045, §9.1, §70).** No reconnect checkbox or prompt,
   and no resume registration.
-- [ ] **Unattended CLI (ADR-046, §3.1).** The CLI still bails with "no
-  channels started", stops on Ctrl-C only, and has no `--require-all`. Of the
-  exit codes it sets only 0 and 4 (finalization incomplete); 2 and 3 are not
-  yet distinguished, and an internal error exits 1.
+- [ ] **CLI stop signals (ADR-046, §3.1).** The CLI stops on Ctrl-C only:
+  SIGTERM on Linux, and console close, logoff and shutdown on Windows, end the
+  process without the graceful stop of §113.
 - [ ] **TCP Listener disabled (ADR-047, §4.1, §16).** `tcp_listener_template` is
   still offered, and validation accepts the kind.
 - [ ] **UDP bind scope and shared port (ADR-047, §15, §75).** No `shared_port`

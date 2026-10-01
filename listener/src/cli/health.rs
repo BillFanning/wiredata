@@ -1,0 +1,391 @@
+//! What the CLI tells an operator about Channel health during an unattended run
+//! (§3.1; listener ADR-046, talker ADR-060).
+//!
+//! - A WARNING when a Channel does not start or goes down, naming it and why.
+//! - A reminder every five minutes while any Channel stays down, with how long
+//!   it has been down and the latest reason.
+//! - A line when a Channel recovers, and one when its retries run out.
+//! - A summary at the end naming every Channel's outcome, which also decides
+//!   whether the run was degraded (exit code 3).
+//!
+//! Pure bookkeeping: the caller observes the runtime and prints the lines.
+
+use std::time::{Duration, Instant};
+
+use crate::core::{ChannelId, RecordingTap};
+
+/// How often a reminder repeats while any Channel is down.
+pub(crate) const REMINDER_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// One Channel's health over the run.
+#[derive(Debug)]
+struct Watched {
+    id: ChannelId,
+    name: String,
+    /// Whether its reconnect policy retries it (§9.1).
+    retries: bool,
+    /// Whether it has run at all this session.
+    ever_up: bool,
+    /// When the current outage began; `None` while it runs.
+    down_since: Option<Instant>,
+    /// The latest reason it is down.
+    reason: String,
+    /// Its retries ran out.
+    gave_up: bool,
+    /// Outages it recovered from, and their total length.
+    recovered: u32,
+    recovered_for: Duration,
+    /// Recording faults and gaps seen, Raw then Display.
+    recording_faults: [u32; 2],
+}
+
+/// The health of every Channel in the run, in the order they were added.
+#[derive(Debug, Default)]
+pub(crate) struct HealthWatch {
+    channels: Vec<Watched>,
+    /// When the last reminder went out; reminders start five minutes after
+    /// the first outage.
+    reminded_at: Option<Instant>,
+}
+
+impl HealthWatch {
+    /// Watch a Channel. `retries` is whether its reconnect policy is on.
+    pub fn add(&mut self, id: ChannelId, name: &str, retries: bool) {
+        self.channels.push(Watched {
+            id,
+            name: name.to_owned(),
+            retries,
+            ever_up: false,
+            down_since: None,
+            reason: String::new(),
+            gave_up: false,
+            recovered: 0,
+            recovered_for: Duration::ZERO,
+            recording_faults: [0; 2],
+        });
+    }
+
+    fn get(&mut self, id: ChannelId) -> Option<&mut Watched> {
+        self.channels.iter_mut().find(|c| c.id == id)
+    }
+
+    /// The Channel is running. Returns the recovery line when it was down.
+    pub fn up(&mut self, id: ChannelId, now: Instant) -> Option<String> {
+        let channel = self.get(id)?;
+        let first_start = !channel.ever_up;
+        channel.ever_up = true;
+        let since = channel.down_since.take()?;
+        let down_for = now.saturating_duration_since(since);
+        channel.recovered += 1;
+        channel.recovered_for += down_for;
+        let name = &channel.name;
+        Some(if first_start {
+            format!("RECOVERED: [{name}] started after {}", describe(down_for))
+        } else {
+            format!(
+                "RECOVERED: [{name}] is running again after {} down",
+                describe(down_for)
+            )
+        })
+    }
+
+    /// The Channel did not start, or went down. Returns the warning for a new
+    /// outage; a Channel already down only takes the newer reason.
+    pub fn down(&mut self, id: ChannelId, reason: &str, now: Instant) -> Option<String> {
+        let channel = self.get(id)?;
+        channel.reason = reason.to_owned();
+        if channel.down_since.is_some() {
+            return None;
+        }
+        channel.down_since = Some(now);
+        let what = if channel.ever_up {
+            "is down"
+        } else {
+            "did not start"
+        };
+        let next = if channel.retries {
+            "retrying under its reconnect policy"
+        } else {
+            "reconnect is off, so it stays down"
+        };
+        Some(format!(
+            "WARNING: [{}] {what}: {reason} — {next}",
+            channel.name
+        ))
+    }
+
+    /// The Channel's retries ran out. Returns the warning, once.
+    pub fn gave_up(&mut self, id: ChannelId) -> Option<String> {
+        let channel = self.get(id)?;
+        if channel.gave_up {
+            return None;
+        }
+        channel.gave_up = true;
+        Some(format!(
+            "WARNING: [{}] ran out of retries and stays down: {}",
+            channel.name, channel.reason
+        ))
+    }
+
+    /// A recording on the Channel faulted or opened a gap (§56.1).
+    pub fn recording_fault(&mut self, id: ChannelId, tap: RecordingTap) {
+        if let Some(channel) = self.get(id) {
+            let slot = match tap {
+                RecordingTap::Raw => 0,
+                RecordingTap::Display => 1,
+            };
+            channel.recording_faults[slot] += 1;
+        }
+    }
+
+    /// Whether a reminder is due: some Channel is down, and five minutes have
+    /// passed since the last reminder or, before the first, since the earliest
+    /// outage began.
+    pub fn reminder_due(&self, now: Instant) -> bool {
+        let earliest = self.channels.iter().filter_map(|c| c.down_since).min();
+        let Some(earliest) = earliest else {
+            return false;
+        };
+        let from = self.reminded_at.map_or(earliest, |at| at.max(earliest));
+        now.saturating_duration_since(from) >= REMINDER_EVERY
+    }
+
+    /// One reminder line per Channel that is down, when one is due.
+    pub fn reminders(&mut self, now: Instant) -> Vec<String> {
+        if !self.reminder_due(now) {
+            return Vec::new();
+        }
+        self.reminded_at = Some(now);
+        self.channels
+            .iter()
+            .filter_map(|c| {
+                let since = c.down_since?;
+                let down_for = describe(now.saturating_duration_since(since));
+                let what = if c.ever_up {
+                    format!("has been down for {down_for}")
+                } else {
+                    format!("has not started after {down_for}")
+                };
+                Some(format!("WARNING: [{}] {what}: {}", c.name, c.reason))
+            })
+            .collect()
+    }
+
+    /// Whether nothing is running and nothing will retry — the run cannot do
+    /// anything (§3.1, exit code 2).
+    pub fn nothing_can_run(&self) -> bool {
+        self.channels
+            .iter()
+            .all(|c| c.down_since.is_some() && !c.retries)
+    }
+
+    /// Whether the run is degraded (§3.1, exit code 3): a Channel never
+    /// started, its retries ran out, or it is down now.
+    pub fn degraded(&self) -> bool {
+        self.channels
+            .iter()
+            .any(|c| !c.ever_up || c.gave_up || c.down_since.is_some())
+    }
+
+    /// The final summary, one line per Channel (§3.1).
+    pub fn summary(&self, now: Instant) -> Vec<String> {
+        self.channels
+            .iter()
+            .map(|c| {
+                let mut line = match (c.down_since, c.ever_up) {
+                    (Some(_), false) => format!("[{}] never started: {}", c.name, c.reason),
+                    (Some(_), true) if c.gave_up => {
+                        format!("[{}] ran out of retries: {}", c.name, c.reason)
+                    }
+                    (Some(since), true) => format!(
+                        "[{}] down at shutdown, for {}: {}",
+                        c.name,
+                        describe(now.saturating_duration_since(since)),
+                        c.reason
+                    ),
+                    (None, _) if c.recovered == 0 => format!("[{}] ran throughout", c.name),
+                    (None, _) => format!(
+                        "[{}] recovered from {} outage{}, {} down in all",
+                        c.name,
+                        c.recovered,
+                        if c.recovered == 1 { "" } else { "s" },
+                        describe(c.recovered_for)
+                    ),
+                };
+                for (tap, count) in [
+                    ("Raw", c.recording_faults[0]),
+                    ("Display", c.recording_faults[1]),
+                ] {
+                    if count > 0 {
+                        line.push_str(&format!(
+                            "; {tap} recording: {count} fault{} or gap{} (see the event log)",
+                            if count == 1 { "" } else { "s" },
+                            if count == 1 { "" } else { "s" },
+                        ));
+                    }
+                }
+                line
+            })
+            .collect()
+    }
+}
+
+/// A length of time in the largest units an operator reads at a glance.
+fn describe(span: Duration) -> String {
+    let secs = span.as_secs();
+    match (secs / 3600, (secs % 3600) / 60) {
+        (0, 0) => format!("{secs} s"),
+        (0, minutes) => format!("{minutes} min"),
+        (hours, minutes) => format!("{hours} h {minutes} min"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn watch_one(retries: bool) -> (HealthWatch, ChannelId, Instant) {
+        let mut watch = HealthWatch::default();
+        let id = ChannelId::new();
+        watch.add(id, "GPS", retries);
+        (watch, id, Instant::now())
+    }
+
+    const MIN: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_channel_that_starts_late_is_warned_about_then_recovers() {
+        // The boot case: the adapter enumerates after the service starts.
+        let (mut watch, id, t0) = watch_one(true);
+        assert_eq!(
+            watch.down(id, "COM3 not found", t0).as_deref(),
+            Some("WARNING: [GPS] did not start: COM3 not found — retrying under its reconnect policy")
+        );
+        assert_eq!(
+            watch.down(id, "COM3 still not found", t0 + MIN),
+            None,
+            "one warning per outage"
+        );
+        assert!(watch.degraded());
+        assert_eq!(
+            watch.up(id, t0 + 2 * MIN).as_deref(),
+            Some("RECOVERED: [GPS] started after 2 min")
+        );
+        assert!(!watch.degraded(), "every outage recovered");
+        assert_eq!(
+            watch.summary(t0 + 3 * MIN),
+            ["[GPS] recovered from 1 outage, 2 min down in all"]
+        );
+    }
+
+    #[test]
+    fn a_run_with_nothing_running_and_nothing_retrying_cannot_do_anything() {
+        let (mut watch, id, t0) = watch_one(false);
+        watch.down(id, "COM3 not found", t0);
+        assert!(watch.nothing_can_run());
+
+        let (mut watch, id, t0) = watch_one(true);
+        watch.down(id, "COM3 not found", t0);
+        assert!(
+            !watch.nothing_can_run(),
+            "a retrying channel may still start"
+        );
+    }
+
+    #[test]
+    fn a_channel_that_never_starts_degrades_the_run() {
+        let (mut watch, id, t0) = watch_one(false);
+        assert_eq!(
+            watch.down(id, "COM3 not found", t0).as_deref(),
+            Some(
+                "WARNING: [GPS] did not start: COM3 not found — reconnect is off, so it stays down"
+            )
+        );
+        assert!(watch.degraded());
+        assert_eq!(watch.summary(t0), ["[GPS] never started: COM3 not found"]);
+    }
+
+    #[test]
+    fn a_running_channel_that_goes_down_is_named_with_its_reason() {
+        let (mut watch, id, t0) = watch_one(true);
+        assert_eq!(watch.up(id, t0), None, "starting is not a recovery");
+        assert_eq!(
+            watch.down(id, "device removed", t0).as_deref(),
+            Some("WARNING: [GPS] is down: device removed — retrying under its reconnect policy")
+        );
+        assert_eq!(
+            watch.up(id, t0 + 90 * Duration::from_secs(1)).as_deref(),
+            Some("RECOVERED: [GPS] is running again after 1 min down")
+        );
+        assert_eq!(
+            watch.summary(t0 + MIN),
+            ["[GPS] recovered from 1 outage, 1 min down in all"]
+        );
+    }
+
+    #[test]
+    fn reminders_repeat_every_five_minutes_with_the_latest_reason() {
+        let (mut watch, id, t0) = watch_one(true);
+        watch.up(id, t0);
+        watch.down(id, "device removed", t0);
+        assert!(watch.reminders(t0 + 4 * MIN).is_empty());
+        assert_eq!(
+            watch.down(id, "COM3 not found", t0 + 4 * MIN),
+            None,
+            "the newer reason, no new warning"
+        );
+        assert_eq!(
+            watch.reminders(t0 + 5 * MIN),
+            ["WARNING: [GPS] has been down for 5 min: COM3 not found"]
+        );
+        assert!(
+            watch.reminders(t0 + 9 * MIN).is_empty(),
+            "not again until five minutes later"
+        );
+        assert_eq!(watch.reminders(t0 + 10 * MIN).len(), 1);
+        watch.up(id, t0 + 11 * MIN);
+        assert!(watch.reminders(t0 + 20 * MIN).is_empty(), "nothing is down");
+    }
+
+    #[test]
+    fn running_out_of_retries_is_reported_once_and_degrades_the_run() {
+        let (mut watch, id, t0) = watch_one(true);
+        watch.up(id, t0);
+        watch.down(id, "device removed", t0);
+        assert_eq!(
+            watch.gave_up(id).as_deref(),
+            Some("WARNING: [GPS] ran out of retries and stays down: device removed")
+        );
+        assert_eq!(watch.gave_up(id), None);
+        assert!(watch.degraded());
+        assert_eq!(
+            watch.summary(t0),
+            ["[GPS] ran out of retries: device removed"]
+        );
+    }
+
+    #[test]
+    fn the_summary_names_each_channel_and_its_recording_faults() {
+        let mut watch = HealthWatch::default();
+        let (gps, ais) = (ChannelId::new(), ChannelId::new());
+        let t0 = Instant::now();
+        watch.add(gps, "GPS", true);
+        watch.add(ais, "AIS", true);
+        watch.up(gps, t0);
+        watch.up(ais, t0);
+        watch.recording_fault(gps, RecordingTap::Raw);
+        watch.recording_fault(gps, RecordingTap::Raw);
+        watch.down(ais, "device removed", t0);
+        assert_eq!(
+            watch.summary(t0 + 12 * MIN),
+            [
+                "[GPS] ran throughout; Raw recording: 2 faults or gaps (see the event log)",
+                "[AIS] down at shutdown, for 12 min: device removed",
+            ]
+        );
+        assert!(
+            watch.degraded(),
+            "a channel down at shutdown degrades the run"
+        );
+    }
+}

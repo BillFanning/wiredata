@@ -1,21 +1,26 @@
 //! CLI presentation layer (spec §3).
 //!
 //! A thin layer over the runtime [`Listener`]: it
-//! turns arguments (or a profile) into channel configs, starts them, prints the
-//! `RuntimeEvent` stream, and shuts down gracefully on Ctrl-C. It contains no
-//! business logic — channel construction lives in `runtime`/`config` (§3, §128).
+//! turns arguments (or a profile) into channel configs, starts what can start,
+//! says loudly what is down (§3.1), prints the `RuntimeEvent` stream, and shuts
+//! down gracefully on Ctrl-C. It contains no business logic — channel
+//! construction lives in `runtime`/`config` (§3, §128).
+
+mod health;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use crate::config::{templates, ChannelConfig, InterfaceConfig, Profile};
-use crate::core::{ChannelId, RuntimeEvent};
+use crate::core::{ChannelId, ChannelState, RuntimeEvent};
 use crate::diagnostics::EventLogStatus;
 use crate::runtime::{Listener, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT};
+use health::HealthWatch;
 
 /// Receive and inspect byte-oriented data from serial and network sources.
 #[derive(Parser, Debug)]
@@ -40,6 +45,12 @@ pub struct Cli {
     /// Serial baud rate (used with --serial).
     #[arg(long, default_value_t = 9600)]
     baud: u32,
+
+    /// Stop and exit with code 2 unless every channel starts. Without it, a
+    /// channel that fails to start is retried under its reconnect policy
+    /// while the others run.
+    #[arg(long)]
+    require_all: bool,
 
     /// Launch the graphical interface. Also the default for a bare invocation
     /// (no source given) — e.g. double-clicking the executable.
@@ -85,15 +96,21 @@ pub fn parse() -> Cli {
     Cli::parse()
 }
 
-/// Exit code: finalization incomplete at shutdown (§3.1, §113).
+/// Exit codes (§3.1, talker ADR-060). 0 is healthy, or every outage
+/// recovered; 1 is an internal error, which `main` reports.
+const EXIT_CANNOT_START: u8 = 2;
+const EXIT_DEGRADED: u8 = 3;
 const EXIT_FINALIZATION_INCOMPLETE: u8 = 4;
 
-/// The exit code for how shutdown went (§3.1).
-fn exit_status(outcome: &ShutdownOutcome) -> u8 {
-    if outcome.is_complete() {
-        0
-    } else {
+/// The exit code for how the run ended (§3.1). Finalization incomplete wins
+/// over degraded: it is the one that says recorded data may be missing.
+fn exit_status(outcome: &ShutdownOutcome, degraded: bool) -> u8 {
+    if !outcome.is_complete() {
         EXIT_FINALIZATION_INCOMPLETE
+    } else if degraded {
+        EXIT_DEGRADED
+    } else {
+        0
     }
 }
 
@@ -118,32 +135,40 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
 }
 
 async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<ExitCode> {
-    let configs = build_channel_configs(&cli)?;
+    let configs = match build_channel_configs(&cli) {
+        Ok(configs) if configs.is_empty() => {
+            eprintln!("ERROR: the profile has no valid channels");
+            return Ok(ExitCode::from(EXIT_CANNOT_START));
+        }
+        Ok(configs) => configs,
+        Err(err) => {
+            eprintln!("ERROR: {}", describe_error(&err));
+            return Ok(ExitCode::from(EXIT_CANNOT_START));
+        }
+    };
 
     let mut listener = Listener::with_default_capacities();
     let mut events = listener
         .take_events()
         .expect("the event stream is available exactly once");
 
-    let mut names = HashMap::new();
-    let mut started = 0usize;
-    for config in configs {
-        let name = config.name.as_str().to_string();
-        let id = listener.add_channel(config);
-        names.insert(id, name.clone());
-        match listener.start(id).await {
-            Ok(()) => {
-                println!("started \"{name}\"");
-                started += 1;
-            }
-            Err(err) => eprintln!("could not start \"{name}\": {err}"),
-        }
+    let mut health = HealthWatch::default();
+    let (run, stop_early) =
+        start_channels(&mut listener, configs, cli.require_all, &mut health).await;
+    if let Some(why) = stop_early {
+        eprintln!("ERROR: {why} — stopping");
+        listener.shutdown().await;
+        return Ok(ExitCode::from(EXIT_CANNOT_START));
     }
-    if started == 0 {
-        bail!("no channels started");
-    }
-
-    println!("listening on {started} channel(s) — press Ctrl-C to stop");
+    let StartedRun {
+        names,
+        ids,
+        running,
+    } = run;
+    println!(
+        "listening on {running} of {} channel(s) — press Ctrl-C to stop",
+        ids.len()
+    );
     // Drive auto-reconnect (§162): the orchestrator has no background loop, so the
     // app ticks it. Channels without reconnect enabled are unaffected. The same
     // tick checks the event log, so a failure that starts mid-run is reported.
@@ -154,6 +179,7 @@ async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<ExitCode> {
             _ = tokio::signal::ctrl_c() => break,
             _ = reconnect.tick() => {
                 listener.reconnect_tick().await;
+                observe_health(&listener, &mut health, &ids, &names).await;
                 let problem = event_log.problem();
                 if problem != reported_problem {
                     if let Some(problem) = &problem {
@@ -163,7 +189,14 @@ async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<ExitCode> {
                 }
             }
             maybe = events.recv() => match maybe {
-                Some(event) => println!("{}", format_event(&event, &names)),
+                Some(event) => {
+                    if let RuntimeEvent::RecordingFaulted(id, tap) = event {
+                        health.recording_fault(id, tap);
+                    }
+                    if let Some(line) = format_event(&event, &names) {
+                        println!("{line}");
+                    }
+                }
                 None => break,
             },
         }
@@ -183,11 +216,148 @@ async fn run_cli(cli: Cli, event_log: EventLogStatus) -> Result<ExitCode> {
                 .join(", ")
         );
     }
+    println!("stopped");
+    println!("summary:");
+    for line in health.summary(Instant::now()) {
+        println!("  {line}");
+    }
     let lost = event_log.lost_entries();
     if lost > 0 {
         eprintln!("WARNING: {lost} event log lines were not saved; the log marks where");
     }
-    Ok(ExitCode::from(exit_status(&outcome)))
+    Ok(ExitCode::from(exit_status(&outcome, health.degraded())))
+}
+
+/// The Channels of a run once their first start has been tried.
+struct StartedRun {
+    names: HashMap<ChannelId, String>,
+    /// In start order, for the health lines and the summary.
+    ids: Vec<ChannelId>,
+    /// How many started on the first try.
+    running: usize,
+}
+
+/// Start what can start (§3.1): a Channel that fails to start is reported and
+/// left to its reconnect policy while the others run. Also returns why the run
+/// cannot go on, when it cannot: `--require-all` with a Channel down, or
+/// nothing running and nothing that will retry (exit code 2).
+async fn start_channels(
+    listener: &mut Listener,
+    configs: Vec<ChannelConfig>,
+    require_all: bool,
+    health: &mut HealthWatch,
+) -> (StartedRun, Option<&'static str>) {
+    let mut run = StartedRun {
+        names: HashMap::new(),
+        ids: Vec::new(),
+        running: 0,
+    };
+    for config in configs {
+        if let Some(warning) = reconnect_off_warning(&config) {
+            eprintln!("{warning}");
+        }
+        let name = config.name.as_str().to_string();
+        let retries = config.reconnect.enabled;
+        let id = listener.add_channel(config);
+        run.names.insert(id, name.clone());
+        run.ids.push(id);
+        health.add(id, &name, retries);
+        match listener.start(id).await {
+            Ok(()) => {
+                println!("started \"{name}\"");
+                health.up(id, Instant::now());
+                run.running += 1;
+            }
+            Err(err) => {
+                if let Some(line) = health.down(id, &err.to_string(), Instant::now()) {
+                    eprintln!("{line}");
+                }
+            }
+        }
+    }
+    let stop = if require_all && run.running < run.ids.len() {
+        Some("not every channel started, and --require-all is set")
+    } else if health.nothing_can_run() {
+        Some("no channel started, and none will retry")
+    } else {
+        None
+    };
+    (run, stop)
+}
+
+/// The warning for a recording Channel whose reconnect is off (§3.1): if its
+/// device drops, the recording stops for the rest of the run.
+fn reconnect_off_warning(config: &ChannelConfig) -> Option<String> {
+    let records = config.raw_recording.enabled || config.display_recording.enabled;
+    (records && !config.reconnect.enabled).then(|| {
+        format!(
+            "WARNING: [{}] records with reconnect off: if its device drops, nothing is \
+             recorded until the run is restarted",
+            config.name.as_str()
+        )
+    })
+}
+
+/// An error with its root cause, each stated once: an I/O error, for one,
+/// often repeats its cause in its own message.
+fn describe_error(err: &anyhow::Error) -> String {
+    let top = err.to_string();
+    let root = err.root_cause().to_string();
+    if top == root || top.ends_with(&root) {
+        top
+    } else {
+        format!("{top}: {root}")
+    }
+}
+
+/// Bring the health watch up to date with the runtime (§3.1), printing what
+/// changed: a Channel going down or recovering, retries running out, and the
+/// five-minute reminder while any is down. Polled rather than driven by
+/// events, so a dropped event cannot leave a Channel's health wrong.
+async fn observe_health(
+    listener: &Listener,
+    health: &mut HealthWatch,
+    ids: &[ChannelId],
+    names: &HashMap<ChannelId, String>,
+) {
+    let now = Instant::now();
+    for &id in ids {
+        let line = match listener.state(id) {
+            Some(ChannelState::Running) => health.up(id, now),
+            Some(ChannelState::Faulted) => {
+                let reason = latest_error(listener, id, &names[&id]).await;
+                let down = health.down(id, &reason, now);
+                if down.is_some() || !listener.reconnect_exhausted(id) {
+                    down
+                } else {
+                    health.gave_up(id)
+                }
+            }
+            // Starting and Stopping are passing through.
+            _ => None,
+        };
+        if let Some(line) = line {
+            eprintln!("{line}");
+        }
+    }
+    for line in health.reminders(now) {
+        eprintln!("{line}");
+    }
+}
+
+/// Why a Channel is down: the newest error in its diagnostics, without the
+/// Channel-name prefix a start fault carries.
+async fn latest_error(listener: &Listener, id: ChannelId, name: &str) -> String {
+    let message = listener
+        .snapshot(id)
+        .await
+        .and_then(|snap| snap.diagnostics.errors.last().map(|d| d.message.clone()));
+    match message {
+        Some(message) => message
+            .strip_prefix(&format!("{name}: "))
+            .map_or_else(|| message.clone(), str::to_owned),
+        None => "see the event log".to_owned(),
+    }
 }
 
 /// Build the channels to run from the profile or the quick-start flags. Per §71,
@@ -233,13 +403,18 @@ fn build_channel_configs(cli: &Cli) -> Result<Vec<ChannelConfig>> {
 }
 
 /// One line for a runtime event, naming the Channel (§3.1). An id with no name
-/// (a TCP connection) is shown as its UUID.
-fn format_event(event: &RuntimeEvent, names: &HashMap<ChannelId, String>) -> String {
+/// (a TCP connection) is shown as its UUID. Lifecycle events give no line: the
+/// health watch reports a Channel going down, its reminders and its recovery,
+/// instead of a line for every retry.
+fn format_event(event: &RuntimeEvent, names: &HashMap<ChannelId, String>) -> Option<String> {
     let label = |id: &ChannelId| names.get(id).cloned().unwrap_or_else(|| id.to_string());
-    match event {
-        RuntimeEvent::ChannelStarted(id) => format!("[{}] started", label(id)),
-        RuntimeEvent::ChannelStopped(id) => format!("[{}] stopped", label(id)),
-        RuntimeEvent::ChannelFaulted(id) => format!("[{}] FAULTED", label(id)),
+    Some(match event {
+        RuntimeEvent::ChannelStarted(_)
+        | RuntimeEvent::ChannelStopped(_)
+        | RuntimeEvent::ChannelFaulted(_)
+        | RuntimeEvent::ChannelReconnecting(..)
+        | RuntimeEvent::ChannelReconnected(_)
+        | RuntimeEvent::ChannelReconnectGaveUp(_) => return None,
         RuntimeEvent::RecordingFaulted(id, tap) => {
             format!("[{}] {} recording faulted", label(id), tap.label())
         }
@@ -255,11 +430,6 @@ fn format_event(event: &RuntimeEvent, names: &HashMap<ChannelId, String>) -> Str
             format!("[{}] TCP client disconnected", label(id))
         }
         RuntimeEvent::ControlLinesChanged(id) => format!("[{}] control lines changed", label(id)),
-        RuntimeEvent::ChannelReconnecting(id, attempt) => {
-            format!("[{}] reconnecting (attempt {attempt})", label(id))
-        }
-        RuntimeEvent::ChannelReconnected(id) => format!("[{}] reconnected", label(id)),
-        RuntimeEvent::ChannelReconnectGaveUp(id) => format!("[{}] reconnect gave up", label(id)),
         RuntimeEvent::DiskSpaceLow(id) => format!("[{}] LOW DISK", label(id)),
         RuntimeEvent::RecordingStoppedLowDisk(id) => {
             format!("[{}] recording stopped (low disk)", label(id))
@@ -267,7 +437,7 @@ fn format_event(event: &RuntimeEvent, names: &HashMap<ChannelId, String>) -> Str
         RuntimeEvent::MatchTriggered(id, rule) => {
             format!("[{}] match rule {rule} fired", label(id))
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -281,19 +451,128 @@ mod tests {
             tcp: None,
             serial: None,
             baud: 9600,
+            require_all: false,
             gui: false,
             cli: false,
         }
     }
 
+    /// A UDP channel on a loopback port held by another socket, so its start
+    /// fails — the stand-in for an adapter that has not enumerated yet.
+    fn blocked_udp_channel(name: &str, retries: bool) -> (ChannelConfig, std::net::UdpSocket) {
+        let port = crate::test_ports::reserve_udp_port();
+        let blocker = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        let mut config = templates::udp_template();
+        config.name = crate::core::ChannelName::new(name);
+        config.reconnect.enabled = retries;
+        if let InterfaceConfig::Udp(udp) = &mut config.interface {
+            udp.bind_address = "127.0.0.1".to_string();
+            udp.port = port;
+        }
+        (config, blocker)
+    }
+
+    fn free_udp_channel(name: &str) -> ChannelConfig {
+        let mut config = templates::udp_template();
+        config.name = crate::core::ChannelName::new(name);
+        if let InterfaceConfig::Udp(udp) = &mut config.interface {
+            udp.bind_address = "127.0.0.1".to_string();
+            udp.port = crate::test_ports::reserve_udp_port();
+        }
+        config
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_will_retry_keeps_the_run_going() {
+        // §3.1: start what can start. One channel down but retrying is no
+        // reason to stop; the health lines say what is down.
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let (late, _blocker) = blocked_udp_channel("GPS", true);
+        let mut health = HealthWatch::default();
+        let (run, stop) = start_channels(
+            &mut listener,
+            vec![late, free_udp_channel("AIS")],
+            false,
+            &mut health,
+        )
+        .await;
+        assert_eq!(stop, None);
+        assert_eq!(run.running, 1);
+        assert!(health.degraded(), "until GPS starts");
+        listener.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn nothing_running_and_nothing_retrying_stops_the_run() {
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let (down, _blocker) = blocked_udp_channel("GPS", false);
+        let mut health = HealthWatch::default();
+        let (_, stop) = start_channels(&mut listener, vec![down], false, &mut health).await;
+        assert_eq!(stop, Some("no channel started, and none will retry"));
+        listener.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn require_all_stops_the_run_when_any_channel_is_down() {
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let (late, _blocker) = blocked_udp_channel("GPS", true);
+        let mut health = HealthWatch::default();
+        let (_, stop) = start_channels(
+            &mut listener,
+            vec![late, free_udp_channel("AIS")],
+            true,
+            &mut health,
+        )
+        .await;
+        assert_eq!(
+            stop,
+            Some("not every channel started, and --require-all is set")
+        );
+        listener.shutdown().await;
+    }
+
     #[test]
-    fn an_incomplete_finalization_exits_with_4() {
-        // §3.1, §113.
-        assert_eq!(exit_status(&ShutdownOutcome::default()), 0);
+    fn a_recording_channel_with_reconnect_off_is_warned_about_at_start() {
+        let mut config = templates::udp_template();
+        config.name = crate::core::ChannelName::new("GPS");
+        config.reconnect.enabled = false;
+        assert_eq!(reconnect_off_warning(&config), None, "it does not record");
+        config.raw_recording.enabled = true;
+        assert_eq!(
+            reconnect_off_warning(&config).as_deref(),
+            Some(
+                "WARNING: [GPS] records with reconnect off: if its device drops, nothing \
+                 is recorded until the run is restarted"
+            )
+        );
+        config.reconnect.enabled = true;
+        assert_eq!(reconnect_off_warning(&config), None);
+    }
+
+    #[test]
+    fn an_error_and_its_root_cause_are_each_stated_once() {
+        let io = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let err = anyhow::Error::new(io).context("loading profile p.toml");
+        assert_eq!(describe_error(&err), "loading profile p.toml: file missing");
+        let plain = anyhow::anyhow!("specify a source");
+        assert_eq!(describe_error(&plain), "specify a source");
+    }
+
+    #[test]
+    fn the_exit_code_says_how_the_run_ended() {
+        // §3.1: healthy 0, degraded 3, finalization incomplete 4 — and 4 wins,
+        // since it is the one that says recorded data may be missing.
+        let complete = ShutdownOutcome::default();
         let incomplete = ShutdownOutcome {
             incomplete: vec!["GPS".to_owned()],
         };
-        assert_eq!(exit_status(&incomplete), 4);
+        assert_eq!(exit_status(&complete, false), 0);
+        assert_eq!(exit_status(&complete, true), 3);
+        assert_eq!(exit_status(&incomplete, false), 4);
+        assert_eq!(exit_status(&incomplete, true), 4);
     }
 
     #[test]
@@ -378,14 +657,32 @@ mod tests {
         let id = crate::core::ChannelId::new();
         let names = std::collections::HashMap::from([(id, "GPS feed".to_owned())]);
         assert_eq!(
-            format_event(&RuntimeEvent::ChannelFaulted(id), &names),
-            "[GPS feed] FAULTED"
+            format_event(&RuntimeEvent::DiskSpaceLow(id), &names).as_deref(),
+            Some("[GPS feed] LOW DISK")
         );
         let unnamed = crate::core::ChannelId::new();
         assert_eq!(
-            format_event(&RuntimeEvent::ChannelStarted(unnamed), &names),
-            format!("[{unnamed}] started")
+            format_event(&RuntimeEvent::DiskSpaceLow(unnamed), &names),
+            Some(format!("[{unnamed}] LOW DISK"))
         );
+    }
+
+    #[test]
+    fn lifecycle_events_are_left_to_the_health_lines() {
+        // A retry loop would otherwise print reconnecting, stopped and FAULTED
+        // for every attempt; the health watch says it once, then reminds.
+        let id = crate::core::ChannelId::new();
+        let names = std::collections::HashMap::new();
+        for event in [
+            RuntimeEvent::ChannelStarted(id),
+            RuntimeEvent::ChannelStopped(id),
+            RuntimeEvent::ChannelFaulted(id),
+            RuntimeEvent::ChannelReconnecting(id, 3),
+            RuntimeEvent::ChannelReconnected(id),
+            RuntimeEvent::ChannelReconnectGaveUp(id),
+        ] {
+            assert_eq!(format_event(&event, &names), None, "{event:?}");
+        }
     }
 
     #[test]
