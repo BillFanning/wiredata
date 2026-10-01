@@ -60,6 +60,9 @@ pub struct RunSummary {
     pub dropped_statuses: u64,
     pub missed_sends: u64,
     pub failed_sends: u64,
+    /// Sends that failed after the interface accepted part of the message
+    /// (§4.4); their accepted bytes are in `total_bytes`.
+    pub possibly_partial_sends: u64,
     pub suppressed_sends: u64,
     pub timing: SendTimingReport,
     pub timer: TimerStatus,
@@ -69,6 +72,7 @@ impl RunSummary {
     pub fn unsent_sends(&self) -> u64 {
         self.missed_sends
             .saturating_add(self.failed_sends)
+            .saturating_add(self.possibly_partial_sends)
             .saturating_add(self.suppressed_sends)
     }
 
@@ -111,6 +115,11 @@ impl RunSummary {
         let _ = writeln!(out, "sent_messages={}", self.total_count);
         let _ = writeln!(out, "sent_bytes={}", self.total_bytes);
         let _ = writeln!(out, "failed_sends={}", self.failed_sends);
+        let _ = writeln!(
+            out,
+            "possibly_partial_sends={}",
+            self.possibly_partial_sends
+        );
         let _ = writeln!(out, "suppressed_sends={}", self.suppressed_sends);
         let _ = writeln!(out, "missed_sends={}", self.missed_sends);
         let _ = writeln!(out, "scheduled_sends={}", self.scheduled_sends());
@@ -371,6 +380,7 @@ mod tests {
             dropped_statuses: 2,
             missed_sends: 3,
             failed_sends: 1,
+            possibly_partial_sends: 1,
             suppressed_sends: 2,
             timing: SendTimingReport {
                 cumulative,
@@ -392,8 +402,8 @@ mod tests {
     #[test]
     fn outcome_totals_are_saturating_and_complete() {
         let summary = summary();
-        assert_eq!(summary.unsent_sends(), 6);
-        assert_eq!(summary.scheduled_sends(), 106);
+        assert_eq!(summary.unsent_sends(), 7);
+        assert_eq!(summary.scheduled_sends(), 107);
     }
 
     #[test]
@@ -403,7 +413,8 @@ mod tests {
         assert!(report.contains("channel_label=\"GPS\\nfeed\"\n"));
         assert!(report.contains("run_id=9\n"));
         assert!(report.contains("elapsed_us=12345000\n"));
-        assert!(report.contains("scheduled_sends=106\n"));
+        assert!(report.contains("scheduled_sends=107\n"));
+        assert!(report.contains("possibly_partial_sends=1\n"));
         assert!(report.contains("per_message_sent=60,40\n"));
         // Every per-message lane is positionally aligned with per_message_sent,
         // so column N of each line describes the same message.

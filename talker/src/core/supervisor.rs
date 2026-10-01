@@ -62,9 +62,11 @@ struct CommandFailure {
 /// `TalkerStatus::Counters`, so it self-corrects across dropped updates.
 #[derive(Clone, Debug, Default)]
 pub struct ChannelTelemetry {
-    /// Running send count across all messages in this channel.
+    /// Running send count across all messages in this channel: complete
+    /// messages only.
     pub total_count: u64,
-    /// Cumulative wire bytes sent.
+    /// Cumulative wire bytes the interface accepted, including the accepted
+    /// part of each possibly-partial send (§4.4).
     pub total_bytes: u64,
     /// Per-message running send counts, indexed by schedule position.
     ///
@@ -81,8 +83,11 @@ pub struct ChannelTelemetry {
     pub dropped_statuses: u64,
     /// Sends skipped under the scheduler's stall policy — cadence health.
     pub missed_sends: u64,
-    /// Interface send attempts that failed.
+    /// Interface send attempts that failed before any byte was accepted.
     pub failed_sends: u64,
+    /// Interface send attempts that failed after part of the message was
+    /// accepted (§4.4).
+    pub possibly_partial_sends: u64,
     /// Due fires intentionally suppressed while send retry backoff was active.
     pub suppressed_sends: u64,
     /// Bounded cumulative send-path timing measurements from the runner.
@@ -1077,6 +1082,7 @@ fn drain_statuses(
                 dropped_statuses,
                 missed_sends,
                 failed_sends,
+                possibly_partial_sends,
                 send_failure_episodes,
                 suppressed_sends,
                 active_send_error,
@@ -1093,6 +1099,7 @@ fn drain_statuses(
                 telemetry.dropped_statuses = dropped_statuses;
                 telemetry.missed_sends = missed_sends;
                 telemetry.failed_sends = failed_sends;
+                telemetry.possibly_partial_sends = possibly_partial_sends;
                 telemetry.suppressed_sends = suppressed_sends;
                 // Immediate failure/recovery edges paint quickly, but share the
                 // bounded observer queue. The cumulative count repairs every
@@ -1242,6 +1249,7 @@ mod tests {
             captured_at: Instant::now(),
             final_snapshot: false,
             timer: TimerStatus::default(),
+            possibly_partial_sends: 0,
         }
     }
 
@@ -1431,6 +1439,7 @@ mod tests {
             suppressed_sends: 0,
             timing: Default::default(),
             timer: Default::default(),
+            possibly_partial_sends: 0,
         }
     }
 
@@ -1458,6 +1467,7 @@ mod tests {
                 suppressed_sends: 0,
                 timing: Default::default(),
                 timer: Default::default(),
+                possibly_partial_sends: 0,
             })
         };
         let mut retained = None;

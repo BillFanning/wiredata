@@ -1,11 +1,10 @@
-use std::io::Write;
 use std::net::TcpStream;
 use std::time::Duration;
 
 use anyhow::Context;
 
 use super::config::{InterfaceConfig, TcpClientConfig};
-use super::{Interface, MissingRetryConfiguration};
+use super::{write_counted, Interface, MissingRetryConfiguration};
 
 /// Cap on connect. Without it the OS default applies (~20s on Windows),
 /// which is far too long for an interactive tool to sit unresponsive.
@@ -51,9 +50,9 @@ fn connect(config: &TcpClientConfig) -> anyhow::Result<TcpStream> {
 impl Interface for TcpClientInterface {
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
         let stream = self.stream.as_mut().context("not connected")?;
-        if let Err(error) = stream.write_all(data) {
+        if let Err(failure) = write_counted(stream, data) {
             self.reconnect_required = true;
-            return Err(error).context("writing to TCP stream");
+            return Err(failure.into_error("writing to TCP stream"));
         }
         Ok(())
     }

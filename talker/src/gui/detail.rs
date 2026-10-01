@@ -126,11 +126,13 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
             // Same shape as the live send-outcomes line: the aggregate, then
             // its parts in parentheses.
             ui.weak(format!(
-                "Sent: {} · {} messages · {} unsent ({} failed · {} suppressed · {} missed)",
+                "Sent: {} · {} messages · {} unsent ({} failed · {} possibly partial · {} \
+                 suppressed · {} missed)",
                 human_bytes(summary.total_bytes),
                 summary.total_count,
                 unsent,
                 summary.failed_sends,
+                summary.possibly_partial_sends,
                 summary.suppressed_sends,
                 summary.missed_sends,
             ))
@@ -319,9 +321,10 @@ impl TalkerApp {
             .unwrap_or((0.0, 0.0));
         let missed = telemetry.missed_sends;
         let failed = telemetry.failed_sends;
+        let partial = telemetry.possibly_partial_sends;
         let suppressed = telemetry.suppressed_sends;
-        let outcomes = send_outcomes(msgs, failed, suppressed, missed);
-        let outcomes_tip = send_outcomes_tooltip(msgs, failed, suppressed, missed);
+        let outcomes = send_outcomes(msgs, failed, partial, suppressed, missed);
+        let outcomes_tip = send_outcomes_tooltip(msgs, failed, partial, suppressed, missed);
 
         // Capacity describes the configuration that is actually sending. The
         // runner reports each message's wire size and interval, so a running

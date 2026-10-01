@@ -15,8 +15,6 @@ The spec states these; the code does not do them yet.
 
 - [ ] **TCP replies (ADR-059, §4.5).** `TcpClientInterface` never reads the
   socket, so replies are neither drained nor counted.
-- [ ] **Possibly partial (ADR-059, §4.4).** Not a send outcome yet, and wire bytes
-  are not counted apart from whole messages.
 - [ ] **Strict profiles (ADR-062, §8.2).** Unknown keys are ignored, and
   `extract_version` treats a missing version as current.
 

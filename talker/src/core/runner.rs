@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use crate::core::{
-    channel::{ChannelId, Interface, InterfaceConfig, MissingRetryConfiguration},
+    channel::{ChannelId, Interface, InterfaceConfig, MissingRetryConfiguration, PartialWrite},
     internal_fault::InternalFaultTally,
     run_summary::{RunEndReason, RunId, RunSummary},
     scheduler::{Schedule, Tick},
@@ -119,9 +119,12 @@ pub enum TalkerStatus {
     /// full queue.
     Counters {
         channel: ChannelId,
-        /// Running send count across all messages in this channel.
+        /// Running send count across all messages in this channel: complete
+        /// messages only.
         total_count: u64,
-        /// Cumulative wire bytes sent across all messages in this channel.
+        /// Cumulative wire bytes the interface accepted across all messages in
+        /// this channel, counted apart from complete messages: it includes the
+        /// accepted part of each possibly-partial send (§4.4).
         total_bytes: u64,
         /// Per-message running send counts, indexed by the message's
         /// position in the compiled schedule.
@@ -136,8 +139,13 @@ pub enum TalkerStatus {
         /// policy (`Schedule::missed_sends`) — the channel couldn't keep to
         /// its configured cadence.
         missed_sends: u64,
-        /// Cumulative send calls that reached the interface and failed.
+        /// Cumulative send calls that reached the interface and failed before
+        /// it accepted any byte.
         failed_sends: u64,
+        /// Cumulative send calls that failed after the interface accepted part
+        /// of the message (§4.4, ADR-059): the receiver may hold a fragment.
+        /// Never resent, and not in `failed_sends`.
+        possibly_partial_sends: u64,
         /// Cumulative send-failure episodes. Repeated attempts inside one
         /// bounded-backoff episode do not increase this count.
         send_failure_episodes: u64,
@@ -270,8 +278,12 @@ struct FailureEpisode {
     /// episode's first failure remains in its edge-triggered log/status event;
     /// later retries update this live description without creating new edges.
     active_error: String,
-    /// Sends attempted and failed, ≥ 1 (the reported first one).
+    /// Sends attempted and failed, ≥ 1 (the reported first one), including
+    /// those that were possibly partial.
     failures: u64,
+    /// Of `failures`, those that failed after the interface accepted part of
+    /// the message.
+    possibly_partial: u64,
     /// Due fires suppressed by the backoff gate without an interface write.
     suppressed: u64,
     backoff: Duration,
@@ -803,6 +815,7 @@ fn run_loop(
     let mut total_count = 0u64;
     let mut total_bytes = 0u64;
     let mut failed_sends = 0u64;
+    let mut possibly_partial_sends = 0u64;
     let mut send_failure_episodes = 0u64;
     let mut suppressed_sends = 0u64;
     let mut send_timing = SendTimingRecorder::default();
@@ -1131,7 +1144,6 @@ fn run_loop(
                                 // "Suppressed" is defined on the send-outcomes
                                 // line and nowhere the log reader can see, so
                                 // this states what happened to those sends.
-                                let failed_noun = if ep.failures == 1 { "send" } else { "sends" };
                                 // A replaced handle names what it reconnected
                                 // to (ADR-059, §4.5).
                                 let replaced = match current_config.as_ref() {
@@ -1147,12 +1159,13 @@ fn run_loop(
                                 };
                                 tracing::info!(
                                     channel = who.id.as_u64(),
-                                    "channel {} {replaced}sending recovered after {} failed {} \
-                                     and {} withheld while retrying",
+                                    "channel {} {replaced}sending recovered after {}",
                                     who.label,
-                                    ep.failures,
-                                    failed_noun,
-                                    ep.suppressed
+                                    recovery_cost(
+                                        ep.failures - ep.possibly_partial,
+                                        ep.possibly_partial,
+                                        ep.suppressed
+                                    )
                                 );
                                 timer.emit(TalkerStatus::SendRecovered {
                                     channel: who.id,
@@ -1192,7 +1205,21 @@ fn run_loop(
                             }
                         }
                         Err(e) => {
-                            failed_sends += 1;
+                            // A write that failed after the interface accepted
+                            // part of the message is possibly partial (§4.4,
+                            // ADR-059). Its bytes count as wire bytes; the
+                            // message is never resent.
+                            let written = e
+                                .downcast_ref::<PartialWrite>()
+                                .map(|partial| partial.written);
+                            match written {
+                                Some(written) => {
+                                    possibly_partial_sends += 1;
+                                    total_bytes += written as u64;
+                                }
+                                None => failed_sends += 1,
+                            }
+                            let partial = u64::from(written.is_some());
                             match episode.as_mut() {
                                 // Edge-triggered: only the episode's first failure is
                                 // reported (warn + `ConnectionError`); it opens the episode.
@@ -1208,6 +1235,7 @@ fn run_loop(
                                     episode = Some(FailureEpisode {
                                         active_error: message.clone(),
                                         failures: 1,
+                                        possibly_partial: partial,
                                         suppressed: 0,
                                         backoff: RETRY_BACKOFF_INITIAL,
                                         next_attempt: Instant::now() + RETRY_BACKOFF_INITIAL,
@@ -1223,6 +1251,7 @@ fn run_loop(
                                 Some(ep) => {
                                     ep.active_error = format!("{e:#}");
                                     ep.failures += 1;
+                                    ep.possibly_partial += partial;
                                     ep.handle_needs_recovery = true;
                                     ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
                                     ep.next_attempt = Instant::now() + ep.backoff;
@@ -1254,6 +1283,7 @@ fn run_loop(
                         dropped_statuses: drops_so_far,
                         missed_sends: schedule.missed_sends(),
                         failed_sends,
+                        possibly_partial_sends,
                         send_failure_episodes,
                         suppressed_sends,
                         active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
@@ -1346,6 +1376,7 @@ fn run_loop(
         dropped_statuses,
         missed_sends,
         failed_sends,
+        possibly_partial_sends,
         send_failure_episodes,
         suppressed_sends,
         active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
@@ -1377,12 +1408,30 @@ fn run_loop(
                 dropped_statuses,
                 missed_sends,
                 failed_sends,
+                possibly_partial_sends,
                 suppressed_sends,
                 timing: final_timing,
                 timer: timer_status,
             }),
         },
     );
+}
+
+/// What a closed failure episode cost, for its recovery line: the sends that
+/// failed, those that were possibly partial, and the due sends withheld.
+fn recovery_cost(failed: u64, possibly_partial: u64, withheld: u64) -> String {
+    let sends = |n: u64| if n == 1 { "send" } else { "sends" };
+    let mut cost = Vec::new();
+    if failed > 0 || possibly_partial == 0 {
+        cost.push(format!("{failed} failed {}", sends(failed)));
+    }
+    if possibly_partial > 0 {
+        cost.push(format!(
+            "{possibly_partial} possibly partial {}",
+            sends(possibly_partial)
+        ));
+    }
+    format!("{} and {withheld} withheld while retrying", cost.join(", "))
 }
 
 /// Queue one status update, best-effort (never blocks the send cadence): a
@@ -2706,6 +2755,96 @@ mod tests {
         assert!(
             active_send_error.is_none(),
             "the final counter snapshot repairs a dropped recovery edge"
+        );
+    }
+
+    #[test]
+    fn a_recovery_line_states_what_the_episode_cost() {
+        assert_eq!(
+            recovery_cost(1, 0, 3),
+            "1 failed send and 3 withheld while retrying"
+        );
+        assert_eq!(
+            recovery_cost(2, 1, 0),
+            "2 failed sends, 1 possibly partial send and 0 withheld while retrying"
+        );
+        assert_eq!(
+            recovery_cost(0, 2, 5),
+            "2 possibly partial sends and 5 withheld while retrying"
+        );
+    }
+
+    /// §4.4, ADR-059: a write that fails after the interface accepted part of
+    /// the message is its own outcome. Its bytes are wire bytes; it is not a
+    /// complete message, not a failed send, and never resent.
+    #[test]
+    fn a_write_that_fails_part_way_is_possibly_partial() {
+        struct CutsOff {
+            sent: Arc<Mutex<Vec<Vec<u8>>>>,
+            cut: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Interface for CutsOff {
+            fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
+                if self.cut.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("connection reset").context(PartialWrite {
+                        written: 1,
+                        total: data.len(),
+                    }));
+                }
+                self.sent.lock().unwrap().push(data.to_vec());
+                Ok(())
+            }
+        }
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let cut = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (handle, logs) = spawn_logging_interface_runner(
+            Box::new(CutsOff {
+                sent: Arc::clone(&sent),
+                cut: Arc::clone(&cut),
+            }),
+            None,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sent.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < deadline, "sending never resumed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let statuses = handle.status_rx.clone();
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(2));
+
+        let (count, bytes, failed, partial) = statuses
+            .try_iter()
+            .find_map(|status| match status {
+                TalkerStatus::Counters {
+                    total_count,
+                    total_bytes,
+                    failed_sends,
+                    possibly_partial_sends,
+                    final_snapshot: true,
+                    ..
+                } => Some((
+                    total_count,
+                    total_bytes,
+                    failed_sends,
+                    possibly_partial_sends,
+                )),
+                _ => None,
+            })
+            .expect("final counters");
+        assert_eq!((failed, partial), (0, 1));
+        assert_eq!(count, sent.lock().unwrap().len() as u64);
+        // Each complete "AB" message is one byte; the cut-off one wrote 1.
+        assert_eq!(bytes, count + 1, "the partial write's byte is a wire byte");
+
+        let lines: Vec<String> = logs.try_iter().map(|event| event.message).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("sending recovered after 1 possibly partial send and")),
+            "{lines:#?}"
         );
     }
 

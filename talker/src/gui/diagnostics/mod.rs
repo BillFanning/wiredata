@@ -244,25 +244,25 @@ mod tests {
     /// the card look clean.
     #[test]
     fn send_outcome_tone_still_escalates_the_card_badge() {
-        let failing = send_outcomes(98, 1, 0, 1);
+        let failing = send_outcomes(98, 1, 0, 0, 1);
         assert_eq!(
             diagnostic_card_tone(failing.tone, SignalTone::Neutral, false, true),
             SignalTone::Fault
         );
 
-        let shortfall = send_outcomes(98, 0, 1, 1);
+        let shortfall = send_outcomes(98, 0, 0, 1, 1);
         assert_eq!(
             diagnostic_card_tone(shortfall.tone, SignalTone::Neutral, false, true),
             SignalTone::Warning
         );
 
-        let missed_only = send_outcomes(98, 0, 0, 2);
+        let missed_only = send_outcomes(98, 0, 0, 0, 2);
         assert_eq!(
             diagnostic_card_tone(missed_only.tone, SignalTone::Neutral, false, true),
             SignalTone::Warning
         );
 
-        let clean = send_outcomes(100, 0, 0, 0);
+        let clean = send_outcomes(100, 0, 0, 0, 0);
         assert_eq!(
             diagnostic_card_tone(clean.tone, SignalTone::Neutral, false, true),
             SignalTone::Healthy

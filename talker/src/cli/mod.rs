@@ -408,6 +408,7 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
                         total_count,
                         total_bytes,
                         failed_sends,
+                        possibly_partial_sends,
                         dropped_statuses,
                         ..
                     } => {
@@ -417,6 +418,7 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
                                 sent: total_count,
                                 bytes: total_bytes,
                                 failed: failed_sends,
+                                possibly_partial: possibly_partial_sends,
                                 dropped: dropped_statuses,
                             },
                         );
@@ -478,6 +480,8 @@ struct FinalCounts {
     sent: u64,
     bytes: u64,
     failed: u64,
+    /// Sends that failed after part of the message was written (§4.4).
+    possibly_partial: u64,
     /// Status updates dropped because the reader was full: with `--echo`,
     /// echo lines not printed (§5.8).
     dropped: u64,
@@ -497,6 +501,9 @@ fn counters_note(counts: Option<&FinalCounts>, echo: bool) -> String {
         counts.failed,
         if counts.failed == 1 { "" } else { "s" }
     );
+    if counts.possibly_partial > 0 {
+        note.push_str(&format!(", {} possibly partial", counts.possibly_partial));
+    }
     if echo && counts.dropped > 0 {
         note.push_str(&format!("; {} echo lines dropped", counts.dropped));
     }
@@ -677,10 +684,11 @@ mod tests {
     fn the_summary_notes_each_channel_s_send_counters() {
         // ADR-060: the final summary gives each channel's send counters
         // (§4.4) and, with --echo, the echo lines dropped (§5.8).
-        let counts = FinalCounts {
+        let mut counts = FinalCounts {
             sent: 120,
             bytes: 4_800,
             failed: 1,
+            possibly_partial: 0,
             dropped: 3,
         };
         assert_eq!(
@@ -692,6 +700,12 @@ mod tests {
             "; sent 120 messages (4800 bytes), 1 failed send; 3 echo lines dropped"
         );
         assert_eq!(counters_note(None, true), "", "a channel that never sent");
+        // §4.4: said only when it happened.
+        counts.possibly_partial = 2;
+        assert_eq!(
+            counters_note(Some(&counts), false),
+            "; sent 120 messages (4800 bytes), 1 failed send, 2 possibly partial"
+        );
     }
 
     #[test]

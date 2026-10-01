@@ -11,12 +11,12 @@ pub(in crate::gui) const SENT_MEANING_TOOLTIP: &str =
 bits reached the wire, a network packet left the host, or a peer received the data.";
 
 pub(in crate::gui) const THROUGHPUT_TOOLTIP: &str =
-    "Total is every byte sent since Start and is retained after Stop. The two rates are a \
-rolling five-second average of sent messages and bytes. Failed, retry-suppressed, and missed \
-sends are excluded from all three. The fixed five-second denominator makes the rates ramp during \
-startup and decay to zero after traffic stops, while the total stands still; they are not \
-instantaneous line rate. Sent means the interface write returned success, not that any peer \
-received the data.";
+    "Total is every byte the interface accepted since Start, including the part of a possibly \
+partial send, and is retained after Stop. The two rates are a rolling five-second average of sent \
+messages and of those bytes. Failed, possibly partial, retry-suppressed, and missed sends are not \
+sent messages. The fixed five-second denominator makes the rates ramp during startup and decay to \
+zero after traffic stops, while the total stands still; they are not instantaneous line rate. Sent \
+means the interface write returned success, not that any peer received the data.";
 
 pub(in crate::gui) const LIVE_UPDATE_QUEUE_TOOLTIP: &str =
     "Current is how many live updates were waiting the last time the screen checked. The screen \
@@ -37,10 +37,14 @@ remain exact. Command results use a separate path.";
 pub(in crate::gui) fn send_outcomes(
     sent: u64,
     failed: u64,
+    possibly_partial: u64,
     suppressed: u64,
     missed: u64,
 ) -> DecisionSignal {
-    let unsent = failed.saturating_add(suppressed).saturating_add(missed);
+    let unsent = failed
+        .saturating_add(possibly_partial)
+        .saturating_add(suppressed)
+        .saturating_add(missed);
     let scheduled = sent.saturating_add(unsent);
     if scheduled == 0 {
         return DecisionSignal {
@@ -51,14 +55,17 @@ pub(in crate::gui) fn send_outcomes(
 
     DecisionSignal {
         text: format!(
-            "Send outcomes: {} scheduled - {} failed - {} suppressed - {} missed = {} sent",
+            "Send outcomes: {} scheduled - {} failed - {} possibly partial - {} suppressed - {} \
+             missed = {} sent",
             thousands(scheduled),
             thousands(failed),
+            thousands(possibly_partial),
             thousands(suppressed),
             thousands(missed),
             thousands(sent),
         ),
-        tone: if failed > 0 {
+        // A possibly partial send is a write that failed, too.
+        tone: if failed > 0 || possibly_partial > 0 {
             SignalTone::Fault
         } else if unsent > 0 {
             SignalTone::Warning
@@ -73,17 +80,22 @@ pub(in crate::gui) fn send_outcomes(
 pub(in crate::gui) fn send_outcomes_tooltip(
     sent: u64,
     failed: u64,
+    possibly_partial: u64,
     suppressed: u64,
     missed: u64,
 ) -> String {
     let scheduled = sent
         .saturating_add(failed)
+        .saturating_add(possibly_partial)
         .saturating_add(suppressed)
         .saturating_add(missed);
     format!(
         "{} scheduled counts every cadence point this run's schedule produced, less \
-         the three ways a send does not go out. {} failed: the interface write was \
-         attempted and returned an error. {} suppressed: after a failure, the send \
+         the four ways a send does not go out whole. {} failed: the interface write was \
+         attempted and returned an error before accepting any byte. {} possibly partial: \
+         the write returned an error after the interface accepted part of the message, so \
+         the receiver may hold a fragment; it is never resent, and its accepted bytes are in \
+         the byte total. {} suppressed: after a failure, the send \
          was withheld during retry backoff and never attempted — these follow failures and \
          cannot occur without one. {} missed: the runner fell more than one interval \
          behind, so the cadence point was skipped before any send existed. The remaining \
@@ -92,6 +104,7 @@ pub(in crate::gui) fn send_outcomes_tooltip(
          and remain after sending recovers; the channel fault line says what is wrong now.",
         thousands(scheduled),
         thousands(failed),
+        thousands(possibly_partial),
         thousands(suppressed),
         thousands(missed),
         thousands(sent),
@@ -109,14 +122,14 @@ mod tests {
     /// reader has to compare against the sent total by eye.
     #[test]
     fn send_outcomes_group_every_count_in_the_line_and_its_tooltip() {
-        let long_run = send_outcomes(1_234_567, 0, 0, 2_400);
+        let long_run = send_outcomes(1_234_567, 0, 0, 0, 2_400);
         assert_eq!(
             long_run.text,
-            "Send outcomes: 1,236,967 scheduled - 0 failed - 0 suppressed - 2,400 missed \
-             = 1,234,567 sent"
+            "Send outcomes: 1,236,967 scheduled - 0 failed - 0 possibly partial - 0 suppressed \
+             - 2,400 missed = 1,234,567 sent"
         );
 
-        let tip = send_outcomes_tooltip(1_234_567, 0, 0, 2_400);
+        let tip = send_outcomes_tooltip(1_234_567, 0, 0, 0, 2_400);
         assert!(tip.contains("1,236,967 scheduled"), "{tip}");
         assert!(tip.contains("2,400 missed"), "{tip}");
         assert!(tip.contains("1,234,567 sent"), "{tip}");
@@ -124,42 +137,54 @@ mod tests {
 
     #[test]
     fn send_outcomes_distinguish_clean_shortfall_and_failure() {
-        let clean = send_outcomes(100, 0, 0, 0);
+        let clean = send_outcomes(100, 0, 0, 0, 0);
         assert_eq!(
             clean.text,
-            "Send outcomes: 100 scheduled - 0 failed - 0 suppressed - 0 missed = 100 sent"
+            "Send outcomes: 100 scheduled - 0 failed - 0 possibly partial - 0 suppressed - 0 \
+             missed = 100 sent"
         );
         assert_eq!(clean.tone, SignalTone::Healthy);
 
         // Stated as arithmetic: the schedule's own cadence points, less each
         // way a send fails to go out. Nothing has to name the remainder.
-        let shortfall = send_outcomes(98, 0, 1, 1);
+        let shortfall = send_outcomes(98, 0, 0, 1, 1);
         assert_eq!(
             shortfall.text,
-            "Send outcomes: 100 scheduled - 0 failed - 1 suppressed - 1 missed = 98 sent"
+            "Send outcomes: 100 scheduled - 0 failed - 0 possibly partial - 1 suppressed - 1 \
+             missed = 98 sent"
         );
         assert_eq!(shortfall.tone, SignalTone::Warning);
 
         // Same totals, but an attempted write returned an error: that is the
         // only component that escalates to a fault.
-        let failed = send_outcomes(98, 1, 0, 1);
+        let failed = send_outcomes(98, 1, 0, 0, 1);
         assert_eq!(
             failed.text,
-            "Send outcomes: 100 scheduled - 1 failed - 0 suppressed - 1 missed = 98 sent"
+            "Send outcomes: 100 scheduled - 1 failed - 0 possibly partial - 0 suppressed - 1 \
+             missed = 98 sent"
         );
         assert_eq!(failed.tone, SignalTone::Fault);
+
+        // §4.4: a write that failed part-way is its own term, and a fault too.
+        let partial = send_outcomes(98, 0, 1, 0, 1);
+        assert_eq!(
+            partial.text,
+            "Send outcomes: 100 scheduled - 0 failed - 1 possibly partial - 0 suppressed - 1 \
+             missed = 98 sent"
+        );
+        assert_eq!(partial.tone, SignalTone::Fault);
     }
 
     #[test]
     fn send_outcomes_are_neutral_before_any_schedule_fires() {
-        let decision = send_outcomes(0, 0, 0, 0);
+        let decision = send_outcomes(0, 0, 0, 0, 0);
         assert_eq!(decision.text, "Send outcomes: no scheduled sends yet");
         assert_eq!(decision.tone, SignalTone::Neutral);
     }
 
     #[test]
     fn send_outcomes_tooltip_defines_each_term_and_its_limit() {
-        let tip = send_outcomes_tooltip(98, 1, 0, 1);
+        let tip = send_outcomes_tooltip(98, 1, 0, 0, 1);
         assert!(tip.contains("100 scheduled counts every cadence point"));
         // Suppressions are downstream of a failure, never an independent
         // fault — the tooltip has to say so or the two read as peers.

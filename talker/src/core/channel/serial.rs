@@ -1,7 +1,7 @@
 use anyhow::Context;
 
 use super::config::{DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits};
-use super::{Interface, MissingRetryConfiguration};
+use super::{write_counted, Interface, MissingRetryConfiguration};
 
 pub(super) struct SerialInterface {
     // `None` only between a failed handle being dropped and a later retry
@@ -73,15 +73,10 @@ fn describe_open_failure(port: &str, error: serialport::Error) -> anyhow::Error 
 
 impl Interface for SerialInterface {
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        use std::io::Write;
-        let result = self
-            .port
-            .as_mut()
-            .context("serial port is not open")?
-            .write_all(data);
-        if let Err(error) = result {
-            self.reopen_required = write_error_requires_reopen(&error);
-            return Err(error).context("writing to serial port");
+        let port = self.port.as_mut().context("serial port is not open")?;
+        if let Err(failure) = write_counted(port.as_mut(), data) {
+            self.reopen_required = write_error_requires_reopen(&failure.io);
+            return Err(failure.into_error("writing to serial port"));
         }
         Ok(())
     }
