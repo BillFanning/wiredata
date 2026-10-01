@@ -51,6 +51,19 @@ Register-ScheduledTask -TaskName "wiredata listener" -Xml (Get-Content -Raw .\wi
 - **Event log:** running as SYSTEM, it is in
   `C:\Windows\System32\config\systemprofile\AppData\Local\listener\logs`.
 
+## What a recording folder holds
+
+Besides the recordings, a recording folder holds two kinds of file listener
+manages. Leave them in place.
+
+| File | What it is |
+|---|---|
+| `GPS_2026-10-01_08.raw`, then `…_2.raw`, `…_3.raw` | A Raw recording. A new numbered segment starts at the size cap and after a gap. |
+| `GPS_2026-10-01_08.raw.idx` | Its timestamp index, when the timestamp sidecar is on. |
+| `GPS_2026-10-01_08.disp` | A Display recording. |
+| `GPS.raw.lock`, `GPS.disp.lock` | The lock that stops two recordings writing the same files, from this listener or another. Empty, and left behind when recording stops. That is expected: deleting a lock file while another program holds it would let two recorders in at once. Delete one only when no listener is running. |
+| `.wiredata-destination` | The marker that makes this folder a recording destination. After a gap, recording resumes only in a folder that has it, so an empty mount point of an unplugged drive is never written to. |
+
 ## Exit codes
 
 | Code | Meaning |

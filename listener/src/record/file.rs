@@ -70,6 +70,11 @@ fn lock_recording_destination(path: &Path) -> Result<std::fs::File, RecordError>
 /// Take the advisory exclusive lock on `lock` itself (see
 /// [`lock_recording_destination`]). A recording made of segments holds one such
 /// lock for its whole life, so its numbered files are allocated under it (§59).
+///
+/// The lock file is never deleted, so it stays beside the recording after
+/// the lock is released. Deleting it on release would let a second recorder
+/// create and lock a fresh file while a third still held the old one (on
+/// Unix a deleted file can stay locked), so two would write at once.
 pub(crate) fn lock_file(lock: &Path) -> Result<std::fs::File, RecordError> {
     // `std::fs::File::try_lock` (stable since Rust 1.89) — no fs4 needed
     // for the lock; fs4 stays for the disk-space free functions (§168).
