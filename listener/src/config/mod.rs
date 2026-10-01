@@ -144,6 +144,17 @@ impl Profile {
 /// Validate one channel's configuration (§71). Resource existence (e.g. whether
 /// a COM port is present) is deferred to Start; this checks only structural
 /// validity.
+/// Whether a Channel's name must be filesystem-safe (§59, §71). When a
+/// recording rotates, the name becomes part of its generated filenames;
+/// non-rotating recordings use a fixed destination path and do not constrain
+/// it. Either recording can rotate (they are independent — ADR-013), so both
+/// count. Whether it records on start does not matter: the Record toggle or a
+/// match rule can begin it live.
+pub fn name_must_be_filesystem_safe(channel: &ChannelConfig) -> bool {
+    channel.raw_recording.file_rotation != FileRotationPolicy::None
+        || channel.display_recording.file_rotation != FileRotationPolicy::None
+}
+
 pub fn validate_channel(
     channel: &ChannelConfig,
     defaults: &DefaultConfig,
@@ -186,15 +197,7 @@ pub fn validate_channel(
         }
     }
 
-    // When a recording rotates, the channel name becomes part of generated filenames
-    // (§59), so it must be filesystem-safe (§71). Non-rotating recordings use a fixed
-    // destination path and do not constrain the name. Either recording can rotate
-    // (they are independent now — ADR-013), so check both.
-    let raw_rotates = channel.raw_recording.enabled
-        && channel.raw_recording.file_rotation != FileRotationPolicy::None;
-    let display_rotates = channel.display_recording.enabled
-        && channel.display_recording.file_rotation != FileRotationPolicy::None;
-    if (raw_rotates || display_rotates) && !is_filesystem_safe(channel.name.as_str()) {
+    if name_must_be_filesystem_safe(channel) && !is_filesystem_safe(channel.name.as_str()) {
         errors.push(ChannelConfigError::InvalidChannelName);
     }
 
@@ -888,6 +891,37 @@ mod tests {
         assert_eq!(
             ChannelConfigError::Limit(limits[2].clone()).to_string(),
             "reconnect multiplier 20 is outside 1.0–10"
+        );
+    }
+
+    /// §59, §71: a rotating recording names its files after the Channel, and
+    /// it can begin live, so the name is checked whether or not it records on
+    /// start. A recording that does not rotate writes to a fixed path.
+    #[test]
+    fn a_channel_name_is_checked_as_a_filename_whenever_rotation_is_configured() {
+        use crate::core::ChannelName;
+        let unsafe_name = |raw: FileRotationPolicy, display: FileRotationPolicy| {
+            let mut channel = templates::udp_template();
+            channel.name = ChannelName::new("GPS/feed");
+            channel.raw_recording.enabled = false;
+            channel.raw_recording.file_rotation = raw;
+            channel.display_recording.enabled = false;
+            channel.display_recording.file_rotation = display;
+            validate_channel(&channel, &DefaultConfig::default())
+        };
+        for (raw, display) in [
+            (FileRotationPolicy::Hourly, FileRotationPolicy::None),
+            (FileRotationPolicy::None, FileRotationPolicy::Daily),
+        ] {
+            assert_eq!(
+                unsafe_name(raw, display),
+                Err(vec![ChannelConfigError::InvalidChannelName]),
+                "{raw:?} / {display:?}"
+            );
+        }
+        assert_eq!(
+            unsafe_name(FileRotationPolicy::None, FileRotationPolicy::None),
+            Ok(())
         );
     }
 

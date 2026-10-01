@@ -160,9 +160,10 @@ struct ListenerApp {
     /// One-shot: open the Configure section on the next frame because focus moved to
     /// an unconfigured/faulted channel that needs attention.
     force_config_open: bool,
-    /// The last in-progress rename duplicated another channel's name (§6, ADR-014), so
-    /// it was not committed; drives an inline warning by the Name field.
-    name_duplicate: bool,
+    /// Why the last in-progress rename was not committed, shown by the Name field:
+    /// it duplicated another channel's name (§6, ADR-014), or a rotating
+    /// recording could not use it in a filename (§59, §71).
+    name_problem: Option<&'static str>,
     /// Per-kind monotonic counter for default channel names (§6): the Nth UDP channel is
     /// `UDP_Channel<N>`. Counts up and is **never** reused — deleting `UDP_Channel2` does
     /// not free the number 2; the next UDP add is 3. Each kind counts independently.
@@ -325,7 +326,7 @@ impl ListenerApp {
             edit_draft: None,
             confirm_remove: None,
             force_config_open: false,
-            name_duplicate: false,
+            name_problem: None,
             channel_seq: std::collections::HashMap::new(),
             channels_collapsed: false,
             dark_mode,
@@ -568,7 +569,7 @@ impl ListenerApp {
                 self.force_config_open =
                     config_incomplete(&view.config) || view.status == ChannelStatus::Faulted;
                 self.edit_draft = Some((id, view.config.clone()));
-                self.name_duplicate = false; // clear any stale rename warning on switch
+                self.name_problem = None; // clear any stale rename warning on switch
             }
         }
     }

@@ -15,8 +15,8 @@ use super::state::{ChannelStatus, ReconnectPrompt};
 use super::widgets::{
     config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
     line_indicator, line_toggle, paint_glyph, recording_facts, recording_glyph_size,
-    recording_indicator, start_button, status_color, status_glyph, status_words, stop_enabled,
-    Refresh,
+    recording_indicator, rename_problem, start_button, status_color, status_glyph, status_words,
+    stop_enabled, Refresh,
 };
 use super::ListenerApp;
 use wiredata_ui::fonts::bold;
@@ -464,17 +464,24 @@ impl ListenerApp {
                 }
             }
             if let Some(name) = renamed {
-                // Names must be unique (§6, ADR-014). Commit only a name not already used
-                // by another channel (case-insensitively); a duplicate is kept in the
-                // draft (so the user can keep editing toward a unique name) but not sent
-                // to the runtime, and an inline warning shows why. This channel itself is
-                // excluded (`v.id != id`), so re-typing its own current name is fine.
-                let is_duplicate = self
-                    .state
-                    .channels()
-                    .any(|v| v.id != id && v.name.eq_ignore_ascii_case(&name));
-                self.name_duplicate = is_duplicate;
-                if !is_duplicate {
+                // Commit only a name validation would accept (§6, §59, §71); one it
+                // would refuse is kept in the draft (so the user can keep editing
+                // toward a usable name) but not sent to the runtime, and an inline
+                // warning shows why. This channel itself is excluded (`v.id != id`),
+                // so re-typing its own current name is fine.
+                let filename = self
+                    .edit_draft
+                    .as_ref()
+                    .is_some_and(|(_, config)| crate::config::name_must_be_filesystem_safe(config));
+                self.name_problem = rename_problem(
+                    &name,
+                    self.state
+                        .channels()
+                        .filter(|v| v.id != id)
+                        .map(|v| v.name.as_str()),
+                    filename,
+                );
+                if self.name_problem.is_none() {
                     // Tell the runtime AND fold locally — the echoed ChannelRenamed is
                     // advisory/lossy (§99), so the optimistic local apply keeps the list
                     // row and re-seeded draft authoritative (#5).
@@ -485,11 +492,8 @@ impl ListenerApp {
                     self.state.apply(bridge::UiUpdate::ChannelRenamed(id, name));
                 }
             }
-            if self.name_duplicate {
-                ui.label(
-                    egui::RichText::new("⚠ name already in use — names must be unique")
-                        .color(palette(ui).warning),
-                );
+            if let Some(problem) = self.name_problem {
+                ui.label(egui::RichText::new(problem).color(palette(ui).warning));
             }
         });
         let reconnect = self.state.channel(id).and_then(|v| v.reconnect);

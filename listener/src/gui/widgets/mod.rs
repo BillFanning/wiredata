@@ -24,6 +24,27 @@ use crate::transport::udp::UdpMode;
 
 use super::bind_scope::{bind_choice_label, bind_choices, LocalAddresses, ALL_INTERFACES_ADDRESS};
 
+/// Why a typed channel name cannot be committed, or `None` when it can: it
+/// duplicates another channel's name (§6, ADR-014; case-insensitively), or a
+/// rotating recording could not use it in a filename (§59, §71). Mirrors
+/// validation, so the GUI cannot save a profile that would not load.
+pub(super) fn rename_problem<'a>(
+    name: &str,
+    mut others: impl Iterator<Item = &'a str>,
+    must_be_filesystem_safe: bool,
+) -> Option<&'static str> {
+    if others.any(|other| other.eq_ignore_ascii_case(name)) {
+        return Some("⚠ name already in use — names must be unique");
+    }
+    if must_be_filesystem_safe && !crate::record::is_filesystem_safe(name) {
+        return Some(
+            "⚠ recording file names use this name: keep it to 64 characters, without \
+             / \\ : * ? \" < > | or a trailing space or dot, and not a device name like CON",
+        );
+    }
+    None
+}
+
 /// Which interface a new channel uses, in the Add menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum AddKind {
@@ -610,6 +631,25 @@ pub(super) fn config_needs_restart(draft: &ChannelConfig, committed: &ChannelCon
 mod tests {
     use super::super::state::ChannelStatus;
     use super::*;
+
+    /// The Name field holds back what validation would refuse (§6, §59, §71),
+    /// so a saved profile always loads every channel it shows.
+    #[test]
+    fn a_rename_is_held_back_when_validation_would_refuse_it() {
+        let others = ["Feed", "AIS"];
+        assert_eq!(rename_problem("GPS", others.into_iter(), true), None);
+        assert_eq!(
+            rename_problem("feed", others.into_iter(), false),
+            Some("⚠ name already in use — names must be unique")
+        );
+        let unsafe_name = rename_problem("GPS/feed", others.into_iter(), true);
+        assert!(
+            unsafe_name.is_some_and(|problem| problem.contains("recording file names")),
+            "{unsafe_name:?}"
+        );
+        // Nothing rotates, so nothing names a file after it.
+        assert_eq!(rename_problem("GPS/feed", others.into_iter(), false), None);
+    }
 
     #[test]
     fn add_menu_defines_the_shared_transport_order() {
