@@ -924,14 +924,17 @@ impl Driver {
             added.push(id);
             self.push(UiUpdate::ChannelAdded(id, name, details, Box::new(echo)));
         }
+        // The skip notice goes after ProfileLoaded: both set the one status
+        // line, so the other way round "Loaded" replaced the reasons at once.
+        self.push(UiUpdate::ProfileLoaded(profile.name.clone()));
         if !skipped.is_empty() {
             self.push(UiUpdate::ProfileError(format!(
-                "loaded with {} channel(s) skipped (invalid):\n{}",
+                "Loaded “{}” with {} channel(s) skipped (invalid):\n{}",
+                profile.name,
                 skipped.len(),
                 skipped.join("\n")
             )));
         }
-        self.push(UiUpdate::ProfileLoaded(profile.name));
         added
     }
 
@@ -1769,36 +1772,41 @@ mod tests {
             .await
             .unwrap();
 
+        // Fold every update into the GUI state, as the app does: what the user
+        // reads is the status line the updates leave behind, not any one update.
+        let mut state = crate::gui::state::AppState::default();
         let mut added = Vec::new();
-        let mut saw_skip_error = false;
         loop {
-            match next(&mut upd_rx).await {
-                UiUpdate::ChannelAdded(_, name, _, _) => added.push(name),
-                UiUpdate::ProfileError(msg) => {
-                    assert!(msg.contains("skipped"), "skip notice expected, got: {msg}");
-                    // Each skipped Channel on its own line, its reason in words
-                    // rather than Rust's debug form.
-                    let reasons: Vec<&str> = msg
-                        .lines()
-                        .filter(|line| line.starts_with("\"Dup\": "))
-                        .collect();
-                    assert_eq!(reasons.len(), 2, "{msg}");
-                    for reason in reasons {
-                        assert!(reason.contains("names must be unique"), "{msg}");
-                        assert!(!reason.contains("DuplicateChannelName"), "{msg}");
-                    }
-                    saw_skip_error = true;
-                }
-                UiUpdate::ProfileLoaded(_) => break,
-                _ => {}
+            let update = next(&mut upd_rx).await;
+            let loaded = matches!(update, UiUpdate::ProfileLoaded(_));
+            if let UiUpdate::ChannelAdded(_, name, _, _) = &update {
+                added.push(name.clone());
             }
+            state.apply(update);
+            if loaded {
+                break;
+            }
+        }
+        // The load's updates are queued together, so any that followed
+        // ProfileLoaded are already here.
+        while let Ok(update) = upd_rx.try_recv() {
+            state.apply(update);
         }
         // Only the uniquely-named channel registered; both duplicates were skipped.
         assert_eq!(added, vec!["Unique".to_string()]);
-        assert!(
-            saw_skip_error,
-            "a skip notice should report the dropped duplicates"
-        );
+        let status = state.workspace_status().unwrap_or_default();
+        assert!(status.contains("“dupes”"), "names the profile: {status}");
+        // Each skipped Channel on its own line, its reason in words rather than
+        // Rust's debug form.
+        let reasons: Vec<&str> = status
+            .lines()
+            .filter(|line| line.starts_with("\"Dup\": "))
+            .collect();
+        assert_eq!(reasons.len(), 2, "{status}");
+        for reason in reasons {
+            assert!(reason.contains("names must be unique"), "{status}");
+            assert!(!reason.contains("DuplicateChannelName"), "{status}");
+        }
 
         cmd_tx.send(UiCommand::Shutdown).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;

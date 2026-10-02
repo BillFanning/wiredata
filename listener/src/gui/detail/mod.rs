@@ -492,12 +492,18 @@ impl ListenerApp {
                     self.state.apply(bridge::UiUpdate::ChannelRenamed(id, name));
                 }
             }
-            if let Some(problem) = self.name_problem {
-                ui.label(egui::RichText::new(problem).color(palette(ui).warning));
-            }
         });
+        // On its own line and wrapped: in the Name row it ran past this column
+        // into the recording block beside it.
+        if let Some(problem) = self.name_problem {
+            ui.add(
+                egui::Label::new(egui::RichText::new(problem).color(palette(ui).warning)).wrap(),
+            );
+        }
         let reconnect = self.state.channel(id).and_then(|v| v.reconnect);
-        ui.horizontal(|ui| {
+        // Wrapped, since the interface details (with the bind scope) are wider
+        // than this column.
+        ui.horizontal_wrapped(|ui| {
             ui.label(status_words(status, reconnect));
             ui.label("·");
             ui.label(egui::RichText::new(details).weak());

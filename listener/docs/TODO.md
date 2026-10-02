@@ -21,6 +21,12 @@ again. Remove an item when it is done: the commit says what changed.
 - [ ] **A glyph for a bare `Mark` (optional).** A `Mark` with no timestamp writes
   its `‹MARK …›` line into the `.disp`, but the live view draws nothing for it.
   Low priority: kept simple on purpose.
+- [ ] **Grey out Port sharing in unicast instead of hiding it (§15).**
+  `edit_interface` drops the Port sharing row when Mode is Unicast, so the row
+  comes and goes as Mode changes. Keep it in place, disabled and unticked, and
+  say in words that sharing is for broadcast and multicast only, so the grey
+  is not the only sign. Switching to unicast still clears `shared_port`, so
+  the profile stays valid.
 - [ ] **RS-422 and RS-485 (§14.5).** They follow RS-232; nothing is specific to
   them yet beyond the RTS line of §14.3.
 
@@ -31,19 +37,6 @@ again. Remove an item when it is done: the commit says what changed.
   `.raw.lock` or `.disp.lock` file that stays in the folder after recording stops
   (`lock_file`). `deploy/README.md` tells operators this. A spec change needs a
   version bump, so this waits for the next one.
-
-## Checks by hand
-
-- [ ] **The new GUI controls in a live run.** Nobody has used these yet:
-  - the bind-address choice (`bind_choices`) in `edit_interface`;
-  - the shared-port checkbox (`shared_port`), offered for broadcast and
-    multicast only;
-  - the Name-field warning (`rename_problem`) for a name that can't be a file
-    name;
-  - a Channel skipped on load, say for exceeding a limit (ADR-048):
-    `register_profile` lists each skipped Channel and its reasons on a line of
-    its own, under the Channel list. A profile that can't resume is listed the
-    same way, in the resume banner.
 
 ## Soak
 
