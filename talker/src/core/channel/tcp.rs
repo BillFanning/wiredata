@@ -1,11 +1,11 @@
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::net::TcpStream;
 use std::time::Duration;
 
 use anyhow::Context;
 
 use super::config::{InterfaceConfig, TcpClientConfig};
-use super::{write_counted, Interface, MissingRetryConfiguration};
+use super::{write_counted, Interface, MissingRetryConfiguration, WriteFailure};
 
 /// Cap on connect. Without it the OS default applies (~20s on Windows),
 /// which is far too long for an interactive tool to sit unresponsive.
@@ -34,6 +34,44 @@ impl std::fmt::Display for PeerClosed {
 }
 
 impl std::error::Error for PeerClosed {}
+
+/// A write the peer took nothing of for [`WRITE_TIMEOUT`]. Said in talker's
+/// words, since Windows describes this timeout as a failed connection attempt.
+#[derive(Debug)]
+struct WriteTimedOut;
+
+impl std::fmt::Display for WriteTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the peer took no data for {} s (write timed out)",
+            WRITE_TIMEOUT.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for WriteTimedOut {}
+
+/// The error for a failed write (§4.4, §4.5). Where `timeouts_hide_sent_bytes`
+/// — on Windows, which reports a timed-out write as sending nothing but
+/// leaves the connection undetermined — a write that timed out is possibly
+/// partial even with no byte counted.
+fn write_error(failure: WriteFailure, timeouts_hide_sent_bytes: bool) -> anyhow::Error {
+    // Unix reports a write timeout as would-block, Windows as timed out. The
+    // stream blocks outside a drain, so would-block means nothing else here.
+    if matches!(
+        failure.io.kind(),
+        ErrorKind::TimedOut | ErrorKind::WouldBlock
+    ) {
+        failure.into_error_as(
+            anyhow::Error::new(WriteTimedOut),
+            "writing to TCP stream",
+            timeouts_hide_sent_bytes,
+        )
+    } else {
+        failure.into_error("writing to TCP stream")
+    }
+}
 
 pub(super) struct TcpClientInterface {
     // `None` only between a failed stream being dropped and a later retry
@@ -118,7 +156,7 @@ impl Interface for TcpClientInterface {
         }
         if let Err(failure) = write_counted(stream, data) {
             self.reconnect_required = true;
-            return Err(failure.into_error("writing to TCP stream"));
+            return Err(write_error(failure, cfg!(windows)));
         }
         Ok(())
     }
@@ -149,6 +187,7 @@ impl Interface for TcpClientInterface {
 mod tests {
     use std::net::TcpListener;
 
+    use super::super::PartialWrite;
     use super::*;
 
     #[test]
@@ -259,6 +298,68 @@ mod tests {
         assert!(error.is::<PeerClosed>(), "{error:#}");
         assert_eq!(error.to_string(), "the peer closed the connection");
         assert!(conn.reconnect_required, "the next retry point reconnects");
+    }
+
+    fn failure(kind: std::io::ErrorKind, written: usize, total: usize) -> WriteFailure {
+        WriteFailure {
+            io: kind.into(),
+            written,
+            total,
+        }
+    }
+
+    #[test]
+    fn a_write_timeout_is_said_in_talkers_words() {
+        // Unix reports a write timeout as would-block, Windows as timed out,
+        // and Windows words it as a failed connection attempt.
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            let error = write_error(failure(kind, 0, 40), false);
+            assert_eq!(
+                format!("{error:#}"),
+                "writing to TCP stream: the peer took no data for 5 s (write timed out)"
+            );
+            assert!(error.downcast_ref::<PartialWrite>().is_none(), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn a_timeout_that_hides_what_was_sent_is_possibly_partial() {
+        // Windows reports nothing sent, but part of the message may have gone.
+        let error = write_error(failure(std::io::ErrorKind::TimedOut, 0, 40), true);
+        let partial = error
+            .downcast_ref::<PartialWrite>()
+            .expect("possibly partial");
+        assert_eq!(
+            partial.written, 0,
+            "no byte is counted that was not reported"
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "the OS cannot say how much of the 40 bytes went before the write failed: \
+             writing to TCP stream: the peer took no data for 5 s (write timed out)"
+        );
+    }
+
+    #[test]
+    fn a_timeout_after_part_was_accepted_is_possibly_partial_everywhere() {
+        let error = write_error(failure(std::io::ErrorKind::WouldBlock, 12, 40), false);
+        let partial = error
+            .downcast_ref::<PartialWrite>()
+            .expect("possibly partial");
+        assert_eq!(partial.written, 12);
+    }
+
+    #[test]
+    fn other_write_errors_keep_the_os_words() {
+        let error = write_error(failure(std::io::ErrorKind::ConnectionReset, 0, 40), true);
+        assert!(error.downcast_ref::<PartialWrite>().is_none(), "{error:#}");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::ConnectionReset)
+        );
+        assert!(format!("{error:#}").starts_with("writing to TCP stream: "));
     }
 
     #[test]

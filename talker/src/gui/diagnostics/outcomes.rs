@@ -107,9 +107,10 @@ pub(in crate::gui) fn send_outcomes_tooltip(
         "{} scheduled counts every cadence point this run's schedule produced, less \
          the four ways a send does not go out whole. {} failed: the interface write was \
          attempted and returned an error before accepting any byte. {} possibly partial: \
-         the write returned an error after the interface accepted part of the message, so \
-         the receiver may hold a fragment; it is never resent, and its accepted bytes are in \
-         the byte total. {} suppressed: after a failure, the send \
+         the write returned an error after the interface accepted part of the message, or a \
+         TCP write timed out on Windows, which cannot say how much it sent. The receiver may \
+         hold a fragment; it is never resent, and its accepted bytes are in the byte total. \
+         {} suppressed: after a failure, the send \
          was withheld during retry backoff and never attempted — these follow failures and \
          cannot occur without one. {} missed: the runner fell more than one interval \
          behind, so the cadence point was skipped before any send existed. The remaining \

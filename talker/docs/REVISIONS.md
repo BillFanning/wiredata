@@ -13,6 +13,13 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-10-01) — a TCP peer that has closed:
+
+- **§4.5 TCP client (ADR-059, amended)** — when the reply drain finds that the
+  peer has closed the connection, that send fails with nothing written and the
+  next retry point reconnects. A message is no longer written into a connection
+  whose peer has gone and counted as sent.
+
 Revision note (2026-09-30) — unattended operation and protocol-correct
 checksums:
 
@@ -423,6 +430,13 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-10-01) — measured costs recorded:
+
+- **ADR-063** records the send-path and GUI optimizations that were measured
+  and not built, with the thresholds that would change that. They were kept in
+  TODO.md until now.
+- **ADR-049** no longer points at a TODO section that has been closed.
 
 Revision note (2026-10-01) — a TCP peer that has closed:
 

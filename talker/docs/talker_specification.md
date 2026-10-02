@@ -1,14 +1,14 @@
 # Talker — Program Specification
-**Version:** 2.5.1
+**Version:** 2.5.2
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-10-01) — a TCP peer that has closed:
+Revision note (2026-10-01) — a TCP write that timed out:
 
-- **§4.5 TCP client (ADR-059, amended)** — when the reply drain finds that the
-  peer has closed the connection, that send fails with nothing written and the
-  next retry point reconnects. A message is no longer written into a connection
-  whose peer has gone and counted as sent.
+- **§4.4 / §4.5 possibly partial (ADR-059, amended)** — on Windows, a TCP write
+  that times out counts as possibly partial: Windows reports nothing sent, but
+  part of the message may have gone. Its error says the peer took no data for
+  5 s, in place of Windows' text about a failed connection attempt.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -548,8 +548,9 @@ Each channel maintains and displays:
 - **Send outcomes** — cumulative scheduled, failed, possibly partial, suppressed,
   missed, and sent totals for the current run; they remain visible after recovery
   and after Stop. **Possibly partial** is a write that failed after transferring
-  part of the message: the receiver may hold a fragment. Wire bytes are counted
-  separately from whole messages
+  part of the message: the receiver may hold a fragment. On Windows a TCP write
+  that timed out counts too, though Windows reports nothing transferred (§4.5).
+  Wire bytes are counted separately from whole messages
 - **Peer replies** — for a TCP client, "peer sent N bytes" (§4.5)
 - **Log counts** — channel-attributed INFO, WARN, and ERROR entries delivered
   to the global Log pane since Start; DEBUG and TRACE remain available there
@@ -579,6 +580,11 @@ while its current-run Send outcomes and log counts still show earlier failures.
   the connection, which can discard the peer's own in-flight data. When a drain
   finds that the peer has closed the connection, that send fails with nothing
   written, and the next retry point reconnects.
+- **A write that times out.** A write the peer takes nothing of for 5 s fails
+  with an error that says so, and the next retry point reconnects.
+  On Windows it counts as possibly partial (§4.4): Windows reports a timed-out
+  write as sending nothing, but leaves the connection in an undetermined state,
+  so the peer may hold part of the message.
 - There is no acknowledgement protocol and no server mode. Viewing replies is
   listener's job.
 

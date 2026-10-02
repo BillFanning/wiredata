@@ -1,15 +1,14 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.24
+**Version:** 1.25
 **Date:** 2026-10-01
 **Status:** Accepted
 
-Revision note (2026-10-01) — measured costs recorded:
+Revision note (2026-10-01) — a TCP write that timed out:
 
-- **ADR-063** records the send-path and GUI optimizations that were measured
-  and not built, with the thresholds that would change that. They were kept in
-  TODO.md until now.
-- **ADR-049** no longer points at a TODO section that has been closed.
+- **ADR-059 (amended)** — on Windows, a TCP write that times out counts as
+  possibly partial, since Windows reports nothing sent but leaves the
+  connection undetermined.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -2446,6 +2445,12 @@ makes most stacks send a reset, which can discard the peer's own in-flight data.
   anyway would put the message into a connection whose peer has gone and count
   it as sent; usually only a later write would fail. The cost falls on a peer
   that half-closes on purpose but keeps reading, which would see reconnects.
+- **A Windows write timeout is possibly partial** (amended 2026-10-01). A write
+  the peer takes nothing of for 5 s fails. Unix reports the part it sent before
+  the timeout. Windows reports nothing sent, but documents the connection as
+  undetermined after a send timeout, so the peer may hold a fragment. Counting
+  that as failed would claim no fragment exists; possibly partial says only
+  that one may. No byte is added to the wire count, since none was reported.
 
 **Boundary:** No resend, no acknowledgement protocol and no server mode. Replies
 are counted, not shown; seeing them is listener's job.

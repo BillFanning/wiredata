@@ -95,7 +95,9 @@ pub trait Interface: Send {
 /// "wrote 12 of 40 bytes before the write failed: …".
 #[derive(Debug)]
 pub struct PartialWrite {
-    /// Bytes the interface accepted before the error.
+    /// Bytes the interface reported accepting before the error. 0 when the OS
+    /// cannot say: a Windows TCP write that timed out reports nothing sent,
+    /// though part of the message may have gone.
     pub written: usize,
     /// The message's length.
     pub total: usize,
@@ -103,11 +105,19 @@ pub struct PartialWrite {
 
 impl std::fmt::Display for PartialWrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "wrote {} of {} bytes before the write failed",
-            self.written, self.total
-        )
+        if self.written == 0 {
+            write!(
+                f,
+                "the OS cannot say how much of the {} bytes went before the write failed",
+                self.total
+            )
+        } else {
+            write!(
+                f,
+                "wrote {} of {} bytes before the write failed",
+                self.written, self.total
+            )
+        }
     }
 }
 
@@ -153,15 +163,43 @@ impl WriteFailure {
     /// carries [`PartialWrite`]; one before any byte was accepted is the bare
     /// error.
     pub fn into_error(self, context: &'static str) -> anyhow::Error {
-        let error = anyhow::Error::new(self.io).context(context);
-        if self.written > 0 {
-            error.context(PartialWrite {
-                written: self.written,
-                total: self.total,
-            })
-        } else {
-            error
-        }
+        let Self { io, written, total } = self;
+        possibly_partial(
+            anyhow::Error::new(io).context(context),
+            written,
+            total,
+            false,
+        )
+    }
+
+    /// [`into_error`](Self::into_error) with `cause` in place of the OS error.
+    /// `sent_unknown` marks a write the OS reports nothing of although part of
+    /// it may have gone, which is possibly partial too (§4.4).
+    pub fn into_error_as(
+        self,
+        cause: anyhow::Error,
+        context: &'static str,
+        sent_unknown: bool,
+    ) -> anyhow::Error {
+        possibly_partial(
+            cause.context(context),
+            self.written,
+            self.total,
+            sent_unknown,
+        )
+    }
+}
+
+fn possibly_partial(
+    error: anyhow::Error,
+    written: usize,
+    total: usize,
+    sent_unknown: bool,
+) -> anyhow::Error {
+    if written > 0 || sent_unknown {
+        error.context(PartialWrite { written, total })
+    } else {
+        error
     }
 }
 
