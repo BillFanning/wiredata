@@ -294,11 +294,19 @@ impl Planner {
 
 /// Run [`Planner::prepare`] on the blocking pool: its checks are filesystem
 /// calls, and a slow drive must not hold an async worker.
+///
+/// The planner travels into the blocking task and back. A task that fails to
+/// join does not give it back, so the next call builds another from `plan`;
+/// the recording's lock went with the lost one and is taken again.
 async fn prepare(
     planner: &mut Option<Planner>,
+    plan: &SegmentPlan,
     request: &OpenRequest,
 ) -> Result<(PathBuf, OverwritePolicy), OpenError> {
-    let mut taken = planner.take().expect("the planner is always returned");
+    let mut taken = planner.take().unwrap_or_else(|| Planner {
+        plan: plan.clone(),
+        lock: None,
+    });
     let request = request.clone();
     let (taken, result) = tokio::task::spawn_blocking(move || {
         let result = taken.prepare(&request);
@@ -317,16 +325,20 @@ async fn prepare(
 
 /// Raw recording segments (`.raw`, with an optional `.raw.idx` sidecar, §57).
 pub struct RawSegments {
+    plan: SegmentPlan,
+    /// `None` only while a blocking task has it, or after one lost it.
     planner: Option<Planner>,
-    size_cap: Option<u64>,
     timestamps: bool,
 }
 
 impl RawSegments {
     pub fn new(plan: SegmentPlan, timestamps: bool) -> Self {
         Self {
-            size_cap: plan.size_cap,
-            planner: Some(Planner { plan, lock: None }),
+            planner: Some(Planner {
+                plan: plan.clone(),
+                lock: None,
+            }),
+            plan,
             timestamps,
         }
     }
@@ -335,18 +347,18 @@ impl RawSegments {
 #[async_trait::async_trait]
 impl SegmentSource<Arc<ReceivedData>> for RawSegments {
     fn period_of(&self, at: SystemTime) -> Option<String> {
-        self.planner.as_ref().and_then(|p| p.plan.period_of(at))
+        self.plan.period_of(at)
     }
 
     fn size_cap(&self) -> Option<u64> {
-        self.size_cap
+        self.plan.size_cap
     }
 
     async fn open(
         &mut self,
         request: OpenRequest,
     ) -> Result<Box<dyn RecorderWriter<Arc<ReceivedData>>>, OpenError> {
-        let (path, mode) = prepare(&mut self.planner, &request).await?;
+        let (path, mode) = prepare(&mut self.planner, &self.plan, &request).await?;
         match RawFileRecorder::open(&path, mode, self.timestamps).await {
             Ok(recorder) => Ok(Box::new(recorder)),
             Err(error) => Err(Planner::open_failed(request.kind, mode, error)),
@@ -356,15 +368,19 @@ impl SegmentSource<Arc<ReceivedData>> for RawSegments {
 
 /// Display recording segments (`.disp`, §54).
 pub struct DisplaySegments {
+    plan: SegmentPlan,
+    /// `None` only while a blocking task has it, or after one lost it.
     planner: Option<Planner>,
-    size_cap: Option<u64>,
 }
 
 impl DisplaySegments {
     pub fn new(plan: SegmentPlan) -> Self {
         Self {
-            size_cap: plan.size_cap,
-            planner: Some(Planner { plan, lock: None }),
+            planner: Some(Planner {
+                plan: plan.clone(),
+                lock: None,
+            }),
+            plan,
         }
     }
 }
@@ -372,18 +388,18 @@ impl DisplaySegments {
 #[async_trait::async_trait]
 impl SegmentSource<RenderedOutput> for DisplaySegments {
     fn period_of(&self, at: SystemTime) -> Option<String> {
-        self.planner.as_ref().and_then(|p| p.plan.period_of(at))
+        self.plan.period_of(at)
     }
 
     fn size_cap(&self) -> Option<u64> {
-        self.size_cap
+        self.plan.size_cap
     }
 
     async fn open(
         &mut self,
         request: OpenRequest,
     ) -> Result<Box<dyn RecorderWriter<RenderedOutput>>, OpenError> {
-        let (path, mode) = prepare(&mut self.planner, &request).await?;
+        let (path, mode) = prepare(&mut self.planner, &self.plan, &request).await?;
         match DisplayFileRecorder::open(&path, mode).await {
             Ok(recorder) => Ok(Box::new(recorder)),
             Err(error) => Err(Planner::open_failed(request.kind, mode, error)),
@@ -456,6 +472,27 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[tokio::test]
+    async fn a_source_whose_planner_was_lost_still_opens_the_next_file() {
+        // A blocking task that fails to join takes the planner with it. The
+        // next open must build another, not panic the recorder task.
+        let dir = temp_dir("lost-planner");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut source =
+            RawSegments::new(plan(&dir.join("run.raw"), FileRotationPolicy::None), false);
+        source.planner = None;
+        let opened = source
+            .open(OpenRequest {
+                kind: OpenKind::First,
+                period: None,
+            })
+            .await;
+        assert!(opened.is_ok(), "{:?}", opened.err());
+        assert!(dir.join("run.raw").is_file());
+        drop(opened);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
