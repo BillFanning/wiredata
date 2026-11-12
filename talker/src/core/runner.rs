@@ -920,7 +920,8 @@ fn run_loop(
                     CommandExecution::Applied
                 } else {
                     CommandExecution::Failed(format!(
-                        "message index {index} is outside the {}-message schedule",
+                        "message {} is outside the {}-message schedule",
+                        index + 1,
                         schedule.len()
                     ))
                 };

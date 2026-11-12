@@ -965,7 +965,10 @@ fn drain_control_statuses(
                                 "interface update failed; the previous interface settings remain in use: {message}"
                             ),
                             CommandTarget::MessageInterval(index) => {
-                                format!("message {index} interval update failed: {message}")
+                                format!(
+                                    "message {} interval update failed: {message}",
+                                    index + 1
+                                )
                             }
                             CommandTarget::Stop => format!("stop command failed: {message}"),
                         };
@@ -1051,7 +1054,10 @@ fn fail_unfinished_commands(
         let message = match target {
             CommandTarget::Interface => format!("interface update did not complete: {reason}"),
             CommandTarget::MessageInterval(index) => {
-                format!("message {index} interval update did not complete: {reason}")
+                format!(
+                    "message {} interval update did not complete: {reason}",
+                    index + 1
+                )
             }
             CommandTarget::Stop => format!("stop command did not complete: {reason}"),
         };
@@ -1821,14 +1827,19 @@ mod tests {
                 target: CommandTarget::MessageInterval(7),
                 message,
                 ..
-            } => assert!(message.contains("outside the 1-message schedule")),
+            // Messages are numbered from 1 for people, as the GUI numbers them:
+            // index 7 is message 8, in both halves of the line.
+            } => assert!(
+                message.contains("message 8 is outside the 1-message schedule"),
+                "{message}"
+            ),
             other => panic!("expected rejected interval completion, got {other:?}"),
         }
         assert!(sup
             .telemetry(0)
             .command_error
             .as_deref()
-            .is_some_and(|message| message.contains("message 7 interval update failed")));
+            .is_some_and(|message| message.contains("message 8 interval update failed")));
 
         let _ = sup.stop(0);
         let mut samples = Vec::new();
