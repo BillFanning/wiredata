@@ -245,8 +245,12 @@ impl<K: Copy + PartialEq> HealthWatch<K> {
     }
 }
 
-/// A length of time in the largest units an operator reads at a glance.
+/// A length of time in the largest units an operator reads at a glance:
+/// milliseconds under a second, then whole seconds, minutes, hours.
 fn describe(span: Duration) -> String {
+    if span < Duration::from_secs(1) {
+        return format!("{} ms", span.as_millis());
+    }
     let secs = span.as_secs();
     match (secs / 3600, (secs % 3600) / 60) {
         (0, 0) => format!("{secs} s"),
@@ -413,6 +417,24 @@ mod tests {
         assert!(
             watch.degraded(),
             "a channel down at the stop degrades the run"
+        );
+    }
+
+    #[test]
+    fn a_span_under_a_second_is_described_in_milliseconds() {
+        assert_eq!(describe(Duration::ZERO), "0 ms");
+        assert_eq!(describe(Duration::from_millis(260)), "260 ms");
+        assert_eq!(describe(Duration::from_millis(999)), "999 ms");
+    }
+
+    #[test]
+    fn a_span_of_a_second_or_more_is_described_in_whole_larger_units() {
+        assert_eq!(describe(Duration::from_secs(1)), "1 s");
+        assert_eq!(describe(Duration::from_secs(59)), "59 s");
+        assert_eq!(describe(Duration::from_secs(61)), "1 min");
+        assert_eq!(
+            describe(Duration::from_secs(2 * 3600 + 5 * 60)),
+            "2 h 5 min"
         );
     }
 }
