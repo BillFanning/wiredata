@@ -261,8 +261,10 @@ pub fn doubling_retry(first: Duration, max: Duration) -> String {
 }
 
 /// A length of time in the largest units an operator reads at a glance:
-/// milliseconds under a second, then whole seconds, minutes, hours.
-fn describe(span: Duration) -> String {
+/// milliseconds under a second, then whole seconds, minutes, hours. It is how
+/// every line here states an outage, and an application's own lines about one
+/// can state it the same way.
+pub fn describe(span: Duration) -> String {
     if span < Duration::from_secs(1) {
         return format!("{} ms", span.as_millis());
     }

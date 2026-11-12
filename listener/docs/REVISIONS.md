@@ -10,6 +10,14 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-12) — the end of a Serial stall is reported:
+
+- **§101, §137.** When a reception stall that reached the warning threshold
+  ends because the blocked hand-off goes through, the reader sends a second
+  advisory notice with the stall's full length, and the runtime emits
+  `ReceptionResumed`. The warning raised at the threshold could only state the
+  length so far, so a stall of ten seconds read as a quarter of one.
+
 Revision note (2026-10-01) — an example profile:
 
 - **§72** points to a complete example profile,

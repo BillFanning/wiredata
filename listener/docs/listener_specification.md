@@ -1,17 +1,16 @@
-# Listener Specification v2.4.2
+# Listener Specification v2.4.3
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-12) — the end of a Serial stall is reported:
+Revision note (2026-11-12) — a failed event log is tried again:
 
-- **§101, §137.** When a reception stall that reached the warning threshold
-  ends because the blocked hand-off goes through, the reader sends a second
-  advisory notice with the stall's full length, and the runtime emits
-  `ReceptionResumed`. The warning raised at the threshold could only state the
-  length so far, so a stall of ten seconds read as a quarter of one.
+- **§118.** A log file that cannot be opened or written is opened again about
+  once a minute, and the recovered log says how long entries are missing. One
+  failed write, or one failed open of the next day's file, used to end the
+  event log for the rest of the run.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -2396,7 +2395,10 @@ by both the CLI and the GUI:
   (the shared `wiredata-log` crate), so a slow disk never stalls the runtime.
   Lines lost to a full handoff are counted, and a gap line records the loss.
 - A log file that cannot be opened or written is reported as a visible fault
-  (§117: logging failure does not stop Listener).
+  (§117: logging failure does not stop Listener). Listener opens it again about
+  once a minute until that succeeds. The fault is reported once, not at each
+  attempt; the recovery is reported once, and a line in the recovered log says
+  how long entries are missing.
 - Log files older than 30 days are deleted at start and at each day's rollover.
   Only log files are deleted, never recordings (§59).
 - The log is flushed at shutdown.

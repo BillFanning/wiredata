@@ -409,7 +409,15 @@ impl ListenerApp {
     /// event log cannot be written, or once any of its lines were lost. It is
     /// not dismissable, because the condition it reports is still true.
     fn show_event_log_banner(&mut self, ui: &mut egui::Ui) {
+        // Tending turns a failed log back on once a minute and writes the
+        // line that marks the gap; the banner shows the state either way.
+        let _ = self.event_log.tend(std::time::Instant::now());
         let problem = self.event_log.problem();
+        if problem.is_some() {
+            // An idle window would otherwise not repaint, and so not retry.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
+        }
         let lost = self.event_log.lost_entries();
         if problem.is_none() && lost == 0 {
             return;

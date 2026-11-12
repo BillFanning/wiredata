@@ -1303,6 +1303,38 @@ mod tests {
     }
 
     #[test]
+    fn enabling_again_after_a_write_failure_reopens_the_file() {
+        let opens = Arc::new(AtomicU64::new(0));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (worker_opens, worker_written) = (Arc::clone(&opens), Arc::clone(&written));
+        let sink = spawn_with(Box::new(move |_| {
+            if worker_opens.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Box::new(FailingWriter))
+            } else {
+                Ok(Box::new(SharedWriter(Arc::clone(&worker_written))))
+            }
+        }))
+        .unwrap();
+        sink.toggle.enable(config()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+        emit(&sink.writer, b"write will fail\n");
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Failed(_))
+        });
+
+        sink.toggle.enable(config()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+        emit(&sink.writer, b"after the failure\n");
+
+        wait_for_text(&written, "after the failure");
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn flush_failure_is_reported_when_file_logging_stops() {
         let sink = spawn_with(Box::new(|_| Ok(Box::new(FlushFailingWriter)))).unwrap();
         sink.toggle.enable(config()).unwrap();

@@ -16,7 +16,7 @@ use clap::Parser;
 
 use crate::config::{describe_channel_errors, templates, ChannelConfig, InterfaceConfig, Profile};
 use crate::core::{ChannelId, ChannelState, RuntimeEvent};
-use crate::diagnostics::EventLogStatus;
+use crate::diagnostics::{EventLogChange, EventLogStatus};
 use crate::runtime::{Listener, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT};
 use crate::transport::STALL_WARNING;
 use wiredata_cli::{exit_status, HealthWatch, EXIT_CANNOT_START};
@@ -131,6 +131,9 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     // event log drains and flushes after the runtime has stopped every Channel.
     let event_log = crate::diagnostics::init_logging();
     let status = event_log.status();
+    // A log that has already failed is reported here, so note it as seen: the
+    // run's first tick then does not report it a second time.
+    let _ = status.tend(Instant::now());
     match (status.folder(), status.problem()) {
         (_, Some(problem)) => eprintln!("WARNING: the event log is not being saved: {problem}"),
         (Some(folder), None) => println!("event log: {}", folder.display()),
@@ -201,7 +204,6 @@ async fn run_cli(
     // app ticks it. Channels without reconnect enabled are unaffected. The same
     // tick checks the event log, so a failure that starts mid-run is reported.
     let mut reconnect = tokio::time::interval(std::time::Duration::from_millis(500));
-    let mut reported_problem = event_log.problem();
     let mut stop_reason = "the event stream closed".to_owned();
     loop {
         tokio::select! {
@@ -213,12 +215,17 @@ async fn run_cli(
             _ = reconnect.tick() => {
                 listener.reconnect_tick().await;
                 observe_health(&listener, &mut health, &ids, &names).await;
-                let problem = event_log.problem();
-                if problem != reported_problem {
-                    if let Some(problem) = &problem {
+                match event_log.tend(Instant::now()) {
+                    Some(EventLogChange::StartedFailing(problem)) => {
                         eprintln!("WARNING: the event log is not being saved: {problem}");
                     }
-                    reported_problem = problem;
+                    Some(EventLogChange::Recovered { after }) => {
+                        eprintln!(
+                            "the event log is being saved again after {}",
+                            wiredata_cli::describe(after)
+                        );
+                    }
+                    None => {}
                 }
             }
             maybe = events.recv() => match maybe {

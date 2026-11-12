@@ -1712,6 +1712,9 @@ failure (talker ADR-006).
   ADR-061): a dedicated thread behind a bounded, non-blocking handoff, a
   cumulative loss count, a gap line after a loss, a visible fault when the file
   cannot be opened or written, and a flush at shutdown.
+- Listener turns a failed log back on about once a minute. The worker reports a
+  failure and stops; trying again is the application's choice, so talker, whose
+  file log has a person at the GUI, is unchanged.
 - Log files older than 30 days are deleted at start and at each day's rollover.
   Only log files are deleted, never recordings (ADR-043).
 - The CLI and the GUI both write it. The CLI prints the log folder at start.

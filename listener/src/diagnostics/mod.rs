@@ -7,7 +7,8 @@
 //! and diagnostic logging ([`init_logging`], §114).
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::Layer;
@@ -235,13 +236,51 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
     }
 }
 
+/// The least time between attempts to turn a failed event log back on. The
+/// first attempt comes this long after the failure is first seen, so a
+/// destination that fails at once is not retried in a loop.
+pub const EVENT_LOG_RETRY_SPACING: Duration = Duration::from_secs(60);
+
+/// A change in whether the event log is being saved, reported once by
+/// [`EventLogStatus::tend`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventLogChange {
+    /// The log has just stopped being saved, for this reason.
+    StartedFailing(String),
+    /// The log is being saved again after this long.
+    Recovered { after: Duration },
+}
+
+/// What [`EventLogStatus::tend`] remembers between calls. Clones of the status
+/// share it, so they agree about whether the log is failing.
+#[derive(Default)]
+struct FailureTrack {
+    /// When the current failure was first seen; `None` while the log is well.
+    first_seen: Option<Instant>,
+    /// The reason the worker last gave.
+    reason: Option<String>,
+    /// When a re-enable was last requested for this failure.
+    last_attempt: Option<Instant>,
+}
+
+/// Whether a failed event log is due another attempt: at least
+/// [`EVENT_LOG_RETRY_SPACING`] after the last attempt, or after the failure
+/// was first seen when none has been made.
+fn retry_due(first_seen: Instant, last_attempt: Option<Instant>, now: Instant) -> bool {
+    let since = last_attempt.unwrap_or(first_seen);
+    now.saturating_duration_since(since) >= EVENT_LOG_RETRY_SPACING
+}
+
 /// What the CLI and GUI show about the persistent event log (§118). Cheap to
 /// clone and to poll.
 #[derive(Clone)]
 pub struct EventLogStatus {
     folder: Option<PathBuf>,
     toggle: Option<FileLogToggle>,
+    /// What the toggle was enabled with, so a failed log can be enabled again.
+    config: Option<LogFileConfig>,
     setup_problem: Option<String>,
+    track: Arc<Mutex<FailureTrack>>,
 }
 
 impl EventLogStatus {
@@ -250,15 +289,69 @@ impl EventLogStatus {
         self.folder.as_deref()
     }
 
+    fn track(&self) -> std::sync::MutexGuard<'_, FailureTrack> {
+        self.track
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Why the event log is not being written, if it is not (§117: this never
-    /// stops Listener; it is reported so someone can act on it).
+    /// stops Listener; it is reported so someone can act on it). While a
+    /// retry after a failure is under way the last reason still stands.
     pub fn problem(&self) -> Option<String> {
         if let Some(problem) = &self.setup_problem {
             return Some(problem.clone());
         }
         match self.toggle.as_ref().map(FileLogToggle::state) {
             Some(FileLogState::Failed(reason)) => Some(reason),
+            Some(FileLogState::Enabling) => {
+                let track = self.track();
+                track.first_seen.and(track.reason.clone())
+            }
             _ => None,
+        }
+    }
+
+    /// Check the event log, turn a failed one back on when a retry is due, and
+    /// report a change once. Call it on the application's regular poll with
+    /// the current time.
+    ///
+    /// A retry that fails again is the same failure and reports nothing. When
+    /// the log is saved again, one WARN line in the log itself says how long
+    /// entries are missing.
+    pub fn tend(&self, now: Instant) -> Option<EventLogChange> {
+        let toggle = self.toggle.as_ref()?;
+        let state = toggle.state();
+        let mut track = self.track();
+        match state {
+            FileLogState::Failed(reason) => {
+                let newly_failed = track.first_seen.is_none();
+                let first_seen = *track.first_seen.get_or_insert(now);
+                track.reason = Some(reason.clone());
+                if let Some(config) = &self.config {
+                    if retry_due(first_seen, track.last_attempt, now) {
+                        track.last_attempt = Some(now);
+                        // A worker that is gone leaves the state `Failed`, and
+                        // the next attempt finds that out again.
+                        let _ = toggle.enable(config.clone());
+                    }
+                }
+                newly_failed.then_some(EventLogChange::StartedFailing(reason))
+            }
+            FileLogState::Enabled { .. } => {
+                track.last_attempt = None;
+                let first_seen = track.first_seen.take()?;
+                let reason = track.reason.take().unwrap_or_default();
+                drop(track);
+                let after = now.saturating_duration_since(first_seen);
+                tracing::warn!(
+                    "the event log was not saved for {}: {reason}; \
+                     entries from that time are missing",
+                    wiredata_cli::describe(after)
+                );
+                Some(EventLogChange::Recovered { after })
+            }
+            FileLogState::Disabled | FileLogState::Enabling | FileLogState::Disabling => None,
         }
     }
 
@@ -289,7 +382,9 @@ impl EventLog {
             status: EventLogStatus {
                 folder,
                 toggle: None,
+                config: None,
                 setup_problem: Some(problem),
+                track: Arc::default(),
             },
             _guard: None,
         }
@@ -303,12 +398,13 @@ where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     let sink = wiredata_log::spawn("Listener")?;
-    sink.toggle.enable(LogFileConfig {
+    let config = LogFileConfig {
         directory: folder.to_path_buf(),
         prefix: EVENT_LOG_PREFIX.to_owned(),
         rotation: Rotation::DailyLocal,
         max_age: Some(EVENT_LOG_MAX_AGE),
-    })?;
+    };
+    sink.toggle.enable(config.clone())?;
     let layer = tracing_subscriber::fmt::layer()
         .with_timer(LocalTime)
         .with_ansi(false)
@@ -318,7 +414,9 @@ where
         status: EventLogStatus {
             folder: Some(folder.to_path_buf()),
             toggle: Some(sink.toggle),
+            config: Some(config),
             setup_problem: None,
+            track: Arc::default(),
         },
         _guard: Some(sink.guard),
     };
@@ -488,6 +586,122 @@ mod tests {
             !text.contains('\u{1b}'),
             "no colour codes in a file: {text:?}"
         );
+    }
+
+    #[test]
+    fn a_retry_is_not_due_before_the_spacing_has_passed() {
+        let first_seen = Instant::now();
+        let almost = first_seen + EVENT_LOG_RETRY_SPACING - Duration::from_millis(1);
+        assert!(!retry_due(first_seen, None, first_seen));
+        assert!(!retry_due(first_seen, None, almost));
+    }
+
+    #[test]
+    fn the_first_retry_is_due_one_spacing_after_the_failure_was_seen() {
+        let first_seen = Instant::now();
+        assert!(retry_due(
+            first_seen,
+            None,
+            first_seen + EVENT_LOG_RETRY_SPACING
+        ));
+    }
+
+    #[test]
+    fn the_next_retry_is_due_one_spacing_after_the_last_attempt() {
+        let first_seen = Instant::now();
+        let attempt = first_seen + EVENT_LOG_RETRY_SPACING;
+        let almost = attempt + EVENT_LOG_RETRY_SPACING - Duration::from_millis(1);
+        assert!(!retry_due(first_seen, Some(attempt), attempt));
+        assert!(!retry_due(first_seen, Some(attempt), almost));
+        assert!(retry_due(
+            first_seen,
+            Some(attempt),
+            attempt + EVENT_LOG_RETRY_SPACING
+        ));
+    }
+
+    #[test]
+    fn a_failed_event_log_is_reported_once_retried_and_reported_when_saved_again() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let root =
+            std::env::temp_dir().join(format!("listener_event_log_tend_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&root);
+        // A file where the log folder should be: the open fails until it goes.
+        std::fs::write(&root, b"in the way").unwrap();
+
+        let (layer, log) = event_log_layer(&root).unwrap();
+        let status = log.status();
+        let toggle = log.status.toggle.clone().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(toggle.state(), FileLogState::Failed(_)) {
+            assert!(Instant::now() < deadline, "the open never failed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let start = Instant::now();
+        let reason = status.problem().expect("the failure is a problem");
+        assert_eq!(
+            status.tend(start),
+            Some(EventLogChange::StartedFailing(reason))
+        );
+        assert_eq!(status.tend(start + Duration::from_secs(1)), None);
+        assert_eq!(status.tend(start + EVENT_LOG_RETRY_SPACING / 2), None);
+        assert!(status.problem().is_some());
+        assert!(matches!(toggle.state(), FileLogState::Failed(_)));
+
+        std::fs::remove_file(&root).unwrap();
+        let later = start + EVENT_LOG_RETRY_SPACING + Duration::from_secs(1);
+        let mut recovered = None;
+        let text = super::test_support::capture(|| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while recovered.is_none() {
+                // Once the log is saved again the problem has gone; until
+                // then, including while the retry is in flight, it stands.
+                let problem = status.problem();
+                if problem.is_none() {
+                    assert!(
+                        matches!(toggle.state(), FileLogState::Enabled { .. }),
+                        "no problem while {:?}",
+                        toggle.state()
+                    );
+                }
+                recovered = status.tend(later);
+                assert!(Instant::now() < deadline, "the log never recovered");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        assert_eq!(
+            recovered,
+            Some(EventLogChange::Recovered {
+                after: later - start
+            })
+        );
+        assert_eq!(status.problem(), None);
+        assert_eq!(status.tend(later + EVENT_LOG_RETRY_SPACING), None);
+        assert!(text.contains("WARN"), "{text}");
+        assert!(
+            text.contains("the event log was not saved for 1 min: "),
+            "{text}"
+        );
+        assert!(
+            text.contains("; entries from that time are missing"),
+            "{text}"
+        );
+
+        // The reopened file takes lines again.
+        super::test_support::with_subscriber(tracing_subscriber::registry().with(layer), || {
+            DiagnosticLog::new(None, None, None)
+                .for_channel("GPS", ChannelId::new())
+                .record(Diagnostic::error("written after the recovery"));
+        });
+        drop(log);
+        let mut saved = String::new();
+        for entry in std::fs::read_dir(&root).unwrap().flatten() {
+            saved.push_str(&std::fs::read_to_string(entry.path()).unwrap());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(saved.contains("written after the recovery"), "{saved}");
     }
 
     #[test]
