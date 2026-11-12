@@ -32,10 +32,6 @@ found again. Remove an item when it is done: the commit says what changed.
   and confirm that flow control causes no port reopen or DTR-reset churn. Watch
   for a possibly partial write while there (§4.4). The automated tests fix the
   state and accounting contract; this checks real drivers.
-- [ ] **The sampled Output pane in a live run (ADR-018).** Above about 10 Hz the
-  pane shows the newest `SendSample` per interval, not every send. Confirm in a
-  real high-rate run that it reads as a sample rather than as lost data. A fix
-  would be in how the pane labels what it shows, not in the lane.
 
 ## GUI
 
