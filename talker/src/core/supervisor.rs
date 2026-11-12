@@ -776,6 +776,7 @@ impl TalkerSupervisor {
                         "the channel stopped before carrying this out",
                     );
                     slot.pending_start = None;
+                    slot.applied_run = None;
                     exited = true;
                 }
             }
@@ -1325,6 +1326,42 @@ mod tests {
             sup.slots[0].faults.runner_panicked,
             InternalFaultTally::default()
         );
+    }
+
+    /// "Applied" means a live runner owns this configuration. A runner that
+    /// ended without being stopped owns nothing.
+    #[test]
+    fn a_runner_that_ends_by_itself_leaves_no_applied_configuration() {
+        struct PanickingInterface;
+        impl Interface for PanickingInterface {
+            fn send(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+                panic!("send panicked on purpose");
+            }
+        }
+
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::every_send());
+        sup.push_slot();
+        let messages = vec![msg("AB", 5)];
+        start_with_interface(
+            &mut sup,
+            0,
+            Box::new(PanickingInterface),
+            schedule(&messages),
+        );
+        // What a confirmed open records, set before the first poll can see
+        // the runner gone.
+        sup.slots[0].applied_run = Some(AppliedRunConfig {
+            interface: InterfaceConfig::Udp(UdpConfig::unicast(
+                "127.0.0.1:9".parse().expect("socket address"),
+            )),
+            cadence_alignment: CadenceAlignment::Immediate,
+            messages,
+        });
+        let mut samples = Vec::new();
+        poll_until(&mut sup, &mut samples, |s| !s.is_running(0));
+
+        assert!(sup.applied_run_config(0).is_none());
+        assert!(sup.applied_interface(0).is_none());
     }
 
     #[test]
