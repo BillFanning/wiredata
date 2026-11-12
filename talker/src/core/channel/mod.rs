@@ -7,6 +7,7 @@ pub use config::{
     ChannelConfig, DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits,
     TcpClientConfig, UdpConfig, UdpMode,
 };
+pub(crate) use tcp::{CONNECT_TIMEOUT, WRITE_TIMEOUT};
 
 /// Stable identity of one configured channel, minted when the channel is
 /// created and unchanged for its whole life (ADR-020).

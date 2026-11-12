@@ -9,12 +9,12 @@ use super::{write_counted, Interface, MissingRetryConfiguration, WriteFailure};
 
 /// Cap on connect. Without it the OS default applies (~20s on Windows),
 /// which is far too long for an interactive tool to sit unresponsive.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cap on each blocking write. Without it, a peer that stops reading
 /// (dead device, full window) wedges the owning talker thread inside
 /// `write_all` forever — it can then never see its Stop command.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most one drain reads before a write (ADR-059, §4.5). A peer that keeps
 /// sending could otherwise hold up the schedule; what is left over is not

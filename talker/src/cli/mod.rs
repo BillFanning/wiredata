@@ -7,7 +7,7 @@ use clap::{Args as ClapArgs, ValueEnum};
 use wiredata_cli::{exit_status, HealthWatch, EXIT_CANNOT_START};
 
 use crate::core::{
-    channel::ChannelId,
+    channel::{ChannelId, CONNECT_TIMEOUT, WRITE_TIMEOUT},
     logging::{self, FileLogConfig, Rotation},
     message::decode_utf8_lossy_latin1,
     profile::{self, Profile},
@@ -175,8 +175,16 @@ pub struct Args {
 
 /// How long the stop may take, once requested, before the CLI stops waiting
 /// for the channels' threads and exits with code 4 (ADR-060). A send blocked
-/// in the operating system cannot be interrupted.
-const STOP_LIMIT: Duration = Duration::from_secs(5);
+/// in the operating system cannot be interrupted, so the limit is the longest
+/// such call plus 1 s: a stop that is only waiting one out is not cut off.
+const STOP_LIMIT: Duration = {
+    let longest = if WRITE_TIMEOUT.as_nanos() > CONNECT_TIMEOUT.as_nanos() {
+        WRITE_TIMEOUT
+    } else {
+        CONNECT_TIMEOUT
+    };
+    longest.saturating_add(Duration::from_secs(1))
+};
 
 /// Run the profile until a stop request, and return the exit code (ADR-060):
 /// 0 healthy or every outage recovered, 2 nothing can start, 3 degraded, 4 the
@@ -666,6 +674,12 @@ fn list_profiles() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_limit_outlasts_the_longest_blocking_call() {
+        assert!(STOP_LIMIT > WRITE_TIMEOUT);
+        assert!(STOP_LIMIT > CONNECT_TIMEOUT);
+    }
 
     fn parse(argv: &[&str]) -> Result<Args, clap::Error> {
         use clap::Parser;
