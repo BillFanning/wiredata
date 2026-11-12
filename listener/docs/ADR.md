@@ -2104,6 +2104,50 @@ same run against the current code, before building any of these.
 **Consequences:** No multi-pattern scanner, no eviction rework and no
 diagnostics deltas, until a new measurement crosses its threshold.
 
+## ADR-054 — A Channel whose task ends by itself is faulted
+
+**Status:** Accepted 2026-11-12.
+
+**Context:** A running Channel is a transport that receives, a pipeline that
+processes, and a monitor that watches the transport (ADR-006). The spec says
+what a Channel does when its transport reports an error. It does not say what
+happens when one of the tasks simply ends: a receive task that panics, a serial
+thread that ends without reporting, a pipeline that ends under a running
+transport. In a run left alone for weeks, that is the failure that matters
+most, because nobody is watching.
+
+**Decision:** An end the Channel was not asked for is a fault.
+
+- A transport that ends without reporting an outcome is reported as `Faulted`.
+- A transport that reports `Completed` is faulted by the monitor unless the
+  Channel's stop has begun. Serial and UDP report `Completed` only when the
+  pipeline's queue has closed, so outside a stop it means the pipeline is gone.
+- The fault takes the ordinary path: the Channel reads Faulted, `ChannelFaulted`
+  is sent, and the reconnect policy (§9.1) restarts the Channel if it has one.
+- The cause goes to the Channel's diagnostics when its pipeline is there to
+  record it, and straight to the event log (§118) when it is not.
+
+A stop cannot be taken for a fault. Stop cancels the transport before either
+task ends, and the monitor looks at that cancellation only after the transport
+has ended.
+
+**Boundary:**
+
+- It detects a task that has ended, not one that is alive and stuck. A pipeline
+  blocked forever still reads Running.
+- It relies on a panic unwinding one task. A build that aborts on panic ends
+  the process instead.
+- When the pipeline is the part that ended, the cause is in the event log only.
+  A pipeline that is gone returns no final snapshot, so the Channel's retained
+  diagnostics do not show it.
+- A TCP connection, disabled in this release (§4.1), is supervised separately:
+  there `Completed` is still a client that closed.
+
+**Consequences:** `Completed` no longer means "not a fault" on its own; whoever
+awaits the transport decides. A Channel with reconnect on now restarts after a
+failure inside Listener, with a new pipeline; one with reconnect off stays
+Faulted and says why.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_
