@@ -148,7 +148,7 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// Heuristic: momentary backpressure that drains quickly is normal and must not
 /// cry loss. The byte count of any overrun is not observable from userland, so the
 /// notice carries the stall duration, not a fabricated count (§101).
-const STALL_WARNING: Duration = Duration::from_millis(250);
+pub(crate) const STALL_WARNING: Duration = Duration::from_millis(250);
 
 /// Retry cadence while stalled on a full Transport→Pipeline queue. The stall is
 /// a poll loop (not a parked `blocking_send`) so the notice can be raised *while*
@@ -622,14 +622,26 @@ fn retry_stalled_send(
         }
 
         match out.try_send(pending) {
-            Ok(()) => break StalledSendOutcome::Sent,
+            Ok(()) => {
+                // Only a send that goes through ends the stall as a resumption;
+                // a cancel or a closed queue ends the run instead.
+                if warned {
+                    if let Some(notices) = notices {
+                        let _ = notices.try_send(TransportNotice::ReceptionResumed {
+                            channel_id,
+                            stalled_for: stalled_at.elapsed(),
+                        });
+                    }
+                }
+                break StalledSendOutcome::Sent;
+            }
             Err(TrySendError::Closed(_)) => break StalledSendOutcome::Closed,
             Err(TrySendError::Full(again)) => {
                 pending = again;
                 // A sustained stall risks a UART/driver overrun upstream of us —
                 // transport-specific loss we flag but cannot quantify (§101).
-                // The shared state remains authoritative even if this
-                // once-per-episode, non-blocking notice attempt is dropped.
+                // The shared state remains authoritative even if either
+                // non-blocking notice attempt, stalled or resumed, is dropped.
             }
         }
     }
@@ -1177,6 +1189,7 @@ mod tests {
         // the queue full until the notice arrives avoids scheduler-dependent
         // sleeps and proves the notice is raised while the episode is active.
         wait_for_active_stall(&stall_state).await;
+        let held_since = Instant::now();
         let notice = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
             .await
             .expect("sustained stall should raise its advisory notice")
@@ -1192,6 +1205,7 @@ mod tests {
             other => panic!("expected ReceptionStalled, got {other:?}"),
         }
 
+        let held_for = held_since.elapsed();
         assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
         assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
 
@@ -1201,6 +1215,19 @@ mod tests {
         assert_eq!(completed.completed_episodes, 1);
         assert!(completed.completed_total >= threshold);
         assert_eq!(completed.completed_max, completed.completed_total);
+
+        // The send went through, so the stall ends with its full length.
+        match notice_rx.try_recv() {
+            Ok(TransportNotice::ReceptionResumed {
+                channel_id,
+                stalled_for,
+            }) => {
+                assert_eq!(channel_id, cid);
+                assert!(stalled_for >= held_for);
+                assert!(stalled_for >= threshold);
+            }
+            other => panic!("expected ReceptionResumed, got {other:?}"),
+        }
         assert!(notice_rx.try_recv().is_err());
 
         cancel.cancel();
@@ -1470,7 +1497,7 @@ mod tests {
         // The consumer frees capacity before the first retry. With a zero
         // threshold, that successful retry is itself the threshold edge.
         assert_eq!(rx.try_recv().unwrap().payload.bytes(), b"first");
-        let (notice_tx, mut notice_rx) = mpsc::channel(1);
+        let (notice_tx, mut notice_rx) = mpsc::channel(2);
         let stall_state = SerialStallState::default();
         assert_eq!(
             retry_stalled_send(
@@ -1489,9 +1516,49 @@ mod tests {
             notice_rx.try_recv(),
             Ok(TransportNotice::ReceptionStalled { .. })
         ));
+        assert!(matches!(
+            notice_rx.try_recv(),
+            Ok(TransportNotice::ReceptionResumed { .. })
+        ));
         assert_eq!(rx.try_recv().unwrap().payload.bytes(), b"pending");
         let snapshot = stall_state.snapshot();
         assert_eq!(snapshot.completed_episodes, 1);
         assert!(snapshot.active_since.is_none());
+    }
+
+    #[test]
+    fn a_stall_ended_by_a_closed_queue_sends_no_resumed_notice() {
+        let (tx, rx) = mpsc::channel(1);
+        let channel_id = ChannelId::new();
+        let block = |tag: &[u8]| ReceivedData {
+            channel_id,
+            received_at: ChunkTime::now(),
+            payload: ReceivedPayload::Bytes(tag.to_vec()),
+        };
+        tx.try_send(block(b"first")).unwrap();
+        let pending = match tx.try_send(block(b"pending")) {
+            Err(TrySendError::Full(pending)) => pending,
+            other => panic!("capacity-one queue should initially be full: {other:?}"),
+        };
+        drop(rx);
+        let (notice_tx, mut notice_rx) = mpsc::channel(2);
+        let stall_state = SerialStallState::default();
+        assert_eq!(
+            retry_stalled_send(
+                channel_id,
+                &tx,
+                &CancellationToken::new(),
+                pending,
+                Duration::ZERO,
+                &Some(notice_tx),
+                &stall_state,
+            ),
+            StalledSendOutcome::Closed
+        );
+        assert!(matches!(
+            notice_rx.try_recv(),
+            Ok(TransportNotice::ReceptionStalled { .. })
+        ));
+        assert!(notice_rx.try_recv().is_err());
     }
 }

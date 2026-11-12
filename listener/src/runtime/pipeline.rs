@@ -55,8 +55,8 @@ use crate::record::{
     DEFAULT_QUEUE_BUDGET,
 };
 use crate::transport::udp::SharedPortStatus;
-use crate::transport::{ReceivedData, SerialStallState, TransportNotice};
-use wiredata_ui::format::human_bytes;
+use crate::transport::{ReceivedData, SerialStallState, TransportNotice, STALL_WARNING};
+use wiredata_ui::format::{compact_duration, human_bytes};
 
 use super::queue::DropOldestQueue;
 
@@ -1439,10 +1439,8 @@ impl ChannelPipeline {
                 stalled_for,
             } => {
                 self.diagnostics.record(Diagnostic::warning(format!(
-                    "reception stalled {} ms on channel {}; possible transport-specific \
-                     loss (UART/driver overrun) — lost byte count is not observable (§101)",
-                    stalled_for.as_millis(),
-                    self.channel_name,
+                    "reception stalled over {}: listener is not keeping up; serial bytes may be lost",
+                    compact_duration(STALL_WARNING),
                 )));
                 // The matching event (§137); advisory, non-blocking like the rest.
                 // Dedicated `ReceptionStalled` (v1.2) so observers can tell a stall
@@ -1450,6 +1448,19 @@ impl ChannelPipeline {
                 if let Some(events) = &self.events {
                     let _ =
                         events.try_send(RuntimeEvent::ReceptionStalled(channel_id, stalled_for));
+                }
+            }
+            TransportNotice::ReceptionResumed {
+                channel_id,
+                stalled_for,
+            } => {
+                self.diagnostics.record(Diagnostic::warning(format!(
+                    "reception resumed after a {} stall; serial bytes may have been lost",
+                    compact_duration(stalled_for),
+                )));
+                if let Some(events) = &self.events {
+                    let _ =
+                        events.try_send(RuntimeEvent::ReceptionResumed(channel_id, stalled_for));
                 }
             }
             TransportNotice::UdpKernelDrops {
@@ -2988,12 +2999,46 @@ mod tests {
             }
             tokio::task::yield_now().await;
         };
-        assert!(snapshot.diagnostics.warnings[0]
-            .message
-            .contains("reception stalled 750 ms"));
+        assert_eq!(
+            snapshot.diagnostics.warnings[0].message,
+            "reception stalled over 250 ms: listener is not keeping up; serial bytes may be lost"
+        );
 
         cancel.cancel();
         let _ = task.await.unwrap();
+    }
+
+    #[test]
+    fn a_resumed_notice_records_the_full_stall_length_and_emits_the_event() {
+        let cid = ChannelId::new();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(4);
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_event_sender(events_tx);
+
+        for (stalled_for, text) in [
+            (
+                Duration::from_millis(1840),
+                "reception resumed after a 1.84 s stall; serial bytes may have been lost",
+            ),
+            (
+                Duration::from_secs(75),
+                "reception resumed after a 75.0 s stall; serial bytes may have been lost",
+            ),
+        ] {
+            p.record_notice(TransportNotice::ReceptionResumed {
+                channel_id: cid,
+                stalled_for,
+            });
+            assert!(p
+                .snapshot()
+                .diagnostics
+                .warnings
+                .iter()
+                .any(|diagnostic| diagnostic.message == text));
+            assert_eq!(
+                events_rx.try_recv(),
+                Ok(RuntimeEvent::ReceptionResumed(cid, stalled_for))
+            );
+        }
     }
 
     #[test]
@@ -3023,7 +3068,9 @@ mod tests {
             .diagnostics
             .warnings
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("reception stalled 750 ms")));
+            .any(|diagnostic| diagnostic
+                .message
+                .starts_with("reception stalled over 250 ms")));
         assert_eq!(
             events_rx.try_recv(),
             Ok(RuntimeEvent::WarningRaised(cid)),

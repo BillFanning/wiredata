@@ -60,6 +60,9 @@ pub enum RuntimeEvent {
     /// stalled. Dedicated variant (v1.2 §137) — replaces the earlier reuse of
     /// `WarningRaised` so observers can distinguish a stall from any other warning.
     ReceptionStalled(ChannelId, Duration),
+    /// A reader stall that had raised [`ReceptionStalled`](Self::ReceptionStalled)
+    /// ended because the blocked send went through; carries the stall's full length.
+    ReceptionResumed(ChannelId, Duration),
     /// A serial Channel's control/status lines changed (§14.3, §161); read the
     /// current state from the snapshot/query. Part of the v1.2 §137 vocabulary.
     ControlLinesChanged(ChannelId),

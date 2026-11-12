@@ -18,8 +18,10 @@ use crate::config::{describe_channel_errors, templates, ChannelConfig, Interface
 use crate::core::{ChannelId, ChannelState, RuntimeEvent};
 use crate::diagnostics::EventLogStatus;
 use crate::runtime::{Listener, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT};
+use crate::transport::STALL_WARNING;
 use wiredata_cli::{exit_status, HealthWatch, EXIT_CANNOT_START};
 use wiredata_stop::StopRequests;
+use wiredata_ui::format::compact_duration;
 
 /// Receive and inspect byte-oriented data from serial and network sources.
 #[derive(Parser, Debug)]
@@ -455,9 +457,16 @@ fn format_event(event: &RuntimeEvent, names: &HashMap<ChannelId, String>) -> Opt
             format!("[{}] {} recording started", label(id), tap.label())
         }
         RuntimeEvent::WarningRaised(id) => format!("[{}] warning raised", label(id)),
-        RuntimeEvent::ReceptionStalled(id, dur) => {
-            format!("[{}] reception stalled {} ms", label(id), dur.as_millis())
-        }
+        RuntimeEvent::ReceptionStalled(id, _) => format!(
+            "[{}] reception stalled over {}: listener is not keeping up; serial bytes may be lost",
+            label(id),
+            compact_duration(STALL_WARNING),
+        ),
+        RuntimeEvent::ReceptionResumed(id, dur) => format!(
+            "[{}] reception resumed after a {} stall; serial bytes may have been lost",
+            label(id),
+            compact_duration(*dur),
+        ),
         RuntimeEvent::TcpClientConnected(id) => format!("[{}] TCP client connected", label(id)),
         RuntimeEvent::TcpClientDisconnected(id) => {
             format!("[{}] TCP client disconnected", label(id))
@@ -706,6 +715,28 @@ mod tests {
         assert_eq!(
             format_event(&RuntimeEvent::DiskSpaceLow(unnamed), &names),
             Some(format!("[{unnamed}] LOW DISK"))
+        );
+    }
+
+    #[test]
+    fn stall_events_print_both_lines_with_the_channel_prefix() {
+        let id = crate::core::ChannelId::new();
+        let names = std::collections::HashMap::from([(id, "GPS".to_owned())]);
+        assert_eq!(
+            format_event(
+                &RuntimeEvent::ReceptionStalled(id, std::time::Duration::from_millis(262)),
+                &names
+            )
+            .as_deref(),
+            Some("[GPS] reception stalled over 250 ms: listener is not keeping up; serial bytes may be lost")
+        );
+        assert_eq!(
+            format_event(
+                &RuntimeEvent::ReceptionResumed(id, std::time::Duration::from_millis(1840)),
+                &names
+            )
+            .as_deref(),
+            Some("[GPS] reception resumed after a 1.84 s stall; serial bytes may have been lost")
         );
     }
 

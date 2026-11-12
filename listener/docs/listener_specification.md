@@ -1,15 +1,17 @@
-# Listener Specification v2.4.1
+# Listener Specification v2.4.2
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-10-01) — an example profile:
+Revision note (2026-11-12) — the end of a Serial stall is reported:
 
-- **§72** points to a complete example profile,
-  [`listener/profiles/profile.example.toml`](../profiles/profile.example.toml),
-  which a test keeps loading.
+- **§101, §137.** When a reception stall that reached the warning threshold
+  ends because the blocked hand-off goes through, the reader sends a second
+  advisory notice with the stall's full length, and the runtime emits
+  `ReceptionResumed`. The warning raised at the threshold could only state the
+  length so far, so a stall of ten seconds read as a quarter of one.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -2199,6 +2201,12 @@ event is omitted. These advisory omissions cannot change the authoritative metri
 The measurements provide risk context but do not guarantee detection or quantify lost
 bytes.
 
+When an episode that reached the threshold ends because a retry succeeds, the reader
+makes one best-effort `ReceptionResumed` notice attempt carrying the episode's full
+length. An episode ended by cancellation, or by the pipeline receiver closing, sends
+none. The notice is advisory in the same way: if it is dropped, its warning
+diagnostic and runtime event are omitted and no metric changes.
+
 ---
 
 # Part XIX — Processing Pipeline and Ownership
@@ -2785,6 +2793,7 @@ pub enum RuntimeEvent {
     TcpClientDisconnected(ChannelId),
     // Live-adjustment additions
     ReceptionStalled(ChannelId, Duration),    // §101/ADR-007: dedicated, replaces the WarningRaised overload
+    ReceptionResumed(ChannelId, Duration),    // §101: a stall that raised ReceptionStalled ended; its full length
     ControlLinesChanged(ChannelId),           // §14.3: input CTS/DSR/DCD/RI changed — poll snapshot for detail
     MatchTriggered(ChannelId, MatchRuleId),   // §50.2: a rule fired (Notify/Mark observable here)
     ChannelReconnecting(ChannelId, u32 /*attempt*/), // §9.1
@@ -2802,6 +2811,10 @@ runtime event is created; if only event delivery is full, the diagnostic remains
 the event is omitted. Observers shall poll the Channel snapshot for completed stall
 aggregates and separate active elapsed time. Notice or event loss shall not change
 those metrics.
+
+`ReceptionResumed` follows a `ReceptionStalled` whose blocked hand-off then went
+through, and carries the stall's full length (§101). It is advisory in the same way,
+so an observer may see a stall with no end reported.
 
 ---
 

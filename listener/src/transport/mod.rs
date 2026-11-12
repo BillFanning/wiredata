@@ -26,11 +26,11 @@ pub mod serial;
 pub mod tcp;
 pub mod udp;
 
-pub(crate) use serial::SerialStallState;
 pub use serial::{
     OpenSerialTransport, SerialControlCommand, SerialControlHooks, SerialControlLines,
     SerialTransport,
 };
+pub(crate) use serial::{SerialStallState, STALL_WARNING};
 pub use tcp::{BoundTcpListenerTransport, TcpConnectionTransport, TcpListenerTransport};
 pub use udp::{BoundUdpTransport, UdpMode, UdpTransport};
 
@@ -100,7 +100,8 @@ pub enum TransportOutcome {
 /// The transport stays free of the diagnostics/event vocabulary: it states what
 /// happened (self-describing, including which channel), and the pipeline — owner
 /// of the channel's `DiagnosticLog` — records it. Delivery follows the condition:
-/// a live [`ReceptionStalled`](Self::ReceptionStalled) warning uses `try_send` and
+/// a live [`ReceptionStalled`](Self::ReceptionStalled) warning (and its
+/// [`ReceptionResumed`](Self::ReceptionResumed) follow-up) uses `try_send` and
 /// may drop rather than block reception, while a terminal
 /// [`TransportFaulted`](Self::TransportFaulted) is awaited by the runtime monitor
 /// after reception ends, when no reader remains to stall.
@@ -112,6 +113,15 @@ pub enum TransportNotice {
     /// risk a UART/driver overrun: possible transport-specific loss, unquantifiable
     /// from userland (§101). `stalled_for` is the observable proxy for "how bad".
     ReceptionStalled {
+        channel_id: ChannelId,
+        stalled_for: Duration,
+    },
+    /// A stall that had passed the [`ReceptionStalled`](Self::ReceptionStalled)
+    /// threshold ended because the blocked send went through. `stalled_for` is the
+    /// stall's full length. Not sent when the stall ends by cancellation or a
+    /// closed queue, nor for a stall that never passed the threshold. Advisory
+    /// like the stall notice: it uses `try_send` and may drop.
+    ReceptionResumed {
         channel_id: ChannelId,
         stalled_for: Duration,
     },

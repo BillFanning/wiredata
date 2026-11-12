@@ -10,6 +10,12 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-10-01) — an example profile:
+
+- **§72** points to a complete example profile,
+  [`listener/profiles/profile.example.toml`](../profiles/profile.example.toml),
+  which a test keeps loading.
+
 Revision note (2026-09-30) — requirements for unattended, weeks-long logging:
 
 - **Recording continuity (ADR-043), §56.1, §56.2, §57, §59.** A recording fault

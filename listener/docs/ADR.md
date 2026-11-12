@@ -241,7 +241,10 @@ reporting contract for each.
    episode — self-describing, carrying the observed stall **duration** (the honest
    §101 proxy) and **no fabricated byte count**. The pipeline records it as a
    Warning `Diagnostic` and emits `ReceptionStalled` (see the seam below). Momentary
-   backpressure that drains quickly is normal and must not notify. *(Refined: the
+   backpressure that drains quickly is normal and must not notify. A stall that
+   notified and then ends because the send goes through sends
+   `TransportNotice::ReceptionResumed` with its full length, under the same
+   non-blocking rule: the first notice can only say the threshold was passed. *(Refined: the
    stall is a bounded retry loop, not a parked `blocking_send`, so the notice is
    raised **while the stall is ongoing** — a permanently wedged pipeline is not
    silent — and cancellation is observed mid-stall, §111.)*
