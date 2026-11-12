@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::{Args as ClapArgs, ValueEnum};
-use wiredata_cli::{exit_status, HealthWatch, EXIT_CANNOT_START};
+use wiredata_cli::{doubling_retry, exit_status, HealthWatch, EXIT_CANNOT_START};
 
 use crate::core::{
     channel::{ChannelId, CONNECT_TIMEOUT, WRITE_TIMEOUT},
@@ -186,6 +186,17 @@ const STOP_LIMIT: Duration = {
     longest.saturating_add(Duration::from_secs(1))
 };
 
+/// How a channel that is down is being retried, for its WARNING line: first
+/// for an interface that did not open, then for a send that failed. The runner
+/// retries the two on different schedules, and each is stated from the
+/// runner's own constants.
+fn retry_words() -> (String, String) {
+    (
+        doubling_retry(runner::OPEN_RETRY_FIRST, runner::OPEN_RETRY_MAX),
+        doubling_retry(runner::RETRY_BACKOFF_INITIAL, runner::RETRY_BACKOFF_MAX),
+    )
+}
+
 /// Run the profile until a stop request, and return the exit code (ADR-060):
 /// 0 healthy or every outage recovered, 2 nothing can start, 3 degraded, 4 the
 /// stop did not finish in time. An internal error is the `Err`, which `main`
@@ -316,10 +327,8 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
     } else {
         runner::ObserverPolicy::sampled()
     };
-    let mut health = HealthWatch::new(
-        "retrying, 1 s doubling to 30 s",
-        "not retrying, so it stays down",
-    );
+    let mut health = HealthWatch::new("not retrying, so it stays down");
+    let (open_retry, send_retry) = retry_words();
     let mut cmd_txs = Vec::new();
     let mut handles = Vec::new();
     // Echo tags stay positional ("ch0:", as before): map each stable id back
@@ -406,9 +415,11 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
                             }
                         }
                     }
-                    TalkerStatus::OpenFailed { channel, message }
-                    | TalkerStatus::ConnectionError { channel, message } => {
-                        say(health.down(channel, &message, now));
+                    TalkerStatus::OpenFailed { channel, message } => {
+                        say(health.down(channel, &message, &open_retry, now));
+                    }
+                    TalkerStatus::ConnectionError { channel, message } => {
+                        say(health.down(channel, &message, &send_retry, now));
                     }
                     TalkerStatus::SendRecovered { channel, .. } => say(health.up(channel, now)),
                     TalkerStatus::Counters {
@@ -674,6 +685,13 @@ fn list_profiles() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_open_and_a_failed_send_state_their_own_retry_schedules() {
+        let (open, send) = retry_words();
+        assert_eq!(open, "retrying in 1 s, doubling to 30 s");
+        assert_eq!(send, "retrying in 250 ms, doubling to 5 s");
+    }
 
     #[test]
     fn stop_limit_outlasts_the_longest_blocking_call() {

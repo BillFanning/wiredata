@@ -69,19 +69,19 @@ pub struct HealthWatch<K> {
     /// When the last reminder went out; reminders start five minutes after
     /// the first outage.
     reminded_at: Option<Instant>,
-    /// What happens to a channel that is down, in the application's words.
-    retrying: &'static str,
+    /// What happens to a channel that is down and not retried, in the
+    /// application's words.
     not_retrying: &'static str,
 }
 
 impl<K: Copy + PartialEq> HealthWatch<K> {
-    /// A watch whose warnings end with `retrying` for a channel that is
-    /// retried while down, and `not_retrying` for one that is not.
-    pub fn new(retrying: &'static str, not_retrying: &'static str) -> Self {
+    /// A watch whose warnings end with `not_retrying` for a channel that is
+    /// not retried while down. One that is retried ends with the words given
+    /// to [`down`](Self::down).
+    pub fn new(not_retrying: &'static str) -> Self {
         Self {
             channels: Vec::new(),
             reminded_at: None,
-            retrying,
             not_retrying,
         }
     }
@@ -127,8 +127,13 @@ impl<K: Copy + PartialEq> HealthWatch<K> {
 
     /// The channel did not start, or went down. Returns the warning for a new
     /// outage; a channel already down only takes the newer reason.
-    pub fn down(&mut self, id: K, reason: &str, now: Instant) -> Option<String> {
-        let (retrying, not_retrying) = (self.retrying, self.not_retrying);
+    ///
+    /// `retrying` says how this outage is being retried, such as
+    /// [`doubling_retry`]'s words. It is given per outage because an
+    /// application can retry a failed start and a failure while running on
+    /// different schedules. A channel that is not retried does not use it.
+    pub fn down(&mut self, id: K, reason: &str, retrying: &str, now: Instant) -> Option<String> {
+        let not_retrying = self.not_retrying;
         let channel = self.get(id)?;
         channel.reason = reason.to_owned();
         if channel.down_since.is_some() {
@@ -245,6 +250,16 @@ impl<K: Copy + PartialEq> HealthWatch<K> {
     }
 }
 
+/// How a channel is retried on a delay that doubles from `first` to `max`, in
+/// words for [`HealthWatch::down`]: "retrying in 1 s, doubling to 30 s".
+pub fn doubling_retry(first: Duration, max: Duration) -> String {
+    format!(
+        "retrying in {}, doubling to {}",
+        describe(first),
+        describe(max)
+    )
+}
+
 /// A length of time in the largest units an operator reads at a glance:
 /// milliseconds under a second, then whole seconds, minutes, hours.
 fn describe(span: Duration) -> String {
@@ -266,7 +281,7 @@ mod tests {
     const MIN: Duration = Duration::from_secs(60);
 
     fn watch_one(retries: bool) -> (HealthWatch<u32>, u32, Instant) {
-        let mut watch = HealthWatch::new("retrying", "not retrying, so it stays down");
+        let mut watch = HealthWatch::new("not retrying, so it stays down");
         watch.add(1, "GPS", retries);
         (watch, 1, Instant::now())
     }
@@ -288,11 +303,11 @@ mod tests {
         // The boot case: the adapter enumerates after the service starts.
         let (mut watch, id, t0) = watch_one(true);
         assert_eq!(
-            watch.down(id, "COM3 not found", t0).as_deref(),
+            watch.down(id, "COM3 not found", "retrying", t0).as_deref(),
             Some("WARNING: [GPS] did not start: COM3 not found — retrying")
         );
         assert_eq!(
-            watch.down(id, "COM3 still not found", t0 + MIN),
+            watch.down(id, "COM3 still not found", "retrying", t0 + MIN),
             None,
             "one warning per outage"
         );
@@ -312,7 +327,7 @@ mod tests {
     fn a_channel_that_never_starts_degrades_the_run() {
         let (mut watch, id, t0) = watch_one(false);
         assert_eq!(
-            watch.down(id, "COM3 not found", t0).as_deref(),
+            watch.down(id, "COM3 not found", "retrying", t0).as_deref(),
             Some("WARNING: [GPS] did not start: COM3 not found — not retrying, so it stays down")
         );
         assert!(watch.degraded());
@@ -327,7 +342,7 @@ mod tests {
         let (mut watch, id, t0) = watch_one(true);
         assert_eq!(watch.up(id, t0), None, "starting is not a recovery");
         assert_eq!(
-            watch.down(id, "device removed", t0).as_deref(),
+            watch.down(id, "device removed", "retrying", t0).as_deref(),
             Some("WARNING: [GPS] is down: device removed — retrying")
         );
         assert_eq!(
@@ -344,10 +359,10 @@ mod tests {
     fn reminders_repeat_every_five_minutes_with_the_latest_reason() {
         let (mut watch, id, t0) = watch_one(true);
         watch.up(id, t0);
-        watch.down(id, "device removed", t0);
+        watch.down(id, "device removed", "retrying", t0);
         assert!(watch.reminders(t0 + 4 * MIN).is_empty());
         assert_eq!(
-            watch.down(id, "COM3 not found", t0 + 4 * MIN),
+            watch.down(id, "COM3 not found", "retrying", t0 + 4 * MIN),
             None,
             "the newer reason, no new warning"
         );
@@ -368,7 +383,7 @@ mod tests {
     fn running_out_of_retries_is_reported_once_and_degrades_the_run() {
         let (mut watch, id, t0) = watch_one(true);
         watch.up(id, t0);
-        watch.down(id, "device removed", t0);
+        watch.down(id, "device removed", "retrying", t0);
         assert_eq!(
             watch.gave_up(id).as_deref(),
             Some("WARNING: [GPS] ran out of retries and stays down: device removed")
@@ -384,11 +399,11 @@ mod tests {
     #[test]
     fn a_run_with_nothing_running_and_nothing_retrying_cannot_do_anything() {
         let (mut watch, id, t0) = watch_one(false);
-        watch.down(id, "COM3 not found", t0);
+        watch.down(id, "COM3 not found", "retrying", t0);
         assert!(watch.nothing_can_run());
 
         let (mut watch, id, t0) = watch_one(true);
-        watch.down(id, "COM3 not found", t0);
+        watch.down(id, "COM3 not found", "retrying", t0);
         assert!(
             !watch.nothing_can_run(),
             "a retrying channel may still start"
@@ -397,13 +412,13 @@ mod tests {
 
     #[test]
     fn the_summary_names_each_channel_by_id_in_order() {
-        let mut watch = HealthWatch::new("retrying", "stays down");
+        let mut watch = HealthWatch::new("stays down");
         let t0 = Instant::now();
         watch.add(7, "GPS", true);
         watch.add(9, "AIS", true);
         watch.up(7, t0);
         watch.up(9, t0);
-        watch.down(9, "device removed", t0);
+        watch.down(9, "device removed", "retrying", t0);
         assert_eq!(
             watch.summary(t0 + 12 * MIN),
             [
@@ -417,6 +432,37 @@ mod tests {
         assert!(
             watch.degraded(),
             "a channel down at the stop degrades the run"
+        );
+    }
+
+    #[test]
+    fn each_outage_says_how_it_is_being_retried() {
+        // An application can retry a failed start and a failure while running
+        // on different schedules; the warning carries the one that applies.
+        let (mut watch, id, t0) = watch_one(true);
+        let slow = doubling_retry(Duration::from_secs(1), Duration::from_secs(30));
+        let fast = doubling_retry(Duration::from_millis(250), Duration::from_secs(5));
+        assert_eq!(
+            watch.down(id, "COM3 not found", &slow, t0).as_deref(),
+            Some(
+                "WARNING: [GPS] did not start: COM3 not found — retrying in 1 s, doubling to 30 s"
+            )
+        );
+        watch.up(id, t0 + MIN);
+        assert_eq!(
+            watch
+                .down(id, "device removed", &fast, t0 + 2 * MIN)
+                .as_deref(),
+            Some("WARNING: [GPS] is down: device removed — retrying in 250 ms, doubling to 5 s")
+        );
+    }
+
+    #[test]
+    fn a_channel_that_is_not_retried_never_says_it_is() {
+        let (mut watch, id, t0) = watch_one(false);
+        assert_eq!(
+            watch.down(id, "COM3 not found", "retrying", t0).as_deref(),
+            Some("WARNING: [GPS] did not start: COM3 not found — not retrying, so it stays down")
         );
     }
 

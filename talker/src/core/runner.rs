@@ -227,11 +227,11 @@ pub enum TalkerStatus {
 /// [`RETRY_BACKOFF_MAX`], and the first successful send closes the episode.
 /// Without this, a 100 Hz schedule against a dead TCP/serial target retries
 /// (and used to log) 100 times a second, burying the original failure.
-const RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
+pub const RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 /// Retry delay cap: a persistently dead interface is probed at most once per
 /// this interval. Retrying stays automatic — there is no manual Retry state —
 /// and transports that require a new OS handle can prepare it at that probe.
-const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// How a runner reports to its observer (ADR-018): the named policy the owner
 /// passes to [`run`]/[`open_and_run`]. Counters and payload samples are

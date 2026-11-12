@@ -91,13 +91,14 @@ pub fn parse() -> Cli {
     Cli::parse()
 }
 
+/// How a Channel that is down is being retried, for its WARNING line (§3.1).
+/// The schedule is the Channel's own reconnect policy, so no numbers.
+const RETRYING: &str = "retrying under its reconnect policy";
+
 /// A listener Channel's health, in listener's words for what happens while
 /// it is down (§3.1).
 fn health_watch() -> HealthWatch<ChannelId> {
-    HealthWatch::new(
-        "retrying under its reconnect policy",
-        "reconnect is off, so it stays down",
-    )
+    HealthWatch::new("reconnect is off, so it stays down")
 }
 
 /// The exit code for how the run ended (§3.1): a finalization abandoned at
@@ -304,7 +305,7 @@ async fn start_channels(
                 run.running += 1;
             }
             Err(err) => {
-                if let Some(line) = health.down(id, &err.to_string(), Instant::now()) {
+                if let Some(line) = health.down(id, &err.to_string(), RETRYING, Instant::now()) {
                     eprintln!("{line}");
                 }
             }
@@ -361,7 +362,7 @@ async fn observe_health(
             Some(ChannelState::Running) => health.up(id, now),
             Some(ChannelState::Faulted) => {
                 let reason = latest_error(listener, id, &names[&id]).await;
-                let down = health.down(id, &reason, now);
+                let down = health.down(id, &reason, RETRYING, now);
                 if down.is_some() || !listener.reconnect_exhausted(id) {
                     down
                 } else {
