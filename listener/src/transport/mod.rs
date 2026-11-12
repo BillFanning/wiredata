@@ -85,8 +85,9 @@ pub struct NewConnection {
 pub enum TransportOutcome {
     /// Ended because its cancellation token was triggered — a normal stop (§111).
     Cancelled,
-    /// Ended normally: TCP EOF (the client closed), or the downstream pipeline
-    /// went away. Not a fault.
+    /// Ended with no error of its own: TCP EOF (the client closed), or the
+    /// downstream pipeline went away. Whether that is a fault is the caller's
+    /// call: a Channel's monitor faults it unless the Channel was being stopped.
     Completed,
     /// Ended on a fatal read/accept error (§94). The reader may have lost data at
     /// the OS before failing — transport-specific loss the runtime reports (§101).
@@ -164,16 +165,19 @@ pub enum TransportJoinHandle {
 impl TransportJoinHandle {
     /// Await transport completion and learn why it ended (§101). Safe to call
     /// from an async context: the blocking-thread variant awaits a `oneshot`
-    /// rather than `JoinHandle::join`. A panicked task / dropped sender reports
-    /// `Completed`.
+    /// rather than `JoinHandle::join`. A panicked task or a dropped sender is
+    /// not a normal end: it reports `Faulted`, because no outcome was produced.
     pub async fn join(self) -> TransportOutcome {
         match self {
-            TransportJoinHandle::Task(handle) => {
-                handle.await.unwrap_or(TransportOutcome::Completed)
-            }
-            TransportJoinHandle::Thread(done) => done.await.unwrap_or(TransportOutcome::Completed),
+            TransportJoinHandle::Task(handle) => handle.await.unwrap_or_else(unexpected_end),
+            TransportJoinHandle::Thread(done) => done.await.unwrap_or_else(unexpected_end),
         }
     }
+}
+
+/// The outcome for a transport that ended without reporting one.
+fn unexpected_end(cause: impl std::fmt::Display) -> TransportOutcome {
+    TransportOutcome::Faulted(format!("the receive task ended unexpectedly: {cause}"))
 }
 
 /// A data-bearing transport: Serial, UDP, or TCP connection (§138).
@@ -191,4 +195,40 @@ pub trait DataTransportRunner {
 /// connection channel.
 pub trait ConnectionAcceptorRunner {
     fn run(self, out: Sender<NewConnection>, cancel: CancellationToken) -> TransportJoinHandle;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_panicked_task_joins_as_faulted() {
+        let handle = TransportJoinHandle::Task(tokio::spawn(async { panic!("boom") }));
+        match handle.join().await {
+            TransportOutcome::Faulted(cause) => {
+                assert!(cause.starts_with("the receive task ended unexpectedly"));
+            }
+            other => panic!("expected Faulted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_thread_sender_joins_as_faulted() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(tx);
+        assert!(matches!(
+            TransportJoinHandle::Thread(rx).join().await,
+            TransportOutcome::Faulted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reported_outcome_passes_through() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(TransportOutcome::Completed).unwrap();
+        assert!(matches!(
+            TransportJoinHandle::Thread(rx).join().await,
+            TransportOutcome::Completed
+        ));
+    }
 }

@@ -100,14 +100,34 @@ pub(crate) const TRANSPORT_NOTICES: usize = 16;
 /// Unlike advisory notices emitted from a live receive loop, this path may await
 /// bounded capacity: no reader remains to stall, and losing the terminal cause
 /// would leave the retained diagnostics unable to explain the faulted state.
+/// Returns whether the pipeline was still there to take it.
 pub(crate) async fn report_transport_fault(
     notices: &Sender<TransportNotice>,
     channel_id: ChannelId,
     cause: String,
-) {
-    let _ = notices
+) -> bool {
+    notices
         .send(TransportNotice::TransportFaulted { channel_id, cause })
-        .await;
+        .await
+        .is_ok()
+}
+
+/// Record why a Channel faulted: in its pipeline's diagnostics when the pipeline
+/// is there to take the notice, otherwise straight in the event log (§118). A
+/// pipeline that ended unexpectedly cannot record its own end, and the cause
+/// must not be lost with it.
+async fn record_fault_cause(
+    notices: &Sender<TransportNotice>,
+    channel_id: ChannelId,
+    channel_name: &str,
+    cause: String,
+) {
+    if report_transport_fault(notices, channel_id, cause.clone()).await {
+        return;
+    }
+    let diagnostic =
+        crate::diagnostics::Diagnostic::error(format!("fault on channel {channel_name}: {cause}"));
+    crate::diagnostics::emit_to_event_log(channel_name, channel_id, &diagnostic);
 }
 
 /// The transport + pipeline tasks for one Channel. A plain holder, destructured
@@ -366,6 +386,10 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
 ) -> MonitoredChannel {
     let (notices_tx, notices_rx) = notices;
     let monitor_events = events.clone();
+    let channel_name = match_setup
+        .channel_name
+        .clone()
+        .unwrap_or_else(|| channel_id.to_string());
     let ChannelTasks {
         channel_id,
         transport_cancel,
@@ -387,16 +411,27 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         serial_stall_state,
     );
 
+    let monitor_cancel = transport_cancel.clone();
     let monitor = tokio::spawn(async move {
-        // A spontaneous fault surfaces as ChannelFaulted; cancel/EOF/pipeline-gone
-        // outcomes are normal ends and emit nothing. The flag reconciles the
+        // A spontaneous fault surfaces as ChannelFaulted. `Cancelled` is a normal
+        // stop, and so is `Completed` once `transport_cancel` has fired: `stop`
+        // and `abort` cancel it before anything else ends, and a token never
+        // un-cancels, so a stop cannot be read as a fault however the two halves
+        // finish. `Completed` while the Channel was never stopped means the
+        // pipeline went away under the transport. The flag reconciles the
         // orchestrator's internal state (ADR-006); the event informs observers;
-        // the CAUSE goes to the pipeline as a notice so it lands in the
-        // channel's diagnostics (and survives stop via the retained log) —
-        // the string used to die unread here.
-        if let TransportOutcome::Faulted(cause) = transport.join().await {
+        // the CAUSE goes to the channel's diagnostics, or to the event log when
+        // the pipeline that keeps them is gone.
+        let fault = match transport.join().await {
+            TransportOutcome::Faulted(cause) => Some(cause),
+            TransportOutcome::Completed if !monitor_cancel.is_cancelled() => {
+                Some("the Channel's processing task ended unexpectedly".to_string())
+            }
+            TransportOutcome::Completed | TransportOutcome::Cancelled => None,
+        };
+        if let Some(cause) = fault {
             faulted.store(true, Ordering::Relaxed);
-            report_transport_fault(&notices_tx, channel_id, cause).await;
+            record_fault_cause(&notices_tx, channel_id, &channel_name, cause).await;
             let _ = monitor_events.try_send(RuntimeEvent::ChannelFaulted(channel_id));
         }
     });
@@ -683,6 +718,153 @@ mod tests {
             "diagnostics carry the transport fault cause: {:?}",
             snap.diagnostics.errors
         );
+    }
+
+    /// Wait for `ChannelFaulted`, skipping any other event, so a test fails by
+    /// timeout rather than hanging when the fault never arrives.
+    async fn expect_channel_faulted(running: &mut RunningChannel, cid: ChannelId) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = running.events().recv().await {
+                if event == RuntimeEvent::ChannelFaulted(cid) {
+                    return;
+                }
+            }
+            panic!("event stream closed without ChannelFaulted");
+        })
+        .await
+        .expect("ChannelFaulted never arrived");
+    }
+
+    #[tokio::test]
+    async fn panicked_transport_task_faults_the_channel() {
+        struct PanickingTransport;
+        impl DataTransportRunner for PanickingTransport {
+            fn run(
+                self,
+                _out: Sender<ReceivedData>,
+                _cancel: CancellationToken,
+            ) -> TransportJoinHandle {
+                TransportJoinHandle::Task(tokio::spawn(async move {
+                    panic!("receive loop blew up");
+                }))
+            }
+        }
+
+        let cid = ChannelId::new();
+        let mut running =
+            start_data_channel(cid, PanickingTransport, PipelineCapacities::default(), None);
+        expect_channel_faulted(&mut running, cid).await;
+        assert!(running.is_faulted());
+        // The pipeline is still there, so the cause reaches its diagnostics.
+        let mut pipeline = running.stop().await.expect("pipeline returns");
+        let snap = pipeline.snapshot();
+        assert!(
+            snap.diagnostics
+                .errors
+                .iter()
+                .any(|d| d.message.contains("receive task ended unexpectedly")),
+            "diagnostics carry the cause: {:?}",
+            snap.diagnostics.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_thread_that_drops_its_outcome_faults_the_channel() {
+        struct SilentThread;
+        impl DataTransportRunner for SilentThread {
+            fn run(
+                self,
+                _out: Sender<ReceivedData>,
+                _cancel: CancellationToken,
+            ) -> TransportJoinHandle {
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                drop(done_tx);
+                TransportJoinHandle::Thread(done_rx)
+            }
+        }
+
+        let cid = ChannelId::new();
+        let mut running =
+            start_data_channel(cid, SilentThread, PipelineCapacities::default(), None);
+        expect_channel_faulted(&mut running, cid).await;
+        assert!(running.is_faulted());
+        let _ = running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pipeline_ending_while_the_channel_runs_faults_it() {
+        // The pipeline half ends on its own (here: cancelled by itself, standing
+        // in for a panic) while the transport has not been told to stop. The
+        // transport sees the closed queue and reports `Completed`.
+        let cid = ChannelId::new();
+        let transport = ScriptedTransport {
+            channel_id: cid,
+            chunks: (0..100_000).map(|i| vec![(i % 256) as u8]).collect(),
+        };
+        let mut running = start_data_channel(cid, transport, PipelineCapacities::default(), None);
+        running.tasks.pipeline_cancel.cancel();
+        expect_channel_faulted(&mut running, cid).await;
+        assert!(running.is_faulted());
+        let _ = running.stop().await;
+    }
+
+    #[test]
+    fn a_fault_cause_the_pipeline_cannot_take_reaches_the_event_log() {
+        // The pipeline is gone, so its end of the notice queue is closed and
+        // its diagnostics cannot record anything. A current-thread runtime
+        // keeps the emit on the thread whose log is being captured.
+        let cid = ChannelId::new();
+        let text = crate::diagnostics::test_support::capture(|| {
+            let (notices, pipeline_end) = mpsc::channel(1);
+            drop(pipeline_end);
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime")
+                .block_on(record_fault_cause(
+                    &notices,
+                    cid,
+                    "GPS",
+                    "the Channel's processing task ended unexpectedly".to_string(),
+                ));
+        });
+        assert!(text.contains("ERROR"), "{text}");
+        assert!(
+            text.contains("fault on channel GPS: the Channel's processing task ended unexpectedly"),
+            "{text}"
+        );
+        assert!(text.contains(&cid.to_string()), "{text}");
+    }
+
+    #[tokio::test]
+    async fn completed_after_a_stop_is_not_a_fault() {
+        // A transport that reports `Completed` rather than `Cancelled` once its
+        // token fires (or whose pipeline finishes first) is still a normal stop.
+        struct CompletesOnCancel;
+        impl DataTransportRunner for CompletesOnCancel {
+            fn run(
+                self,
+                _out: Sender<ReceivedData>,
+                cancel: CancellationToken,
+            ) -> TransportJoinHandle {
+                TransportJoinHandle::Task(tokio::spawn(async move {
+                    cancel.cancelled().await;
+                    TransportOutcome::Completed
+                }))
+            }
+        }
+
+        let cid = ChannelId::new();
+        let RunningChannel {
+            tasks,
+            mut events,
+            faulted,
+        } = start_data_channel(cid, CompletesOnCancel, PipelineCapacities::default(), None);
+        // `stop` also awaits the monitor, so the verdict is final on return.
+        let _ = tasks.stop().await;
+        assert!(!faulted.load(Ordering::Relaxed));
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event, RuntimeEvent::ChannelFaulted(cid));
+        }
     }
 
     #[tokio::test]
