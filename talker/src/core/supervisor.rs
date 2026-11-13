@@ -90,8 +90,8 @@ pub struct ChannelTelemetry {
     pub possibly_partial_sends: u64,
     /// Bytes the TCP peer sent this run (§4.5); `None` for other transports.
     pub peer_bytes: Option<u64>,
-    /// Due fires intentionally suppressed while send retry backoff was active.
-    pub suppressed_sends: u64,
+    /// Due fires intentionally withheld while send retry backoff was active.
+    pub withheld_sends: u64,
     /// Bounded cumulative send-path timing measurements from the runner.
     pub timing: SendTimingTelemetry,
     /// Approximate last-ten-seconds timing from fixed one-second segments.
@@ -1094,7 +1094,7 @@ fn drain_statuses(
                 possibly_partial_sends,
                 peer_bytes,
                 send_failure_episodes,
-                suppressed_sends,
+                withheld_sends,
                 active_send_error,
                 timing,
                 captured_at,
@@ -1111,7 +1111,7 @@ fn drain_statuses(
                 telemetry.failed_sends = failed_sends;
                 telemetry.possibly_partial_sends = possibly_partial_sends;
                 telemetry.peer_bytes = peer_bytes;
-                telemetry.suppressed_sends = suppressed_sends;
+                telemetry.withheld_sends = withheld_sends;
                 // Immediate failure/recovery edges paint quickly, but share the
                 // bounded observer queue. The cumulative count repairs every
                 // dropped opening edge, including two failures separated by a
@@ -1137,7 +1137,7 @@ fn drain_statuses(
                 ..
             } => {
                 // Live proof of a working interface: clear the banner. During
-                // a failing episode sends are suppressed, so no samples
+                // a failing episode sends are withheld, so no samples
                 // arrive and the banner correctly persists.
                 telemetry.last_error = None;
                 samples.push(PayloadSample {
@@ -1254,7 +1254,7 @@ mod tests {
             missed_sends: 0,
             failed_sends: episodes,
             send_failure_episodes: episodes,
-            suppressed_sends: 0,
+            withheld_sends: 0,
             active_send_error: active_send_error.map(str::to_owned),
             timing: Box::default(),
             captured_at: Instant::now(),
@@ -1484,7 +1484,7 @@ mod tests {
             dropped_statuses: 0,
             missed_sends: 0,
             failed_sends: 0,
-            suppressed_sends: 0,
+            withheld_sends: 0,
             timing: Default::default(),
             timer: Default::default(),
             possibly_partial_sends: 0,
@@ -1513,7 +1513,7 @@ mod tests {
                 dropped_statuses: 0,
                 missed_sends: 0,
                 failed_sends: 0,
-                suppressed_sends: 0,
+                withheld_sends: 0,
                 timing: Default::default(),
                 timer: Default::default(),
                 possibly_partial_sends: 0,

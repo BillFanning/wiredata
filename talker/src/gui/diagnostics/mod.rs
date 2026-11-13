@@ -351,7 +351,7 @@ mod tests {
 
         // The line states one count; a boundary repeats it only where its own
         // population differs. Render and the send call are recorded in
-        // lockstep, so they stay silent; lateness carries the suppressed sends
+        // lockstep, so they stay silent; lateness carries the withheld sends
         // that never reached a write, so it says so.
         let line_samples = timing.send_duration.sample_count();
         assert_eq!(

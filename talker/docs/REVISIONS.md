@@ -13,6 +13,19 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-13) — hover text and the missed-send callout:
+
+- **§3.2 Hover text (ADR-065)** — every hover that explains something opens with a bold
+  sentence, then short paragraphs in plain, complete sentences. A hover used
+  to be one dense paragraph.
+- **§3.2 Missed-send routing** — the measured branch states its total, its
+  measured part and its remainder on separate lines, in full sentences. Each
+  branch's hover now explains only that branch; the limits of every kind of
+  evidence used to be listed in **Timing & runtime details**.
+- **§3.2 Diagnostics card (ADR-066)** — the card has no status badge and no
+  header row. The Send outcomes line starts with ⚠ when any deduction is
+  nonzero, where it used to rely on colour and on the badge.
+
 Revision note (2026-11-12) — a console that stops taking output:
 
 - **§9.2 CLI logging (ADR-064)** — stdout log lines go through a bounded queue

@@ -155,8 +155,8 @@ pub enum TalkerStatus {
         /// Cumulative send-failure episodes. Repeated attempts inside one
         /// bounded-backoff episode do not increase this count.
         send_failure_episodes: u64,
-        /// Cumulative due fires suppressed by the bounded-backoff gate.
-        suppressed_sends: u64,
+        /// Cumulative due fires withheld by the bounded-backoff gate.
+        withheld_sends: u64,
         /// The current write or reopen error from the open failure episode.
         ///
         /// This repeats the immediate [`ConnectionError`](Self::ConnectionError)
@@ -208,21 +208,21 @@ pub enum TalkerStatus {
     ConnectionError { channel: ChannelId, message: String },
     /// Sending resumed after a failing episode. Carries the episode's cost so
     /// the observer can state what was lost: `failures` sends were attempted
-    /// and failed (the first was reported as `ConnectionError`), `suppressed`
+    /// and failed (the first was reported as `ConnectionError`), `withheld`
     /// due fires were skipped by the bounded-backoff retry policy without an
     /// interface write; some may have found that the handle could not yet be
     /// reopened.
     SendRecovered {
         channel: ChannelId,
         failures: u64,
-        suppressed: u64,
+        withheld: u64,
     },
     /// Opening the interface failed; the runner exits after sending this.
     OpenFailed { channel: ChannelId, message: String },
 }
 
 /// First retry delay after a send failure (the **bounded-backoff** retry
-/// policy): while an interface is failing, due fires are suppressed — counted,
+/// policy): while an interface is failing, due fires are withheld — counted,
 /// with no interface write — until the next retry instant. At that instant a
 /// transport may first prepare or replace its failed handle; an unavailable
 /// replacement withholds that fire too. Each unsuccessful retry doubles the wait up to
@@ -290,8 +290,8 @@ struct FailureEpisode {
     /// Of `failures`, those that failed after the interface accepted part of
     /// the message.
     possibly_partial: u64,
-    /// Due fires suppressed by the backoff gate without an interface write.
-    suppressed: u64,
+    /// Due fires withheld by the backoff gate without an interface write.
+    withheld: u64,
     backoff: Duration,
     next_attempt: Instant,
     /// The last attempted handle failed and must be prepared before it is used
@@ -943,7 +943,7 @@ fn run_loop(
     let mut possibly_partial_sends = 0u64;
     let mut peer_bytes = 0u64;
     let mut send_failure_episodes = 0u64;
-    let mut suppressed_sends = 0u64;
+    let mut withheld_sends = 0u64;
     let mut send_timing = SendTimingRecorder::default();
     // Lane rate limits (ADR-018): `None` = nothing emitted yet, so the first
     // send always produces both a sample and counters (instant first paint).
@@ -1188,7 +1188,7 @@ fn run_loop(
                             // both measurement boundaries.
                             if let Some(ep) = episode.as_mut() {
                                 ep.active_error = format!("{e:#}");
-                                ep.suppressed += 1;
+                                ep.withheld += 1;
                                 ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
                                 ep.next_attempt = Instant::now() + ep.backoff;
                                 if e.downcast_ref::<MissingRetryConfiguration>().is_some() {
@@ -1207,7 +1207,7 @@ fn run_loop(
                                          {} withheld while retrying): {e:#}",
                                         who.label,
                                         ep.failures,
-                                        ep.suppressed
+                                        ep.withheld
                                     );
                                 }
                             }
@@ -1216,17 +1216,17 @@ fn run_loop(
                     }
                 }
                 if backoff_withheld || reopen_withheld {
-                    // Backoff gate: this due fire is suppressed — counted, but
+                    // Backoff gate: this due fire is withheld — counted, but
                     // not rendered or written. A retry-edge fire may have tried
                     // to reopen the handle first. The scheduler has already
                     // advanced, consistent with the stall policy (cadence over
                     // count).
                     if backoff_withheld {
                         if let Some(ep) = episode.as_mut() {
-                            ep.suppressed += 1;
+                            ep.withheld += 1;
                         }
                     }
-                    suppressed_sends += 1;
+                    withheld_sends += 1;
                 } else {
                     let render_started = Instant::now();
                     let Some(payload) = schedule.render(index) else {
@@ -1272,7 +1272,7 @@ fn run_loop(
                     match send_result {
                         Ok(()) => {
                             if let Some(ep) = episode.take() {
-                                // "Suppressed" is defined on the send-outcomes
+                                // "Withheld" is defined on the send-outcomes
                                 // line and nowhere the log reader can see, so
                                 // this states what happened to those sends.
                                 // A replaced handle names what it reconnected
@@ -1297,13 +1297,13 @@ fn run_loop(
                                         replaced.as_deref(),
                                         ep.failures - ep.possibly_partial,
                                         ep.possibly_partial,
-                                        ep.suppressed
+                                        ep.withheld
                                     )
                                 );
                                 timer.emit(TalkerStatus::SendRecovered {
                                     channel: who.id,
                                     failures: ep.failures,
-                                    suppressed: ep.suppressed,
+                                    withheld: ep.withheld,
                                 });
                             }
                             total_count += 1;
@@ -1368,7 +1368,7 @@ fn run_loop(
                                         active_error: message.clone(),
                                         failures: 1,
                                         possibly_partial: partial,
-                                        suppressed: 0,
+                                        withheld: 0,
                                         backoff: RETRY_BACKOFF_INITIAL,
                                         next_attempt: Instant::now() + RETRY_BACKOFF_INITIAL,
                                         handle_needs_recovery: true,
@@ -1401,7 +1401,7 @@ fn run_loop(
                 }
 
                 // Cumulative outcomes remain observable even when every due
-                // send is failing or suppressed. This lane is rate-limited
+                // send is failing or withheld. This lane is rate-limited
                 // and best-effort, so it cannot slow the scheduler hot path.
                 let now = Instant::now();
                 if timer.counters_due(now, policy.counter_interval) {
@@ -1419,7 +1419,7 @@ fn run_loop(
                         possibly_partial_sends,
                         peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
                         send_failure_episodes,
-                        suppressed_sends,
+                        withheld_sends,
                         active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
                         timing: Box::new(send_timing.snapshot_at(now)),
                         captured_at: now,
@@ -1512,7 +1512,7 @@ fn run_loop(
         possibly_partial_sends,
         peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
         send_failure_episodes,
-        suppressed_sends,
+        withheld_sends,
         active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
         timing: Box::new(final_timing),
         captured_at: finished_mono,
@@ -1544,7 +1544,7 @@ fn run_loop(
                 failed_sends,
                 possibly_partial_sends,
                 peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
-                suppressed_sends,
+                withheld_sends,
                 timing: final_timing,
                 timer: timer_status,
             }),
@@ -2397,7 +2397,7 @@ mod tests {
                     dropped_statuses,
                     missed_sends,
                     failed_sends,
-                    suppressed_sends,
+                    withheld_sends,
                     timing,
                     timer,
                     ..
@@ -2408,7 +2408,7 @@ mod tests {
                     dropped_statuses,
                     missed_sends,
                     failed_sends,
-                    suppressed_sends,
+                    withheld_sends,
                     *timing,
                     timer,
                 )),
@@ -2435,7 +2435,7 @@ mod tests {
         assert_eq!(summary.dropped_statuses, final_counters.3);
         assert_eq!(summary.missed_sends, final_counters.4);
         assert_eq!(summary.failed_sends, final_counters.5);
-        assert_eq!(summary.suppressed_sends, final_counters.6);
+        assert_eq!(summary.withheld_sends, final_counters.6);
         assert_eq!(summary.timing, final_counters.7);
         assert_eq!(summary.timer, final_counters.8);
         assert_eq!(summary.total_count, sent.lock().unwrap().len() as u64);
@@ -2802,9 +2802,9 @@ mod tests {
                     status,
                     TalkerStatus::Counters {
                         failed_sends,
-                        suppressed_sends,
+                        withheld_sends,
                         ..
-                    } if *failed_sends >= 1 && *suppressed_sends >= 1
+                    } if *failed_sends >= 1 && *withheld_sends >= 1
                 )
             });
             if saw_live_outcomes {
@@ -2812,7 +2812,7 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "failed and suppressed counters did not become live"
+                "failed and withheld counters did not become live"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -2828,20 +2828,20 @@ mod tests {
             TalkerStatus::Counters {
                 total_count,
                 failed_sends,
-                suppressed_sends,
+                withheld_sends,
                 active_send_error,
                 timing,
                 ..
             } => Some((
                 *total_count,
                 *failed_sends,
-                *suppressed_sends,
+                *withheld_sends,
                 active_send_error.clone(),
                 **timing,
             )),
             _ => None,
         });
-        let (sent, failed, suppressed, active_send_error, timing) =
+        let (sent, failed, withheld, active_send_error, timing) =
             outcomes.expect("live cumulative counters");
         let cumulative = timing.cumulative;
         assert_eq!(sent, 0);
@@ -2853,18 +2853,18 @@ mod tests {
             "counter snapshots repeat the open failure episode"
         );
         assert!(
-            suppressed >= 1,
-            "backoff-suppressed sends are visible before stop"
+            withheld >= 1,
+            "backoff-withheld sends are visible before stop"
         );
         assert_eq!(
             cumulative.deadline_lateness.sample_count(),
-            sent + failed + suppressed,
+            sent + failed + withheld,
             "every handled due fire contributes one deadline sample"
         );
         assert_eq!(
             cumulative.render_duration.sample_count(),
             sent + failed,
-            "suppressed due fires must not render payloads"
+            "withheld due fires must not render payloads"
         );
         assert_eq!(
             cumulative.send_duration.sample_count(),
@@ -2971,7 +2971,7 @@ mod tests {
         });
         let handle = spawn_interface_runner(interface, None);
 
-        // Let the episode open (first failure) and some fires get suppressed,
+        // Let the episode open (first failure) and some fires get withheld,
         // then heal the interface: the next backoff retry closes the episode.
         std::thread::sleep(Duration::from_millis(50));
         fail.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2985,20 +2985,18 @@ mod tests {
             );
             for s in handle.status_rx.try_iter() {
                 if let TalkerStatus::SendRecovered {
-                    failures,
-                    suppressed,
-                    ..
+                    failures, withheld, ..
                 } = s
                 {
-                    recovered = Some((failures, suppressed));
+                    recovered = Some((failures, withheld));
                 }
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        let (failures, suppressed) = recovered.unwrap();
+        let (failures, withheld) = recovered.unwrap();
         assert!(failures >= 1, "the reported first failure is counted");
         assert!(
-            suppressed >= 1,
+            withheld >= 1,
             "5 ms fires during the 250 ms backoff make no interface write"
         );
         assert!(
@@ -3011,17 +3009,17 @@ mod tests {
         let final_outcomes = final_statuses.try_iter().find_map(|status| match status {
             TalkerStatus::Counters {
                 failed_sends,
-                suppressed_sends,
+                withheld_sends,
                 active_send_error,
                 final_snapshot: true,
                 ..
-            } => Some((failed_sends, suppressed_sends, active_send_error)),
+            } => Some((failed_sends, withheld_sends, active_send_error)),
             _ => None,
         });
-        let (failed_total, suppressed_total, active_send_error) =
+        let (failed_total, withheld_total, active_send_error) =
             final_outcomes.expect("final cumulative counters");
         assert!(failed_total >= failures);
-        assert!(suppressed_total >= suppressed);
+        assert!(withheld_total >= withheld);
         assert!(
             active_send_error.is_none(),
             "the final counter snapshot repairs a dropped recovery edge"
@@ -3296,16 +3294,14 @@ mod tests {
                     ..
                 }) => active_errors.push(error),
                 Ok(TalkerStatus::SendRecovered {
-                    failures,
-                    suppressed,
-                    ..
-                }) => recovered = Some((failures, suppressed)),
+                    failures, withheld, ..
+                }) => recovered = Some((failures, withheld)),
                 Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
 
-        let (failures, suppressed) = recovered.expect("replacement should resume the same run");
+        let (failures, withheld) = recovered.expect("replacement should resume the same run");
         assert_eq!(errors, 1, "one failure episode has one error edge");
         assert!(
             active_errors
@@ -3318,7 +3314,7 @@ mod tests {
             "failed reopen attempts are withheld, not reported as failed writes"
         );
         assert!(
-            suppressed >= 1,
+            withheld >= 1,
             "backoff remains active while the port is absent"
         );
         assert_eq!(
@@ -3334,7 +3330,7 @@ mod tests {
         let (
             sent_total,
             failed_total,
-            suppressed_total,
+            withheld_total,
             render_samples,
             send_samples,
             message_render_samples,
@@ -3345,7 +3341,7 @@ mod tests {
                 TalkerStatus::Counters {
                     total_count,
                     failed_sends,
-                    suppressed_sends,
+                    withheld_sends,
                     timing,
                     per_message_timing,
                     final_snapshot: true,
@@ -3353,7 +3349,7 @@ mod tests {
                 } => Some((
                     total_count,
                     failed_sends,
-                    suppressed_sends,
+                    withheld_sends,
                     timing.cumulative.render_duration.sample_count(),
                     timing.cumulative.send_duration.sample_count(),
                     per_message_timing
@@ -3367,7 +3363,7 @@ mod tests {
             })
             .expect("final cumulative counters");
         assert_eq!(failed_total, 1);
-        assert!(suppressed_total >= suppressed);
+        assert!(withheld_total >= withheld);
         assert_eq!(
             render_samples,
             sent_total + failed_total,

@@ -19,7 +19,7 @@ pub(in crate::gui) const THROUGHPUT_TOOLTIP: Hover = Hover::new(
      The two rates are averages over the last five seconds. They climb for the first five \
      seconds after Start and fall to zero over the five seconds after sending stops, while the \
      total stays put, so they are not the rate on the line at this instant.\n\n\
-     Failed, possibly partial, suppressed and missed sends are not counted as sent messages. \
+     Failed, possibly partial, withheld and missed sends are not counted as sent messages. \
      Sent means the interface accepted the data, not that anything received it.",
 );
 
@@ -62,12 +62,12 @@ pub(in crate::gui) fn send_outcomes(
     sent: u64,
     failed: u64,
     possibly_partial: u64,
-    suppressed: u64,
+    withheld: u64,
     missed: u64,
 ) -> DecisionSignal {
     let unsent = failed
         .saturating_add(possibly_partial)
-        .saturating_add(suppressed)
+        .saturating_add(withheld)
         .saturating_add(missed);
     let scheduled = sent.saturating_add(unsent);
     if scheduled == 0 {
@@ -79,12 +79,12 @@ pub(in crate::gui) fn send_outcomes(
 
     DecisionSignal {
         text: format!(
-            "Send outcomes: {} scheduled - {} failed - {} possibly partial - {} suppressed - {} \
+            "Send outcomes: {} scheduled - {} failed - {} possibly partial - {} withheld - {} \
              missed = {} sent",
             thousands(scheduled),
             thousands(failed),
             thousands(possibly_partial),
-            thousands(suppressed),
+            thousands(withheld),
             thousands(missed),
             thousands(sent),
         ),
@@ -115,13 +115,13 @@ pub(in crate::gui) fn send_outcomes_tooltip(
     sent: u64,
     failed: u64,
     possibly_partial: u64,
-    suppressed: u64,
+    withheld: u64,
     missed: u64,
 ) -> Hover {
     let scheduled = sent
         .saturating_add(failed)
         .saturating_add(possibly_partial)
-        .saturating_add(suppressed)
+        .saturating_add(withheld)
         .saturating_add(missed);
     Hover::from_paragraphs([
         "Send outcomes shows how every scheduled send in this run ended.".to_owned(),
@@ -142,10 +142,10 @@ pub(in crate::gui) fn send_outcomes_tooltip(
             thousands(possibly_partial)
         ),
         format!(
-            "{} suppressed: after a failure, Talker waits before trying again, and a send that \
+            "{} withheld: after a failure, Talker waits before trying again, and a send that \
              comes due during that wait is held back and never tried. These only happen after \
              a failure.",
-            thousands(suppressed)
+            thousands(withheld)
         ),
         format!(
             "{} missed: the channel fell more than one interval behind, so it skipped that \
@@ -177,7 +177,7 @@ mod tests {
         let long_run = send_outcomes(1_234_567, 0, 0, 0, 2_400);
         assert_eq!(
             long_run.text,
-            "Send outcomes: 1,236,967 scheduled - 0 failed - 0 possibly partial - 0 suppressed \
+            "Send outcomes: 1,236,967 scheduled - 0 failed - 0 possibly partial - 0 withheld \
              - 2,400 missed = 1,234,567 sent"
         );
 
@@ -193,7 +193,7 @@ mod tests {
         let clean = send_outcomes(100, 0, 0, 0, 0);
         assert_eq!(
             clean.text,
-            "Send outcomes: 100 scheduled - 0 failed - 0 possibly partial - 0 suppressed - 0 \
+            "Send outcomes: 100 scheduled - 0 failed - 0 possibly partial - 0 withheld - 0 \
              missed = 100 sent"
         );
         assert_eq!(clean.tone, SignalTone::Healthy);
@@ -203,7 +203,7 @@ mod tests {
         let shortfall = send_outcomes(98, 0, 0, 1, 1);
         assert_eq!(
             shortfall.text,
-            "Send outcomes: 100 scheduled - 0 failed - 0 possibly partial - 1 suppressed - 1 \
+            "Send outcomes: 100 scheduled - 0 failed - 0 possibly partial - 1 withheld - 1 \
              missed = 98 sent"
         );
         assert_eq!(shortfall.tone, SignalTone::Warning);
@@ -213,7 +213,7 @@ mod tests {
         let failed = send_outcomes(98, 1, 0, 0, 1);
         assert_eq!(
             failed.text,
-            "Send outcomes: 100 scheduled - 1 failed - 0 possibly partial - 0 suppressed - 1 \
+            "Send outcomes: 100 scheduled - 1 failed - 0 possibly partial - 0 withheld - 1 \
              missed = 98 sent"
         );
         assert_eq!(failed.tone, SignalTone::Fault);
@@ -222,7 +222,7 @@ mod tests {
         let partial = send_outcomes(98, 0, 1, 0, 1);
         assert_eq!(
             partial.text,
-            "Send outcomes: 100 scheduled - 0 failed - 1 possibly partial - 0 suppressed - 1 \
+            "Send outcomes: 100 scheduled - 0 failed - 1 possibly partial - 0 withheld - 1 \
              missed = 98 sent"
         );
         assert_eq!(partial.tone, SignalTone::Fault);
@@ -233,8 +233,8 @@ mod tests {
     /// not.
     #[test]
     fn a_send_outcomes_line_with_trouble_is_marked_without_colour() {
-        let marked = |sent, failed, partial, suppressed, missed| {
-            send_outcomes_line(&send_outcomes(sent, failed, partial, suppressed, missed))
+        let marked = |sent, failed, partial, withheld, missed| {
+            send_outcomes_line(&send_outcomes(sent, failed, partial, withheld, missed))
         };
         assert!(marked(98, 0, 0, 0, 2).starts_with("\u{26A0} Send outcomes:"));
         assert!(marked(98, 0, 0, 2, 0).starts_with("\u{26A0} Send outcomes:"));
@@ -274,13 +274,13 @@ mod tests {
                 "100 scheduled",
                 "1 failed",
                 "0 possibly partial",
-                "0 suppressed",
+                "0 withheld",
                 "1 missed",
                 "98 sent"
             ]
         );
         let tip = hover.text();
-        // Suppressions are downstream of a failure, never an independent
+        // Withheld sends are downstream of a failure, never an independent
         // fault — the tooltip has to say so or the two read as peers.
         assert!(tip.contains("These only happen after a failure."));
         // The remainder is defined by the equation, but its limit still needs

@@ -1,20 +1,14 @@
 # Talker — Program Specification
-**Version:** 2.5.4
+**Version:** 2.5.5
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-13) — hover text and the missed-send callout:
+Revision note (2026-11-13) — "withheld" in place of "suppressed":
 
-- **§3.2 Hover text (ADR-065)** — every hover that explains something opens with a bold
-  sentence, then short paragraphs in plain, complete sentences. A hover used
-  to be one dense paragraph.
-- **§3.2 Missed-send routing** — the measured branch states its total, its
-  measured part and its remainder on separate lines, in full sentences. Each
-  branch's hover now explains only that branch; the limits of every kind of
-  evidence used to be listed in **Timing & runtime details**.
-- **§3.2 Diagnostics card (ADR-066)** — the card has no status badge and no
-  header row. The Send outcomes line starts with ⚠ when any deduction is
-  nonzero, where it used to rely on colour and on the badge.
+- **§3.2 Send outcomes, §4.4** — a send held back during a retry wait is
+  called *withheld*, on screen, in the run summary (`withheld_sends`) and in
+  the code. It was called *suppressed* there, while the log lines already said
+  *withheld*; one name now serves everywhere. Nothing is counted differently.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -276,7 +270,7 @@ The **detail pane** (right) shows the selected channel:
 - **Header** — status glyph + editable name (duplicates allowed but hinted);
   a `status · interface summary` row; then the readouts, grouped by subsystem:
   - *Send outcomes:* `Send outcomes: <scheduled> scheduled - <f> failed -
-    <p> possibly partial - <s> suppressed - <m> missed = <sent> sent`, shown
+    <p> possibly partial - <w> withheld - <m> missed = <sent> sent`, shown
     **always** and directly
     beneath the `status · interface` row — amber when any deduction is nonzero,
     red when any write failed. The line is stated as visible arithmetic over the
@@ -295,7 +289,7 @@ The **detail pane** (right) shows the selected channel:
   - **Sent** throughout the GUI means the configured-interface write returned
     success. It never asserts that bytes reached the wire or that a peer received
     them; the tooltips carry that boundary. The aggregate `unsent`
-    (`failed + possibly partial + suppressed + missed`) remains in the
+    (`failed + possibly partial + withheld + missed`) remains in the
     completed-run summary and in
     `RunSummary::unsent_sends`, where a single shortfall number is still useful.
   - *Capacity:* aggregate `msg/s` and wire `B/s` **for the configuration that is
@@ -559,7 +553,7 @@ channel, as in listener.
 
 Each channel maintains and displays:
 
-- **Send outcomes** — cumulative scheduled, failed, possibly partial, suppressed,
+- **Send outcomes** — cumulative scheduled, failed, possibly partial, withheld,
   missed, and sent totals for the current run; they remain visible after recovery
   and after Stop. **Possibly partial** is a write that failed after transferring
   part of the message: the receiver may hold a fragment. On Windows a TCP write

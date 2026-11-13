@@ -66,7 +66,7 @@ pub struct RunSummary {
     /// Bytes the TCP peer sent, read and discarded (§4.5); `None` for a
     /// transport that does not read its peer.
     pub peer_bytes: Option<u64>,
-    pub suppressed_sends: u64,
+    pub withheld_sends: u64,
     pub timing: SendTimingReport,
     pub timer: TimerStatus,
 }
@@ -76,7 +76,7 @@ impl RunSummary {
         self.missed_sends
             .saturating_add(self.failed_sends)
             .saturating_add(self.possibly_partial_sends)
-            .saturating_add(self.suppressed_sends)
+            .saturating_add(self.withheld_sends)
     }
 
     pub fn scheduled_sends(&self) -> u64 {
@@ -123,7 +123,7 @@ impl RunSummary {
             "possibly_partial_sends={}",
             self.possibly_partial_sends
         );
-        let _ = writeln!(out, "suppressed_sends={}", self.suppressed_sends);
+        let _ = writeln!(out, "withheld_sends={}", self.withheld_sends);
         match self.peer_bytes {
             Some(bytes) => {
                 let _ = writeln!(out, "peer_sent_bytes={bytes}");
@@ -393,7 +393,7 @@ mod tests {
             failed_sends: 1,
             possibly_partial_sends: 1,
             peer_bytes: Some(42),
-            suppressed_sends: 2,
+            withheld_sends: 2,
             timing: SendTimingReport {
                 cumulative,
                 recent: cumulative,

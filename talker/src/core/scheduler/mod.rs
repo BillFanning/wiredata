@@ -333,7 +333,7 @@ impl Schedule {
     /// Render one compiled message immediately before a send attempt.
     ///
     /// Keeping rendering separate from [`poll`](Self::poll) lets the runner
-    /// suppress a due fire during retry backoff without allocating payload
+    /// withhold a due fire during retry backoff without allocating payload
     /// bytes or sampling a dynamic timestamp that will never reach `send`.
     pub fn render(&self, index: usize) -> Option<Vec<u8>> {
         self.messages
