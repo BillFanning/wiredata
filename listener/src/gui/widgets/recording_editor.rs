@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use crate::config::ChannelConfig;
 use crate::record::{effective_overwrite, FileRotationPolicy, OverwritePolicy};
 
+use wiredata_ui::hover::{Hover, ShowHover};
 use wiredata_ui::palette::active as palette;
 
 /// The shared destination / overwrite / rotation controls for a recording (§55–§59),
@@ -62,57 +63,101 @@ fn recording_file_fields(
     // shared §59 rule the runtime settings builders apply.
     *overwrite_policy = effective_overwrite(*overwrite_policy, *file_rotation);
     ui.horizontal(|ui| {
-        ui.label("On exists")
-            .on_hover_text("What to do when the destination file already exists.");
+        ui.label("On exists").on_hover(&ON_EXISTS_HOVER);
         ui.add_enabled_ui(!rotating, |ui| {
-            ui.radio_value(overwrite_policy, OverwritePolicy::Refuse, "Refuse")
-                .on_hover_text(if rotating {
-                    "Not available with rotation — each period starts a fresh file."
-                } else {
-                    "Don't record — fail rather than touch the existing file."
-                });
+            let refuse = ui.radio_value(overwrite_policy, OverwritePolicy::Refuse, "Refuse");
+            if rotating {
+                refuse.on_hover(&REFUSE_ROTATING_HOVER);
+            } else {
+                refuse.on_hover_text(
+                    "Does not start recording if the file already exists, and leaves \
+                     that file untouched.",
+                );
+            }
         });
         ui.radio_value(overwrite_policy, OverwritePolicy::Overwrite, "Overwrite")
-            .on_hover_text("Replace the existing file (its current contents are lost).");
+            .on_hover_text("Replaces the existing file; its current contents are lost.");
         ui.radio_value(overwrite_policy, OverwritePolicy::AppendIfExists, "Append")
-            .on_hover_text("Keep the existing file and add new data to the end.");
+            .on_hover(&APPEND_HOVER);
     });
     ui.horizontal(|ui| {
-        ui.label("Rotate").on_hover_text(
-            "Start a fresh file each time period instead of one continuously growing \
-             file. When on, the destination is a folder and files are named \
-             <channel>_<time period>.",
-        );
+        ui.label("Rotate").on_hover(&ROTATE_HOVER);
         ui.radio_value(file_rotation, FileRotationPolicy::None, "None")
-            .on_hover_text("One file that grows for the whole session.");
+            .on_hover(&ROTATE_NONE_HOVER);
         ui.radio_value(file_rotation, FileRotationPolicy::Hourly, "Hourly")
-            .on_hover_text(
-                "A new file each hour, named <channel>_<date>_<hour> (e.g. \
-                 GPS_2026-06-03_08) — keep the channel name filesystem-safe (§59).",
-            );
+            .on_hover(&ROTATE_HOURLY_HOVER);
         ui.radio_value(file_rotation, FileRotationPolicy::Daily, "Daily")
-            .on_hover_text(
-                "A new file each day, named <channel>_<date> (e.g. GPS_2026-06-03) — keep \
-                 the channel name filesystem-safe (§59).",
-            );
+            .on_hover(&ROTATE_DAILY_HOVER);
     });
 }
+
+const ON_EXISTS_HOVER: Hover = Hover::new(
+    "What Listener does when the recording's first file already exists as recording \
+     starts.\n\n\
+     This applies only to the first file. Every later file of the same recording, \
+     whether it follows a new rotation period, the size limit, or recording resuming \
+     after an interruption, is a new numbered file, so nothing is overwritten.",
+);
+const REFUSE_ROTATING_HOVER: Hover = Hover::new(
+    "Not available with rotation.\n\n\
+     A rotating recording may find the current period's file already there, for \
+     example after a restart. Append is used instead, so recording adds to that file \
+     rather than failing.",
+);
+const APPEND_HOVER: Hover = Hover::new(
+    "Keeps what is already recorded and adds the new data after it.\n\n\
+     If the recording was earlier continued in numbered files such as GPS_2.raw, \
+     the data is added to the newest of them, or to a new numbered file if that one \
+     has reached the size limit.",
+);
+const ROTATE_HOVER: Hover = Hover::new(
+    "Starts a new file each hour or day instead of writing one file continuously.\n\n\
+     With rotation on, the destination is a folder and the files in it are named \
+     <channel>_<time period>. The time period is local time.\n\n\
+     A new file is started when the first data of the next period arrives, so a \
+     period with no data produces no file.",
+);
+const ROTATE_NONE_HOVER: Hover = Hover::new(
+    "Writes one file for the whole recording.\n\n\
+     If the file grows past the size limit, about 2 GB unless the profile sets a \
+     different limit, or if recording resumes after an interruption, Listener \
+     continues in a new numbered file such as GPS_2.raw.",
+);
+const ROTATE_HOURLY_HOVER: Hover = Hover::new(
+    "Starts a new file every hour, named <channel>_<date>_<hour>, for example \
+     GPS_2026-06-03_08.\n\n\
+     The date and hour are local time, and the name ends in .raw or .disp. The channel \
+     name must be safe to use in a file name. If one hour's file grows past the size \
+     limit, Listener continues in GPS_2026-06-03_08_2, then _3, and so on.",
+);
+const ROTATE_DAILY_HOVER: Hover = Hover::new(
+    "Starts a new file every day, named <channel>_<date>, for example \
+     GPS_2026-06-03.\n\n\
+     The date is local time, and the name ends in .raw or .disp. The channel name \
+     must be safe to use in a file name. If one day's file grows past the size \
+     limit, Listener continues in GPS_2026-06-03_2, then _3, and so on.",
+);
 
 /// Help for the timestamp sidecar (§57). It names the file, the format, and the
 /// resolution the timestamps actually have — a nanosecond *field* is not
 /// nanosecond accuracy, and the recorded time is when the read completed, not
 /// when any particular byte reached the wire.
-const TIMESTAMP_SIDECAR_TOOLTIP: &str = concat!(
-    "Write arrival times to a companion file beside the recording, named after it ",
-    "with .idx added (GPS.raw → GPS.raw.idx). One line per received block: the byte ",
-    "offset where that block starts in the .raw, a comma, and the wall-clock time in ",
-    "nanoseconds since the Unix epoch. It is plain text, so any tool can read it, and ",
-    "it is kept out of the .raw so that file stays byte-exact. Times are captured per ",
-    "block when the read completes — not per byte, and not device or wire time — so a ",
-    "nanosecond field does not imply nanosecond accuracy. Offsets are always positions ",
-    "in the file beside them, so appending to an existing recording continues from its ",
-    "end rather than starting over, and with rotation on each file has its own sidecar ",
-    "counting from that file's start."
+const TIMESTAMP_SIDECAR_TOOLTIP: Hover = Hover::new(
+    "Writes the arrival time of each received block to a companion file beside the \
+     Raw recording.\n\n\
+     The companion file has the recording's name with .idx added, so GPS.raw gets \
+     GPS.raw.idx. Each line holds the byte position where a block starts in the .raw \
+     file, a comma, and the wall-clock time in nanoseconds since 1 January 1970 UTC \
+     (Unix time).\n\n\
+     It is plain text, so any tool can read it. It is kept out of the .raw file so \
+     that file stays exactly the bytes received.\n\n\
+     The time is taken once for each block, when it is received. It is not per byte, \
+     and it is not device or wire time, so a nanosecond field does not mean \
+     nanosecond accuracy.\n\n\
+     The positions always refer to the .raw file beside the companion file. Appending \
+     to an existing recording continues from the end of that file instead of starting \
+     over, and every .raw file, including each rotation period's file, has its own \
+     companion file counting from the start of that file.",
 );
 
 /// Edit the channel's **Raw** recording setup (§53): destination, overwrite, rotation,
@@ -132,7 +177,7 @@ pub(crate) fn edit_raw_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) 
     // taps independent, and only this one is byte-exact).
     ui.horizontal(|ui| {
         ui.checkbox(&mut rec.timestamp_enabled, "Timestamp sidecar")
-            .on_hover_text(TIMESTAMP_SIDECAR_TOOLTIP);
+            .on_hover(&TIMESTAMP_SIDECAR_TOOLTIP);
         if rec.timestamp_enabled {
             let name = rec
                 .destination
@@ -144,7 +189,7 @@ pub(crate) fn edit_raw_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) 
                 // naming one would be a guess; name the suffix instead.
                 .unwrap_or_else(|| "<recording>.idx".to_owned());
             ui.label(egui::RichText::new(name).weak())
-                .on_hover_text(TIMESTAMP_SIDECAR_TOOLTIP);
+                .on_hover(&TIMESTAMP_SIDECAR_TOOLTIP);
         }
     });
 }

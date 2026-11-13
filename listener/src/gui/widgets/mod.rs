@@ -21,6 +21,7 @@ use crate::config::{
 };
 use crate::core::ChannelId;
 use crate::transport::udp::UdpMode;
+use wiredata_ui::hover::{Hover, ShowHover};
 
 use super::bind_scope::{bind_choice_label, bind_choices, LocalAddresses, ALL_INTERFACES_ADDRESS};
 
@@ -217,6 +218,73 @@ fn port_field(ui: &mut egui::Ui, id: &str, port: &mut u16) {
     });
 }
 
+const BROADCAST_HOVER: Hover = Hover::new(
+    "Receives datagrams that a sender addresses to the whole subnet.\n\n\
+     Set the Binding address to All interfaces to accept them on any of this \
+     computer's network interfaces.",
+);
+const UNICAST_HOVER: Hover = Hover::new(
+    "Receives datagrams addressed directly to this computer.\n\n\
+     Set the Binding address to All interfaces to listen on every network \
+     interface, or to one local address to listen on only that one.",
+);
+const MULTICAST_HOVER: Hover = Hover::new(
+    "Joins a multicast group and receives the datagrams sent to it.\n\n\
+     Enter the group's address in Group. Listener joins the group on this \
+     computer's default network interface; the Binding address does not choose \
+     which interface joins it.",
+);
+
+const BROADCAST_BIND_HOVER: Hover = Hover::new(
+    "The local network interface to receive on.\n\n\
+     All interfaces (0.0.0.0) is the usual choice for broadcast, because the sender \
+     addresses the whole subnet rather than one computer.",
+);
+const UNICAST_BIND_HOVER: Hover = Hover::new(
+    "The local network interface to receive on.\n\n\
+     All interfaces (0.0.0.0) accepts datagrams on every network adapter. Choose one \
+     local address to receive only on that adapter, or 127.0.0.1 to receive only \
+     what programs on this computer send.",
+);
+const MULTICAST_BIND_HOVER: Hover = Hover::new(
+    "The local address this channel binds to.\n\n\
+     All interfaces (0.0.0.0) is the usual choice. Listener joins the multicast \
+     group on this computer's default network interface, and the address chosen here \
+     does not change that.",
+);
+
+const GROUP_HINT: Hover = Hover::new(
+    "The multicast group address to join.\n\n\
+     It must be from 224.0.0.0 to 239.255.255.255, and it must be the same group the \
+     sender uses.\n\n\
+     Addresses from 239.0.0.0 to 239.255.255.255 are the private block meant for use \
+     inside one organization, and are a good default. Avoid addresses that start \
+     with 224.0.0, which are reserved for local network control traffic.",
+);
+
+const SHARED_HINT: Hover = Hover::new(
+    "Lets another program receive on the same UDP port at the same time.\n\n\
+     Before it binds the port, Listener asks the operating system to allow \
+     sharing. The Diagnostics section shows whether the system applied the request. \
+     The other program usually has to ask for sharing as well.\n\n\
+     Both programs then receive the same broadcast or multicast datagrams. This is \
+     not offered for Unicast, because there the operating system delivers each \
+     datagram to only one of the programs sharing a port.",
+);
+
+const KERNEL_TIMESTAMP_HINT: Hover = Hover::new(
+    "Asks the operating system to take each UDP datagram's arrival time itself, \
+     instead of Listener taking it after the read.\n\n\
+     This works on Linux only. Windows and macOS report the request as unavailable \
+     and take the time after the read, as they do when this is off.\n\n\
+     The arrival times used by timestamp marks and written to the timestamp sidecar \
+     then leave out the delay between a datagram reaching this computer and Listener \
+     reading it. The Handoff and Read gap figures in Diagnostics do not change.\n\n\
+     The time is software time. It is not the device's clock, not hardware time, \
+     and not the arrival time of any single byte on the wire. Linux supplies it in \
+     nanosecond fields, which does not mean it is accurate to a nanosecond.",
+);
+
 /// A list the interface editor asks to have listed again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Refresh {
@@ -252,24 +320,11 @@ pub(super) fn edit_interface(
                         .on_hover_text("How this UDP socket receives datagrams.");
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut udp.mode, UdpMode::Broadcast, "Broadcast")
-                            .on_hover_text(
-                                "Receive broadcast datagrams (sent to the subnet \
-                                 broadcast address). Bind to All interfaces to accept \
-                                 them on any local interface.",
-                            );
+                            .on_hover(&BROADCAST_HOVER);
                         ui.radio_value(&mut udp.mode, UdpMode::Unicast, "Unicast")
-                            .on_hover_text(
-                                "Receive datagrams addressed directly to this host. \
-                                 Bind to All interfaces to listen on every local \
-                                 interface, or one local address to listen on just that \
-                                 one.",
-                            );
+                            .on_hover(&UNICAST_HOVER);
                         ui.radio_value(&mut udp.mode, UdpMode::Multicast, "Multicast")
-                            .on_hover_text(
-                                "Join a multicast group and receive its datagrams. Bind \
-                                 to All interfaces to join on any interface; set the \
-                                 Group address below.",
-                            );
+                            .on_hover(&MULTICAST_HOVER);
                     });
                     ui.end_row();
 
@@ -280,23 +335,11 @@ pub(super) fn edit_interface(
                     // default in every mode (accept on any local interface), but *why*
                     // differs.
                     let bind_hint = match udp.mode {
-                        UdpMode::Broadcast => {
-                            "The local network interface(s) to receive on. All interfaces \
-                             (0.0.0.0) is the usual choice for broadcast, since the sender \
-                             targets the subnet, not a specific host."
-                        }
-                        UdpMode::Unicast => {
-                            "The local network interface(s) to receive on. All interfaces \
-                             (0.0.0.0) accepts on every NIC; choose one local address to \
-                             receive only on that NIC, or 127.0.0.1 for this computer only."
-                        }
-                        UdpMode::Multicast => {
-                            "The local network interface to join the group on. All \
-                             interfaces (0.0.0.0) is fine for most setups; choose one local \
-                             address to join on just that NIC."
-                        }
+                        UdpMode::Broadcast => BROADCAST_BIND_HOVER,
+                        UdpMode::Unicast => UNICAST_BIND_HOVER,
+                        UdpMode::Multicast => MULTICAST_BIND_HOVER,
                     };
-                    ui.label("Binding address").on_hover_text(bind_hint);
+                    ui.label("Binding address").on_hover(&bind_hint);
                     ui.horizontal(|ui| {
                         // The choices say who can reach the socket (§15, ADR-047).
                         // If the OS cannot list its addresses, the address is typed.
@@ -307,10 +350,12 @@ pub(super) fn edit_interface(
                                     .desired_width(130.0)
                                     .hint_text(ALL_INTERFACES_ADDRESS),
                             )
-                            .on_hover_text(format!(
-                                "{bind_hint}\n\nThis computer's addresses could not be \
-                                 listed: {why}"
-                            ));
+                            .on_hover(
+                                &bind_hint.clone().with_paragraph(&format!(
+                                    "This computer's addresses could not be listed, so type \
+                                 the address instead. The system reported: {why}"
+                                )),
+                            );
                         } else {
                             let listed = local_addresses.listed();
                             let combo = egui::ComboBox::from_id_salt("udp_bind")
@@ -324,7 +369,7 @@ pub(super) fn edit_interface(
                                 });
                             // Listed again as the choice opens, as the serial
                             // port list is: an adapter may have come or gone.
-                            if combo.response.on_hover_text(bind_hint).clicked() {
+                            if combo.response.on_hover(&bind_hint).clicked() {
                                 refresh = Some(Refresh::LocalAddresses);
                             }
                         }
@@ -344,12 +389,7 @@ pub(super) fn edit_interface(
                     ui.end_row();
 
                     if udp.mode == UdpMode::Multicast {
-                        const GROUP_HINT: &str = "The multicast group address to join, in \
-                            the 224.0.0.0–239.255.255.255 range. 239.0.0.0/8 is the \
-                            administratively-scoped (private) block — a good default; \
-                            avoid 224.0.0.x, which is reserved for local control traffic. \
-                            Must match the sender's group.";
-                        ui.label("Group").on_hover_text(GROUP_HINT);
+                        ui.label("Group").on_hover(&GROUP_HINT);
                         let mut group = udp.multicast_group.clone().unwrap_or_default();
                         if ui
                             .add(
@@ -358,7 +398,7 @@ pub(super) fn edit_interface(
                                     .desired_width(130.0)
                                     .hint_text("239.0.0.1"),
                             )
-                            .on_hover_text(GROUP_HINT)
+                            .on_hover(&GROUP_HINT)
                             .changed()
                         {
                             let g = group.trim();
@@ -373,26 +413,19 @@ pub(super) fn edit_interface(
                     if udp.mode == UdpMode::Unicast {
                         udp.shared_port = false;
                     } else {
-                        const SHARED_HINT: &str = "Let another program bind this port \
-                            too, and receive the same broadcast or multicast datagrams. \
-                            Listener sets the OS's address-reuse option before binding; \
-                            Diagnostics says whether the OS applied it. The other program \
-                            usually has to request sharing as well. Not offered for \
-                            unicast, where the OS delivers each datagram to only one of \
-                            the programs sharing a port.";
-                        ui.label("Port sharing").on_hover_text(SHARED_HINT);
+                        ui.label("Port sharing").on_hover(&SHARED_HINT);
                         ui.checkbox(&mut udp.shared_port, "Request shared port")
-                            .on_hover_text(SHARED_HINT);
+                            .on_hover(&SHARED_HINT);
                         ui.end_row();
                     }
 
                     ui.label("Arrival timing").on_hover_text(
-                        "Choose whether UDP arrival wall-clock timestamps are captured after the read or requested from the OS receive path.",
+                        "Choose who takes the arrival time of each UDP datagram: Listener \
+                         after it reads the datagram, or the operating system when it \
+                         receives it.",
                     );
                     ui.checkbox(&mut udp.kernel_timestamps, "Kernel timestamp")
-                        .on_hover_text(
-                            "Request a kernel software timestamp for each UDP datagram. Linux SO_TIMESTAMPNS returns a software timestamp represented with nanosecond fields; that representation does not guarantee nanosecond accuracy. It removes post-receive userland scheduling delay from recorded wall-clock capture but does not change Handoff or Read gap. Windows and macOS report the request as unavailable and use post-read capture. This is not hardware, device, or per-byte wire timing.",
-                        );
+                        .on_hover(&KERNEL_TIMESTAMP_HINT);
                     ui.end_row();
                 });
         }

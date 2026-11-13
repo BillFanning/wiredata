@@ -2205,6 +2205,53 @@ thing.
 else. Listener now depends directly on `tracing-appender`, which the workspace
 already used.
 
+## ADR-056 — Hover text opens with a bold sentence, then short paragraphs
+
+**Status:** Accepted 2026-11-13.
+
+**Context:** Talker adopted a hover format on 13 November (talker ADR-065)
+after the user found its hovers hard to read: dense paragraphs in internal
+terms, some describing cases not on screen. Listener's hovers had the same
+shape, and listener's own ADR-019 asks the two apps to look like one product.
+
+**Decision:** Listener follows talker ADR-065 as written: a bold first
+sentence that states the point, short paragraphs in plain, complete sentences
+using the names on screen, one plain line for short hints, and no "/" as a
+separator. It uses the same `Hover` and `ShowHover` from `wiredata-ui`. What
+each hover says stays in listener.
+
+Checking each hover against the code while rewriting it found nine that
+described behaviour the code does not have. The largest: the multicast
+Binding address hover said the chosen address picks the interface that joins
+the group. It does not: the GUI never sets `multicast_interface`, so the group
+is joined on the operating system's default interface. The hovers now say
+what the code does; the behaviour is unchanged.
+
+**Boundary:** Text only. Whether the GUI should let the user choose the
+multicast join interface is a separate, open question.
+
+**Consequences:** Listener's and talker's hovers look and read alike.
+
+## ADR-057 — The Receive diagnostics card has no status badge
+
+**Status:** Accepted 2026-11-13. Amends ADR-033, whose card carried the badge.
+
+**Context:** Talker removed its card badge (talker ADR-066) once every reason
+it rose for was found marked elsewhere. Listener's badge rose only from the
+Transport and Pressure rows. Both mark themselves with ⚠ when they want
+attention, and kernel drops and Serial stalls also have their own callouts.
+Its calm words were said elsewhere as well: MONITORING by the Channel status
+at the top of the pane, LAST RUN by the Pipeline row's "~final 10 s", and
+AWAITING DATA by the rows' own "awaiting".
+
+**Decision:** The card is drawn with `wiredata_ui::diagnostics::diagnostic_card`,
+with no title and no badge. `wiredata-ui` no longer has a badge at all.
+
+**Boundary:** ADR-033's other decisions stand: the three rows, the bounded
+claims, and the callouts.
+
+**Consequences:** The card starts with the Transport row, a row higher.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

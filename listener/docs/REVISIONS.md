@@ -10,6 +10,13 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-12) — console output never holds up reception:
+
+- **§3.1 (ADR-055).** Every line printed while Channels run goes through a
+  bounded queue, and a line the console does not take is dropped and counted.
+  A Channel used to wait for the console: a text selection that paused a
+  console window paused reception with it.
+
 Revision note (2026-11-12) — a failed event log is tried again:
 
 - **§118.** A log file that cannot be opened or written is opened again about

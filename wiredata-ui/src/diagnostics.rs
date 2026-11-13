@@ -1,8 +1,9 @@
 //! Shared presentation primitives for compact, decision-oriented diagnostics.
 //!
 //! The applications decide what each signal means and when it deserves attention;
-//! this module owns only the identical egui chrome: a quiet card, status badge,
-//! aligned signal rows, and a restrained attention callout.
+//! this module owns only the identical egui chrome: a quiet card, aligned
+//! signal rows, the ⚠ that marks a row wanting attention, and a restrained
+//! attention callout.
 //!
 //! # Shared readout vocabulary
 //!
@@ -66,10 +67,7 @@ use std::hash::Hash;
 
 use egui::{Color32, Response, RichText, Ui, WidgetText};
 
-use crate::{
-    fonts::bold,
-    palette::{active, tint},
-};
+use crate::palette::{active, tint};
 
 /// Visual emphasis for a diagnostic signal. Semantics and thresholds remain local
 /// to the application that owns the measurement.
@@ -101,8 +99,7 @@ impl SignalTone {
         match self {
             // The shared running green is deliberately bright because it was
             // chosen for status glyphs. On the light card it is too pale for
-            // small text, so calm states use the theme's foreground color and
-            // reserve green for the badge border/fill.
+            // small text, so calm states use the theme's foreground color.
             Self::Neutral | Self::Healthy => ui.visuals().text_color(),
             Self::Warning | Self::Fault => self.accent(ui),
         }
@@ -125,31 +122,13 @@ fn card_frame(ui: &Ui) -> egui::Frame {
         .inner_margin(egui::Margin::same(11))
 }
 
-fn status_badge(ui: &mut Ui, text: WidgetText, tone: SignalTone) -> Response {
-    let accent = tone.accent(ui);
-    let text_color = tone.text_color(ui);
-    let fill = tint(ui, accent, 38);
-    egui::Frame::new()
-        .fill(fill)
-        .stroke(egui::Stroke::new(1.0_f32, translucent(accent, 145)))
-        .corner_radius(egui::CornerRadius::same(12))
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new(text.text())
-                    .small()
-                    .strong()
-                    .color(text_color),
-            )
-        })
-        .inner
-}
-
-/// The diagnostic card with no header row: no title and no status badge.
+/// The diagnostic card: a framed box for the caller's rows and callouts, with
+/// no header row.
 ///
-/// For a card whose every reason for attention is already marked on its own
-/// row or callout (talker ADR-066). A badge there only repeats them, and costs
-/// a row at the top of the card.
+/// It had one, a title and a status badge summing up the card in one word.
+/// Every reason that badge rose for was already marked on its own row or
+/// callout, so it said *that* something was wrong but not *what*, and took a
+/// row to do it (talker ADR-066, listener ADR-057).
 pub fn diagnostic_card<R>(
     ui: &mut Ui,
     add_contents: impl FnOnce(&mut Ui) -> R,
@@ -157,35 +136,7 @@ pub fn diagnostic_card<R>(
     card_frame(ui).show(ui, add_contents)
 }
 
-/// Draw one compact diagnostic card. The caller supplies app-specific rows and any
-/// progressive-disclosure control beneath them.
-pub fn decision_card<R>(
-    ui: &mut Ui,
-    title: impl Into<WidgetText>,
-    status: impl Into<WidgetText>,
-    tone: SignalTone,
-    add_contents: impl FnOnce(&mut Ui) -> R,
-) -> egui::InnerResponse<R> {
-    let title = title.into();
-    let status = status.into();
-    card_frame(ui).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            // An empty title leaves the badge alone on the row. A card whose
-            // rows already name themselves does not need a heading that only
-            // repeats a word from the readouts beside it.
-            if !title.text().is_empty() {
-                ui.label(bold(title.text()));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                status_badge(ui, status, tone);
-            });
-        });
-        ui.add_space(7.0);
-        add_contents(ui)
-    })
-}
-
-/// Draw a two-column signal grid inside [`decision_card`]. Call
+/// Draw a two-column signal grid inside [`diagnostic_card`]. Call
 /// [`signal_row`] from `add_rows` for each decision-level signal.
 pub fn signal_grid<R>(
     ui: &mut Ui,
@@ -237,9 +188,9 @@ pub fn signal_row(
 ///
 /// Warning and Fault share `⚠` deliberately. What must survive without colour
 /// is the binary *does this row want attention*, and both answer yes; which of
-/// the two it is stays in the row's own text and in the card's badge, where a
-/// word already says it. Adding a second glyph would split a distinction the
-/// reader does not have to make at a glance.
+/// the two it is stays in the row's own text, where words already say it.
+/// Adding a second glyph would split a distinction the reader does not have to
+/// make at a glance.
 pub fn tone_marker(tone: SignalTone) -> &'static str {
     match tone {
         SignalTone::Warning | SignalTone::Fault => "\u{26A0} ",

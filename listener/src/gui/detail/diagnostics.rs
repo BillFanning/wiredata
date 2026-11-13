@@ -19,180 +19,219 @@ use crate::transport::udp::{ReceiveBuffer, SharedPortStatus};
 use super::super::state::{ChannelStatus, ChannelView};
 use super::super::widgets::human_bytes;
 use wiredata_ui::diagnostics::{
-    attention_callout, decision_card, signal_grid, signal_row, SignalTone,
+    attention_callout, diagnostic_card, signal_grid, signal_row, SignalTone,
 };
 use wiredata_ui::format::{compact_duration, thousands};
+use wiredata_ui::hover::{Hover, ShowHover};
 use wiredata_ui::palette::active as palette;
 
 // Diagnostic help follows the same technician-facing sequence throughout:
-// locate the measurement in the receive path, explain how to read it, then
-// state the operational implication and the boundary of what it can prove.
-const TRANSPORT_TOOLTIP: &str = concat!(
-    "Shows transport-specific evidence available from this channel run. ",
-    "For Linux UDP, a reported drop is a datagram discarded because this socket's ",
-    "kernel receive queue filled; the displayed cumulative count is a lower bound ",
-    "because status updates are best-effort. For Serial, a stall means the receive ",
-    "loop stopped issuing reads while a block waited for Ingest space. Serial ",
-    "snapshots read the reader's authoritative state: completed totals cover finished ",
-    "stalls, while Active is the elapsed time of the current unfinished stall. A ",
-    "reported zero does not rule out loss in the network, device, adapter, driver, ",
-    "or upstream buffer."
+// the point first, then where the measurement sits in the receive path, how to
+// read it, and the boundary of what it can prove (talker ADR-065).
+const TRANSPORT_TOOLTIP: Hover = Hover::new(
+    "What this channel's input itself can report about trouble.\n\n\
+     On a Linux UDP channel, a reported drop is a datagram that the operating system discarded \
+     because this socket's receive queue was full. The count shown is a lower bound, because \
+     the updates that carry it can be missed.\n\n\
+     On a Serial channel, a stall is a time when Listener's Serial reader stopped reading \
+     because a block was waiting for room in the Ingest queue. The reader counts these itself, \
+     so the Serial figures are exact, not estimated. The completed figures cover stalls that \
+     have ended. Active is how long the stall now in progress has lasted so far.\n\n\
+     A reported zero does not rule out loss in the network, the device, the adapter, the driver \
+     or an upstream buffer.",
 );
-const PRESSURE_TOOLTIP: &str = concat!(
-    "Ingest is received data moving through Listener's in-memory processing queue; ",
-    "its summary shows the highest sampled in-flight count this run, not a live ",
-    "current depth. Raw is the background recorder's in-memory queue, measured in bytes; ",
-    "while recording, its ",
-    "latest status sample and highest observed occupancy are shown, and afterward ",
-    "the highest observed occupancy is retained for the channel run. The writer may ",
-    "be handling one block concurrently. These are application queues, not device or ",
-    "driver buffers. Half capacity is an early-warning reference: active Raw pressure ",
-    "at or above it raises Attention, while a historical peak remains visible but does ",
-    "not escalate the card by itself. A brief burst can set a peak, and occupancy is ",
-    "not proof of data loss or sustained pressure."
+const PRESSURE_TOOLTIP: Hover = Hover::new(
+    "How full Listener's own queues have been while it handled received data.\n\n\
+     Ingest is the queue that holds received data on its way to being processed. Its figure is \
+     the highest count of blocks waiting that Listener has sampled this run. It is not a live \
+     reading of the queue now.\n\n\
+     Raw is the queue that holds data for the background recorder, measured in bytes. While \
+     recording, the latest sample and the highest observed amount are shown. After recording \
+     stops, the highest observed amount stays on screen for this run. The recorder may be \
+     writing one block at the same time.\n\n\
+     These are queues inside Listener, not device or driver buffers.\n\n\
+     Half capacity is the early-warning point. While Raw is recording, a latest sample at or \
+     above half of its capacity raises Attention. A highest observed amount stays visible but \
+     does not raise Attention by itself. A Raw gap or a failed recording raises Issue.\n\n\
+     A brief burst can set a high figure, so a high figure is not proof of data loss or of \
+     sustained pressure.",
 );
-const PIPELINE_TOOLTIP: &str = concat!(
-    "Handoff is the time from a completed operating-system read until Listener ",
-    "starts processing that block. Processing is the time Listener spends handling ",
-    "it synchronously; background recorder I/O may run concurrently and is outside this ",
-    "boundary. Recent values use an approximate latest or final ten-second segmented ",
-    "window, and the chunk count on the same line says how many samples that is. The ",
-    "worst value is exact at any count; 99% ≤ X appears beside it only when at least ",
-    "99% of samples fell within a figure below that worst one. Compare changes with ",
-    "queue pressure and normal operation; there is no universal good/bad latency limit."
-);
-
-const UDP_DROP_CALLOUT_TOOLTIP: &str = concat!(
-    "Linux confirms at least this many datagrams were discarded because this ",
-    "socket's kernel receive queue filled. The displayed cumulative count is the ",
-    "latest update that reached Listener's pipeline; the actual run total may be ",
-    "higher. It excludes packets lost before reaching this socket. Check host load, ",
-    "input rate, and receive-buffer capacity."
-);
-const SERIAL_BACKPRESSURE_TOOLTIP: &str = concat!(
-    "Shows authoritative Serial backpressure state for this channel run. A stall ",
-    "starts after a block is read when the Ingest queue is full; the reader retries ",
-    "for space about every 5 ms and issues no new read meanwhile. Episodes is the ",
-    "number of completed stalls; Total and Max also cover completed stalls only. ",
-    "Active is measured separately from the reader's current stall start. Advisory ",
-    "warnings may be dropped without changing these values. While the channel ",
-    "continues, the pending block is retried, but it is not retained if the channel ",
-    "stops or its processing path closes. Upstream adapter or driver loss is not ",
-    "observable here."
+const PIPELINE_TOOLTIP: Hover = Hover::new(
+    "How long received data waited for Listener, and how long Listener took to handle it.\n\n\
+     Handoff is the time from the moment the operating system finished a read until Listener \
+     started processing that block.\n\n\
+     Processing is the time Listener then spent handling the block. The background recorder's \
+     disk work may run at the same time as that handling, and it is not part of Processing.\n\n\
+     Recent figures cover about the last ten seconds while the channel runs, and about the \
+     final ten seconds once it has stopped. The window is approximate. The chunk count on the \
+     same line says how many blocks the recent figures are based on.\n\n\
+     The worst value is exact, however few blocks there are. \"99% ≤\" appears beside it only \
+     when at least 99 of every 100 blocks were within a time that is lower than the worst. It is \
+     an upper bound: the true value is at or below it.\n\n\
+     There is no universal good or bad limit for these times. Compare a change with the \
+     pressure figures and with how the channel behaves normally.",
 );
 
-const RECEIVE_DETAILS_TOOLTIP: &str = concat!(
-    "Use these measurements to locate pressure between the input, Listener ",
-    "processing, and storage. Recent or final values use an approximate ten-second ",
-    "segmented window; run values cover the time since Start. Each row states its worst ",
-    "value with the number of samples behind it; 99% ≤ X is an upper-bound estimate for ",
-    "at least 99% of those samples, and appears only where it differs from the worst."
+const UDP_DROP_CALLOUT_TOOLTIP: Hover = Hover::new(
+    "Linux confirms that at least this many datagrams were discarded because this socket's \
+     receive queue was full.\n\n\
+     The count shown comes from the latest update that reached Listener. The true total for the \
+     run may be higher. Packets lost before they reached this socket, in the network or the \
+     device, are not counted.\n\n\
+     Check the load on this computer, the rate at which data arrives, and the size of the \
+     receive buffer.",
 );
-const HANDOFF_TOOLTIP: &str = concat!(
-    "Measures each received block from immediately after the operating-system read ",
-    "returns until Listener begins processing it. This includes copying, waiting in ",
-    "the Ingest queue, and thread scheduling. It excludes time spent in the device, ",
-    "adapter, driver, or kernel before the read completed. Rising Handoff together ",
-    "with Ingest pressure means arrivals were not drained promptly; compare Processing ",
-    "to distinguish Listener workload from scheduling delay or input bursts."
+const SERIAL_BACKPRESSURE_TOOLTIP: Hover = Hover::new(
+    "Listener's Serial reader had to wait because the Ingest queue was full.\n\n\
+     After reading a block, the reader holds it until the Ingest queue has room, trying again \
+     about every 5 ms. It does not read again while it waits. Each such wait is one episode.\n\n\
+     Completed episodes counts the episodes that have ended. The completed total and the \
+     completed maximum are the combined and the longest duration of those same episodes. \
+     Active is how long the episode now in progress has lasted so far, and is not included in \
+     the completed figures.\n\n\
+     The warning lines about a stall are advisory and can be lost. Losing one does not change \
+     these figures.\n\n\
+     While the channel keeps running, the waiting block is tried again. If the channel stops or \
+     its processing path closes, the block is discarded.\n\n\
+     Anything the adapter or driver lost while the reader waited cannot be seen here.",
 );
-const PROCESSING_TOOLTIP: &str = concat!(
-    "Measures how long Listener handles each received block: accounting, scrollback, ",
-    "match rules, display preparation, and recorder handoff and checks. It excludes ",
-    "Handoff and background recorder I/O, which may run concurrently. Rising Processing ",
-    "together with Ingest pressure points to a Listener workload bottleneck."
+
+const RECEIVE_DETAILS_TOOLTIP: Hover = Hover::new(
+    "The measurements behind the Transport, Pressure and Pipeline rows.\n\n\
+     Use them to find where data is held up: at the input, in Listener's processing, or in \
+     recording.\n\n\
+     Recent and final figures cover about the last ten seconds, or the final ten seconds after \
+     the channel has stopped. The window is approximate. Figures marked \"run\" cover \
+     everything since Start.\n\n\
+     Each row gives its worst value and the number of samples behind it. \"99% ≤\" is an upper \
+     bound that at least 99 of every 100 samples stayed within, and it appears only where it is \
+     lower than the worst.",
 );
-const CHUNK_SHAPE_TOOLTIP: &str = concat!(
-    "Cumulative across the full channel run, not the recent ten-second window. One ",
-    "chunk is the block returned by a single operating-system read; it is not ",
-    "necessarily a complete line or protocol message. Size shows bytes per read; a ",
-    "median or percentile appears only when reads actually varied, so a transport ",
-    "returning uniform blocks states just the largest. ",
-    "Read gap is between consecutive post-read monotonic captures and can reflect ",
-    "source cadence, buffering, and host scheduling—not per-byte wire timing. Because ",
-    "these values accumulate, a long run can dilute a brief change."
+const HANDOFF_TOOLTIP: Hover = Hover::new(
+    "How long each received block waited before Listener began processing it.\n\n\
+     The time starts just after the operating system's read returns. It includes copying the \
+     data, waiting in the Ingest queue, and waiting for the operating system to run Listener. It \
+     leaves out any time spent in the device, adapter, driver or kernel before the read \
+     completed.\n\n\
+     If Handoff rises together with Ingest pressure, data arrived faster than Listener took it \
+     in. Compare Processing to tell a heavy Listener workload from a scheduling delay or a burst \
+     of input.",
 );
-const ARRIVAL_TIMESTAMP_TOOLTIP: &str = concat!(
-    "Wall-clock source for timestamped Mark annotations and recording metadata. ",
-    "Post-read is host time captured when the operating-system read returns; Linux ",
-    "kernel software time is captured earlier in the socket receive path. When kernel ",
-    "timing is active, a post-read fallback is a datagram whose ancillary metadata ",
-    "did not contain a usable timestamp. SO_TIMESTAMPNS returns a software timestamp ",
-    "with nanosecond fields; that representation does not imply nanosecond accuracy. ",
-    "Handoff and Read gap always use post-read monotonic captures. Neither source is ",
-    "device time, hardware time, or per-byte arrival time."
+const PROCESSING_TOOLTIP: Hover = Hover::new(
+    "How long Listener spent handling each received block.\n\n\
+     The time covers counting the data, the scrollback, the match rules, preparing the display, \
+     and handing the block to the recorder along with the recorder's checks. It leaves out \
+     Handoff. It also leaves out the background recorder's disk work, which may run at the same \
+     time.\n\n\
+     If Processing rises together with Ingest pressure, Listener's own workload is the \
+     bottleneck.",
 );
-const UDP_NOT_APPLICABLE_TOOLTIP: &str = concat!(
-    "This channel does not use an input with a per-socket UDP receive-overflow ",
-    "counter. This is expected for this transport and says nothing about data loss."
+const CHUNK_SHAPE_TOOLTIP: Hover = Hover::new(
+    "The size of each read and the time between reads, over the whole run.\n\n\
+     One chunk is the block returned by a single operating-system read. It is not necessarily a \
+     whole line or a whole protocol message.\n\n\
+     Size is in bytes per read. A median or a \"99% ≤\" figure appears only when the reads \
+     actually varied in size, so an input that returns same-sized blocks shows only the \
+     largest.\n\n\
+     Read gap is the time between the end of one read and the end of the next. It can reflect \
+     how the source sends, buffering, and the computer's own scheduling. It is not the timing of \
+     individual bytes on the wire.\n\n\
+     These figures cover the full channel run, not the recent ten-second window, so a long run \
+     can hide a brief change.",
 );
-const UDP_UNAVAILABLE_TOOLTIP: &str = concat!(
-    "Listener does not have an active drop counter attributable to this UDP socket. ",
-    "The operating system may not support it, or enabling it may have failed. Treat ",
-    "unavailable as unknown, not zero. Use packet capture or operating-system and ",
-    "network counters if an independent loss measurement is required."
+const ARRIVAL_TIMESTAMP_TOOLTIP: Hover = Hover::new(
+    "Where the time of day on each received block comes from.\n\n\
+     Timestamped Mark annotations and the recording's metadata use this time.\n\n\
+     Post-read is the computer's clock read just after the operating system's read returns. \
+     Linux kernel software time is captured earlier, as the data enters the socket. When kernel \
+     timing is in use, a post-read fallback is a datagram that arrived without a usable kernel \
+     timestamp. Kernel unavailable means kernel timing was asked for but could not be used, so \
+     post-read is used instead.\n\n\
+     The kernel's software timestamp carries digits down to the nanosecond. That does not mean it \
+     is accurate to a nanosecond.\n\n\
+     Handoff and Read gap always use the post-read clock. Neither kind of timestamp is device \
+     time, hardware time, or the arrival time of individual bytes.",
 );
-const UDP_AVAILABLE_TOOLTIP: &str = concat!(
-    "Latest cumulative drop total reported for this Linux UDP socket. ",
-    "A nonzero value confirms at least that many datagrams were discarded because ",
-    "the kernel receive queue filled; a later update can be missed, so the actual run ",
-    "total may be higher. Zero means no nonzero update reached this display, not that ",
-    "no packets were lost here or elsewhere."
+const UDP_NOT_APPLICABLE_TOOLTIP: Hover = Hover::new(
+    "This channel's input has no UDP receive-overflow counter.\n\n\
+     That is expected for this kind of channel. It says nothing about whether data was lost.",
 );
-const IDLE_RULE_TIMING_TOOLTIP: &str = concat!(
-    "Measures how late Listener evaluates and fires each Idle rule after its ",
-    "configured no-data deadline. The worst firing is stated with the number of ",
-    "firings behind it; where it differs, 99% ≤ 2 ms means at least 99% of measured ",
-    "firings were no more than about 2 ms late. Lateness can include ",
-    "operating-system wake delay, processor contention, and time Listener spent ",
-    "servicing requests, processing input, or handling recording before evaluation. ",
-    "It is not wall-clock or receive-time accuracy."
+const UDP_UNAVAILABLE_TOOLTIP: Hover = Hover::new(
+    "Listener has no drop counter for this UDP socket.\n\n\
+     The operating system may not support one, or turning it on may have failed. Treat \
+     unavailable as unknown, not as zero.\n\n\
+     If you need an independent measure of loss, use a packet capture or the operating system's \
+     and network's own counters.",
 );
-const IDLE_TIMER_TOOLTIP: &str = concat!(
-    "Counts completed Idle-deadline wakes, not every wait that was started. On ",
-    "Windows, Listener requests 1 ms timer resolution only during the final 32 ms; ",
-    "1 ms unavailable counts completed wakes for which that request was ineffective, ",
-    "not necessarily distinct Windows API calls. Linux and macOS use native deadline ",
-    "waits. One completed wake can fire several rules. A wait restarted by ",
-    "new input or other channel work is not counted. Compare unavailable wakes ",
-    "with measured lateness; unavailable alone is not proof that a rule fired late."
+const UDP_AVAILABLE_TOOLTIP: Hover = Hover::new(
+    "The latest total of datagrams discarded because this Linux UDP socket's receive queue was \
+     full.\n\n\
+     A nonzero value confirms that at least that many datagrams were discarded. A later update \
+     can be missed, so the actual total for the run may be higher.\n\n\
+     Zero means that no nonzero update has reached this display. It does not mean that no \
+     packets were lost here or elsewhere.",
 );
-const INGEST_QUEUE_TOOLTIP: &str = concat!(
-    "Last sample is the number of blocks in flight when Listener most recently took ",
-    "one for processing, including that block; it is not a live queue reading. Peak ",
-    "is the highest such sample this run and capacity is the queue limit. A brief ",
-    "burst can set the peak, so compare a high value with Handoff timing and ",
-    "transport stalls."
+const IDLE_RULE_TIMING_TOOLTIP: Hover = Hover::new(
+    "How late each Idle rule fired after its no-data deadline.\n\n\
+     The worst firing is shown with the number of firings behind it. Where it differs, a figure \
+     such as \"99% ≤ 2 ms\" means that at least 99 of every 100 measured firings were no more \
+     than about 2 ms late.\n\n\
+     Lateness can include the operating system's delay in waking Listener, competition for the \
+     processor, and time Listener spent on requests, on processing input, or on recording before \
+     it checked the rule.\n\n\
+     It does not measure the accuracy of wall-clock time or of when data was received.",
 );
-const RAW_QUEUE_ACTIVE_TOOLTIP: &str = concat!(
-    "Bytes of received blocks queued for the background Raw recorder, each block ",
-    "counted with a small fixed allowance. Latest sample is the queue occupancy in the ",
-    "most recent status snapshot, highest observed is the largest sample this run, and ",
-    "capacity is the queue limit. The writer may be handling one block concurrently. A ",
-    "brief burst can set the observed high. If a block would not fit, Raw recording ",
-    "enters a gap: those bytes are not recorded, the gap is logged, and recording ",
-    "resumes in a new file while reception continues."
+const IDLE_TIMER_TOOLTIP: Hover = Hover::new(
+    "How many times Listener woke at an Idle rule's no-data deadline, and how it waited.\n\n\
+     Only completed wakes are counted, not every wait that was started. A wait that was \
+     restarted by new input or by other channel work is not counted. One completed wake can fire \
+     several rules.\n\n\
+     On Windows, Listener asks for 1 ms timer resolution only during the final 32 ms before a \
+     deadline. 1 ms effective counts wakes where the request worked. 1 ms unavailable counts \
+     completed wakes where it did not, which is not necessarily the same as the number of failed \
+     requests to Windows.\n\n\
+     Linux and macOS use the system's own precise waits, shown as native deadline wakes.\n\n\
+     Compare unavailable wakes with the measured lateness. Unavailable wakes alone are not proof \
+     that a rule fired late.",
 );
-const RAW_QUEUE_GAP_TOOLTIP: &str = concat!(
-    "Raw recording is in a gap: received bytes are not being recorded until the next ",
-    "file opens. The gap's start, end and reason are logged in the diagnostics and the ",
-    "event log. Reception continues. The highest observed queue occupancy remains ",
-    "visible for this channel run."
+const INGEST_QUEUE_TOOLTIP: Hover = Hover::new(
+    "How many received blocks were waiting in the Ingest queue.\n\n\
+     Last sample is the number of blocks in the queue, counting the one just taken, at the \
+     moment Listener most recently took a block for processing. It is not a live reading. Peak \
+     is the highest such sample this run, and the second number is the queue's capacity.\n\n\
+     A brief burst can set the peak, so when it is high, compare it with Handoff timing and \
+     with transport stalls.",
 );
-const RAW_QUEUE_RETAINED_TOOLTIP: &str = concat!(
-    "Raw recording is no longer active. This preserves the highest observed queue ",
-    "occupancy from the current channel run so earlier writer pressure remains ",
-    "visible. It does not describe current storage load."
+const RAW_QUEUE_ACTIVE_TOOLTIP: Hover = Hover::new(
+    "Bytes of received data waiting for the background Raw recorder.\n\n\
+     Each queued block counts as its length plus a small fixed allowance. Latest sample is the \
+     amount queued in the most recent status update. Highest observed is the largest sample \
+     this run, and the second figure is the queue's capacity. The recorder may be writing one \
+     block at the same time. A brief burst can set the highest observed figure.\n\n\
+     If a block would not fit, Raw recording enters a gap. Those bytes are not recorded, the gap \
+     is logged, and recording resumes in a new file. Reception continues throughout.",
 );
-const RAW_QUEUE_FAULTED_TOOLTIP: &str = concat!(
-    "Raw recording could not begin — for example, the file exists and on-exists is ",
-    "Refuse, or another recording holds the destination — and retrying on its own ",
-    "cannot fix it. Reception continues. Check the diagnostics for the specific cause, ",
-    "then press Record again. The highest observed queue occupancy remains visible for ",
-    "this channel run."
+const RAW_QUEUE_GAP_TOOLTIP: Hover = Hover::new(
+    "Raw recording is in a gap, so received bytes are not being recorded.\n\n\
+     Recording resumes when the next file opens. The start, the end and the reason for the gap \
+     are logged in the diagnostics and in the event log. Reception continues.\n\n\
+     The highest observed queue amount stays on screen for this run.",
+);
+const RAW_QUEUE_RETAINED_TOOLTIP: Hover = Hover::new(
+    "The highest Raw queue amount observed earlier in this run.\n\n\
+     Raw recording is no longer active. The figure is kept so that earlier pressure on the \
+     recorder stays visible. It does not describe how busy the storage is now.",
+);
+const RAW_QUEUE_FAULTED_TOOLTIP: Hover = Hover::new(
+    "Raw recording could not begin, and trying again on its own will not fix it.\n\n\
+     For example, the file already exists and the recording is set to Refuse, or another \
+     recording holds the destination. Reception continues.\n\n\
+     Check the diagnostics for the specific cause, then press Record again. The highest observed \
+     queue amount stays on screen for this run.",
 );
 const RAW_QUEUE_INACTIVE_TOOLTIP: &str =
     "Raw recording is not active, so there is no Raw recorder queue to measure.";
+
 #[derive(Debug, PartialEq, Eq)]
 struct DecisionSignal {
     value: String,
@@ -205,19 +244,23 @@ fn queue_level_reaches_half(level: usize, capacity: usize) -> bool {
     capacity > 0 && level >= capacity.div_ceil(2)
 }
 
-const SHARED_PORT_TOOLTIP: &str = concat!(
-    "Request shared port sets the operating system's address-reuse option before the ",
-    "bind, so another program that also requests sharing can bind this port and ",
-    "receive the same broadcast or multicast datagrams. This line says whether the ",
-    "operating system applied it; it cannot say whether another program is bound."
+const SHARED_PORT_TOOLTIP: Hover = Hover::new(
+    "Whether the operating system applied the request to share this port.\n\n\
+     Request shared port sets the operating system's address-reuse option before Listener opens \
+     the port. Another program that also asks for sharing can then open this port too and \
+     receive the same broadcast or multicast datagrams.\n\n\
+     This line says whether the operating system applied the option. It cannot say whether \
+     another program is actually bound.",
 );
 
-const RECEIVE_BUFFER_TOOLTIP: &str = concat!(
-    "SO_RCVBUF: how much received data the operating system holds for this socket ",
-    "while Listener reads. When it fills, the operating system drops datagrams. ",
-    "Listener asks for 4 MiB unless the profile sets recv_buffer_bytes. Linux grants ",
-    "at most net.core.rmem_max; raise it with sysctl to allow more. The figure is in ",
-    "the request's terms: Linux reports twice what it set, and that is halved here."
+const RECEIVE_BUFFER_TOOLTIP: Hover = Hover::new(
+    "How much received data the operating system will hold for this socket while Listener reads \
+     it.\n\n\
+     When the buffer fills, the operating system drops datagrams.\n\n\
+     Listener asks for 4 MiB unless the profile sets recv_buffer_bytes. On Linux the most that \
+     can be granted is net.core.rmem_max, and raising it with sysctl allows more.\n\n\
+     Linux reports twice the size it actually set aside. Listener halves that report, so the \
+     figure shown can be compared directly with the size requested.",
 );
 
 /// The receive-buffer line (§75): what was granted against what was asked.
@@ -304,7 +347,10 @@ fn pressure_signal(
     let ingest_text = if ingest.capacity == 0 {
         "Ingest awaiting data".to_owned()
     } else {
-        format!("Ingest highest sampled {}/{}", ingest.peak, ingest.capacity)
+        format!(
+            "Ingest highest sampled {} of {}",
+            ingest.peak, ingest.capacity
+        )
     };
     // The Raw queue is measured in bytes (ADR-043).
     let bytes = |n: usize| human_bytes(n as u64);
@@ -515,34 +561,6 @@ fn timing_window(status: ChannelStatus) -> &'static str {
     }
 }
 
-fn card_tone(transport: SignalTone, pressure: SignalTone) -> SignalTone {
-    if transport == SignalTone::Fault || pressure == SignalTone::Fault {
-        SignalTone::Fault
-    } else if transport == SignalTone::Warning || pressure == SignalTone::Warning {
-        SignalTone::Warning
-    } else {
-        SignalTone::Neutral
-    }
-}
-
-fn diagnostics_badge(
-    tone: SignalTone,
-    status: ChannelStatus,
-    has_completed_run: bool,
-) -> &'static str {
-    match tone {
-        SignalTone::Fault => "ISSUE",
-        SignalTone::Warning => "ATTENTION",
-        SignalTone::Neutral | SignalTone::Healthy
-            if matches!(status, ChannelStatus::Running | ChannelStatus::Reconnecting) =>
-        {
-            "MONITORING"
-        }
-        SignalTone::Neutral | SignalTone::Healthy if has_completed_run => "LAST RUN",
-        SignalTone::Neutral | SignalTone::Healthy => "AWAITING DATA",
-    }
-}
-
 pub(super) fn show_receive_diagnostics_card(
     ui: &mut egui::Ui,
     id: ChannelId,
@@ -552,47 +570,32 @@ pub(super) fn show_receive_diagnostics_card(
     let transport = transport_signal(view.transport_health);
     let pressure = pressure_signal(view.ingest_queue, view.raw_recording_queue, view.recording);
     let pipeline = pipeline_signal(view, status);
-    let tone = card_tone(transport.tone, pressure.tone);
-    let has_completed_run = view
-        .snapshot
-        .as_ref()
-        .is_some_and(|snapshot| snapshot.last_run_summary.is_some());
-    let badge = diagnostics_badge(tone, status, has_completed_run);
 
-    decision_card(ui, "Receive diagnostics", badge, tone, |ui| {
+    // No header row (ADR-057): the badge rose only from Transport and
+    // Pressure, which mark themselves with ⚠ and have their own callouts. Its
+    // calm words are said elsewhere: running or stopped by the status at the
+    // top of the pane, last-run figures by Pipeline's "~final 10 s", and no
+    // data yet by the rows' own "awaiting".
+    diagnostic_card(ui, |ui| {
         signal_grid(ui, ("listener_receive_signals", id), |ui| {
-            signal_row(
-                ui,
-                "Transport",
-                transport.value,
-                transport.tone,
-                TRANSPORT_TOOLTIP,
-            );
-            signal_row(
-                ui,
-                "Pressure",
-                pressure.value,
-                pressure.tone,
-                PRESSURE_TOOLTIP,
-            );
-            signal_row(
-                ui,
-                "Pipeline",
-                pipeline.value,
-                pipeline.tone,
-                PIPELINE_TOOLTIP,
-            );
+            let help = TRANSPORT_TOOLTIP.layout(ui.style());
+            signal_row(ui, "Transport", transport.value, transport.tone, help);
+            let help = PRESSURE_TOOLTIP.layout(ui.style());
+            signal_row(ui, "Pressure", pressure.value, pressure.tone, help);
+            let help = PIPELINE_TOOLTIP.layout(ui.style());
+            signal_row(ui, "Pipeline", pipeline.value, pipeline.tone, help);
         });
 
         if let CounterAvailability::Available(dropped) = view.transport_health.udp_kernel_drops {
             if dropped > 0 {
                 ui.add_space(6.0);
+                let help = UDP_DROP_CALLOUT_TOOLTIP.layout(ui.style());
                 let _ = attention_callout(
                     ui,
                     ("listener_udp_kernel_drops", id),
                     format!("Kernel receive queue reported at least {dropped} dropped datagrams."),
                     SignalTone::Fault,
-                    UDP_DROP_CALLOUT_TOOLTIP,
+                    help,
                 );
             }
         }
@@ -603,6 +606,7 @@ pub(super) fn show_receive_diagnostics_card(
                     .active_for
                     .map(|elapsed| format!(", active for {}", compact_duration(elapsed)))
                     .unwrap_or_default();
+                let help = SERIAL_BACKPRESSURE_TOOLTIP.layout(ui.style());
                 let _ = attention_callout(
                     ui,
                     ("listener_serial_stalls", id),
@@ -613,7 +617,7 @@ pub(super) fn show_receive_diagnostics_card(
                         compact_duration(stalls.max),
                     ),
                     SignalTone::Warning,
-                    SERIAL_BACKPRESSURE_TOOLTIP,
+                    help,
                 );
             }
         }
@@ -623,9 +627,7 @@ pub(super) fn show_receive_diagnostics_card(
             .id_salt(("listener_receive_transport_details", id))
             .default_open(false)
             .show(ui, |ui| show_receive_transport_details(ui, status, view));
-        details
-            .header_response
-            .on_hover_text(RECEIVE_DETAILS_TOOLTIP);
+        details.header_response.on_hover(&RECEIVE_DETAILS_TOOLTIP);
     });
 }
 
@@ -639,7 +641,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
         window,
     );
     ui.label(egui::RichText::new(timing_text).weak())
-        .on_hover_text(HANDOFF_TOOLTIP);
+        .on_hover(&HANDOFF_TOOLTIP);
 
     let processing_text = detail_timing(
         "Processing timing",
@@ -649,7 +651,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
         window,
     );
     ui.label(egui::RichText::new(processing_text).weak())
-        .on_hover_text(PROCESSING_TOOLTIP);
+        .on_hover(&PROCESSING_TOOLTIP);
 
     let chunks = view.chunk_shape;
     let chunk_count = chunks.chunk_count();
@@ -669,7 +671,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
         )
     };
     ui.label(egui::RichText::new(chunk_text).weak())
-        .on_hover_text(CHUNK_SHAPE_TOOLTIP);
+        .on_hover(&CHUNK_SHAPE_TOOLTIP);
 
     if let Some(stalls) = view.transport_health.serial_stalls {
         let active = stalls
@@ -685,7 +687,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
             ))
             .weak(),
         )
-        .on_hover_text(SERIAL_BACKPRESSURE_TOOLTIP);
+        .on_hover(&SERIAL_BACKPRESSURE_TOOLTIP);
     }
 
     let arrival = view.transport_health.arrival_timestamps;
@@ -709,7 +711,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
         ),
     };
     ui.label(egui::RichText::new(arrival_text).weak())
-        .on_hover_text(ARRIVAL_TIMESTAMP_TOOLTIP);
+        .on_hover(&ARRIVAL_TIMESTAMP_TOOLTIP);
 
     let shared_port = view.transport_health.udp_shared_port;
     if let Some(words) = shared_port_words(shared_port) {
@@ -719,7 +721,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
         } else {
             text.weak()
         })
-        .on_hover_text(SHARED_PORT_TOOLTIP);
+        .on_hover(&SHARED_PORT_TOOLTIP);
     }
 
     if let Some(buffer) = view.transport_health.udp_receive_buffer {
@@ -729,17 +731,17 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
         } else {
             text.weak()
         })
-        .on_hover_text(RECEIVE_BUFFER_TOOLTIP);
+        .on_hover(&RECEIVE_BUFFER_TOOLTIP);
     }
 
     match view.transport_health.udp_kernel_drops {
         CounterAvailability::NotApplicable => {
             ui.label(egui::RichText::new("UDP kernel drops: not applicable").weak())
-                .on_hover_text(UDP_NOT_APPLICABLE_TOOLTIP);
+                .on_hover(&UDP_NOT_APPLICABLE_TOOLTIP);
         }
         CounterAvailability::Unsupported => {
             ui.label(egui::RichText::new("UDP kernel drops: counter unavailable").weak())
-                .on_hover_text(UDP_UNAVAILABLE_TOOLTIP);
+                .on_hover(&UDP_UNAVAILABLE_TOOLTIP);
         }
         CounterAvailability::Available(dropped) => {
             let reported = reported_udp_drops(dropped);
@@ -749,7 +751,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
             } else {
                 text.weak()
             })
-            .on_hover_text(UDP_AVAILABLE_TOOLTIP);
+            .on_hover(&UDP_AVAILABLE_TOOLTIP);
         }
     }
 
@@ -767,7 +769,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
             window,
         );
         ui.label(egui::RichText::new(text).weak())
-            .on_hover_text(IDLE_RULE_TIMING_TOOLTIP);
+            .on_hover(&IDLE_RULE_TIMING_TOOLTIP);
         let timer = view.idle_deadline_timer;
         let timer_text = if cfg!(windows) {
             format!(
@@ -785,7 +787,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
             )
         };
         ui.label(egui::RichText::new(timer_text).weak())
-            .on_hover_text(IDLE_TIMER_TOOLTIP);
+            .on_hover(&IDLE_TIMER_TOOLTIP);
     }
 
     let ingest = view.ingest_queue;
@@ -793,12 +795,12 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
         "Ingest pressure: awaiting first block".to_owned()
     } else {
         format!(
-            "Ingest pressure (run): peak {}/{} · last sample {}",
+            "Ingest pressure (run): peak {} of {} · last sample {}",
             ingest.peak, ingest.capacity, ingest.current
         )
     };
     ui.label(egui::RichText::new(ingest_text).weak())
-        .on_hover_text(INGEST_QUEUE_TOOLTIP);
+        .on_hover(&INGEST_QUEUE_TOOLTIP);
 
     let bytes = |n: usize| human_bytes(n as u64);
     match view.raw_recording_queue {
@@ -815,7 +817,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
                 ))
                 .color(palette(ui).fault),
             )
-            .on_hover_text(RAW_QUEUE_GAP_TOOLTIP);
+            .on_hover(&RAW_QUEUE_GAP_TOOLTIP);
         }
         Some(queue) if view.recording == Some(RecordingState::Faulted) => {
             ui.label(
@@ -826,7 +828,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
                 ))
                 .color(palette(ui).fault),
             )
-            .on_hover_text(RAW_QUEUE_FAULTED_TOOLTIP);
+            .on_hover(&RAW_QUEUE_FAULTED_TOOLTIP);
         }
         Some(queue) if view.recording == Some(RecordingState::Enabled) => {
             // The half-capacity judgement is named, not just coloured. The
@@ -846,7 +848,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
             } else {
                 text
             })
-            .on_hover_text(RAW_QUEUE_ACTIVE_TOOLTIP);
+            .on_hover(&RAW_QUEUE_ACTIVE_TOOLTIP);
         }
         Some(queue) => {
             ui.label(
@@ -857,7 +859,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
                 ))
                 .weak(),
             )
-            .on_hover_text(RAW_QUEUE_RETAINED_TOOLTIP);
+            .on_hover(&RAW_QUEUE_RETAINED_TOOLTIP);
         }
         None => {
             ui.label(egui::RichText::new("Raw record queue: (not recording)").weak())
@@ -871,14 +873,16 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        card_tone, compact_timing, counted, detail_timing, diagnostics_badge, pressure_signal,
-        queue_level_reaches_half, receive_buffer_words, shared_port_words, size_figures,
-        timing_figures, timing_window, transport_signal, ChannelStatus, ReceiveBuffer,
-        SharedPortStatus, ARRIVAL_TIMESTAMP_TOOLTIP, CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP,
-        IDLE_RULE_TIMING_TOOLTIP, IDLE_TIMER_TOOLTIP, PIPELINE_TOOLTIP, PRESSURE_TOOLTIP,
+        compact_timing, counted, detail_timing, pressure_signal, queue_level_reaches_half,
+        receive_buffer_words, shared_port_words, size_figures, timing_figures, timing_window,
+        transport_signal, ChannelStatus, ReceiveBuffer, SharedPortStatus,
+        ARRIVAL_TIMESTAMP_TOOLTIP, CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP, IDLE_RULE_TIMING_TOOLTIP,
+        IDLE_TIMER_TOOLTIP, INGEST_QUEUE_TOOLTIP, PIPELINE_TOOLTIP, PRESSURE_TOOLTIP,
         PROCESSING_TOOLTIP, RAW_QUEUE_ACTIVE_TOOLTIP, RAW_QUEUE_FAULTED_TOOLTIP,
-        RAW_QUEUE_GAP_TOOLTIP, RECEIVE_DETAILS_TOOLTIP, SERIAL_BACKPRESSURE_TOOLTIP,
-        SHARED_PORT_TOOLTIP, TRANSPORT_TOOLTIP, UDP_AVAILABLE_TOOLTIP, UDP_UNAVAILABLE_TOOLTIP,
+        RAW_QUEUE_GAP_TOOLTIP, RAW_QUEUE_RETAINED_TOOLTIP, RECEIVE_BUFFER_TOOLTIP,
+        RECEIVE_DETAILS_TOOLTIP, SERIAL_BACKPRESSURE_TOOLTIP, SHARED_PORT_TOOLTIP,
+        TRANSPORT_TOOLTIP, UDP_AVAILABLE_TOOLTIP, UDP_DROP_CALLOUT_TOOLTIP,
+        UDP_NOT_APPLICABLE_TOOLTIP, UDP_UNAVAILABLE_TOOLTIP,
     };
     use crate::core::RecordingState;
     use crate::runtime::{
@@ -976,7 +980,7 @@ mod tests {
         assert_eq!(quiet.tone, SignalTone::Neutral);
         assert_eq!(
             quiet.value,
-            "Ingest highest sampled 9/10 · Raw latest sample 2 B · highest observed 7 B of 8 B"
+            "Ingest highest sampled 9 of 10 · Raw latest sample 2 B · highest observed 7 B of 8 B"
         );
 
         let pressured = pressure_signal(
@@ -990,7 +994,7 @@ mod tests {
         assert_eq!(retained.tone, SignalTone::Neutral);
         assert_eq!(
             retained.value,
-            "Ingest highest sampled 9/10 · Raw retained highest observed 7 B of 8 B"
+            "Ingest highest sampled 9 of 10 · Raw retained highest observed 7 B of 8 B"
         );
 
         let faulted = pressure_signal(ingest, Some(raw), Some(RecordingState::Faulted));
@@ -1017,84 +1021,121 @@ mod tests {
 
     #[test]
     fn pressure_help_locates_both_queues_inside_listener() {
-        assert!(PRESSURE_TOOLTIP.contains("Listener's in-memory processing queue"));
-        assert!(PRESSURE_TOOLTIP.contains("recorder's in-memory queue"));
-        assert!(PRESSURE_TOOLTIP.contains("not device or driver buffers"));
-        assert!(PRESSURE_TOOLTIP.contains("not a live current depth"));
-        assert!(PRESSURE_TOOLTIP.contains("does not escalate the card by itself"));
-        assert!(PRESSURE_TOOLTIP.contains("not proof of data loss"));
+        let hover = PRESSURE_TOOLTIP;
+        let text = hover.text();
+        assert!(text.contains("queue that holds received data on its way to being processed"));
+        assert!(text.contains("queue that holds data for the background recorder"));
+        assert!(text.contains("queues inside Listener, not device or driver buffers"));
+        assert!(text.contains("It is not a live reading of the queue now"));
+        assert!(text.contains("does not raise Attention by itself"));
+        assert!(text.contains("not proof of data loss"));
     }
 
     #[test]
     fn technician_help_preserves_measurement_boundaries() {
-        assert!(TRANSPORT_TOOLTIP.contains("reader's authoritative state"));
-        assert!(TRANSPORT_TOOLTIP.contains("current unfinished stall"));
-        assert!(UDP_UNAVAILABLE_TOOLTIP.contains("unknown, not zero"));
-        assert!(UDP_AVAILABLE_TOOLTIP.contains("actual run total may be higher"));
-        assert!(UDP_AVAILABLE_TOOLTIP.contains("not that no packets were lost"));
-        assert!(PIPELINE_TOOLTIP.contains("approximate"));
-        assert!(PIPELINE_TOOLTIP.contains("background recorder I/O may run concurrently"));
-        assert!(PIPELINE_TOOLTIP.contains("no universal good/bad latency limit"));
+        assert!(TRANSPORT_TOOLTIP
+            .text()
+            .contains("so the Serial figures are exact, not estimated"));
+        assert!(TRANSPORT_TOOLTIP
+            .text()
+            .contains("how long the stall now in progress has lasted so far"));
+        assert!(UDP_UNAVAILABLE_TOOLTIP
+            .text()
+            .contains("unknown, not as zero"));
+        assert!(UDP_AVAILABLE_TOOLTIP
+            .text()
+            .contains("actual total for the run may be higher"));
+        assert!(UDP_AVAILABLE_TOOLTIP
+            .text()
+            .contains("It does not mean that no packets were lost here or elsewhere"));
+        assert!(PIPELINE_TOOLTIP
+            .text()
+            .contains("The window is approximate"));
+        assert!(PIPELINE_TOOLTIP
+            .text()
+            .contains("background recorder's disk work may run at the same time"));
+        assert!(PIPELINE_TOOLTIP
+            .text()
+            .contains("no universal good or bad limit"));
     }
 
     #[test]
     fn technician_help_states_timing_timestamp_and_retention_limits() {
-        assert!(SERIAL_BACKPRESSURE_TOOLTIP.contains("authoritative"));
-        assert!(SERIAL_BACKPRESSURE_TOOLTIP.contains("completed stalls only"));
-        assert!(SERIAL_BACKPRESSURE_TOOLTIP.contains("warnings may be dropped"));
-        assert!(IDLE_RULE_TIMING_TOOLTIP.contains("processor contention"));
-        assert!(IDLE_RULE_TIMING_TOOLTIP.contains("handling recording before evaluation"));
-        assert!(IDLE_TIMER_TOOLTIP.contains("completed Idle-deadline wakes"));
-        assert!(IDLE_TIMER_TOOLTIP.contains("One completed wake can fire several rules"));
-        assert!(CHUNK_SHAPE_TOOLTIP.contains("full channel run"));
-        assert!(CHUNK_SHAPE_TOOLTIP.contains("not the recent ten-second window"));
-        assert!(ARRIVAL_TIMESTAMP_TOOLTIP.contains("does not imply nanosecond accuracy"));
-        assert!(ARRIVAL_TIMESTAMP_TOOLTIP.contains("Handoff and Read gap always use post-read"));
-        assert!(RAW_QUEUE_ACTIVE_TOOLTIP.contains("most recent status snapshot"));
-        assert!(RAW_QUEUE_ACTIVE_TOOLTIP.contains("reception continues"));
-        assert!(RAW_QUEUE_FAULTED_TOOLTIP.contains("could not begin"));
-        assert!(RAW_QUEUE_GAP_TOOLTIP.contains("not being recorded"));
-        assert!(RAW_QUEUE_GAP_TOOLTIP.contains("Reception continues"));
+        assert!(SERIAL_BACKPRESSURE_TOOLTIP
+            .text()
+            .contains("not included in the completed figures"));
+        assert!(SERIAL_BACKPRESSURE_TOOLTIP
+            .text()
+            .contains("advisory and can be lost"));
+        assert!(IDLE_RULE_TIMING_TOOLTIP
+            .text()
+            .contains("competition for the processor"));
+        assert!(IDLE_RULE_TIMING_TOOLTIP
+            .text()
+            .contains("or on recording before it checked the rule"));
+        assert!(IDLE_TIMER_TOOLTIP
+            .text()
+            .contains("Only completed wakes are counted"));
+        assert!(IDLE_TIMER_TOOLTIP
+            .text()
+            .contains("One completed wake can fire several rules"));
+        assert!(CHUNK_SHAPE_TOOLTIP.text().contains("full channel run"));
+        assert!(CHUNK_SHAPE_TOOLTIP
+            .text()
+            .contains("not the recent ten-second window"));
+        assert!(ARRIVAL_TIMESTAMP_TOOLTIP
+            .text()
+            .contains("does not mean it is accurate to a nanosecond"));
+        assert!(ARRIVAL_TIMESTAMP_TOOLTIP
+            .text()
+            .contains("Handoff and Read gap always use the post-read clock"));
+        assert!(RAW_QUEUE_ACTIVE_TOOLTIP
+            .text()
+            .contains("most recent status update"));
+        assert!(RAW_QUEUE_ACTIVE_TOOLTIP
+            .text()
+            .contains("Reception continues throughout"));
+        assert!(RAW_QUEUE_FAULTED_TOOLTIP
+            .heading()
+            .contains("could not begin"));
+        assert!(RAW_QUEUE_GAP_TOOLTIP
+            .heading()
+            .contains("received bytes are not being recorded"));
+        assert!(RAW_QUEUE_GAP_TOOLTIP.text().contains("Reception continues"));
     }
 
+    /// Every explanatory hover opens with a one-sentence heading, and no
+    /// paragraph break falls inside the heading.
     #[test]
-    fn card_badge_escalates_only_from_actionable_transport_or_pressure_evidence() {
-        assert_eq!(
-            card_tone(SignalTone::Fault, SignalTone::Neutral),
-            SignalTone::Fault
-        );
-        assert_eq!(
-            card_tone(SignalTone::Neutral, SignalTone::Warning),
-            SignalTone::Warning
-        );
-        assert_eq!(
-            card_tone(SignalTone::Neutral, SignalTone::Neutral),
-            SignalTone::Neutral
-        );
-    }
-
-    #[test]
-    fn neutral_badge_distinguishes_live_completed_and_empty_states() {
-        assert_eq!(
-            diagnostics_badge(SignalTone::Neutral, ChannelStatus::Running, false),
-            "MONITORING"
-        );
-        assert_eq!(
-            diagnostics_badge(SignalTone::Neutral, ChannelStatus::Reconnecting, true),
-            "MONITORING"
-        );
-        assert_eq!(
-            diagnostics_badge(SignalTone::Neutral, ChannelStatus::Stopped, true),
-            "LAST RUN"
-        );
-        assert_eq!(
-            diagnostics_badge(SignalTone::Neutral, ChannelStatus::Stopped, false),
-            "AWAITING DATA"
-        );
-        assert_eq!(
-            diagnostics_badge(SignalTone::Warning, ChannelStatus::Stopped, true),
-            "ATTENTION"
-        );
+    fn every_explanatory_hover_opens_with_a_single_sentence_heading() {
+        for hover in [
+            &TRANSPORT_TOOLTIP,
+            &PRESSURE_TOOLTIP,
+            &PIPELINE_TOOLTIP,
+            &UDP_DROP_CALLOUT_TOOLTIP,
+            &SERIAL_BACKPRESSURE_TOOLTIP,
+            &RECEIVE_DETAILS_TOOLTIP,
+            &HANDOFF_TOOLTIP,
+            &PROCESSING_TOOLTIP,
+            &CHUNK_SHAPE_TOOLTIP,
+            &ARRIVAL_TIMESTAMP_TOOLTIP,
+            &UDP_NOT_APPLICABLE_TOOLTIP,
+            &UDP_UNAVAILABLE_TOOLTIP,
+            &UDP_AVAILABLE_TOOLTIP,
+            &IDLE_RULE_TIMING_TOOLTIP,
+            &IDLE_TIMER_TOOLTIP,
+            &INGEST_QUEUE_TOOLTIP,
+            &RAW_QUEUE_ACTIVE_TOOLTIP,
+            &RAW_QUEUE_GAP_TOOLTIP,
+            &RAW_QUEUE_RETAINED_TOOLTIP,
+            &RAW_QUEUE_FAULTED_TOOLTIP,
+            &SHARED_PORT_TOOLTIP,
+            &RECEIVE_BUFFER_TOOLTIP,
+        ] {
+            let heading = hover.heading();
+            assert!(heading.ends_with('.'), "{heading}");
+            assert!(hover.text().len() > heading.len(), "{heading}");
+        }
     }
 
     /// One sample recorded `count` times, for exercising the state ladder.
@@ -1262,13 +1303,15 @@ mod tests {
             Some("Shared port: requested · the OS did not apply it · not shared")
         );
         // It reports the option, not whether anyone else is bound.
-        assert!(SHARED_PORT_TOOLTIP.contains("cannot say whether another program is bound"));
+        assert!(SHARED_PORT_TOOLTIP
+            .text()
+            .contains("cannot say whether another program is actually bound"));
     }
 
     /// Nothing in the panel may teach the state Listener no longer has.
     #[test]
     fn no_readout_teaches_the_retired_warm_up_state() {
-        for tooltip in [
+        for hover in [
             PIPELINE_TOOLTIP,
             RECEIVE_DETAILS_TOOLTIP,
             IDLE_RULE_TIMING_TOOLTIP,
@@ -1276,6 +1319,7 @@ mod tests {
             HANDOFF_TOOLTIP,
             PROCESSING_TOOLTIP,
         ] {
+            let tooltip = hover.text();
             assert!(
                 !tooltip.to_ascii_lowercase().contains("warm"),
                 "tooltip still teaches a warm-up: {tooltip}"

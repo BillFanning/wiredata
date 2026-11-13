@@ -1,16 +1,18 @@
-# Listener Specification v2.4.4
+# Listener Specification v2.4.5
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-12) — console output never holds up reception:
+Revision note (2026-11-13) — hover text and the diagnostics card:
 
-- **§3.1 (ADR-055).** Every line printed while Channels run goes through a
-  bounded queue, and a line the console does not take is dropped and counted.
-  A Channel used to wait for the console: a text selection that paused a
-  console window paused reception with it.
+- **§3.2 Hover text (ADR-056).** Every hover that explains something opens
+  with a bold sentence, then short paragraphs in plain, complete sentences. A
+  hover used to be one dense paragraph, and several stated things the code
+  does not do.
+- **§3.2 Receive diagnostics card (ADR-057).** The card has no title and no
+  status badge; its rows and callouts carry its warnings.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -111,6 +113,19 @@ ADR-046:
 
 The CLI does not install itself as a service. `deploy/` at the workspace root
 holds example systemd and Task Scheduler definitions.
+
+### 3.2 GUI Presentation
+
+- **Hover text** (ADR-056) — a hover that explains something opens with one
+  sentence in bold that states the point, followed by short paragraphs set
+  apart by blank lines. It is written in plain, complete sentences, using the
+  names on screen, and explains only what the element it belongs to shows. A
+  short hint (a button's action, a keyboard shortcut, a path) stays one plain
+  line. A separator never reuses `/`, which on these screens means "per".
+- **The Receive diagnostics card has no header row** (ADR-057): no title and
+  no status badge. Each of its Transport, Pressure and Pipeline rows marks
+  itself with ⚠ when it wants attention, and drops and Serial stalls have
+  their own callouts.
 
 ---
 

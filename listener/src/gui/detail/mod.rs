@@ -21,25 +21,36 @@ use super::widgets::{
 use super::ListenerApp;
 use wiredata_ui::fonts::bold;
 use wiredata_ui::format::{compact_duration, human_byte_rate};
+use wiredata_ui::hover::{Hover, ShowHover};
 use wiredata_ui::palette::active as palette;
 
 /// Uniform size for the lifecycle / recording control buttons. Text wider than the
 /// min grows the button (so "Apply & Restart" doesn't clip).
 const CONTROL_BUTTON_SIZE: egui::Vec2 = egui::vec2(96.0, 32.0);
 
-const THROUGHPUT_TOOLTIP: &str = concat!(
-    "Received is the cumulative byte count processed by Listener since Start and is ",
-    "retained after Stop. Throughput uses bytes whose post-read arrival times fall in ",
-    "the current and previous four one-second buckets, divided by five seconds and ",
-    "scaled by SI unit. It is an approximate five-second application receive rate ",
-    "from the latest status snapshot, not instantaneous line rate, link utilization, ",
-    "or device-buffer occupancy. During the first five seconds it still uses the full ",
-    "five-second denominator; after Stop the rate is zero while Received remains."
+const THROUGHPUT_TOOLTIP: Hover = Hover::new(
+    "How many bytes this channel has received since it started, and how fast they \
+     are arriving now.\n\n\
+     Received counts every byte Listener took from the input since Start. It stays \
+     on screen after Stop and goes back to zero when the channel starts again.\n\n\
+     Throughput is an average over the last five seconds: the bytes that arrived \
+     in the current second and the four seconds before it, divided by five. The \
+     current second is not finished yet, so a steady stream can read a little low. \
+     During the first five seconds after Start the total is still divided by five, \
+     so the figure reads low until those seconds have passed. After Stop it \
+     is zero, while Received stays.\n\n\
+     Throughput is the rate at which Listener received bytes. It is not the speed \
+     of the line, how busy the link is, or how full the device's own buffer is.",
 );
-const FINAL_SNAPSHOT_TOOLTIP: &str = concat!(
-    "When complete, completed-run values come from the channel's final snapshot. If ",
-    "the final snapshot is incomplete, timing, queue, and transport values may be ",
-    "missing or defaulted and must not be read as measured zero."
+const FINAL_SNAPSHOT_TOOLTIP: Hover = Hover::new(
+    "The figures from this channel's last run, from Start until it stopped or \
+     failed.\n\n\
+     Normally these are the channel's final figures, taken as the run ended.\n\n\
+     If the line inside says \u{201C}final snapshot incomplete\u{201D}, the final \
+     figures could not all be collected, because part of the channel stopped \
+     unexpectedly or did not finish shutting down in time. The byte count, the \
+     chunk count, and the timing, queue and transport figures may then be missing \
+     or shown as zero. A zero there does not mean that zero was measured.",
 );
 
 /// Which recording tap a shared control targets (ADR-013): the byte-exact Raw
@@ -67,7 +78,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &ListenerRunSummary) {
                     ui.ctx().copy_text(summary.to_report_text());
                 }
                 ui.weak(format!(
-                    "Listener {} · {} · {}/{}",
+                    "Listener {} · {} · {}, {}",
                     env!("CARGO_PKG_VERSION"),
                     if cfg!(debug_assertions) {
                         "debug"
@@ -84,7 +95,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &ListenerRunSummary) {
                 summary.finished_utc()
             ));
             ui.weak(format!(
-                "Ingest queue peak {}/{} · {} warnings · {} errors{}",
+                "Ingest queue peak {} of {} · {} warnings · {} errors{}",
                 summary.ingest_queue.peak,
                 summary.ingest_queue.capacity,
                 summary.diagnostics_warnings,
@@ -98,7 +109,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &ListenerRunSummary) {
         });
     summary_view
         .header_response
-        .on_hover_text(FINAL_SNAPSHOT_TOOLTIP);
+        .on_hover(&FINAL_SNAPSHOT_TOOLTIP);
 }
 
 impl ListenerApp {
@@ -447,16 +458,23 @@ impl ListenerApp {
             // Painted into a fixed cell so the glyph never drives the row height.
             let (glyph, scale) = status_glyph(status);
             paint_glyph(ui, glyph, scale, status_color(status, palette(ui)));
-            const NAME_HINT: &str = "This channel's display name. When file rotation is \
-                on, it's also the base name of the rotated files (<channel>_<time \
-                period>), so keep it filesystem-safe.";
-            ui.label(bold("Name")).on_hover_text(NAME_HINT);
+            const NAME_HINT: Hover = Hover::new(
+                "The name this channel is listed under.\n\n\
+                 It must differ from every other channel's name; capital and small \
+                 letters count as the same.\n\n\
+                 When file rotation is on, the name is also the start of each \
+                 recording file's name (<channel>_<time period>). It must then be \
+                 safe to use in a file name: at most 64 characters, none of the \
+                 characters named in the warning that appears, no space or dot at \
+                 the end, and not a device name such as CON.",
+            );
+            ui.label(bold("Name")).on_hover(&NAME_HINT);
             let mut renamed = None;
             if let Some((_, config)) = &mut self.edit_draft {
                 let mut name = config.name.as_str().to_string();
                 if ui
                     .add(egui::TextEdit::singleline(&mut name).desired_width(180.0))
-                    .on_hover_text(NAME_HINT)
+                    .on_hover(&NAME_HINT)
                     .changed()
                 {
                     config.name = crate::core::ChannelName::new(name.clone());
@@ -514,7 +532,7 @@ impl ListenerApp {
             human_bytes(bytes_total),
             human_byte_rate(bps)
         ))
-        .on_hover_text(THROUGHPUT_TOOLTIP);
+        .on_hover(&THROUGHPUT_TOOLTIP);
         ui.add_space(12.0); // a blank line between the readouts and the buttons
         let size = CONTROL_BUTTON_SIZE;
         ui.horizontal(|ui| {
@@ -702,17 +720,26 @@ impl ListenerApp {
         // "Record on start" — the auto-start flag, editable whether or not the
         // channel is running (it governs the next start).
         if let Some((_, config)) = &mut self.edit_draft {
+            const RAW_ON_START: Hover = Hover::new(
+                "Start the Raw recording by itself each time this channel starts.\n\n\
+                 The Raw recording is the .raw file: exactly the bytes received, with \
+                 nothing added.\n\n\
+                 This takes effect the next time the channel starts. Recording does \
+                 not begin until a destination is set below.",
+            );
+            const DISPLAY_ON_START: Hover = Hover::new(
+                "Start the Display recording by itself each time this channel starts.\n\n\
+                 The Display recording is the .disp file: the text as the view shows it, \
+                 including any timestamp marks. It is not a copy of the received bytes; \
+                 use the Raw recording for that. It keeps recording while the view is \
+                 paused.\n\n\
+                 This takes effect the next time the channel starts.",
+            );
             let (flag, hover) = match tap {
-                RecTap::Raw => (
-                    &mut config.raw_recording.enabled,
-                    "Begin recording automatically when the channel starts (§53).",
-                ),
-                RecTap::Display => (
-                    &mut config.display_recording.enabled,
-                    "Record the rendered view output (.disp) — what the display shows,                      not the raw bytes (§54) — automatically when the channel starts.",
-                ),
+                RecTap::Raw => (&mut config.raw_recording.enabled, &RAW_ON_START),
+                RecTap::Display => (&mut config.display_recording.enabled, &DISPLAY_ON_START),
             };
-            ui.checkbox(flag, "Record on start").on_hover_text(hover);
+            ui.checkbox(flag, "Record on start").on_hover(hover);
         }
         if status != ChannelStatus::Running {
             return;
@@ -957,10 +984,23 @@ mod tests {
 
     #[test]
     fn throughput_and_final_snapshot_help_prevent_false_precision() {
-        assert!(THROUGHPUT_TOOLTIP.contains("divided by five seconds"));
-        assert!(THROUGHPUT_TOOLTIP.contains("full five-second denominator"));
-        assert!(THROUGHPUT_TOOLTIP.contains("after Stop the rate is zero"));
-        assert!(FINAL_SNAPSHOT_TOOLTIP.contains("channel's final snapshot"));
-        assert!(FINAL_SNAPSHOT_TOOLTIP.contains("must not be read as measured zero"));
+        let throughput_hover = THROUGHPUT_TOOLTIP;
+        let throughput = throughput_hover.text();
+        // The rate is an average over five seconds, divided by five even
+        // while the window is still filling, and zero once stopped.
+        assert!(throughput.contains("divided by five"));
+        assert!(throughput.contains("still divided by five"));
+        assert!(throughput.contains("After Stop it is zero, while Received stays"));
+        // It is Listener's receive rate, not the line's.
+        assert!(throughput.contains("It is not the speed of the line"));
+        assert!(THROUGHPUT_TOOLTIP.heading().contains("since it started"));
+
+        let last_run_hover = FINAL_SNAPSHOT_TOOLTIP;
+        let last_run = last_run_hover.text();
+        // The hover names the on-screen warning and says a zero there is not
+        // a measurement.
+        assert!(last_run.contains("final snapshot incomplete"));
+        assert!(last_run.contains("does not mean that zero was measured"));
+        assert!(FINAL_SNAPSHOT_TOOLTIP.heading().contains("last run"));
     }
 }

@@ -19,6 +19,41 @@ use super::super::widgets::{edit_mark_rules, human_bytes, ColorScheme, MSG_FONT_
 use super::super::ListenerApp;
 use crate::config::schema::HexGrouping;
 use wiredata_ui::fonts::MonoFont;
+use wiredata_ui::hover::{Hover, ShowHover};
+
+const PAUSE_HOVER: Hover = Hover::new(
+    "Freezes the view so you can read it or scroll back.\n\n\
+     The channel keeps receiving and any recording keeps running. Bytes that arrive \
+     while the view is paused are not added to it, so they do not appear when you \
+     press Resume. If a recording is running, they are in the recording.",
+);
+
+const GROUP_HOVER: Hover = Hover::new(
+    "How many bytes are written together before a space in the Hex view.\n\n\
+     With 1, every byte stands alone, as in a conventional hex dump (41 42 43 44). \
+     With 4, four bytes run together as one word (41424344).\n\n\
+     The grouping is part of the rendering, so a Display recording (.disp) has the \
+     same spacing as the view.",
+);
+
+const LINE_HOVER: Hover = Hover::new(
+    "How many groups fit on one line of the Hex view.\n\n\
+     The choice \u{201C}fit to width\u{201D} lets the view decide, so a wider window shows more on each line. \
+     A fixed number keeps the columns where they are while you resize the window. \
+     If the window is too narrow for that many groups, fewer are shown. A byte is \
+     never split across two lines; if not even one whole group fits, the line \
+     breaks between bytes.\n\n\
+     This changes only how the view is laid out. A Display recording (.disp) is \
+     not broken into lines of a fixed length either way.",
+);
+
+const SCROLL_BUFFER_HOVER: Hover = Hover::new(
+    "How far back you can scroll in this channel's view.\n\n\
+     A larger buffer uses more memory and can make scrolling and drawing slower, so \
+     choose the smallest size that covers what you need.\n\n\
+     The buffer limits only what the view keeps. If a Raw recording is running, it \
+     holds every byte received, whatever the buffer size.",
+);
 
 impl ListenerApp {
     /// The stream viewer (§41): the toolbar (Pause/Resume, View mode, ctrl-chars,
@@ -71,13 +106,7 @@ impl ListenerApp {
                         self.resume_scroll_bottom = Some(id);
                     }
                     ui.label("view paused — reception continues");
-                } else if ui
-                    .button("Pause")
-                    .on_hover_text(
-                        "Freeze the view — reception continues (the channel stays open).",
-                    )
-                    .clicked()
-                {
+                } else if ui.button("Pause").on_hover(&PAUSE_HOVER).clicked() {
                     self.send(UiCommand::PauseDisplay(id, view_id));
                 }
             }
@@ -314,11 +343,11 @@ impl ListenerApp {
             ui.radio_value(&mut prefs.mode, DisplayMode::Hex, "Hex")
                 .on_hover_text("Each byte as two-digit hex (e.g. 0A 0D 41).");
             ui.radio_value(&mut prefs.mode, DisplayMode::Rendered, "Rendered")
-                .on_hover_text("As text, honoring real CR/LF line breaks (§44).");
+                .on_hover_text("As text, where line break bytes (CR and LF) start a new line.");
             ui.radio_value(&mut prefs.mode, DisplayMode::Raw, "Raw")
                 .on_hover_text(
-                    "As text, but with control characters shown as pictures/markers \
-                     instead of acting on the layout (§46).",
+                    "As text, but control characters are shown as the marks chosen under \
+                     ctrl-chars instead of moving the text around.",
                 );
             ui.separator();
             // Control-character rendering (§46) — enabled only in Raw mode. The
@@ -346,12 +375,7 @@ impl ListenerApp {
         // either way, so switching modes and back does not lose it.
         ui.add_enabled_ui(prefs.mode == DisplayMode::Hex, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Group").on_hover_text(
-                    "How many bytes run together between spaces. 1 is the conventional \
-                         hexdump (41 42 43 44); 4 reads as words (41424344). Grouping is part \
-                         of the rendering, so a Display recording (.disp) gets the same \
-                         spacing the viewer shows.",
-                );
+                ui.label("Group").on_hover(&GROUP_HOVER);
                 egui::ComboBox::from_id_salt("hex_bytes_per_group")
                     .selected_text(format!(
                         "{} bytes",
@@ -366,14 +390,7 @@ impl ListenerApp {
                             );
                         }
                     });
-                ui.label("Line").on_hover_text(
-                    "How many groups fill one line. Fit to width lets the pane decide, \
-                         so a wider window shows more per line; a fixed count holds the \
-                         columns still while the window is resized, and is reduced if the \
-                         window is too narrow to show it — a row never splits a byte. \
-                         This is layout, not rendering: a Display recording (.disp) is \
-                         never hard-wrapped either way.",
-                );
+                ui.label("Line").on_hover(&LINE_HOVER);
                 egui::ComboBox::from_id_salt("hex_groups_per_line")
                     .selected_text(hex_line_label(prefs.hex_grouping))
                     .show_ui(ui, |ui| {
@@ -439,12 +456,8 @@ impl ListenerApp {
         // (2 … 256 kB) — no free text, so it's always a known value. The current fill is
         // shown alongside. Persisted via retention (the runtime adopts it next start; the
         // GUI viewer caps live).
-        const SCROLL_BUFFER_HINT: &str = "How far back you can scroll in this channel's \
-            view. A larger buffer uses more memory and can make scrolling and rendering \
-            heavier, so pick the smallest that covers what you need — the full history is \
-            kept in the .raw recording regardless.";
         ui.horizontal(|ui| {
-            ui.label("Scroll buffer").on_hover_text(SCROLL_BUFFER_HINT);
+            ui.label("Scroll buffer").on_hover(&SCROLL_BUFFER_HOVER);
             egui::ComboBox::from_id_salt("scroll_buffer")
                 .selected_text(scroll_buffer_label(prefs.scroll_buffer_bytes))
                 // Tall enough for every preset: the default popup max height sat
@@ -464,13 +477,13 @@ impl ListenerApp {
                     }
                 })
                 .response
-                .on_hover_text(SCROLL_BUFFER_HINT);
+                .on_hover(&SCROLL_BUFFER_HOVER);
             ui.separator();
             // The current fill (how much is buffered right now, ≤ the cap).
             ui.label(
                 egui::RichText::new(format!("now: {}", human_bytes(stream_len as u64))).weak(),
             )
-            .on_hover_text("Bytes currently buffered (≤ the scroll-buffer cap).");
+            .on_hover_text("The bytes in the scroll buffer right now, never more than its size.");
         });
     }
 

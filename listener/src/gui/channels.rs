@@ -2,6 +2,7 @@
 
 use crate::core::ChannelId;
 use wiredata_ui::format::human_byte_rate;
+use wiredata_ui::hover::{Hover, ShowHover};
 use wiredata_ui::selection;
 
 use super::bridge::UiCommand;
@@ -352,15 +353,23 @@ impl ListenerApp {
     /// The Profile menu's "Resume this profile on launch" choice (ADR-045), for
     /// the current profile, and which profile resumes when that is another.
     fn resume_menu_item(&mut self, ui: &mut egui::Ui) {
-        const HINT: &str = "When Listener starts, it checks this profile, waits 10 s so \
-            you can cancel, then loads it and starts every channel. Recordings set to \
-            record on start begin too.";
+        const HINT: Hover = Hover::new(
+            "Starts this profile's channels by themselves each time Listener starts.\n\n\
+             At launch Listener first checks that the profile is still where it was \
+             saved, that it loads without errors, and that every folder a channel \
+             records to has held a recording before, which guards against a recording \
+             drive that is not plugged in. If all is well, a banner counts down 10 \
+             seconds and you can press Cancel. If not, nothing starts and the banner \
+             says why.\n\n\
+             When the countdown ends, Listener checks again, loads the profile and \
+             starts every channel in it. Recordings set to Record on start begin too.",
+        );
         match self.current_profile_path.clone() {
             Some(current) => {
                 let mut on = self.resume_profile.as_ref() == Some(&current);
                 if ui
                     .checkbox(&mut on, "Resume this profile on launch")
-                    .on_hover_text(HINT)
+                    .on_hover(&HINT)
                     .changed()
                 {
                     self.resume_profile = on.then_some(current);

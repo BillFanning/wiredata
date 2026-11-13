@@ -14,6 +14,42 @@ use crate::config::{
     MatchRule,
 };
 use crate::core::{validate_zda_talker_id, TimestampConfig, MAX_ZDA_TALKER_ID_BYTES};
+use wiredata_ui::hover::{Hover, ShowHover};
+
+const MARKS_HOVER: Hover = Hover::new(
+    "Puts a timestamp next to a byte pattern each time that pattern is received.\n\n\
+     The timestamp is either the local arrival time or an NMEA ZDA sentence, placed \
+     before or after the pattern. It appears in the view and in the Display recording \
+     (.disp). It is never added to the Raw recording (.raw).\n\n\
+     The time is the arrival time of the block of data that held the pattern, so \
+     patterns in the same block get the same time.\n\n\
+     Changes take effect with Apply & Restart, which restarts the channel.",
+);
+const RULE_ENABLED_HOVER: Hover = Hover::new(
+    "Turns this timestamp mark on or off.\n\n\
+     When unchecked, the rule stays in the list but adds no timestamps. The change \
+     takes effect with Apply & Restart.",
+);
+const PATTERN_HOVER: Hover = Hover::new(
+    "The bytes to look for in the received data.\n\n\
+     Type them as text. Write a control byte as two hex digits between angle \
+     brackets: GGA<0D><0A> is GGA followed by a carriage return and a line feed. \
+     This is the same notation the view shows when View is Raw and ctrl-chars is \
+     <0A>.\n\n\
+     A rule with an empty pattern never adds a timestamp.",
+);
+const TALKER_HOVER: Hover = Hover::new(
+    "The talker ID at the start of the ZDA sentence, such as GP in $GPZDA.\n\n\
+     It is one to 32 printable ASCII characters, and letters are changed to capitals as \
+     you type. Two characters make a standard NMEA talker ID; a longer value is a \
+     custom ID. A space, tab, $, !, comma or * is not allowed.",
+);
+const SEPARATOR_HOVER: Hover = Hover::new(
+    "Text added immediately after the timestamp, to set it apart from the data.\n\n\
+     It can be a space, a comma and a space, or a control byte written as two hex \
+     digits between angle brackets, such as <0A> for a new line. Leave it empty to add \
+     nothing.",
+);
 
 /// Is this rule one the Mark editor owns — a single `BytePattern` condition whose only
 /// action is a timestamped `Mark`? Other rules (Idle, Record, bare Mark, multi-action)
@@ -31,10 +67,7 @@ fn is_mark_timestamp_rule(rule: &MatchRule) -> bool {
 /// add-row. Returns nothing — edits land in `config.match_rules`; the caller's
 /// Apply & Restart path picks them up.
 pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
-    ui.label("Timestamp marks").on_hover_text(
-        "Insert local arrival time or an NMEA ZDA sentence before/after a byte pattern, \
-             inline in the view and .disp recording (never .raw). Applying restarts the channel.",
-    );
+    ui.label("Timestamp marks").on_hover(&MARKS_HOVER);
 
     // Edit existing editor-owned rules in place; collect indices to delete afterwards
     // so we don't mutate the vec while iterating it.
@@ -58,10 +91,8 @@ pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
             // checkbox edits it like any other rule field — committed via
             // Apply & Restart. (A *live* toggle without a restart is the
             // deferred ADR-012 seam; this is not that.)
-            ui.checkbox(&mut rule.enabled, "").on_hover_text(
-                "Evaluate this rule. Uncheck to keep it configured but inactive. \
-                 Applying restarts the channel.",
-            );
+            ui.checkbox(&mut rule.enabled, "")
+                .on_hover(&RULE_ENABLED_HOVER);
             mark_pattern_field(ui, pattern);
             mark_position_selector(ui, &mut ts.position);
             mark_style_selector(ui, &mut ts.style);
@@ -80,7 +111,9 @@ pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
                     MarkTimestampStyle::NmeaZda { talker } => {
                         mark_zda_talker_field(ui, talker);
                         ui.checkbox(&mut ts.format.include_millis, "ms")
-                            .on_hover_text("Include milliseconds in the ZDA UTC time field.");
+                            .on_hover_text(
+                                "Adds milliseconds to the UTC time field of the ZDA sentence.",
+                            );
                     }
                 }
                 mark_separator_field(ui, &mut ts.separator);
@@ -96,7 +129,7 @@ pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
     // it can't fire; the user fills it in on the row above after adding.
     if ui
         .button("+ Add timestamp mark")
-        .on_hover_text("Add a new byte-pattern → timestamp rule")
+        .on_hover_text("Adds a new rule that puts a timestamp next to a byte pattern.")
         .clicked()
     {
         let n = config
@@ -197,10 +230,7 @@ fn mark_pattern_field(ui: &mut egui::Ui, pattern: &mut Vec<u8>) {
                 .desired_width(120.0)
                 .hint_text("pattern e.g. $GPGGA"),
         )
-        .on_hover_text(
-            "Byte pattern to match. Control bytes as <XX> hex escapes, e.g. \
-             $GPGGA or GGA<0D><0A> — the same notation the Hex-escape view shows.",
-        );
+        .on_hover(&PATTERN_HOVER);
     if resp.changed() {
         *pattern = parse_escaped_bytes(&text);
     }
@@ -252,10 +282,7 @@ fn mark_zda_talker_field(ui: &mut egui::Ui, talker: &mut String) {
     if response.changed() {
         *talker = talker.to_ascii_uppercase();
     }
-    response.on_hover_text(
-        "One to 32 printable ASCII characters. Two characters form a standard NMEA talker ID; \
-         longer values are custom IDs. Whitespace and $ ! , * are not allowed.",
-    );
+    response.on_hover(&TALKER_HOVER);
     if let Err(error) = validate_zda_talker_id(talker) {
         ui.colored_label(ui.visuals().error_fg_color, "invalid talker")
             .on_hover_text(error.to_string());
@@ -274,11 +301,7 @@ fn mark_separator_field(ui: &mut egui::Ui, separator: &mut String) {
                 .desired_width(100.0)
                 .hint_text("␣ ,"),
         )
-        .on_hover_text(
-            "Text added immediately after the timestamp to separate it from the \
-             data — e.g. a space, \", \", or a control byte as a <XX> hex escape \
-             (<0A> = newline). Empty = nothing added.",
-        );
+        .on_hover(&SEPARATOR_HOVER);
     if resp.changed() {
         // The separator is spliced into rendered text, so it stays a String;
         // escapes that don't decode to valid UTF-8 become U+FFFD.
@@ -290,11 +313,11 @@ fn mark_separator_field(ui: &mut egui::Ui, separator: &mut String) {
 /// always present, so there's no toggle for it — matches talker's `TimestampConfig`.
 fn mark_format_toggles(ui: &mut egui::Ui, format: &mut TimestampConfig) {
     ui.checkbox(&mut format.include_date, "date")
-        .on_hover_text("Prefix the calendar date (YYYY-MM-DD).");
+        .on_hover_text("Starts the timestamp with the date and a T, as in 2026-06-03T14:05:09.");
     ui.checkbox(&mut format.include_millis, "ms")
-        .on_hover_text("Include milliseconds (.123).");
+        .on_hover_text("Adds milliseconds, as in 14:05:09.123.");
     ui.checkbox(&mut format.include_timezone, "tz")
-        .on_hover_text("Append the local UTC offset (e.g. -07:00).");
+        .on_hover_text("Ends the timestamp with the local offset from UTC, such as -07:00.");
 }
 
 #[cfg(test)]
