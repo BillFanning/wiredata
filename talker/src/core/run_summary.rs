@@ -9,7 +9,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use super::{
     channel::ChannelId,
     telemetry::{DurationHistogram, MessageTiming, SendTimingReport},
-    timing::{CadenceAlignment, TimerMode, TimerReason, TimerStatus},
+    timing::{CadenceAlignment, TimerIntent, TimerMode, TimerStatus},
 };
 
 /// Process-unique run identity. A channel can restart before its predecessor's
@@ -209,7 +209,7 @@ impl RunSummary {
         });
         let _ = writeln!(out, "observer_updates_dropped={}", self.dropped_statuses);
         let _ = writeln!(out, "timer_policy={}", timer_mode_name(self.timer.mode));
-        let _ = writeln!(out, "timer_reason={}", timer_reason_name(self.timer.reason));
+        let _ = writeln!(out, "timer_reason={}", timer_intent_name(self.timer.intent));
         let shortest_us = self
             .timer
             .shortest_active_interval()
@@ -306,18 +306,18 @@ const fn end_reason_name(reason: RunEndReason) -> &'static str {
 
 const fn timer_mode_name(mode: TimerMode) -> &'static str {
     match mode {
-        TimerMode::Standard => "standard",
+        TimerMode::NoRequest => "no_request",
         TimerMode::WindowsOneMillisecond => "windows_1_ms",
         TimerMode::WindowsRequestFailed => "windows_request_failed",
         TimerMode::NativeDeadlineWaits => "native_deadline_waits",
     }
 }
 
-const fn timer_reason_name(reason: TimerReason) -> &'static str {
-    match reason {
-        TimerReason::None => "none",
-        TimerReason::HighRate => "high_rate",
-        TimerReason::PrecisionWindow => "precision_window",
+const fn timer_intent_name(intent: TimerIntent) -> &'static str {
+    match intent {
+        TimerIntent::None => "none",
+        TimerIntent::ContinuousHighRate => "high_rate",
+        TimerIntent::PrecisionWindow => "precision_window",
     }
 }
 
@@ -400,7 +400,7 @@ mod tests {
             },
             timer: TimerStatus {
                 mode: TimerMode::WindowsOneMillisecond,
-                reason: TimerReason::HighRate,
+                intent: TimerIntent::ContinuousHighRate,
                 active_cadence: Some(ActiveCadence {
                     messages: 1,
                     shortest: Duration::from_millis(10),

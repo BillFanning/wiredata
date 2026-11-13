@@ -812,7 +812,7 @@ impl<'a> TimerReconciler<'a> {
     }
 
     /// Select and prepare the next interruptible wait, including the guard
-    /// transition at the start of a Precise deadline window.
+    /// transition at the start of a deadline window.
     fn prepare_wait(&mut self, now: Instant, deadline: Instant) -> Instant {
         match timing::wait_plan(self.intent, now, deadline) {
             timing::WaitPlan::Direct(deadline) => {
@@ -2164,7 +2164,10 @@ mod tests {
 
         timer.reconcile_schedule(one_cadence(10), timing::CadenceAlignment::Immediate, 0);
         assert_eq!(timer.intent, timing::TimerIntent::ContinuousHighRate);
-        assert_eq!(timer.status().reason, timing::TimerReason::HighRate);
+        assert_eq!(
+            timer.status().intent,
+            timing::TimerIntent::ContinuousHighRate
+        );
         assert!(timer.guard.is_some());
         assert_eq!(timer.guard_acquisitions, 1);
         assert_eq!(timer.guard_releases, 0);
@@ -2184,12 +2187,12 @@ mod tests {
 
         timer.reconcile_schedule(None, timing::CadenceAlignment::Immediate, 0);
         assert!(timer.guard.is_none(), "an idle schedule releases the guard");
-        assert_eq!(timer.status().mode, timing::TimerMode::Standard);
+        assert_eq!(timer.status().mode, timing::TimerMode::NoRequest);
         assert_eq!((timer.guard_acquisitions, timer.guard_releases), (1, 1));
 
         timer.reconcile_schedule(one_cadence(50), timing::CadenceAlignment::Immediate, 0);
         assert_eq!(timer.intent, timing::TimerIntent::PrecisionWindow);
-        assert_eq!(timer.status().reason, timing::TimerReason::PrecisionWindow);
+        assert_eq!(timer.status().intent, timing::TimerIntent::PrecisionWindow);
         assert!(timer.guard.is_none());
         assert_eq!((timer.guard_acquisitions, timer.guard_releases), (1, 1));
 
@@ -2351,7 +2354,7 @@ mod tests {
                         status.shortest_active_interval(),
                         Some(Duration::from_millis(10))
                     );
-                    assert_ne!(status.mode, timing::TimerMode::Standard);
+                    assert_ne!(status.mode, timing::TimerMode::NoRequest);
                 }
                 _ => panic!("unexpected status variant"),
             }
@@ -2666,14 +2669,14 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(dormant.unwrap().mode, timing::TimerMode::Standard);
+        assert_eq!(dormant.unwrap().mode, timing::TimerMode::NoRequest);
 
         handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
         join_within(handle, Duration::from_secs(1));
     }
 
     #[test]
-    fn precise_slow_schedule_uses_windowed_policy_and_dormant_releases_it() {
+    fn a_slow_schedule_uses_windowed_policy_and_dormant_releases_it() {
         let policy = ObserverPolicy {
             counter_interval: Duration::from_secs(3600),
             sample_interval: Duration::from_secs(3600),
@@ -2686,7 +2689,7 @@ mod tests {
             for status in handle.status_rx.try_iter() {
                 if let TalkerStatus::TimerStatus { channel, status } = status {
                     assert_eq!(channel, id);
-                    if status.reason == timing::TimerReason::PrecisionWindow {
+                    if status.intent == timing::TimerIntent::PrecisionWindow {
                         saw_window_policy = true;
                         #[cfg(windows)]
                         {
@@ -2706,7 +2709,7 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "precise deadline-window status not reported"
+                "deadline-window status not reported"
             );
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -2731,13 +2734,13 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "dormant precise policy not reported before idle"
+                "dormant policy not reported before idle"
             );
             std::thread::sleep(Duration::from_millis(2));
         }
         let dormant = dormant.unwrap();
-        assert_eq!(dormant.reason, timing::TimerReason::None);
-        assert_eq!(dormant.mode, timing::TimerMode::Standard);
+        assert_eq!(dormant.intent, timing::TimerIntent::None);
+        assert_eq!(dormant.mode, timing::TimerMode::NoRequest);
 
         handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
         join_within(handle, Duration::from_secs(1));

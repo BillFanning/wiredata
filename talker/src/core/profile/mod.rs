@@ -272,12 +272,12 @@ mod tests {
         let path = temp_path("full");
         let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
         let mut profile = Profile::new("full");
-        let mut precise = ChannelConfig::new(
+        let mut aligned = ChannelConfig::new(
             InterfaceConfig::TcpClient(TcpClientConfig::new(addr)),
             vec![MessageConfig::new(PayloadConfig::raw_hex("AABB"), 500)],
         );
-        precise.cadence_alignment = CadenceAlignment::UtcPhase;
-        profile.channels.push(precise);
+        aligned.cadence_alignment = CadenceAlignment::UtcPhase;
+        profile.channels.push(aligned);
         profile.channels.push(ChannelConfig::new(
             InterfaceConfig::Udp(UdpConfig::unicast(addr)),
             vec![MessageConfig::new(

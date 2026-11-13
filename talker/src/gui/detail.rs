@@ -14,7 +14,7 @@ use crate::core::{
     message::NmeaChecksumMode,
     run_summary::RunSummary,
     telemetry::{recent_snapshot_state, RecentSnapshotState},
-    timing::{ActiveCadence, CadenceAlignment, TimerReason},
+    timing::{ActiveCadence, CadenceAlignment, TimerIntent},
 };
 
 use wiredata_ui::{
@@ -491,7 +491,7 @@ impl TalkerApp {
         let timer_prefix = if running {
             "Timer"
         } else if telemetry.timer.active_cadence.is_some()
-            || telemetry.timer.reason != TimerReason::None
+            || telemetry.timer.intent != TimerIntent::None
         {
             "Timer (last run)"
         } else {

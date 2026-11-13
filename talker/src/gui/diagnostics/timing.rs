@@ -104,43 +104,43 @@ pub(in crate::gui) fn timer_status_detail(status: TimerStatus) -> (String, bool)
         .shortest_active_interval()
         .map(compact_duration)
         .unwrap_or_else(|| "no active messages".to_owned());
-    match (status.reason, status.mode) {
-        (TimerReason::HighRate, TimerMode::WindowsOneMillisecond) => (
+    match (status.intent, status.mode) {
+        (TimerIntent::ContinuousHighRate, TimerMode::WindowsOneMillisecond) => (
             format!("Windows 1 ms continuous (high rate) · shortest {shortest}"),
             false,
         ),
-        (TimerReason::HighRate, TimerMode::WindowsRequestFailed) => (
+        (TimerIntent::ContinuousHighRate, TimerMode::WindowsRequestFailed) => (
             format!("Windows 1 ms request failed (high rate) · shortest {shortest}"),
             true,
         ),
-        (TimerReason::HighRate, TimerMode::NativeDeadlineWaits) => (
+        (TimerIntent::ContinuousHighRate, TimerMode::NativeDeadlineWaits) => (
             format!("native deadline waits (high rate) · shortest {shortest}"),
             false,
         ),
-        (TimerReason::HighRate, TimerMode::Standard) => (
+        (TimerIntent::ContinuousHighRate, TimerMode::NoRequest) => (
             format!("high-rate timer request pending · shortest {shortest}"),
             false,
         ),
-        (TimerReason::PrecisionWindow, TimerMode::WindowsOneMillisecond) => (
+        (TimerIntent::PrecisionWindow, TimerMode::WindowsOneMillisecond) => (
             format!("Windows 1 ms deadline windows · shortest {shortest}"),
             false,
         ),
-        (TimerReason::PrecisionWindow, TimerMode::WindowsRequestFailed) => (
+        (TimerIntent::PrecisionWindow, TimerMode::WindowsRequestFailed) => (
             format!("Windows 1 ms request failed · shortest {shortest}"),
             true,
         ),
-        (TimerReason::PrecisionWindow, TimerMode::NativeDeadlineWaits) => (
+        (TimerIntent::PrecisionWindow, TimerMode::NativeDeadlineWaits) => (
             format!("native deadline waits · shortest {shortest}"),
             false,
         ),
-        (TimerReason::PrecisionWindow, TimerMode::Standard) => (
+        (TimerIntent::PrecisionWindow, TimerMode::NoRequest) => (
             format!("first waited deadline window pending · shortest {shortest}"),
             false,
         ),
-        (TimerReason::None, _) if status.active_cadence.is_some() => {
-            (format!("standard deadline waits · {shortest}"), false)
+        (TimerIntent::None, _) if status.active_cadence.is_some() => {
+            (format!("ordinary deadline waits · {shortest}"), false)
         }
-        (TimerReason::None, _) => (
+        (TimerIntent::None, _) => (
             "idle · no active messages; no timer request".to_owned(),
             false,
         ),
@@ -153,14 +153,14 @@ mod tests {
     use std::time::Duration;
 
     use crate::core::timing::{
-        ActiveCadence, CadenceAlignment, TimerMode, TimerReason, TimerStatus,
+        ActiveCadence, CadenceAlignment, TimerIntent, TimerMode, TimerStatus,
     };
 
     #[test]
-    fn precise_near_threshold_status_names_the_deadline_window_policy() {
+    fn a_near_threshold_status_names_the_deadline_window_policy() {
         let (detail, hot) = timer_status_detail(TimerStatus {
             mode: TimerMode::WindowsOneMillisecond,
-            reason: TimerReason::PrecisionWindow,
+            intent: TimerIntent::PrecisionWindow,
             active_cadence: Some(ActiveCadence {
                 messages: 1,
                 shortest: Duration::from_millis(50),
@@ -176,10 +176,10 @@ mod tests {
 
     #[test]
     fn dormant_timer_status_names_idle_state_and_no_request() {
-        // One idle state now, not two: with no configured mode there is no
-        // "Precise selected but idle" to distinguish from plain idle.
-        let (standard, hot) = timer_status_detail(TimerStatus::default());
-        assert_eq!(standard, "idle · no active messages; no timer request");
+        // The timer policy follows the schedule alone, so a channel with
+        // nothing to send has exactly one state to report.
+        let (dormant, hot) = timer_status_detail(TimerStatus::default());
+        assert_eq!(dormant, "idle · no active messages; no timer request");
         assert!(!hot);
     }
 }

@@ -30,7 +30,7 @@ use crate::core::capacity::{
 use crate::core::telemetry::{
     DurationHistogram, MessageTiming, RecentSnapshotState, SendTimingTelemetry, RECENT_WINDOW,
 };
-use crate::core::timing::{ActiveCadence, TimerMode, TimerReason, TimerStatus};
+use crate::core::timing::{ActiveCadence, TimerIntent, TimerMode, TimerStatus};
 use wiredata_ui::diagnostics::{tone_marker, SignalTone};
 use wiredata_ui::format::{compact_duration, interval as format_interval, percent, thousands};
 use wiredata_ui::hover::Hover;
