@@ -12,12 +12,14 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
+use wiredata_cli::doubling_retry;
+use wiredata_ui::format::{compact_duration, interval as whole_ms, thousands};
 
 use crate::core::{
     channel::{ChannelId, Interface, InterfaceConfig, MissingRetryConfiguration, PartialWrite},
     internal_fault::InternalFaultTally,
     run_summary::{RunEndReason, RunId, RunSummary},
-    scheduler::{Schedule, Tick},
+    scheduler::{ClockStep, Schedule, Tick},
     telemetry::{MessageTiming, MessageTimingRecorder, SendTimingRecorder, SendTimingReport},
     timing,
 };
@@ -299,6 +301,8 @@ struct FailureEpisode {
     /// episode. Retained across later failures so the one recovery edge can
     /// distinguish replacement from a transient write recovery.
     handle_replaced: bool,
+    /// When the first send of the episode failed.
+    since: Instant,
 }
 
 /// How long a channel must go without skipping a scheduled send before its
@@ -335,6 +339,8 @@ struct MissEpisode {
     skipped: u64,
     /// When the most recent skip was observed, for the settle test.
     last_skip: Instant,
+    /// When the first skip was observed: the episode's start.
+    since: Instant,
 }
 
 /// What one poll's skip count is worth reporting, if anything.
@@ -346,9 +352,13 @@ enum MissReport {
     /// The channel has just fallen off cadence. Carries this poll's own count,
     /// which is what is known at the moment it is reported.
     FellBehind(u64),
-    /// The channel has held its cadence for [`MISS_RECOVERY_SETTLE`]. Carries
-    /// the episode's total.
-    BackOnSchedule(u64),
+    /// The channel has held its cadence for [`MISS_RECOVERY_SETTLE`].
+    BackOnSchedule {
+        /// The episode's total.
+        missed: u64,
+        /// From the first skip to the last; the settle window is not in it.
+        length: Duration,
+    },
 }
 
 /// Fold one poll's skip count into the off-cadence episode.
@@ -368,17 +378,149 @@ fn observe_skips(episode: &mut Option<MissEpisode>, skipped: u64, now: Instant) 
             *episode = Some(MissEpisode {
                 skipped,
                 last_skip: now,
+                since: now,
             });
             MissReport::FellBehind(skipped)
         }
         (false, Some(open))
             if now.saturating_duration_since(open.last_skip) >= MISS_RECOVERY_SETTLE =>
         {
-            let total = open.skipped;
+            let report = MissReport::BackOnSchedule {
+                missed: open.skipped,
+                length: open.last_skip.saturating_duration_since(open.since),
+            };
             *episode = None;
-            MissReport::BackOnSchedule(total)
+            report
         }
         _ => MissReport::Silent,
+    }
+}
+
+/// "4 sends missed", with the count grouped in thousands.
+fn sends_missed(count: u64) -> String {
+    let sends = if count == 1 { "send" } else { "sends" };
+    format!("{} {sends} missed", thousands(count))
+}
+
+/// The warning for the first skipped send of an episode: which message, at
+/// what interval, how late its send was handled, and how many points were lost.
+/// `index` is the message's position in the schedule; people count from 1. The
+/// interval is in milliseconds, as it is configured.
+fn missed_line(
+    label: &str,
+    index: usize,
+    interval: Duration,
+    late: Duration,
+    missed: u64,
+) -> String {
+    format!(
+        "channel {label}: message {} ({} interval) was {} late; {}",
+        index + 1,
+        whole_ms(interval),
+        compact_duration(late),
+        sends_missed(missed)
+    )
+}
+
+/// The line that closes an episode: the clean `quiet` stretch that ended it,
+/// the sends it lost, and how long it lasted (left out for a single skip).
+/// `quiet` is a fixed window, so it reads in whole units.
+fn back_on_schedule_line(label: &str, quiet: Duration, missed: u64, length: Duration) -> String {
+    let lasted = if length.is_zero() {
+        String::new()
+    } else {
+        format!(" in {}", compact_duration(length))
+    };
+    format!(
+        "channel {label}: on schedule again ({} without a miss); {}{lasted}",
+        wiredata_cli::describe(quiet),
+        sends_missed(missed)
+    )
+}
+
+/// The line for a run that stops with an episode still open.
+fn stopped_behind_line(label: &str, missed_this_run: u64) -> String {
+    format!(
+        "channel {label}: stopped while behind schedule; {} this run",
+        sends_missed(missed_this_run)
+    )
+}
+
+/// The warning for the first failed send of an episode. The error is the
+/// reason; the retry schedule is the policy of [`RETRY_BACKOFF_INITIAL`] and
+/// [`RETRY_BACKOFF_MAX`].
+fn send_failed_line(label: &str, error: &str) -> String {
+    format!(
+        "channel {label}: send failed: {error}; {}",
+        doubling_retry(RETRY_BACKOFF_INITIAL, RETRY_BACKOFF_MAX)
+    )
+}
+
+/// The line that closes a failure episode. `down` is the time from the first
+/// failed send to the first successful one; `via` names what was reopened or
+/// reconnected, when the interface's handle was replaced.
+fn recovery_line(
+    label: &str,
+    down: Duration,
+    via: Option<&str>,
+    failed: u64,
+    possibly_partial: u64,
+    withheld: u64,
+) -> String {
+    let via = via.map(|via| format!(" ({via})")).unwrap_or_default();
+    format!(
+        "channel {label}: sending again after {}{via}; {}",
+        compact_duration(down),
+        recovery_cost(failed, possibly_partial, withheld)
+    )
+}
+
+/// The line for a step of the system clock that re-aligned the schedule, with
+/// the step's size and direction signed.
+fn clock_step_line(label: &str, step: ClockStep) -> String {
+    let sign = if step.forward { '+' } else { '-' };
+    format!(
+        "channel {label}: system clock moved {sign}{}; sends re-aligned to UTC",
+        compact_duration(step.by)
+    )
+}
+
+/// The warning for a refused Windows timer-resolution request.
+fn timer_refused_line(label: &str) -> String {
+    format!(
+        "channel {label}: Windows refused {} timer resolution; sends may be up to {} late",
+        whole_ms(timing::REQUESTED_TIMER_RESOLUTION),
+        whole_ms(timing::WINDOWS_DEFAULT_TICK)
+    )
+}
+
+/// The warning for the first status update dropped for a full receiver.
+fn display_dropped_line(label: &str) -> String {
+    format!("channel {label}: display updates dropped; sending is unaffected")
+}
+
+/// A failed open. `retry` is the first and longest wait of a retrying open;
+/// `None` when the failure is final.
+fn open_failed_line(label: &str, error: &str, retry: Option<(Duration, Duration)>) -> String {
+    let retry = retry
+        .map(|(first, max)| format!("; {}", doubling_retry(first, max)))
+        .unwrap_or_default();
+    format!("channel {label}: did not open: {error}{retry}")
+}
+
+/// Queue [`TalkerStatus::OpenFailed`], best-effort, and wake the owner.
+fn emit_open_failed(who: &RunnerIdentity, observer: &RunnerObserver, message: String) {
+    if observer
+        .status_tx
+        .try_send(TalkerStatus::OpenFailed {
+            channel: who.id,
+            message,
+        })
+        .is_ok()
+    {
+        if let Some(n) = &observer.notify {
+            n();
+        }
     }
 }
 
@@ -492,8 +634,8 @@ fn open_retrying_and_run_with(
                 if failures == 1 {
                     tracing::warn!(
                         channel = who.id.as_u64(),
-                        "channel {} did not open: {message}; retrying",
-                        who.label
+                        "{}",
+                        open_failed_line(&who.label, &message, Some((first, max)))
                     );
                 } else {
                     tracing::debug!(
@@ -502,18 +644,7 @@ fn open_retrying_and_run_with(
                         who.label
                     );
                 }
-                if observer
-                    .status_tx
-                    .try_send(TalkerStatus::OpenFailed {
-                        channel: who.id,
-                        message,
-                    })
-                    .is_ok()
-                {
-                    if let Some(n) = &observer.notify {
-                        n();
-                    }
-                }
+                emit_open_failed(&who, &observer, message);
                 let deadline = Instant::now() + wait;
                 loop {
                     match cmd_rx.recv_deadline(deadline) {
@@ -554,23 +685,13 @@ pub fn open_and_run(
             run(who, interface, Some(cfg), schedule, cmd_rx, observer);
         }
         Err(e) => {
+            let message = format!("{e:#}");
             tracing::error!(
                 channel = who.id.as_u64(),
-                "failed to open channel {}: {e:#}",
-                who.label
+                "{}",
+                open_failed_line(&who.label, &message, None)
             );
-            if observer
-                .status_tx
-                .try_send(TalkerStatus::OpenFailed {
-                    channel: who.id,
-                    message: format!("{e:#}"),
-                })
-                .is_ok()
-            {
-                if let Some(n) = &observer.notify {
-                    n();
-                }
-            }
+            emit_open_failed(&who, &observer, message);
         }
     }
 }
@@ -749,8 +870,8 @@ impl<'a> TimerReconciler<'a> {
         {
             tracing::warn!(
                 channel = self.who.id.as_u64(),
-                "channel {} could not enable Windows 1 ms timer resolution; sends may start late",
-                self.who.label
+                "{}",
+                timer_refused_line(&self.who.label)
             );
         }
         self.current = next;
@@ -978,12 +1099,12 @@ fn run_loop(
             }
         }
 
-        if schedule.reconcile_wall_clock(Instant::now()) {
+        if let Some(step) = schedule.reconcile_wall_clock(Instant::now()) {
             tracing::info!(
                 channel = who.id.as_u64(),
                 realignments = schedule.clock_realignments(),
-                "channel {} re-aligned its future sends after the system clock jumped",
-                who.label
+                "{}",
+                clock_step_line(&who.label, step)
             );
         }
 
@@ -1025,20 +1146,23 @@ fn run_loop(
                 match observe_skips(&mut miss_episode, skipped, due_handled_at) {
                     MissReport::FellBehind(now_skipped) => tracing::warn!(
                         channel = who.id.as_u64(),
-                        "channel {} missed {now_skipped} scheduled sends — output is running \
-                         below its configured rate",
-                        who.label
+                        "{}",
+                        missed_line(
+                            &who.label,
+                            index,
+                            interval,
+                            due_handled_at.saturating_duration_since(scheduled_for),
+                            now_skipped
+                        )
                     ),
                     // Not "back to normal": this is a statement about cadence
                     // points only. Sends can still be failing or withheld by
                     // retry backoff while every point is reached, and that
                     // episode reports itself separately.
-                    MissReport::BackOnSchedule(total) => tracing::info!(
+                    MissReport::BackOnSchedule { missed, length } => tracing::info!(
                         channel = who.id.as_u64(),
-                        "channel {} has missed no further scheduled sends for {} seconds \
-                         ({total} missed in that episode)",
-                        who.label,
-                        MISS_RECOVERY_SETTLE.as_secs()
+                        "{}",
+                        back_on_schedule_line(&who.label, MISS_RECOVERY_SETTLE, missed, length)
                     ),
                     MissReport::Silent => {}
                 }
@@ -1155,20 +1279,22 @@ fn run_loop(
                                 // to (ADR-059, §4.5).
                                 let replaced = match current_config.as_ref() {
                                     Some(InterfaceConfig::Serial(config)) if ep.handle_replaced => {
-                                        format!("reopened serial port {}; ", config.port)
+                                        Some(format!("reopened serial port {}", config.port))
                                     }
                                     Some(InterfaceConfig::TcpClient(config))
                                         if ep.handle_replaced =>
                                     {
-                                        format!("reconnected to {}; ", config.address)
+                                        Some(format!("reconnected to {}", config.address))
                                     }
-                                    _ => String::new(),
+                                    _ => None,
                                 };
                                 tracing::info!(
                                     channel = who.id.as_u64(),
-                                    "channel {} {replaced}sending recovered after {}",
-                                    who.label,
-                                    recovery_cost(
+                                    "{}",
+                                    recovery_line(
+                                        &who.label,
+                                        send_finished.saturating_duration_since(ep.since),
+                                        replaced.as_deref(),
                                         ep.failures - ep.possibly_partial,
                                         ep.possibly_partial,
                                         ep.suppressed
@@ -1232,13 +1358,12 @@ fn run_loop(
                                 // reported (warn + `ConnectionError`); it opens the episode.
                                 None => {
                                     send_failure_episodes += 1;
+                                    let message = format!("{e:#}");
                                     tracing::warn!(
                                         channel = who.id.as_u64(),
-                                        "channel {} send failed (retrying, with a growing delay \
-                                         between attempts): {e:#}",
-                                        who.label
+                                        "{}",
+                                        send_failed_line(&who.label, &message)
                                     );
-                                    let message = format!("{e:#}");
                                     episode = Some(FailureEpisode {
                                         active_error: message.clone(),
                                         failures: 1,
@@ -1248,6 +1373,7 @@ fn run_loop(
                                         next_attempt: Instant::now() + RETRY_BACKOFF_INITIAL,
                                         handle_needs_recovery: true,
                                         handle_replaced: false,
+                                        since: send_finished,
                                     });
                                     timer.emit(TalkerStatus::ConnectionError {
                                         channel: who.id,
@@ -1367,9 +1493,8 @@ fn run_loop(
     if miss_episode.is_some() {
         tracing::warn!(
             channel = who.id.as_u64(),
-            "channel {} stopped while off schedule — {missed_sends} scheduled sends missed \
-             during this run",
-            who.label
+            "{}",
+            stopped_behind_line(&who.label, missed_sends)
         );
     }
     let final_timing = send_timing.snapshot_at(finished_mono);
@@ -1436,18 +1561,15 @@ fn peer_sent(config: Option<&InterfaceConfig>, bytes: u64) -> Option<u64> {
 /// What a closed failure episode cost, for its recovery line: the sends that
 /// failed, those that were possibly partial, and the due sends withheld.
 fn recovery_cost(failed: u64, possibly_partial: u64, withheld: u64) -> String {
-    let sends = |n: u64| if n == 1 { "send" } else { "sends" };
     let mut cost = Vec::new();
     if failed > 0 || possibly_partial == 0 {
-        cost.push(format!("{failed} failed {}", sends(failed)));
+        cost.push(format!("{failed} failed"));
     }
     if possibly_partial > 0 {
-        cost.push(format!(
-            "{possibly_partial} possibly partial {}",
-            sends(possibly_partial)
-        ));
+        cost.push(format!("{possibly_partial} possibly partial"));
     }
-    format!("{} and {withheld} withheld while retrying", cost.join(", "))
+    cost.push(format!("{withheld} withheld"));
+    cost.join(", ")
 }
 
 /// Queue one status update, best-effort (never blocks the send cadence): a
@@ -1475,9 +1597,8 @@ fn emit_status(
             if *dropped_statuses == 1 {
                 tracing::warn!(
                     channel = who.id.as_u64(),
-                    "channel {}: the live output display may lag with no disruption of \
-                     output count or cadence",
-                    who.label
+                    "{}",
+                    display_dropped_line(&who.label)
                 );
             }
         }
@@ -1549,7 +1670,11 @@ mod tests {
         let last_skip = start + Duration::from_millis(1_000);
         assert_eq!(
             observe_skips(&mut episode, 0, last_skip + MISS_RECOVERY_SETTLE),
-            MissReport::BackOnSchedule(3 + 2 * 1_000)
+            MissReport::BackOnSchedule {
+                missed: 3 + 2 * 1_000,
+                length: Duration::from_millis(1_000),
+            },
+            "the length runs from the first skip to the last, not through the settle window"
         );
         assert!(episode.is_none(), "recovery closes the episode");
 
@@ -1571,7 +1696,10 @@ mod tests {
         observe_skips(&mut episode, 5, start);
         assert_eq!(
             observe_skips(&mut episode, 0, start + MISS_RECOVERY_SETTLE),
-            MissReport::BackOnSchedule(5)
+            MissReport::BackOnSchedule {
+                missed: 5,
+                length: Duration::ZERO,
+            }
         );
 
         let later = start + MISS_RECOVERY_SETTLE * 4;
@@ -1581,8 +1709,134 @@ mod tests {
         );
         assert_eq!(
             observe_skips(&mut episode, 0, later + MISS_RECOVERY_SETTLE),
-            MissReport::BackOnSchedule(1),
+            MissReport::BackOnSchedule {
+                missed: 1,
+                length: Duration::ZERO,
+            },
             "the second episode must not carry the first one's total"
+        );
+    }
+
+    #[test]
+    fn the_missed_send_line_states_the_message_its_interval_and_how_late() {
+        assert_eq!(
+            missed_line(
+                "GPS",
+                1,
+                Duration::from_millis(10),
+                Duration::from_millis(47),
+                4
+            ),
+            "channel GPS: message 2 (10 ms interval) was 47 ms late; 4 sends missed"
+        );
+        assert_eq!(
+            missed_line(
+                "GPS",
+                0,
+                Duration::from_secs(2),
+                Duration::from_micros(1_500),
+                1
+            ),
+            "channel GPS: message 1 (2,000 ms interval) was 1.50 ms late; 1 send missed"
+        );
+    }
+
+    #[test]
+    fn the_back_on_schedule_line_states_the_settle_window_and_the_episode() {
+        assert_eq!(
+            back_on_schedule_line("GPS", MISS_RECOVERY_SETTLE, 1_204, Duration::from_secs(12)),
+            "channel GPS: on schedule again (5 s without a miss); 1,204 sends missed in 12.0 s"
+        );
+        assert_eq!(
+            back_on_schedule_line("GPS", MISS_RECOVERY_SETTLE, 1, Duration::ZERO),
+            "channel GPS: on schedule again (5 s without a miss); 1 send missed",
+            "an episode of one skip has no length to state"
+        );
+    }
+
+    #[test]
+    fn the_stopped_behind_schedule_line_states_the_runs_total() {
+        assert_eq!(
+            stopped_behind_line("GPS", 5_415),
+            "channel GPS: stopped while behind schedule; 5,415 sends missed this run"
+        );
+    }
+
+    #[test]
+    fn the_send_failed_line_states_the_retry_schedule() {
+        assert_eq!(
+            send_failed_line("GPS", "writing to TCP stream: broken pipe"),
+            "channel GPS: send failed: writing to TCP stream: broken pipe; \
+             retrying in 250 ms, doubling to 5 s"
+        );
+    }
+
+    #[test]
+    fn the_recovery_line_states_how_long_sending_was_down() {
+        assert_eq!(
+            recovery_line(
+                "GPS",
+                Duration::from_millis(1_300),
+                Some("reconnected to 10.0.0.5:4001"),
+                1,
+                0,
+                13
+            ),
+            "channel GPS: sending again after 1.30 s (reconnected to 10.0.0.5:4001); \
+             1 failed, 13 withheld"
+        );
+        assert_eq!(
+            recovery_line("GPS", Duration::from_millis(40), None, 2, 1, 0),
+            "channel GPS: sending again after 40 ms; 2 failed, 1 possibly partial, 0 withheld"
+        );
+    }
+
+    #[test]
+    fn the_clock_step_line_gives_the_size_and_direction_of_the_step() {
+        let step = |by_ms, forward| ClockStep {
+            by: Duration::from_millis(by_ms),
+            forward,
+        };
+        assert_eq!(
+            clock_step_line("GPS", step(1_200, true)),
+            "channel GPS: system clock moved +1.20 s; sends re-aligned to UTC"
+        );
+        assert_eq!(
+            clock_step_line("GPS", step(350, false)),
+            "channel GPS: system clock moved -350 ms; sends re-aligned to UTC"
+        );
+    }
+
+    #[test]
+    fn the_timer_refused_line_states_the_request_and_the_worst_lateness() {
+        assert_eq!(
+            timer_refused_line("GPS"),
+            "channel GPS: Windows refused 1 ms timer resolution; sends may be up to 16 ms late"
+        );
+    }
+
+    #[test]
+    fn the_display_lag_line_says_sending_is_unaffected() {
+        assert_eq!(
+            display_dropped_line("GPS"),
+            "channel GPS: display updates dropped; sending is unaffected"
+        );
+    }
+
+    #[test]
+    fn an_open_failure_is_worded_the_same_with_and_without_a_retry() {
+        assert_eq!(
+            open_failed_line("GPS", "no device is present at COM4", None),
+            "channel GPS: did not open: no device is present at COM4"
+        );
+        assert_eq!(
+            open_failed_line(
+                "GPS",
+                "no device is present at COM4",
+                Some((OPEN_RETRY_FIRST, OPEN_RETRY_MAX))
+            ),
+            "channel GPS: did not open: no device is present at COM4; \
+             retrying in 1 s, doubling to 30 s"
         );
     }
 
@@ -1786,11 +2040,11 @@ mod tests {
 
         handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
         join_within(handle, Duration::from_secs(5));
-        wait_for_line(&log_rx, &mut lines, "stopped while off schedule");
+        wait_for_line(&log_rx, &mut lines, "stopped while behind schedule");
 
         let fell_behind = lines
             .iter()
-            .filter(|line| line.contains("missed") && line.contains("below its configured rate"))
+            .filter(|line| line.contains("was ") && line.contains(" late; "))
             .count();
         assert_eq!(
             fell_behind, 1,
@@ -2776,18 +3030,12 @@ mod tests {
 
     #[test]
     fn a_recovery_line_states_what_the_episode_cost() {
-        assert_eq!(
-            recovery_cost(1, 0, 3),
-            "1 failed send and 3 withheld while retrying"
-        );
+        assert_eq!(recovery_cost(1, 0, 3), "1 failed, 3 withheld");
         assert_eq!(
             recovery_cost(2, 1, 0),
-            "2 failed sends, 1 possibly partial send and 0 withheld while retrying"
+            "2 failed, 1 possibly partial, 0 withheld"
         );
-        assert_eq!(
-            recovery_cost(0, 2, 5),
-            "2 possibly partial sends and 5 withheld while retrying"
-        );
+        assert_eq!(recovery_cost(0, 2, 5), "2 possibly partial, 5 withheld");
     }
 
     /// §4.4, ADR-059: a write that fails after the interface accepted part of
@@ -2857,9 +3105,8 @@ mod tests {
 
         let lines: Vec<String> = logs.try_iter().map(|event| event.message).collect();
         assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("sending recovered after 1 possibly partial send and")),
+            lines.iter().any(|line| line.contains("sending again after")
+                && line.contains("; 1 possibly partial,")),
             "{lines:#?}"
         );
     }
@@ -2978,11 +3225,11 @@ mod tests {
         let recoveries: Vec<String> = logs
             .try_iter()
             .map(|event| event.message)
-            .filter(|line| line.contains("sending recovered"))
+            .filter(|line| line.contains("sending again after"))
             .collect();
         assert_eq!(recoveries.len(), 1, "{recoveries:#?}");
         assert!(
-            recoveries[0].contains(&format!("reconnected to {address}; sending recovered")),
+            recoveries[0].contains(&format!("(reconnected to {address})")),
             "{recoveries:#?}"
         );
     }
@@ -3143,7 +3390,7 @@ mod tests {
         let recovery_lines = log_rx
             .try_iter()
             .filter(|event| {
-                event.level == tracing::Level::INFO && event.message.contains("sending recovered")
+                event.level == tracing::Level::INFO && event.message.contains("sending again after")
             })
             .collect::<Vec<_>>();
         assert_eq!(

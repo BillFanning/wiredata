@@ -16,6 +16,17 @@ use crate::core::timing::{ActiveCadence, CadenceAlignment};
 const CLOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CLOCK_STEP_THRESHOLD: Duration = Duration::from_millis(250);
 
+/// How far the system clock moved relative to the monotonic clock, as found
+/// by [`Schedule::reconcile_wall_clock`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClockStep {
+    /// The size of the step.
+    pub by: Duration,
+    /// Whether the clock moved ahead of where the monotonic clock predicted
+    /// (`true`) or back from it.
+    pub forward: bool,
+}
+
 /// One compiled message tracked by the scheduler.
 #[derive(Debug)]
 struct ScheduledMessage {
@@ -167,34 +178,43 @@ impl Schedule {
         }
     }
 
-    /// Check at most once per second for a material wall-clock step. UTC-aligned
-    /// schedules rebase only future deadlines and never replay the skipped wall grid.
-    pub fn reconcile_wall_clock(&mut self, now: Instant) -> bool {
+    /// Check at most once per second for a material wall-clock step, and return
+    /// it when one was found. UTC-aligned schedules rebase only future deadlines
+    /// and never replay the skipped wall grid.
+    pub fn reconcile_wall_clock(&mut self, now: Instant) -> Option<ClockStep> {
         if self.alignment != CadenceAlignment::UtcPhase
             || self.next_clock_check.is_none_or(|check| now < check)
         {
-            return false;
+            return None;
         }
         self.reconcile_wall_clock_at(now, SystemTime::now())
     }
 
-    fn reconcile_wall_clock_at(&mut self, now: Instant, wall_clock: SystemTime) -> bool {
+    fn reconcile_wall_clock_at(
+        &mut self,
+        now: Instant,
+        wall_clock: SystemTime,
+    ) -> Option<ClockStep> {
         self.next_clock_check = now.checked_add(CLOCK_CHECK_INTERVAL);
         let Some((anchor_mono, anchor_wall)) = self.wall_anchor else {
             self.wall_anchor = Some((now, wall_clock));
-            return false;
+            return None;
         };
         let expected = anchor_wall
             .checked_add(now.saturating_duration_since(anchor_mono))
             .unwrap_or(anchor_wall);
-        if system_time_distance(expected, wall_clock) < CLOCK_STEP_THRESHOLD {
-            return false;
+        let by = system_time_distance(expected, wall_clock);
+        if by < CLOCK_STEP_THRESHOLD {
+            return None;
         }
 
         self.align_deadlines(now, wall_clock);
         self.wall_anchor = Some((now, wall_clock));
         self.clock_realignments = self.clock_realignments.saturating_add(1);
-        true
+        Some(ClockStep {
+            by,
+            forward: wall_clock >= expected,
+        })
     }
 
     pub fn cadence_alignment(&self) -> CadenceAlignment {
@@ -785,10 +805,36 @@ mod tests {
 
         let checked_at = t0 + Duration::from_secs(1);
         let stepped_wall = SystemTime::UNIX_EPOCH + ms(15_400);
-        assert!(schedule.reconcile_wall_clock_at(checked_at, stepped_wall));
+        assert_eq!(
+            schedule.reconcile_wall_clock_at(checked_at, stepped_wall),
+            Some(ClockStep {
+                by: ms(4_150),
+                forward: true
+            }),
+            "the wall clock read 15.4 s where the monotonic anchor predicted 11.25 s"
+        );
         assert_eq!(schedule.clock_realignments(), 1);
         assert_eq!(schedule.missed_sends(), 0);
         assert_eq!(schedule.poll(checked_at), Tick::Wait(checked_at + ms(600)));
+    }
+
+    #[test]
+    fn a_wall_clock_step_backwards_is_reported_as_backwards() {
+        let t0 = Instant::now();
+        let mut schedule = Schedule::compile_unarmed(&[msg("AB", 1_000)])
+            .unwrap()
+            .with_alignment(CadenceAlignment::UtcPhase);
+        schedule.arm_at(t0, SystemTime::UNIX_EPOCH + ms(10_250));
+
+        // The anchor predicts 11.25 s one second on; the clock reads 10.3 s.
+        let checked_at = t0 + Duration::from_secs(1);
+        assert_eq!(
+            schedule.reconcile_wall_clock_at(checked_at, SystemTime::UNIX_EPOCH + ms(10_300)),
+            Some(ClockStep {
+                by: ms(950),
+                forward: false
+            })
+        );
     }
 
     #[test]
@@ -802,7 +848,10 @@ mod tests {
 
         let checked_at = t0 + Duration::from_secs(1);
         let expected_plus_100ms = SystemTime::UNIX_EPOCH + ms(11_350);
-        assert!(!schedule.reconcile_wall_clock_at(checked_at, expected_plus_100ms));
+        assert_eq!(
+            schedule.reconcile_wall_clock_at(checked_at, expected_plus_100ms),
+            None
+        );
         assert_eq!(schedule.clock_realignments(), 0);
         assert!(matches!(
             schedule.poll(checked_at),

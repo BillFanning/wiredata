@@ -38,6 +38,13 @@ pub use wiredata_timing::{
     high_resolution, keep_timer_resolution_when_minimized, HighResolutionGuard,
 };
 
+/// The timer resolution `wiredata_timing::high_resolution` asks Windows for.
+pub const REQUESTED_TIMER_RESOLUTION: Duration = Duration::from_millis(1);
+
+/// Windows' default timer tick (15.625 ms), rounded up to a whole millisecond:
+/// the most a send can be late when the timer-resolution request is refused.
+pub const WINDOWS_DEFAULT_TICK: Duration = Duration::from_millis(16);
+
 /// Intervals shorter than this want 1 ms timer resolution: two default
 /// Windows scheduler ticks (2 × 15.625 ms), the point below which a deadline
 /// wait can no longer be trusted to land inside its own interval.
