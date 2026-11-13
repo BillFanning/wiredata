@@ -418,7 +418,7 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
                     TalkerStatus::OpenFailed { channel, message } => {
                         say(health.down(channel, &message, &open_retry, now));
                     }
-                    TalkerStatus::ConnectionError { channel, message } => {
+                    TalkerStatus::SendFailed { channel, message } => {
                         say(health.down(channel, &message, &send_retry, now));
                     }
                     TalkerStatus::SendRecovered { channel, .. } => say(health.up(channel, now)),

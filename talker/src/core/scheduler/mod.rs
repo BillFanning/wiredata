@@ -53,18 +53,18 @@ pub enum Tick {
         index: usize,
         scheduled_for: Instant,
         /// The cadence this fire belongs to. Carried so a receiver can place
-        /// the skipped grid points below on the timeline without holding its
+        /// the missed grid points below on the timeline without holding its
         /// own copy of the schedule, which could have moved since.
         interval: Duration,
         /// Cadence points of *this* message that this poll passed over: they
         /// lie at `scheduled_for + interval`, `+ 2 * interval`, … and none of
         /// them will ever fire (see the stall policy on [`Schedule::poll`]).
         ///
-        /// Reported here, at the poll that skips them, because that is the
+        /// Reported here, at the poll that misses them, because that is the
         /// only moment their position in time is known. A count recovered
         /// later can say how many were lost but not when — and *when* is what
         /// decides who was holding the thread.
-        skipped: u64,
+        missed: u64,
     },
     /// Nothing is due yet — sleep until at most this instant.
     Wait(Instant),
@@ -76,7 +76,7 @@ pub enum Tick {
 #[derive(Debug)]
 pub struct Schedule {
     messages: Vec<ScheduledMessage>,
-    /// Cumulative count of cadence grid points that were skipped (will never
+    /// Cumulative count of cadence grid points that were missed (will never
     /// fire) under the stall policy — see [`Schedule::poll`]. A growing value
     /// means the send loop couldn't keep to the configured intervals.
     missed_sends: u64,
@@ -180,7 +180,7 @@ impl Schedule {
 
     /// Check at most once per second for a material wall-clock step, and return
     /// it when one was found. UTC-aligned schedules rebase only future deadlines
-    /// and never replay the skipped wall grid.
+    /// and never replay the missed wall grid.
     pub fn reconcile_wall_clock(&mut self, now: Instant) -> Option<ClockStep> {
         if self.alignment != CadenceAlignment::UtcPhase
             || self.next_clock_check.is_none_or(|check| now < check)
@@ -288,10 +288,10 @@ impl Schedule {
                     index,
                     scheduled_for: next_fire,
                     interval,
-                    skipped: 0,
+                    missed: 0,
                 };
             };
-            let mut skipped = 0u64;
+            let mut missed = 0u64;
             if following <= now {
                 // More than one interval behind: skip the missed grid
                 // points. Integer math, not a loop — a long sleep with a
@@ -303,26 +303,26 @@ impl Schedule {
                 // Grid points in (old next_fire, now] that will never fire:
                 // the one at `next_fire` plus one per full interval of
                 // additional lateness.
-                skipped = (late / interval_nanos + 1) as u64;
+                missed = (late / interval_nanos + 1) as u64;
                 let rem = late % interval_nanos;
                 following = (now - Duration::from_nanos(rem as u64))
                     .checked_add(interval)
                     .unwrap_or(following);
             }
             msg.next_fire = Some(following);
-            self.missed_sends = self.missed_sends.saturating_add(skipped);
+            self.missed_sends = self.missed_sends.saturating_add(missed);
             Tick::Due {
                 index,
                 scheduled_for: next_fire,
                 interval,
-                skipped,
+                missed,
             }
         } else {
             Tick::Wait(next_fire)
         }
     }
 
-    /// Cumulative count of sends skipped under the stall policy (grid points
+    /// Cumulative count of sends missed under the stall policy (grid points
     /// that will never fire). Monotonic for the life of the schedule; a
     /// nonzero, growing value at high message rates means the interface's
     /// send call blocks longer than the configured interval.
@@ -509,12 +509,12 @@ mod tests {
                 index,
                 scheduled_for,
                 interval,
-                skipped,
+                missed,
             } => {
                 assert_eq!(index, 0);
                 assert_eq!(scheduled_for, t0);
                 assert_eq!(interval, ms(100));
-                assert_eq!(skipped, 0);
+                assert_eq!(missed, 0);
                 assert_eq!(s.render(index), Some(vec![0xAB]));
             }
             other => panic!("expected Due, got {other:?}"),
@@ -557,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn stall_fires_once_then_skips_missed_ticks_staying_on_grid() {
+    fn stall_fires_once_then_misses_ticks_staying_on_grid() {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
         assert!(matches!(s.poll(t0), Tick::Due { .. })); // next fire → t0+100
@@ -566,14 +566,14 @@ mod tests {
             s.poll(t0 + ms(1050)),
             Tick::Due {
                 scheduled_for,
-                skipped: 9,
+                missed: 9,
                 ..
             } if scheduled_for == t0 + ms(100)
         ));
         // …and the next fire is the first *future* point of the original
         // cadence grid (t0+1100) — not nine burst sends, and no drift.
         assert_eq!(s.poll(t0 + ms(1050)), Tick::Wait(t0 + ms(1100)));
-        // The nine skipped grid points (t0+200 … t0+1000) are counted.
+        // The nine missed grid points (t0+200 … t0+1000) are counted.
         assert_eq!(s.missed_sends(), 9);
     }
 
@@ -590,16 +590,16 @@ mod tests {
         // Poll across an even stall, an uneven one, and points that are on
         // grid, draining every message due at each instant.
         for offset in [0, 30, 1050, 1100, 1337, 3000] {
-            while let Tick::Due { skipped, .. } = s.poll(t0 + ms(offset)) {
-                reported += skipped;
+            while let Tick::Due { missed, .. } = s.poll(t0 + ms(offset)) {
+                reported += missed;
             }
         }
-        assert!(reported > 0, "the stalls should have skipped something");
+        assert!(reported > 0, "the stalls should have missed something");
         assert_eq!(reported, s.missed_sends());
     }
 
     #[test]
-    fn stall_of_exactly_one_interval_does_not_skip() {
+    fn stall_of_exactly_one_interval_does_not_miss() {
         // One interval late is the boundary: the normal advance already
         // lands the next fire in the future, so no skipping happens.
         let t0 = Instant::now();
@@ -625,13 +625,13 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
         assert!(matches!(s.poll(t0), Tick::Due { .. })); // next fire → t0+100
-                                                         // Two intervals late: the t0+200 point is skipped (fires at 250 as
+                                                         // Two intervals late: the t0+200 point is missed (fires at 250 as
                                                          // the late t0+100 point; next fire lands on t0+300).
         assert!(matches!(s.poll(t0 + ms(250)), Tick::Due { .. }));
         assert_eq!(s.missed_sends(), 1);
         assert!(matches!(s.poll(t0 + ms(300)), Tick::Due { .. })); // on grid
                                                                    // A second stall adds to the same counter: the send at 550 is the
-                                                                   // late t0+400 point, so only t0+500 is skipped.
+                                                                   // late t0+400 point, so only t0+500 is missed.
         assert!(matches!(s.poll(t0 + ms(550)), Tick::Due { .. }));
         assert_eq!(s.missed_sends(), 2);
     }

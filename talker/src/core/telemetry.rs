@@ -81,13 +81,13 @@ pub struct SendTimingReport {
 /// **What that pair does and does not establish.** Delay blame
 /// ([`blocked_others`](MessageTiming::blocked_others)) is measured against
 /// deadlines the channel *reached*, so it explains observed **lateness**
-/// directly (ADR-045). It could never explain a **miss**, because a skipped
+/// directly (ADR-045). It could never explain a **miss**, because a missed
 /// cadence point is passed over before any of it runs — and it failed worst
 /// exactly under overload, where fewer deadlines are reached and the evidence
 /// thins out as the problem grows.
 ///
 /// [`missed_others`](MessageTiming::missed_others) closes that gap by counting
-/// at the skip instead of at the deadline (ADR-051). The two are separate
+/// at the miss instead of at the deadline (ADR-051). The two are separate
 /// columns on purpose: one is time other messages spent waiting, the other is
 /// sends they never made, and neither is convertible into the other.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -133,13 +133,13 @@ pub struct MessageTiming {
     /// rather than the ones that happened late — and the one that survives
     /// overload. `blocked_others` can only grow when a deadline is *reached*,
     /// so the worse the stall, the fewer deadlines there are to observe and
-    /// the thinner the evidence gets. A skipped point is counted where it
+    /// the thinner the evidence gets. A missed point is counted where it
     /// occurred, so this grows with the problem instead (ADR-051).
     ///
     /// Summing this across every message gives the share of the channel's
     /// `missed_sends` that some send is answerable for. The remainder has no
     /// matching retained send window. A real schedule retains enough windows
-    /// that a point skipped behind a send can always find it; defensive,
+    /// that a point missed behind a send can always find it; defensive,
     /// out-of-model calls still under-attribute rather than guess. Either way,
     /// no match is never presented as proof that the channel was idle.
     pub missed_others: u64,
@@ -156,8 +156,8 @@ impl MessageTiming {
 /// How many of `count` points, starting at `first` and spaced `interval`
 /// apart, fall inside `[start, end)`.
 ///
-/// Closed form, not a loop: a 1 ms cadence stalled for a minute skips sixty
-/// thousand points, and a machine suspended overnight skips tens of millions.
+/// Closed form, not a loop: a 1 ms cadence stalled for a minute misses sixty
+/// thousand points, and a machine suspended overnight misses tens of millions.
 /// This runs on the channel thread between sends, so it has to cost the same
 /// whether one point was lost or a billion — and it is evaluated once per
 /// retained window, so a loop here would multiply.
@@ -202,8 +202,8 @@ struct SendWindow {
 /// happen to precede each later victim. Lateness with no send spanning the
 /// deadline — an OS wake delay on an idle thread — is charged to nobody.
 ///
-/// Cadence points that were skipped outright follow the same rule at the same
-/// resolution ([`record_skips`](Self::record_skips)): each point is charged to
+/// Cadence points that were missed outright follow the same rule at the same
+/// resolution ([`record_misses`](Self::record_misses)): each point is charged to
 /// whichever send held the thread when it passed. One rule, two consequences —
 /// time lost and sends lost.
 ///
@@ -289,7 +289,7 @@ impl MessageTimingRecorder {
 
     /// [`Self::blocker_for`], and advance the backlog cursor to match.
     ///
-    /// Only the deadline actually being handled may move the cursor. A skipped
+    /// Only the deadline actually being handled may move the cursor. A missed
     /// point lies *after* that deadline, so letting it advance the cursor would
     /// step over deadlines the runner has not processed yet — messages are
     /// handled earliest-first, so a later query must not decide for an earlier
@@ -334,15 +334,15 @@ impl MessageTimingRecorder {
         }
     }
 
-    /// Charge the cadence points this poll skipped to the sends that were
+    /// Charge the cadence points this poll missed to the sends that were
     /// holding the thread as they passed.
     ///
-    /// `scheduled_for` is the deadline that *did* fire; the `skipped` points
+    /// `scheduled_for` is the deadline that *did* fire; the `missed` points
     /// follow it at `interval` spacing. Call this after
     /// [`record_due`](Self::record_due) for the same tick.
     ///
-    /// A skipped range is **partitioned** across every retained window it
-    /// overlaps, not assigned whole to one. A stall long enough to skip points
+    /// A missed range is **partitioned** across every retained window it
+    /// overlaps, not assigned whole to one. A stall long enough to miss points
     /// is usually long enough to contain several writes, and charging the
     /// range to the first of them would credit one message with damage the
     /// others did. Partitioning also makes the backlog rule unnecessary here:
@@ -355,14 +355,14 @@ impl MessageTimingRecorder {
     /// rendering or handling commands, and a genuinely free thread all leave
     /// that same gap, and nothing measured here separates them, so no readout
     /// may call it idle time.
-    pub(crate) fn record_skips(
+    pub(crate) fn record_misses(
         &mut self,
         index: usize,
         scheduled_for: Instant,
         interval: Duration,
-        skipped: u64,
+        missed: u64,
     ) {
-        if skipped == 0 || interval.is_zero() {
+        if missed == 0 || interval.is_zero() {
             return;
         }
         let Some(first) = scheduled_for.checked_add(interval) else {
@@ -385,7 +385,7 @@ impl MessageTimingRecorder {
             if send.index == index {
                 continue;
             }
-            let charged = points_in(first, interval, skipped, send.started, send.ended);
+            let charged = points_in(first, interval, missed, send.started, send.ended);
             if charged == 0 {
                 continue;
             }
@@ -538,7 +538,7 @@ mod tests {
     /// Sends that never happened, charged the same way as sends that happened
     /// late: to whoever was writing when the point went by.
     #[test]
-    fn a_skipped_point_is_charged_to_the_send_that_was_writing() {
+    fn a_missed_point_is_charged_to_the_send_that_was_writing() {
         let t0 = Instant::now();
         let mut recorder = MessageTimingRecorder::new(4);
 
@@ -547,7 +547,7 @@ mod tests {
         // at 100 fires late as soon as the thread comes free.
         recorder.record_send(3, t0, t0 + ms(412));
         recorder.record_due(1, t0 + ms(100), t0 + ms(412));
-        recorder.record_skips(1, t0 + ms(100), ms(100), 3);
+        recorder.record_misses(1, t0 + ms(100), ms(100), 3);
 
         let snapshot = recorder.snapshot();
         assert_eq!(snapshot[3].missed_others, 3);
@@ -557,13 +557,13 @@ mod tests {
         );
     }
 
-    /// A stall long enough to skip points is usually long enough to contain
+    /// A stall long enough to miss points is usually long enough to contain
     /// several writes. Charging the whole run to the first of them would
     /// credit one message with damage the others did; charging only what the
     /// first covers would drop the rest on the floor and — since the callout
     /// reads the shortfall — report a busy thread as an idle one.
     #[test]
-    fn a_skipped_run_is_split_across_every_write_it_spans() {
+    fn a_missed_run_is_split_across_every_write_it_spans() {
         let t0 = Instant::now();
         let mut recorder = MessageTimingRecorder::new(4);
 
@@ -574,7 +574,7 @@ mod tests {
         recorder.record_send(2, t0, t0 + ms(250));
         recorder.record_send(3, t0 + ms(250), t0 + ms(400));
         recorder.record_due(1, t0 + ms(100), t0 + ms(400));
-        recorder.record_skips(1, t0 + ms(100), ms(100), 3);
+        recorder.record_misses(1, t0 + ms(100), ms(100), 3);
 
         let snapshot = recorder.snapshot();
         assert_eq!(snapshot[2].missed_others, 1, "the point at 200 ms is #2's");
@@ -597,7 +597,7 @@ mod tests {
         recorder.record_send(2, t0 + ms(250), t0 + ms(400));
         recorder.record_due(0, t0 + ms(10), t0 + ms(400));
         // Points at 20, 30 … 400: 39 of them.
-        recorder.record_skips(0, t0 + ms(10), ms(10), 39);
+        recorder.record_misses(0, t0 + ms(10), ms(10), 39);
 
         let snapshot = recorder.snapshot();
         let charged = snapshot[1].missed_others + snapshot[2].missed_others;
@@ -653,7 +653,7 @@ mod tests {
         let victim = WRITERS;
         let handled = t0 + ms(10 * WRITERS as u64);
         recorder.record_due(victim, t0, handled);
-        recorder.record_skips(victim, t0, ms(10), WRITERS as u64 - 1);
+        recorder.record_misses(victim, t0, ms(10), WRITERS as u64 - 1);
 
         let snapshot = recorder.snapshot();
         let charged: u64 = snapshot.iter().map(|m| m.missed_others).sum();
@@ -675,7 +675,7 @@ mod tests {
     /// here is deliberately artificial. What it pins is that running out of
     /// history under-charges rather than mis-charges.
     #[test]
-    fn a_skip_behind_an_evicted_write_goes_uncharged_rather_than_misplaced() {
+    fn a_miss_behind_an_evicted_write_goes_uncharged_rather_than_misplaced() {
         let t0 = Instant::now();
         let mut recorder = MessageTimingRecorder::new(2);
 
@@ -684,7 +684,7 @@ mod tests {
         recorder.record_send(0, t0 + ms(200), t0 + ms(201));
         recorder.record_send(0, t0 + ms(202), t0 + ms(203));
         recorder.record_due(1, t0 + ms(10), t0 + ms(400));
-        recorder.record_skips(1, t0 + ms(10), ms(10), 8);
+        recorder.record_misses(1, t0 + ms(10), ms(10), 8);
 
         assert_eq!(
             recorder.snapshot()[0].missed_others,
@@ -695,9 +695,9 @@ mod tests {
 
     /// The split that makes the column worth having: an over-subscribed
     /// channel and a starved one both miss sends, and only the position of
-    /// the skipped points tells them apart.
+    /// the missed points tells them apart.
     #[test]
-    fn points_skipped_after_the_write_returned_are_charged_to_nobody() {
+    fn points_missed_after_the_write_returned_are_charged_to_nobody() {
         let t0 = Instant::now();
         let mut recorder = MessageTimingRecorder::new(4);
 
@@ -706,7 +706,7 @@ mod tests {
         // at 200, 300, 400 and 500.
         recorder.record_send(3, t0, t0 + ms(250));
         recorder.record_due(1, t0 + ms(100), t0 + ms(550));
-        recorder.record_skips(1, t0 + ms(100), ms(100), 4);
+        recorder.record_misses(1, t0 + ms(100), ms(100), 4);
 
         let snapshot = recorder.snapshot();
         assert_eq!(
@@ -719,13 +719,13 @@ mod tests {
     /// a cost to anyone else — and it is already visible as a send call longer
     /// than the interval.
     #[test]
-    fn a_message_is_never_charged_for_its_own_skipped_points() {
+    fn a_message_is_never_charged_for_its_own_missed_points() {
         let t0 = Instant::now();
         let mut recorder = MessageTimingRecorder::new(2);
 
         recorder.record_send(1, t0, t0 + ms(412));
         recorder.record_due(1, t0 + ms(100), t0 + ms(412));
-        recorder.record_skips(1, t0 + ms(100), ms(100), 3);
+        recorder.record_misses(1, t0 + ms(100), ms(100), 3);
 
         assert_eq!(recorder.snapshot()[1].missed_others, 0);
     }
@@ -734,7 +734,7 @@ mod tests {
     /// collected at a deadline the channel *reached*, so a block long enough
     /// to swallow a thousand cadence points still yields exactly one lateness
     /// sample: the evidence thins out as the fault gets worse. Counting at the
-    /// skip scales with the damage instead.
+    /// miss scales with the damage instead.
     #[test]
     fn miss_blame_scales_with_overload_where_delay_blame_thins_out() {
         let t0 = Instant::now();
@@ -743,7 +743,7 @@ mod tests {
         // One ten-second write against a 10 ms cadence.
         recorder.record_send(0, t0, t0 + ms(10_005));
         recorder.record_due(1, t0 + ms(10), t0 + ms(10_005));
-        recorder.record_skips(1, t0 + ms(10), ms(10), 999);
+        recorder.record_misses(1, t0 + ms(10), ms(10), 999);
 
         let snapshot = recorder.snapshot();
         assert_eq!(
@@ -754,41 +754,41 @@ mod tests {
         assert_eq!(snapshot[0].missed_others, 999);
     }
 
-    /// A suspended machine skips more cadence points than any loop could
+    /// A suspended machine misses more cadence points than any loop could
     /// visit. Recording the charge is arithmetic, so it costs the same whether
     /// one point was lost or billions.
     #[test]
     fn an_enormous_stall_is_charged_without_visiting_each_point() {
         let t0 = Instant::now();
         let mut recorder = MessageTimingRecorder::new(2);
-        // The write outlasts the hour by a millisecond, so the last skipped
+        // The write outlasts the hour by a millisecond, so the last missed
         // point falls inside it and the count is not a boundary case.
         let block_end = t0 + Duration::from_secs(3600) + Duration::from_millis(1);
 
         recorder.record_send(0, t0, block_end);
         recorder.record_due(1, t0, block_end);
         // A 1 µs cadence across an hour: 3.6 billion points.
-        recorder.record_skips(1, t0, Duration::from_micros(1), 3_600_000_000);
+        recorder.record_misses(1, t0, Duration::from_micros(1), 3_600_000_000);
 
         assert_eq!(recorder.snapshot()[0].missed_others, 3_600_000_000);
     }
 
-    /// Messages are handled earliest-first, so a tick's skipped points reach
+    /// Messages are handled earliest-first, so a tick's missed points reach
     /// further forward in time than deadlines still queued behind it. Looking
     /// those points up must not advance the backlog cursor past the deadlines
     /// still to come, or the message handled next finds no blocker and a real
     /// block goes unattributed.
     #[test]
-    fn charging_skips_does_not_disinherit_the_deadline_handled_next() {
+    fn charging_misses_does_not_disinherit_the_deadline_handled_next() {
         let t0 = Instant::now();
         let mut recorder = MessageTimingRecorder::new(3);
 
         // #2 holds the thread from 0 to 350 ms.
         recorder.record_send(2, t0, t0 + ms(350));
-        // #0 runs at 300 ms and is handled very late; its skipped points start
+        // #0 runs at 300 ms and is handled very late; its missed points start
         // at 400 ms, after that block ended.
         recorder.record_due(0, t0 + ms(100), t0 + ms(900));
-        recorder.record_skips(0, t0 + ms(100), ms(300), 2);
+        recorder.record_misses(0, t0 + ms(100), ms(300), 2);
         // #0's own catch-up send becomes the most recent one…
         recorder.record_send(0, t0 + ms(900), t0 + ms(901));
         // …and only now is #1's deadline handled, which fell inside #2's block.
@@ -797,12 +797,12 @@ mod tests {
         let snapshot = recorder.snapshot();
         assert_eq!(
             snapshot[2].missed_others, 0,
-            "points skipped after the block ended belong to nobody"
+            "points missed after the block ended belong to nobody"
         );
         assert_eq!(
             snapshot[2].blocked_others,
             ms(250) + ms(200),
-            "the deadline handled after the skip lookup lost its blocker"
+            "the deadline handled after the miss lookup lost its blocker"
         );
     }
 

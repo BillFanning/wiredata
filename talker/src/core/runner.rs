@@ -137,7 +137,7 @@ pub enum TalkerStatus {
         /// Cumulative count of status updates this channel discarded because
         /// the receiver was full.
         dropped_statuses: u64,
-        /// Cumulative count of sends skipped under the scheduler's stall
+        /// Cumulative count of sends missed under the scheduler's stall
         /// policy (`Schedule::missed_sends`) — the channel couldn't keep to
         /// its configured cadence.
         missed_sends: u64,
@@ -159,7 +159,7 @@ pub enum TalkerStatus {
         withheld_sends: u64,
         /// The current write or reopen error from the open failure episode.
         ///
-        /// This repeats the immediate [`ConnectionError`](Self::ConnectionError)
+        /// This repeats the immediate [`SendFailed`](Self::SendFailed)
         /// edge so a later counter snapshot repairs observer state if that edge
         /// was dropped. Later retry errors refresh the live explanation without
         /// opening another counted episode. `None` likewise repairs a dropped
@@ -205,10 +205,10 @@ pub enum TalkerStatus {
     /// the *first* failure of a failing episode is reported; repeats are
     /// counted, not re-reported, and [`SendRecovered`](Self::SendRecovered)
     /// closes the episode with the totals.
-    ConnectionError { channel: ChannelId, message: String },
+    SendFailed { channel: ChannelId, message: String },
     /// Sending resumed after a failing episode. Carries the episode's cost so
     /// the observer can state what was lost: `failures` sends were attempted
-    /// and failed (the first was reported as `ConnectionError`), `withheld`
+    /// and failed (the first was reported as `SendFailed`), `withheld`
     /// due fires were skipped by the bounded-backoff retry policy without an
     /// interface write; some may have found that the handle could not yet be
     /// reopened.
@@ -237,7 +237,7 @@ pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// How a runner reports to its observer (ADR-018): the named policy the owner
 /// passes to [`run`]/[`open_and_run`]. Counters and payload samples are
-/// **rate-limited lanes**; errors ([`TalkerStatus::ConnectionError`] /
+/// **rate-limited lanes**; errors ([`TalkerStatus::SendFailed`] /
 /// [`TalkerStatus::SendRecovered`] / [`TalkerStatus::OpenFailed`]) are always
 /// immediate and never rate-limited.
 #[derive(Clone, Copy, Debug)]
@@ -305,48 +305,48 @@ struct FailureEpisode {
     since: Instant,
 }
 
-/// How long a channel must go without skipping a scheduled send before its
+/// How long a channel must go without missing a scheduled send before its
 /// off-cadence episode is closed.
 ///
-/// Recovery cannot be "the first poll that skipped nothing". A marginal channel
-/// skips intermittently, so closing on the first clean tick would log a start
+/// Recovery cannot be "the first poll that missed nothing". A marginal channel
+/// misses intermittently, so closing on the first clean tick would log a start
 /// and an end for every pair of ticks — at a 10 ms cadence, a hundred pairs a
 /// second, which is the flood the edge-triggering exists to prevent. The window
-/// only has to outlast the skip's cause, and the coarsest ordinary one is an OS
+/// only has to outlast the miss's cause, and the coarsest ordinary one is an OS
 /// scheduling quantum, measured in tens of milliseconds. Seconds is therefore
 /// the right order of magnitude, and five is a settle time chosen within it
 /// rather than a threshold proven by anything.
 ///
-/// **It is a minimum, not a deadline.** The test runs only where the skip count
+/// **It is a minimum, not a deadline.** The test runs only where the miss count
 /// arrives, on a reached cadence point, so a channel is not woken to announce
 /// its own recovery: a 15 s schedule reports at its next send, not at 5 s. A run
 /// that stops first never reports one at all, which is why the end of the run
 /// states the missed total instead.
 const MISS_RECOVERY_SETTLE: Duration = Duration::from_secs(5);
 
-/// One episode of a channel failing to keep its cadence: from the first skipped
+/// One episode of a channel failing to keep its cadence: from the first missed
 /// send (reported) to [`MISS_RECOVERY_SETTLE`] without another (reported with
 /// these counts).
 ///
-/// Edge-triggered for the reason the failure path is, only more so. Skips are
+/// Edge-triggered for the reason the failure path is, only more so. Misses are
 /// counted at every poll, and they concentrate on the shortest interval, so a
-/// line per skipped send would emit thousands a second under exactly the
+/// line per missed send would emit thousands a second under exactly the
 /// overload it is describing — into a log pane that is itself a queue consumer.
-/// The first skip and the return to schedule are the two facts worth a line;
+/// The first miss and the return to schedule are the two facts worth a line;
 /// the count in between belongs on the line that closes the episode.
 struct MissEpisode {
-    /// Scheduled sends skipped since the episode opened, ≥ 1.
-    skipped: u64,
-    /// When the most recent skip was observed, for the settle test.
-    last_skip: Instant,
-    /// When the first skip was observed: the episode's start.
+    /// Scheduled sends missed since the episode opened, ≥ 1.
+    missed: u64,
+    /// When the most recent miss was observed, for the settle test.
+    last_miss: Instant,
+    /// When the first miss was observed: the episode's start.
     since: Instant,
 }
 
-/// What one poll's skip count is worth reporting, if anything.
+/// What one poll's miss count is worth reporting, if anything.
 #[derive(Debug, PartialEq, Eq)]
 enum MissReport {
-    /// Either nothing was skipped and nothing was open, or the episode is
+    /// Either nothing was missed and nothing was open, or the episode is
     /// still running and this poll only added to it.
     Silent,
     /// The channel has just fallen off cadence. Carries this poll's own count,
@@ -356,38 +356,38 @@ enum MissReport {
     BackOnSchedule {
         /// The episode's total.
         missed: u64,
-        /// From the first skip to the last; the settle window is not in it.
+        /// From the first miss to the last; the settle window is not in it.
         length: Duration,
     },
 }
 
-/// Fold one poll's skip count into the off-cadence episode.
+/// Fold one poll's miss count into the off-cadence episode.
 ///
 /// Separated from the send loop so the edge behaviour can be exercised
 /// directly: what has to hold is that a sustained overload logs twice and not
-/// once per skipped send, and that is a statement about this transition table
+/// once per missed send, and that is a statement about this transition table
 /// rather than about any particular run.
-fn observe_skips(episode: &mut Option<MissEpisode>, skipped: u64, now: Instant) -> MissReport {
-    match (skipped > 0, episode.as_mut()) {
+fn observe_misses(episode: &mut Option<MissEpisode>, missed: u64, now: Instant) -> MissReport {
+    match (missed > 0, episode.as_mut()) {
         (true, Some(open)) => {
-            open.skipped = open.skipped.saturating_add(skipped);
-            open.last_skip = now;
+            open.missed = open.missed.saturating_add(missed);
+            open.last_miss = now;
             MissReport::Silent
         }
         (true, None) => {
             *episode = Some(MissEpisode {
-                skipped,
-                last_skip: now,
+                missed,
+                last_miss: now,
                 since: now,
             });
-            MissReport::FellBehind(skipped)
+            MissReport::FellBehind(missed)
         }
         (false, Some(open))
-            if now.saturating_duration_since(open.last_skip) >= MISS_RECOVERY_SETTLE =>
+            if now.saturating_duration_since(open.last_miss) >= MISS_RECOVERY_SETTLE =>
         {
             let report = MissReport::BackOnSchedule {
-                missed: open.skipped,
-                length: open.last_skip.saturating_duration_since(open.since),
+                missed: open.missed,
+                length: open.last_miss.saturating_duration_since(open.since),
             };
             *episode = None;
             report
@@ -402,7 +402,7 @@ fn sends_missed(count: u64) -> String {
     format!("{} {sends} missed", thousands(count))
 }
 
-/// The warning for the first skipped send of an episode: which message, at
+/// The warning for the first missed send of an episode: which message, at
 /// what interval, how late its send was handled, and how many points were lost.
 /// `index` is the message's position in the schedule; people count from 1. The
 /// interval is in milliseconds, as it is configured.
@@ -423,7 +423,7 @@ fn missed_line(
 }
 
 /// The line that closes an episode: the clean `quiet` stretch that ended it,
-/// the sends it lost, and how long it lasted (left out for a single skip).
+/// the sends it lost, and how long it lasted (left out for a single miss).
 /// `quiet` is a fixed window, so it reads in whole units.
 fn back_on_schedule_line(label: &str, quiet: Duration, missed: u64, length: Duration) -> String {
     let lasted = if length.is_zero() {
@@ -1123,7 +1123,7 @@ fn run_loop(
                 index,
                 scheduled_for,
                 interval,
-                skipped,
+                missed,
             } => {
                 // A bounded-window request has done its job once the deadline
                 // wait returns. Rendering and clock reads do not benefit from
@@ -1136,15 +1136,15 @@ fn run_loop(
                 );
                 per_message_timing.record_due(index, scheduled_for, due_handled_at);
                 // Order matters: `record_due` settles which send this tick's
-                // backlog belongs to, and the skipped points belong to the
+                // backlog belongs to, and the missed points belong to the
                 // same one.
-                per_message_timing.record_skips(index, scheduled_for, interval, skipped);
+                per_message_timing.record_misses(index, scheduled_for, interval, missed);
                 // Report falling off cadence and returning to it, and nothing
-                // in between. The first skip is reported for the same reason
+                // in between. The first miss is reported for the same reason
                 // the first failed send is: it is the moment the reader could
                 // have acted, and every later one says only "still".
-                match observe_skips(&mut miss_episode, skipped, due_handled_at) {
-                    MissReport::FellBehind(now_skipped) => tracing::warn!(
+                match observe_misses(&mut miss_episode, missed, due_handled_at) {
+                    MissReport::FellBehind(now_missed) => tracing::warn!(
                         channel = who.id.as_u64(),
                         "{}",
                         missed_line(
@@ -1152,7 +1152,7 @@ fn run_loop(
                             index,
                             interval,
                             due_handled_at.saturating_duration_since(scheduled_for),
-                            now_skipped
+                            now_missed
                         )
                     ),
                     // Not "back to normal": this is a statement about cadence
@@ -1355,7 +1355,7 @@ fn run_loop(
                             let partial = u64::from(written.is_some());
                             match episode.as_mut() {
                                 // Edge-triggered: only the episode's first failure is
-                                // reported (warn + `ConnectionError`); it opens the episode.
+                                // reported (warn + `SendFailed`); it opens the episode.
                                 None => {
                                     send_failure_episodes += 1;
                                     let message = format!("{e:#}");
@@ -1375,7 +1375,7 @@ fn run_loop(
                                         handle_replaced: false,
                                         since: send_finished,
                                     });
-                                    timer.emit(TalkerStatus::ConnectionError {
+                                    timer.emit(TalkerStatus::SendFailed {
                                         channel: who.id,
                                         message,
                                     });
@@ -1633,18 +1633,18 @@ mod tests {
     use crate::core::channel::{SerialConfig, TcpClientConfig};
     use crate::core::message::{CodePage, MessageConfig, PayloadConfig};
 
-    /// Sustained overload must log twice, not once per skipped send. This is
-    /// the whole reason the episode exists: skips concentrate on the shortest
+    /// Sustained overload must log twice, not once per missed send. This is
+    /// the whole reason the episode exists: misses concentrate on the shortest
     /// interval, so a line each would flood the log with the fault's own
     /// symptom at the moment the log is least able to carry it.
     #[test]
-    fn falling_off_cadence_reports_the_edges_and_not_every_skipped_send() {
+    fn falling_off_cadence_reports_the_edges_and_not_every_missed_send() {
         let start = Instant::now();
         let mut episode = None;
 
-        // The first skip is the one the reader could have acted on.
+        // The first miss is the one the reader could have acted on.
         assert_eq!(
-            observe_skips(&mut episode, 3, start),
+            observe_misses(&mut episode, 3, start),
             MissReport::FellBehind(3)
         );
 
@@ -1652,7 +1652,7 @@ mod tests {
         // count accrues for the line that closes the episode.
         for tick in 1..=1_000 {
             assert_eq!(
-                observe_skips(&mut episode, 2, start + Duration::from_millis(tick)),
+                observe_misses(&mut episode, 2, start + Duration::from_millis(tick)),
                 MissReport::Silent,
                 "a continuing episode must not log again at tick {tick}"
             );
@@ -1662,25 +1662,25 @@ mod tests {
         // marginal channel alternates, and reporting each clean tick would
         // produce the same flood with two lines instead of one.
         assert_eq!(
-            observe_skips(&mut episode, 0, start + MISS_RECOVERY_SETTLE),
+            observe_misses(&mut episode, 0, start + MISS_RECOVERY_SETTLE),
             MissReport::Silent
         );
 
-        // Settle is measured from the last skip, not from the episode's start.
-        let last_skip = start + Duration::from_millis(1_000);
+        // Settle is measured from the last miss, not from the episode's start.
+        let last_miss = start + Duration::from_millis(1_000);
         assert_eq!(
-            observe_skips(&mut episode, 0, last_skip + MISS_RECOVERY_SETTLE),
+            observe_misses(&mut episode, 0, last_miss + MISS_RECOVERY_SETTLE),
             MissReport::BackOnSchedule {
                 missed: 3 + 2 * 1_000,
                 length: Duration::from_millis(1_000),
             },
-            "the length runs from the first skip to the last, not through the settle window"
+            "the length runs from the first miss to the last, not through the settle window"
         );
         assert!(episode.is_none(), "recovery closes the episode");
 
         // And a quiet channel stays quiet.
         assert_eq!(
-            observe_skips(&mut episode, 0, last_skip + MISS_RECOVERY_SETTLE * 10),
+            observe_misses(&mut episode, 0, last_miss + MISS_RECOVERY_SETTLE * 10),
             MissReport::Silent
         );
     }
@@ -1693,9 +1693,9 @@ mod tests {
         let start = Instant::now();
         let mut episode = None;
 
-        observe_skips(&mut episode, 5, start);
+        observe_misses(&mut episode, 5, start);
         assert_eq!(
-            observe_skips(&mut episode, 0, start + MISS_RECOVERY_SETTLE),
+            observe_misses(&mut episode, 0, start + MISS_RECOVERY_SETTLE),
             MissReport::BackOnSchedule {
                 missed: 5,
                 length: Duration::ZERO,
@@ -1704,11 +1704,11 @@ mod tests {
 
         let later = start + MISS_RECOVERY_SETTLE * 4;
         assert_eq!(
-            observe_skips(&mut episode, 1, later),
+            observe_misses(&mut episode, 1, later),
             MissReport::FellBehind(1)
         );
         assert_eq!(
-            observe_skips(&mut episode, 0, later + MISS_RECOVERY_SETTLE),
+            observe_misses(&mut episode, 0, later + MISS_RECOVERY_SETTLE),
             MissReport::BackOnSchedule {
                 missed: 1,
                 length: Duration::ZERO,
@@ -1750,7 +1750,7 @@ mod tests {
         assert_eq!(
             back_on_schedule_line("GPS", MISS_RECOVERY_SETTLE, 1, Duration::ZERO),
             "channel GPS: on schedule again (5 s without a miss); 1 send missed",
-            "an episode of one skip has no length to state"
+            "an episode of one miss has no length to state"
         );
     }
 
@@ -2014,11 +2014,11 @@ mod tests {
     }
 
     /// The edge-triggering, through the real send path rather than the
-    /// transition table: overload that skips hundreds of cadence points must
+    /// transition table: overload that misses hundreds of cadence points must
     /// still produce one line, and a run stopped mid-episode must not leave the
     /// warning unanswered.
     ///
-    /// 120 ms writes against a 10 ms cadence skip at least a dozen points per
+    /// 120 ms writes against a 10 ms cadence miss at least a dozen points per
     /// send, on any machine — the assertion is on the count of *lines*, which
     /// the edge-trigger fixes at one however many points are lost.
     #[test]
@@ -2030,7 +2030,7 @@ mod tests {
         );
         let mut lines = Vec::new();
 
-        // Two completed slow writes guarantee skipped points between them.
+        // Two completed slow writes guarantee missed points between them.
         let deadline = Instant::now() + Duration::from_secs(5);
         while sent.lock().unwrap().len() < 2 {
             assert!(Instant::now() < deadline, "the slow interface never sent");
@@ -2048,11 +2048,11 @@ mod tests {
             .count();
         assert_eq!(
             fell_behind, 1,
-            "the episode opens once, however many points are skipped: {lines:#?}"
+            "the episode opens once, however many points are missed: {lines:#?}"
         );
         assert!(
             !lines.iter().any(|line| line.contains("no further")),
-            "five seconds never elapsed without a skip, so nothing recovered: {lines:#?}"
+            "five seconds never elapsed without a miss, so nothing recovered: {lines:#?}"
         );
     }
 
@@ -2143,7 +2143,7 @@ mod tests {
         // from the one deadline it did reach.
         assert!(
             slow.missed_others >= 5,
-            "skipped points were not charged to the blocking send: {slow:?}"
+            "missed points were not charged to the blocking send: {slow:?}"
         );
         assert_eq!(
             fast.missed_others, 0,
@@ -2772,13 +2772,13 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         let mut saw_error = false;
         for s in handle.status_rx.try_iter() {
-            if let TalkerStatus::ConnectionError { channel, message } = s {
+            if let TalkerStatus::SendFailed { channel, message } = s {
                 assert_eq!(channel, id, "errors carry the stable id");
                 assert!(message.contains("mock send failure"));
                 saw_error = true;
             }
         }
-        assert!(saw_error, "expected at least one ConnectionError");
+        assert!(saw_error, "expected at least one SendFailed");
         assert!(
             !handle.thread.is_finished(),
             "runner must survive send errors"
@@ -2790,7 +2790,7 @@ mod tests {
     #[test]
     fn repeated_send_failures_report_one_connection_error() {
         // 5 ms fires against a permanently failing interface: without the
-        // edge trigger every retry could emit a ConnectionError; with it,
+        // edge trigger every retry could emit a SendFailed; with it,
         // exactly one is emitted for the whole failure episode.
         let (_, handle, _id) = spawn_runner(&[msg("AB", 5)], true);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2818,7 +2818,7 @@ mod tests {
         }
         let errors = statuses
             .iter()
-            .filter(|s| matches!(s, TalkerStatus::ConnectionError { .. }))
+            .filter(|s| matches!(s, TalkerStatus::SendFailed { .. }))
             .count();
         assert_eq!(
             errors, 1,
@@ -3194,7 +3194,7 @@ mod tests {
             if handle
                 .status_rx
                 .try_iter()
-                .any(|s| matches!(s, TalkerStatus::ConnectionError { .. }))
+                .any(|s| matches!(s, TalkerStatus::SendFailed { .. }))
             {
                 break;
             }
@@ -3288,7 +3288,7 @@ mod tests {
         let mut recovered = None;
         while recovered.is_none() && Instant::now() < deadline {
             match handle.status_rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(TalkerStatus::ConnectionError { .. }) => errors += 1,
+                Ok(TalkerStatus::SendFailed { .. }) => errors += 1,
                 Ok(TalkerStatus::Counters {
                     active_send_error: Some(error),
                     ..

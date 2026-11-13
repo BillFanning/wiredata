@@ -81,7 +81,7 @@ pub struct ChannelTelemetry {
     pub per_message_timing: Arc<[MessageTiming]>,
     /// Status updates the runner discarded because the queue was full.
     pub dropped_statuses: u64,
-    /// Sends skipped under the scheduler's stall policy — cadence health.
+    /// Sends missed under the scheduler's stall policy — cadence health.
     pub missed_sends: u64,
     /// Interface send attempts that failed before any byte was accepted.
     pub failed_sends: u64,
@@ -1146,7 +1146,7 @@ fn drain_statuses(
                     replacement_wire_offsets,
                 });
             }
-            TalkerStatus::ConnectionError { message, .. } => {
+            TalkerStatus::SendFailed { message, .. } => {
                 telemetry.errors_total += 1;
                 telemetry.send_failure_episodes += 1;
                 telemetry.last_error = Some(message);
@@ -1887,7 +1887,7 @@ mod tests {
     fn counters_repair_a_dropped_failure_edge() {
         let mut telemetry = ChannelTelemetry::default();
         let (tx, rx) = crossbeam_channel::bounded(1);
-        // No `ConnectionError` is delivered: only the later, self-describing
+        // No `SendFailed` is delivered: only the later, self-describing
         // counter snapshot survives observer pressure.
         tx.send(failure_counter(Some(
             "writing to serial port: device removed",
@@ -1941,7 +1941,7 @@ mod tests {
         let mut telemetry = ChannelTelemetry::default();
         let (tx, rx) = crossbeam_channel::bounded(2);
         // The first active snapshot is followed by a later episode. The
-        // intervening recovery edge/snapshot and both ConnectionError edges
+        // intervening recovery edge/snapshot and both SendFailed edges
         // are intentionally absent.
         tx.send(failure_counter_at(Some("first failure"), 1))
             .unwrap();
