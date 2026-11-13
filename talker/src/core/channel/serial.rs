@@ -1,7 +1,15 @@
 use anyhow::Context;
 
 use super::config::{DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits};
-use super::{write_counted, Interface, MissingRetryConfiguration};
+use super::{write_counted, Interface, MissingRetryConfiguration, WriteFailure};
+
+/// How long a serial write may stall, on flow control or a full driver buffer,
+/// before it fails as timed out.
+pub(super) const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Windows' `ERROR_OPERATION_ABORTED`, which Rust maps to `TimedOut` and which
+/// USB serial drivers commonly return when an unplug aborts `WriteFile`.
+const WINDOWS_ERROR_OPERATION_ABORTED: i32 = 995;
 
 pub(super) struct SerialInterface {
     // `None` only between a failed handle being dropped and a later retry
@@ -29,7 +37,7 @@ fn open_port(config: &SerialConfig) -> anyhow::Result<Box<dyn serialport::Serial
         .parity(to_sp_parity(config.parity))
         .stop_bits(to_sp_stop_bits(config.stop_bits))
         .flow_control(to_sp_flow_control(config.flow_control))
-        .timeout(std::time::Duration::from_secs(1))
+        .timeout(WRITE_TIMEOUT)
         .open()
         .map_err(|error| describe_open_failure(&config.port, error))
         // Names the port. Why a port that appears in the list can still fail to
@@ -76,7 +84,7 @@ impl Interface for SerialInterface {
         let port = self.port.as_mut().context("serial port is not open")?;
         if let Err(failure) = write_counted(port.as_mut(), data) {
             self.reopen_required = write_error_requires_reopen(&failure.io);
-            return Err(failure.into_error("writing to serial port"));
+            return Err(write_error(failure));
         }
         Ok(())
     }
@@ -150,12 +158,47 @@ impl Interface for SerialInterface {
     }
 }
 
+/// A write the port took nothing of for [`WRITE_TIMEOUT`]. Said in talker's
+/// words, as the TCP interface says its own.
+#[derive(Debug)]
+struct WriteTimedOut;
+
+impl std::fmt::Display for WriteTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the port took no data for {} s (write timed out)",
+            WRITE_TIMEOUT.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for WriteTimedOut {}
+
+/// The error for a failed write. A timed-out write is said in talker's words;
+/// error 995 is not one, since it is what an unplug raises.
+fn write_error(failure: WriteFailure) -> anyhow::Error {
+    // Unix reports a write timeout as would-block, Windows as timed out.
+    let timed_out = matches!(
+        failure.io.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) && failure.io.raw_os_error() != Some(WINDOWS_ERROR_OPERATION_ABORTED);
+    if timed_out {
+        failure.into_error_as(
+            anyhow::Error::new(WriteTimedOut),
+            "writing to serial port",
+            false,
+        )
+    } else {
+        failure.into_error("writing to serial port")
+    }
+}
+
 fn write_error_requires_reopen(error: &std::io::Error) -> bool {
     // Windows maps ERROR_OPERATION_ABORTED to `TimedOut`, but USB serial
     // drivers commonly return it when an unplug aborts `WriteFile`. Preserve
     // the raw code before exempting ordinary timeouts or a zero-byte write
     // caused by flow control.
-    const WINDOWS_ERROR_OPERATION_ABORTED: i32 = 995;
     if error.raw_os_error() == Some(WINDOWS_ERROR_OPERATION_ABORTED) {
         return true;
     }
@@ -227,6 +270,7 @@ fn to_sp_flow_control(f: FlowControl) -> serialport::FlowControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::channel::PartialWrite;
 
     #[test]
     fn absent_serial_port_is_described_as_a_device() {
@@ -302,6 +346,70 @@ mod tests {
                 "Windows device-removal-shaped error {code} must replace the handle"
             );
         }
+    }
+
+    fn failure(kind: std::io::ErrorKind, written: usize, total: usize) -> WriteFailure {
+        WriteFailure {
+            io: kind.into(),
+            written,
+            total,
+        }
+    }
+
+    #[test]
+    fn a_write_timeout_is_said_in_talkers_words() {
+        // Unix reports a write timeout as would-block, Windows as timed out.
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            let error = write_error(failure(kind, 0, 40));
+            assert_eq!(
+                format!("{error:#}"),
+                "writing to serial port: the port took no data for 1 s (write timed out)"
+            );
+            assert!(error.downcast_ref::<PartialWrite>().is_none(), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn a_timeout_after_part_was_accepted_is_possibly_partial() {
+        let error = write_error(failure(std::io::ErrorKind::TimedOut, 12, 40));
+        let partial = error
+            .downcast_ref::<PartialWrite>()
+            .expect("possibly partial");
+        assert_eq!(partial.written, 12);
+        assert_eq!(
+            format!("{error:#}"),
+            "wrote 12 of 40 bytes before the write failed: \
+             writing to serial port: the port took no data for 1 s (write timed out)"
+        );
+    }
+
+    #[test]
+    fn other_write_errors_keep_the_os_detail() {
+        let error = write_error(WriteFailure {
+            io: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "device disconnected"),
+            written: 0,
+            total: 40,
+        });
+        assert_eq!(
+            format!("{error:#}"),
+            "writing to serial port: device disconnected"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_unplug_aborted_write_is_not_called_a_timeout() {
+        // Windows words error 995 as a timeout, but it is what an unplug
+        // raises, and the port did not merely stall.
+        let error = write_error(WriteFailure {
+            io: std::io::Error::from_raw_os_error(WINDOWS_ERROR_OPERATION_ABORTED),
+            written: 0,
+            total: 40,
+        });
+        assert!(
+            !format!("{error:#}").contains("write timed out"),
+            "{error:#}"
+        );
     }
 
     #[test]
