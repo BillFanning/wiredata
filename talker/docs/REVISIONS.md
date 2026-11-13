@@ -13,6 +13,12 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-12) — a console that stops taking output:
+
+- **§9.2 CLI logging (ADR-064)** — stdout log lines go through a bounded queue
+  on a logger thread, as file lines do. A line the console does not take is
+  dropped and counted, where the channel's send thread used to wait for it.
+
 Revision note (2026-10-01) — a TCP write that timed out:
 
 - **§4.4 / §4.5 possibly partial (ADR-059, amended)** — on Windows, a TCP write
@@ -437,6 +443,11 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-11-12) — a console that stops taking output:
+
+- **ADR-064** — stdout log lines go through a bounded queue that drops, so a
+  paused console cannot hold up a channel's send thread.
 
 Revision note (2026-10-01) — a TCP write that timed out:
 

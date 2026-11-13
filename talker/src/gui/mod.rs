@@ -31,6 +31,7 @@ use crate::core::{
 
 use draft::{ConnDraft, ConnKind, ScheduleDraft, UdpModeDraft};
 use view::ChannelView;
+use wiredata_ui::hover::{Hover, ShowHover};
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -1490,10 +1491,11 @@ impl TalkerApp {
                     .fold((0u64, 0u64), |(s, e), t| {
                         (s + t.total_count, e + t.errors_total)
                     });
-                ui.label(format!("Sent: {total_sent}")).on_hover_text(
-                    "Configured-interface writes that returned success across all channels. \
-                         This does not confirm physical-wire or peer delivery.",
-                );
+                ui.label(format!("Sent: {total_sent}"))
+                    .on_hover(&Hover::new(
+                        "The messages the interfaces accepted, across all channels.\n\n\
+                     This does not confirm that anything reached the wire or a receiver.",
+                    ));
                 ui.separator();
                 // Per-run errors: each channel's tally resets when it starts,
                 // like the send counts and log tallies.
@@ -1570,11 +1572,12 @@ impl TalkerApp {
                 ui.horizontal(|ui| {
                     ui.strong("Log");
                     ui.separator();
-                    ui.label("Detail:").on_hover_text(
-                        "Choose how much new logging to collect. Debug is collected at Debug or \
-                         Trace and is saved when Log file is on. Trace is collected only at Trace. \
-                         This setting lasts until Talker closes; profiles do not change it.",
-                    );
+                    ui.label("Detail:").on_hover(&Hover::new(
+                        "How much logging to collect from now on.\n\n\
+                         Debug entries are collected at Debug or Trace, and Trace entries only at \
+                         Trace. What is collected is also saved when Log file is on.\n\n\
+                         This setting lasts until Talker closes. Profiles do not change it.",
+                    ));
                     let before = self.log_level;
                     egui::ComboBox::from_id_salt("log_level")
                         .selected_text(log_level_label(self.log_level))
@@ -1612,51 +1615,52 @@ impl TalkerApp {
                         file_available && !pending,
                         egui::Checkbox::new(&mut file_enabled, "Log file"),
                     );
-                    let mut file_hint = match &self.file_log_state {
+                    let mut file_hint = Hover::from(match &self.file_log_state {
                         FileLogState::Enabled { directory, prefix } => format!(
-                            "Saving logs in {}. Files begin with {prefix}. Talker uses this log \
-                             folder; it cannot be changed in this window. A new file starts each \
-                             day. Old log files are not deleted automatically. Show in pane does \
-                             not change file content. File logging stays on only until Talker \
+                            "Saving logs in {}.\n\n\
+                             Files begin with {prefix}, and a new file starts each day. Old log \
+                             files are not deleted automatically.\n\n\
+                             The folder cannot be changed in this window. Show in pane does not \
+                             change what is saved. File logging stays on only until Talker \
                              closes.",
                             directory.display()
                         ),
                         FileLogState::Enabling => "Starting file logging…".to_owned(),
-                        FileLogState::Disabling => {
-                            "Finishing the current log file…".to_owned()
-                        }
+                        FileLogState::Disabling => "Finishing the current log file…".to_owned(),
                         FileLogState::Failed(error) => match &self.file_log_config {
                             Some(config) => format!(
-                                "File logging is off: {error}. Select Log file to retry. Talker \
-                                 uses {}; that folder cannot be changed in this window, and old \
-                                 log files are not deleted automatically.",
+                                "File logging is off: {error}.\n\n\
+                                 Select Log file to try again. Talker saves logs in {}; that \
+                                 folder cannot be changed in this window, and old log files are \
+                                 not deleted automatically.",
                                 config.directory.display()
                             ),
                             None => format!("File logging is off: {error}."),
                         },
                         FileLogState::Disabled => match &self.file_log_config {
                             Some(config) => format!(
-                                "Save logs in {}. Files begin with {}. Talker uses this log folder; \
-                                 it cannot be changed in this window. A new file starts each day. \
-                                 Old log files are not deleted automatically. File logging starts \
-                                 off each time Talker opens, and profiles do not turn it on.",
+                                "Saves logs in {}.\n\n\
+                                 Files begin with {}, and a new file starts each day. Old log \
+                                 files are not deleted automatically.\n\n\
+                                 The folder cannot be changed in this window. File logging is off \
+                                 each time Talker opens, and profiles do not turn it on.",
                                 config.directory.display(),
                                 config.prefix
                             ),
-                            None => "File logging is unavailable because no local data directory \
-                                     was found."
+                            None => "File logging is unavailable: this computer has no local \
+                                     data folder for it."
                                 .to_owned(),
                         },
-                    };
+                    });
                     if file_dropped > 0 {
-                        file_hint.push_str(&format!(
-                            " {file_dropped} log entries were not written to a file this session \
-                             because saving could not keep up. While file logging remains \
-                             available, the saved logs mark the gap after saving catches up or \
-                             file logging stops."
+                        file_hint = file_hint.with_paragraph(&format!(
+                            "{file_dropped} log entries were not saved this session because \
+                             saving could not keep up. As long as file logging stays available, \
+                             the saved logs mark the gap once saving catches up or file logging \
+                             stops."
                         ));
                     }
-                    response.clone().on_hover_text(file_hint);
+                    response.clone().on_hover(&file_hint);
                     if response.changed() {
                         let result = if file_enabled {
                             self.file_log_config
@@ -1682,14 +1686,14 @@ impl TalkerApp {
                                 "Open folder"
                             }),
                         )
-                        .on_hover_text(match &self.file_log_config {
+                        .on_hover(&Hover::from(match &self.file_log_config {
                             Some(config) => format!(
-                                "Create {} if needed, then open it. This does not turn on file \
-                                 logging.",
+                                "Opens {}, creating it if needed.\n\n\
+                                 This does not turn on file logging.",
                                 config.directory.display()
                             ),
                             None => "No local log folder is available on this computer.".to_owned(),
-                        });
+                        }));
                     if folder_button.clicked() {
                         if let Some(config) = &self.file_log_config {
                             if self.log_folder.open(config.directory.clone()) {
@@ -1705,10 +1709,11 @@ impl TalkerApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .small_button("Clear")
-                            .on_hover_text(
-                                "Clear the on-screen log. Channel counts, saved log files, and \
-                                 log-loss notices are unchanged.",
-                            )
+                            .on_hover(&Hover::new(
+                                "Clears the on-screen log.\n\n\
+                                 Channel counts, saved log files and notices about lost entries \
+                                 are not changed.",
+                            ))
                             .clicked()
                         {
                             self.log_lines.clear();
@@ -1716,65 +1721,86 @@ impl TalkerApp {
                     });
                 });
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Show in pane:").on_hover_text(
-                        "Display only. The pane keeps the newest 2,000 entries that meet the Detail \
-                         setting, with one shared limit for all five levels. Hidden entries still \
-                         use that space and can push older visible entries out. These boxes do not \
-                         change what Detail collects or what the file contains, and last until \
-                         Talker closes.",
-                    );
+                    ui.label("Show in pane:").on_hover(&Hover::new(
+                        "These boxes choose which levels the pane shows.\n\n\
+                         The pane keeps the newest 2,000 entries collected at the Detail setting, \
+                         with one limit shared by all five levels. Hidden entries still take up \
+                         space, and can push older visible entries out.\n\n\
+                         The boxes do not change what Detail collects or what the log file \
+                         contains. They last until Talker closes.",
+                    ));
                     ui.checkbox(&mut self.log_visibility.trace, "Trace");
                     ui.checkbox(&mut self.log_visibility.debug, "Debug");
                     ui.checkbox(&mut self.log_visibility.info, "Info");
                     ui.checkbox(&mut self.log_visibility.warn, "Warn");
                     ui.checkbox(&mut self.log_visibility.error, "Error");
                 });
-                ui.weak("keeps newest 2,000 entries").on_hover_text(
-                    "Trace, Debug, Info, Warn, and Error share one chronological history. Hidden \
-                     entries count toward the same 2,000-entry limit.",
-                );
+                ui.weak("keeps newest 2,000 entries").on_hover(&Hover::new(
+                    "The pane keeps the newest 2,000 entries, all levels together.\n\n\
+                     Trace, Debug, Info, Warn and Error share one history, in time order. Hidden \
+                     entries count toward the same limit.",
+                ));
                 if let Some(error) = file_failure {
+                    let hover = Hover::from(format!(
+                        "The log file is off: {error}.\n\n\
+                         Select Log file to try again."
+                    ))
+                    .layout(ui.style());
                     attention_callout(
                         ui,
                         "file_log_unavailable",
                         "File unavailable",
                         SignalTone::Fault,
-                        format!("The log file is off: {error}. Select Log file to retry."),
+                        hover,
                     );
                 }
                 if file_dropped > 0 {
+                    let hover = Hover::new(
+                        "Talker produced log entries faster than they could be saved.\n\n\
+                         As long as file logging stays available, the saved logs say how many \
+                         are missing once saving catches up or file logging stops.\n\n\
+                         Sending carried on without waiting. The on-screen log is collected \
+                         separately.",
+                    )
+                    .layout(ui.style());
                     attention_callout(
                         ui,
                         "file_log_entries_not_saved",
                         format!("{file_dropped} log entries not saved this session"),
                         SignalTone::Fault,
-                        "Talker produced log entries faster than they could be saved. While file \
-                         logging remains available, the saved logs mark the missing count after \
-                         saving catches up or file logging stops. Sending continued without \
-                         waiting; the on-screen Log is collected separately.",
+                        hover,
                     );
                 }
                 if pane_dropped > 0 {
+                    let hover = Hover::new(
+                        "The on-screen log could not keep up, so these entries are missing from \
+                         it.\n\n\
+                         The Info, Warn and Error counts on each channel may be lower than what \
+                         happened.\n\n\
+                         Sending carried on without waiting. Saved log files are collected \
+                         separately.",
+                    )
+                    .layout(ui.style());
                     attention_callout(
                         ui,
                         "pane_log_entries_not_shown",
                         format!("{pane_dropped} log entries not shown this session"),
                         SignalTone::Fault,
-                        "The on-screen Log could not keep up. These entries are missing, and channel \
-                         Info/Warn/Error counts may be lower than what occurred. Sending continued \
-                         without waiting; saved log files are collected separately.",
+                        hover,
                     );
                 }
                 if let Some(error) = folder_failure {
+                    let hover = Hover::from(format!(
+                        "The log folder could not be created or opened: {error}.\n\n\
+                         Select Open folder to try again."
+                    ))
+                    .layout(ui.style());
                     attention_callout(
                         ui,
                         "log_folder_unavailable",
                         "Log folder did not open",
                         SignalTone::Fault,
-                        format!(
-                            "The log folder could not be created or opened: {error}. Select Open \
-                             folder to retry."
-                        ),
+                        hover,
                     );
                 }
                 ui.separator();

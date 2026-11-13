@@ -1,13 +1,16 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.26
-**Date:** 2026-11-12
+**Version:** 1.27
+**Date:** 2026-11-13
 **Status:** Accepted
 
-Revision note (2026-11-12) — a console that stops taking output:
+Revision note (2026-11-13) — hover text:
 
-- **ADR-064** — stdout log lines go through a bounded queue that drops, so a
-  paused console cannot hold up a channel's send thread.
+- **ADR-065** — a hover that explains something opens with a bold sentence,
+  then short paragraphs in plain sentences. The format lives in `wiredata-ui`
+  so listener can share it.
+- **ADR-066** — the diagnostics card loses its status badge and header row;
+  the Send outcomes line is marked ⚠ instead.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -2663,6 +2666,89 @@ This has not been tried by hand in talker; the measurement is listener's.
 
 **Consequences:** A paused or stalled console costs log lines on the console
 and nothing else. The log file, when enabled, is unaffected.
+
+---
+
+## ADR-065 — Hover text opens with a bold sentence, then short paragraphs
+
+**Status:** Accepted 2026-11-13.
+
+**Context:** Talker's hovers were single dense paragraphs, some over 150
+words, written in internal terms such as "cadence point", "configured-interface
+write" and "monotonic deadline". One hover often covered every case at once:
+the missed-send callout's explained phrases that were not on the line above
+it. The November 2026 review shortened several to clipped phrases. Checking
+them in the GUI on 13 November, the user found those rushed as well: "this
+information is very important, make it understandable." On the Capacity row,
+a "/" between two figures read as "per", which is what it means in `msg/s`.
+
+**Decision:**
+
+- A hover that explains something opens with one sentence, in bold, that
+  states the point. Short paragraphs follow, set apart by blank lines, in
+  plain complete sentences that use the names on screen.
+- A hover explains what its own element shows. Where one element can say
+  several things, as the missed-send callout can, each version carries its own
+  hover.
+- A short hint (a button's action, a keyboard shortcut, a path) stays one
+  plain line: a bold heading over nothing is only a bold hint.
+- On these screens "/" means "per" and is never a separator.
+- The format is chrome, so it lives in `wiredata-ui` as `Hover` and
+  `ShowHover`, under ADR-016's rule: identical in both apps and egui-only.
+  What each hover says stays in its app.
+
+**Boundary:** This governs hover text and separators. It does not set the
+wording of readout lines, log lines or CLI output, and it adds no hover where
+there was none. Listener adopts the format separately, under its own ADR.
+
+**Alternatives considered:**
+
+- A struct holding a heading and a list of paragraphs. It describes itself
+  better, but cannot be a `const`, and most hovers are fixed text. The one
+  string uses a blank line between paragraphs instead, and the first paragraph
+  is the heading.
+- Separate labels per paragraph inside `on_hover_ui`. The look is the same,
+  but the decision rows and callouts in `wiredata-ui` take their hover as text,
+  and would have needed changing to accept it.
+
+**Consequences:** Hovers run to more lines but read faster: the bold sentence
+alone answers the usual question. Until listener is converted, the two apps'
+hovers look different.
+
+---
+
+## ADR-066 — The diagnostics card has no status badge
+
+**Status:** Accepted 2026-11-13. Amends ADR-041, whose card carried the badge.
+
+**Context:** The card's top row held one word, ISSUE, ATTENTION, LIVE or
+IDLE, summing up the card. Asked what it was for, the user pointed out that
+the callouts below it already say what is wrong. Checked case by case, every
+reason the badge rose for was already marked: missed sends by their callout
+and the Send outcomes count, a live failure by the error line and its
+callout, capacity by ⚠ on the Capacity row, an impossible serial schedule and
+a refused timer by their own callouts. The badge said *that* something was
+wrong but not *what*, and took a row at the top of the card to do it.
+
+One reason was carried only by colour: the Send outcomes line turned amber or
+red with no mark, and after the missed-send callout is dismissed it is the
+only place that says the run missed sends. With the badge gone, that line had
+to say it without colour.
+
+**Decision:**
+
+- Talker's card is drawn with `wiredata_ui::diagnostics::diagnostic_card`,
+  which has no header row: no title, no badge.
+- The Send outcomes line starts with ⚠ (`tone_marker`, the mark the card rows
+  use) when any deduction is nonzero.
+
+**Boundary:** Listener's card keeps `decision_card` and its badge until the
+same case-by-case check is done for listener's reasons. The channel list's
+status glyphs and severity counts are unaffected.
+
+**Consequences:** The card starts with its first readout, a row higher. A
+reader who scanned for one word now reads the ⚠ marks, which say what is
+wrong as well as that something is.
 
 ---
 

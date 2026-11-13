@@ -247,18 +247,18 @@ pub(in crate::gui) fn cadence_decision(
     }
 }
 
-/// The one tooltip for the Cadence row.
+/// The one tooltip for the Cadence row: what the figure is based on, as a bold
+/// heading, then one paragraph per thing it does and does not measure.
 ///
-/// Written for a technician who has never read the source: it defines the
-/// channel-of-messages model first, then what "late" measures, then why the
-/// number is a pool rather than one message's behaviour.
+/// The pooling paragraph appears only with more than one active message,
+/// because it is the only case where the figure is not one message's behaviour.
 pub(in crate::gui) fn cadence_tooltip(
     cadence: Option<ActiveCadence>,
     groups: &[(std::time::Duration, usize)],
     recent_samples: u64,
     run_samples: u64,
     snapshot_state: RecentSnapshotState,
-) -> String {
+) -> Hover {
     // Same source rule as the row itself: per-message detail when the channel
     // has reported any, the timer status' own count otherwise.
     let active = if groups.is_empty() {
@@ -266,77 +266,56 @@ pub(in crate::gui) fn cadence_tooltip(
     } else {
         groups.iter().map(|(_, count)| count).sum()
     };
-    let pooling = match active {
-        0 => "No message is currently scheduled to send. When messages are active, each follows \
-              its own repeating interval."
-            .to_owned(),
-        1 => "A channel sends each of its messages on its own repeating interval; this one \
-              currently has a single message sending, so its cadence timing describes that \
-              message."
-            .to_owned(),
-        _ => format!(
-            "This channel is sending {active} messages, each on its own repeating interval, and \
-             all of them go out through one interface, one at a time. When timing is available, \
-             it pools every active message's sends together — it is the channel's behaviour, \
-             not any single message's. Because a \
-             message that repeats more often contributes more sends, the fastest messages weigh \
-             most heavily in it."
-        ),
-    };
 
     // The sample count lives here rather than on the line, and never alone. It
     // follows the same source choice as the line: current/final timing when it
     // has samples, otherwise the labelled run-wide fallback.
+    let window = RECENT_WINDOW.as_secs();
     let using_run = matches!(snapshot_state, RecentSnapshotState::Expired(_))
         || (recent_samples == 0 && run_samples > 0);
     let (samples, period) = if using_run {
-        (run_samples, "since this run started")
+        (run_samples, "since this run started".to_owned())
     } else if matches!(snapshot_state, RecentSnapshotState::Final) {
-        (recent_samples, "in the final ~10-second period before stop")
-    } else {
         (
             recent_samples,
-            "in the ~10-second period ending at the latest timing update",
-        )
-    };
-    let basis = if samples == 0 {
-        "No scheduled deadlines have been measured yet.".to_owned()
-    } else if using_run {
-        format!(
-            "The run-wide figure is based on {} scheduled {} {period}.",
-            thousands(samples),
-            if samples == 1 {
-                "deadline"
-            } else {
-                "deadlines"
-            },
+            format!("in the final ~{window} s before stop"),
         )
     } else {
+        (recent_samples, format!("in the last ~{window} s"))
+    };
+    let heading = if samples == 0 {
+        "Cadence has not measured any scheduled sends yet.".to_owned()
+    } else {
+        let noun = if samples == 1 { "send" } else { "sends" };
         format!(
-            "Based on {} scheduled {} {period}.",
-            thousands(samples),
-            if samples == 1 {
-                "deadline"
-            } else {
-                "deadlines"
-            },
+            "Cadence is based on {} scheduled {noun} {period}.",
+            thousands(samples)
         )
     };
 
-    format!(
-        "{basis} {pooling} This measures one thing: the gap between the moment a send was \
-         scheduled for and the moment the channel actually got to it. It does not include how \
-         long the send itself took, and it never means the data arrived late at the far end. The \
-         timing covers every scheduled send the channel got to, including any \
-         that were then withheld by retry backoff without being transmitted, and excludes points \
-         skipped entirely, which are counted as Missed on the Send outcomes line and never appear \
-         here. \"99% within X\" appears \
-         alongside only when that is a different figure from the worst — below a hundred it never \
-         is — and means at most one in a hundred waited longer than X, rounded up to a histogram \
-         bucket edge, which is what ≤ marks elsewhere. Any percentage compares the delay with the \
-         shortest interval on the channel, to show whether it is a rounding error against the \
-         tightest schedule or a real part of it; it is not a per-message figure."
-    )
+    // "Behind schedule" is sampled when the channel reaches a deadline, before
+    // retry backoff decides whether to send, so the explanation says "got to",
+    // not "sent".
+    let mut paragraphs = vec![
+        "\"Behind schedule\" is how long after its scheduled time the channel got to a send. It \
+         does not include how long the send itself took, and it says nothing about when the \
+         data arrived."
+            .to_owned(),
+        "The percentage compares the worst figure with the shortest interval on the channel. \
+         \"99% within …\" means 99 of every 100 sends were within that time; it is shown only \
+         when it differs from the worst."
+            .to_owned(),
+    ];
+    if active > 1 {
+        paragraphs.push(format!(
+            "All {active} messages are measured together. Messages with shorter intervals send \
+             more often, so they make up more of the figure."
+        ));
+    }
+    paragraphs.push(
+        "Missed sends are not counted here. They are on the Send outcomes line above.".to_owned(),
+    );
+    Hover::from_paragraphs(std::iter::once(heading).chain(paragraphs))
 }
 
 #[cfg(test)]
@@ -574,14 +553,30 @@ mod tests {
         );
     }
 
-    /// The tooltip has to teach the channel-of-messages model, since a
-    /// technician reading the row has no other source for it.
+    /// The tooltip leads with what the figure is based on, then one paragraph
+    /// per fact, and says the figure pools several messages only when it does.
     #[test]
-    fn cadence_tooltip_explains_pooling_only_when_several_messages_send() {
+    fn cadence_tooltip_leads_with_its_basis_and_pools_only_when_several_messages_send() {
         let current = RecentSnapshotState::Current(Duration::ZERO);
-        let many = cadence_tooltip(mixed_cadence(), &mixed_groups(), 201, 2_001, current);
-        assert!(many.contains("sending 3 messages, each on its own repeating interval"));
-        assert!(many.contains("pools every active message's sends together"));
+        let window = crate::core::telemetry::RECENT_WINDOW.as_secs();
+        let behind = "\"Behind schedule\" is how long after its scheduled time the channel got to \
+                      a send. It does not include how long the send itself took, and it says \
+                      nothing about when the data arrived.";
+        let figures = "The percentage compares the worst figure with the shortest interval on \
+                       the channel. \"99% within …\" means 99 of every 100 sends were within \
+                       that time; it is shown only when it differs from the worst.";
+        let missed = "Missed sends are not counted here. They are on the Send outcomes line above.";
+
+        let many = cadence_tooltip(mixed_cadence(), &mixed_groups(), 1_234, 2_001, current);
+        assert_eq!(
+            many.text(),
+            format!(
+                "Cadence is based on 1,234 scheduled sends in the last ~{window} s.\n\n\
+                 {behind}\n\n{figures}\n\n\
+                 All 3 messages are measured together. Messages with shorter intervals send \
+                 more often, so they make up more of the figure.\n\n{missed}"
+            )
+        );
 
         let one = cadence_tooltip(
             Some(ActiveCadence {
@@ -593,26 +588,45 @@ mod tests {
             2_001,
             current,
         );
-        assert!(
-            !one.contains("pools every active message's sends together"),
-            "a single-message channel must not be told its figure is a pool"
+        assert_eq!(
+            one.text(),
+            format!(
+                "Cadence is based on 201 scheduled sends in the last ~{window} s.\n\n\
+                 {behind}\n\n{figures}\n\n{missed}"
+            )
         );
-        assert!(one.contains("describes that message"));
 
-        // Both forms must define what "late" measures and rule out delivery.
-        for tooltip in [&many, &one] {
-            assert!(tooltip.contains("scheduled for"));
-            assert!(tooltip.contains("never means the data arrived late at the far end"));
-            // The sample count left the row for here, and may never appear
-            // without the window it was gathered over — a bare denominator is
-            // the thing that move was meant to stop showing.
-            assert!(
-                tooltip.starts_with(
-                    "Based on 201 scheduled deadlines in the ~10-second period ending at the latest timing update"
-                ),
-                "the count must lead, paired with its window: {tooltip}"
-            );
-        }
+        // The pooled count comes from the schedule, not from a typed number.
+        let five = cadence_tooltip(
+            None,
+            &cadence_groups(std::iter::repeat_n(Duration::from_millis(250), 5)),
+            1,
+            1,
+            current,
+        );
+        assert!(
+            five.heading()
+                .starts_with("Cadence is based on 1 scheduled send in the last")
+                && five
+                    .text()
+                    .contains("All 5 messages are measured together."),
+            "{five:?}"
+        );
+
+        // The period follows whichever source supplied the figure.
+        let final_period = cadence_tooltip(
+            mixed_cadence(),
+            &mixed_groups(),
+            201,
+            2_001,
+            RecentSnapshotState::Final,
+        );
+        assert_eq!(
+            final_period.heading(),
+            format!(
+                "Cadence is based on 201 scheduled sends in the final ~{window} s before stop."
+            )
+        );
 
         // Nothing measured yet says so, rather than offering a zero to weigh.
         let none = cadence_tooltip(
@@ -622,16 +636,12 @@ mod tests {
             0,
             RecentSnapshotState::Pending,
         );
-        assert!(
-            none.starts_with("No scheduled deadlines have been measured"),
-            "{none}"
+        assert_eq!(
+            none.heading(),
+            "Cadence has not measured any scheduled sends yet."
         );
         let dormant = cadence_tooltip(None, &[], 0, 0, RecentSnapshotState::Pending);
-        assert!(
-            dormant.contains("No message is currently scheduled to send"),
-            "a dormant channel must not be described as having one message: {dormant}"
-        );
-        assert!(!dormant.contains("single message sending"), "{dormant}");
+        assert!(!dormant.text().contains("measured together"), "{dormant:?}");
 
         // Once recent timing expires (or contains no sends), the line falls
         // back to its run-wide maximum. The tooltip's count must follow that
@@ -643,11 +653,9 @@ mod tests {
             2_001,
             RecentSnapshotState::Expired(Duration::from_secs(11)),
         );
-        assert!(
-            run_wide.starts_with(
-                "The run-wide figure is based on 2,001 scheduled deadlines since this run started"
-            ),
-            "{run_wide}"
+        assert_eq!(
+            run_wide.heading(),
+            "Cadence is based on 2,001 scheduled sends since this run started."
         );
 
         // Defensive but grammatical: cumulative timing can exist before a

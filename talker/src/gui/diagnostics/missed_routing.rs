@@ -6,38 +6,47 @@
 
 use super::*;
 
-/// Hover text for the missed-send callout: what a miss is, and what to do.
-///
-/// Deliberately short. A technician hovering a fault wants the next action, not
-/// the epistemology of the measurement; the limits that qualify the answer live
-/// in [`MISSED_ROUTING_LIMITS`], under Timing & runtime details, where someone
-/// who has followed the routing and wants to know how far to trust it will look.
-pub(in crate::gui) const MISSED_ROUTING_TOOLTIP: &str =
-    "A missed send is a scheduled send the channel never reached, having fallen more than one \
-interval behind: nothing was attempted, so no timing exists for it. Work the line left to right \
-— it is ordered by what would settle the question soonest. See Timing & runtime details for how \
-far this evidence reaches.";
+/// The hover's heading, the same on every branch.
+const MISSED_SEND_HEADING: &str = "A missed send is a scheduled send that never happened.";
 
-/// Plain-language limits behind the routing line, shown in the details section.
+/// What a missed send is. Every branch's hover opens with it, because the
+/// callout is often the first place a reader meets the term.
+const WHAT_A_MISS_IS: &str = "When a message falls more than one interval behind its schedule, \
+     the channel sends it once, late, and skips the scheduled times it has already passed \
+     instead of sending them in a burst to catch up. Each skipped time is one missed send. \
+     The count is also on the Send outcomes line.";
+
+/// Unmatched is not idle: a late wake, work outside the send call and a free
+/// thread leave the same gap, so the hover names the likely two and claims
+/// neither.
+const NO_SEND_IN_PROGRESS: &str = "No message was being sent when these sends came due. That does \
+     not mean the channel was idle: it may have woken late from its timer, or been busy \
+     preparing a message to send.";
+
+/// The missed-send callout: what was found, and a hover that says how far this
+/// particular finding can be trusted.
 ///
-/// The labelled paragraphs distinguish a measured missed-send count from a
-/// delay-based lead, then state what the remaining evidence can and cannot
-/// establish. The history-sizing proof that makes the third paragraph true is
-/// a durable implementation decision and stays in ADR-051 rather than on the
-/// technician's screen.
-pub(in crate::gui) const MISSED_ROUTING_LIMITS: &str = concat!(
-    "How to read the missed-send result — and its limits\n\n",
-    "• A count beside a message means its serial or network send was still in progress when other ",
-    "sends were missed. Unlike delay evidence, it does not thin out during severe ",
-    "slowdowns. Each message gets only its own share. For a message's own misses, compare its ",
-    "longest send call with its interval.\n\n",
-    "• “Check message #…” is a lead from observed delays, not proof.\n\n",
-    "• “No serial or network send was recorded as being in progress” does not mean the channel ",
-    "was idle; timing cannot identify the cause.\n\n",
-    "• Other clues — fix a current send failure first, but do not assume it caused the misses. An ",
-    "impossible serial schedule is direct evidence. Earlier failures may have cleared; application ",
-    "capacity is an estimate."
-);
+/// The hover follows the branch rather than covering every branch at once. One
+/// shared text explained phrases the reader could not see on the line above
+/// it, which is how it came to read as a list of riddles.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::gui) struct MissedSendRouting {
+    pub(in crate::gui) text: String,
+    pub(in crate::gui) hover: Hover,
+}
+
+impl MissedSendRouting {
+    fn new(text: impl Into<String>, explanation: &[&str]) -> Self {
+        Self {
+            text: text.into(),
+            hover: Hover::from_paragraphs(
+                [MISSED_SEND_HEADING, WHAT_A_MISS_IS]
+                    .into_iter()
+                    .chain(explanation.iter().copied()),
+            ),
+        }
+    }
+}
 
 /// Evidence available when scheduled sends are being skipped.
 ///
@@ -55,6 +64,84 @@ pub(in crate::gui) struct MissedSendEvidence {
     pub service: Option<ServiceEstimate>,
 }
 
+/// "1 send" or "12 sends", with a thousands separator on the count.
+fn sends(count: u64) -> String {
+    let noun = if count == 1 { "send" } else { "sends" };
+    format!("{} {noun}", thousands(count))
+}
+
+/// The amount-stating branch: how many sends were skipped while some message
+/// was being sent, which message accounts for most of them, and how many
+/// remain with no known cause, so the numbers add up.
+fn measured_routing(
+    missed: u64,
+    index: usize,
+    message: &MessageTiming,
+    attributed: u64,
+) -> MissedSendRouting {
+    let number = index + 1;
+    // ", whose longest send took 120 ms", or nothing when no send was seen to
+    // hold the channel.
+    let longest = if message.longest_block.is_zero() {
+        String::new()
+    } else {
+        format!(
+            ", whose longest send took {}",
+            compact_duration(message.longest_block)
+        )
+    };
+    let total = if missed == 1 {
+        "1 scheduled send was missed".to_owned()
+    } else {
+        format!("{} scheduled sends were missed", thousands(missed))
+    };
+
+    // Who the channel was busy with, phrased to follow "while".
+    let only_one_message = message.missed_others == attributed;
+    let busy = if only_one_message {
+        format!("the channel was busy sending message #{number}{longest}")
+    } else {
+        format!(
+            "the channel was busy sending another message, most of them ({}) while it was \
+             sending message #{number}{longest}",
+            thousands(message.missed_others)
+        )
+    };
+
+    // With a remainder, one line each for the total, the measured part and the
+    // remainder, so the arithmetic can be read down the callout.
+    let text = if attributed >= missed {
+        let all = if missed == 1 { "" } else { "all " };
+        format!("{total}, {all}while {busy}.")
+    } else {
+        format!(
+            "{total}.\n{} came due while {busy}.\nNo cause is known for the remaining {}.",
+            thousands(attributed),
+            thousands(missed - attributed)
+        )
+    };
+
+    let counted = if only_one_message {
+        "These sends came due, and were skipped, while the channel was busy sending the message \
+         named. That is measured as each one happens, not inferred afterwards."
+    } else {
+        "A count beside a message is measured: those sends came due, and were skipped, while the \
+         channel was busy sending that message. It is recorded as each one happens, not \
+         inferred afterwards."
+    };
+    let table = "Per-message timing lists every message's figures; the longest send is its \
+                 Longest block column.";
+    let mut explanation = vec![counted, table];
+    if attributed < missed {
+        explanation.push(
+            "\"No cause is known\" means no message was being sent when those sends came due. \
+             That does not mean the channel was idle: it may have woken late from its timer, or \
+             been busy preparing a message to send.",
+        );
+    }
+    MissedSendRouting::new(text, &explanation)
+}
+
 /// Where to look when scheduled sends are being skipped.
 ///
 /// Mostly a router, occasionally a verdict, and the wording says which. One
@@ -63,7 +150,7 @@ pub(in crate::gui) struct MissedSendEvidence {
 /// thread as each point passed (ADR-051) — and where that lands on a message the
 /// text states an amount rather than a place to look. Everything else here is a
 /// run total or evidence from deadlines that were reached, so those branches
-/// keep the hedged verbs: "check", "start from", "may not".
+/// keep the hedged verbs: "check", "may".
 ///
 /// Capacity findings use the running schedule, not the editable draft, so an
 /// unapplied edit is never blamed for a run's misses.
@@ -76,7 +163,7 @@ pub(in crate::gui) struct MissedSendEvidence {
 pub(in crate::gui) fn missed_send_routing(
     evidence: &MissedSendEvidence,
     per_message: &[MessageTiming],
-) -> Option<DecisionSignal> {
+) -> Option<MissedSendRouting> {
     let MissedSendEvidence {
         missed,
         interface_erroring,
@@ -95,7 +182,7 @@ pub(in crate::gui) fn missed_send_routing(
         .max_by_key(|(_, message)| message.blocked_others);
     // Measured where the miss happened rather than inferred from lateness, so
     // this outranks `blocker` when both are present.
-    let convicted = per_message
+    let measured = per_message
         .iter()
         .enumerate()
         .filter(|(_, message)| message.missed_others > 0)
@@ -105,134 +192,91 @@ pub(in crate::gui) fn missed_send_routing(
         .filter(|message| !message.interval.is_zero())
         .count();
 
-    let text = if interface_erroring {
-        "Missed sends: the interface is failing right now — fix that first in Send outcomes, then \
-         see whether cadence recovers."
-            .to_owned()
-    } else if serial_oversubscribed {
-        "Missed sends: the serial line cannot carry this schedule — see Capacity.".to_owned()
-    } else if let Some((index, message)) = convicted {
-        // The one branch entitled to state an amount rather than a lead: every
-        // point counted here was attributed while some message's send held the
-        // thread.
-        //
-        // All three quantities appear. Naming only the largest culprit and the
-        // shortfall drops every other attributed message out of a sentence whose
-        // numbers are supposed to add up — with 5 to #2, 4 to #3 and 3
-        // unmatched, the old wording said 5 and 3 of 12.
-        let attributed: u64 = per_message
-            .iter()
-            .map(|message| message.missed_others)
-            .sum();
-        let headline = if attributed >= missed {
-            format!(
-                "for all {}, Talker was waiting for another message's serial or network send to \
-                 finish",
-                thousands(missed)
-            )
-        } else {
-            format!(
-                "for {} of {}, Talker was waiting for another message's serial or network send to \
-                 finish",
-                thousands(attributed),
-                thousands(missed)
-            )
-        };
-        let largest = if message.missed_others == attributed {
-            format!("; it was message #{} every time", index + 1)
-        } else {
-            format!(
-                "; message #{} accounts for the largest share ({})",
-                index + 1,
-                thousands(message.missed_others)
-            )
-        };
-        let hold = if message.longest_block.is_zero() {
-            String::new()
-        } else {
-            format!(
-                " Its longest send held the channel {}.",
-                compact_duration(message.longest_block)
-            )
-        };
-        // Unmatched is not idle, and nothing here can tell the causes apart.
-        // What the record supports is one negative fact — no measured interface
-        // write spanned the point — and a late wake, work outside the send
-        // call, and a free thread all produce exactly that. Ageing out is *not*
-        // among them: the history is sized from the schedule (ADR-051), so a
-        // write that could have spanned the point is still there to be found.
-        let remainder = if attributed >= missed {
-            String::new()
-        } else {
-            format!(
-                " For the other {}, no serial or network send was recorded as being in progress. \
-                 This does not mean the channel was idle; the available timing cannot identify \
-                 the cause.",
-                thousands(missed - attributed)
-            )
-        };
-        format!("Missed sends: {headline}{largest}.{hold}{remainder} See Per-message timing.")
-    } else if let Some((index, message)) = blocker {
-        // Two different quantities, and only one of them is an elapsed hold:
-        // the longest blocking send is what the channel actually spent, while
-        // the combined figure sums every delayed message's wait and can exceed
-        // it. Stating the hold first keeps the larger number from reading as
-        // one.
-        format!(
-            "Missed sends: check message #{} first — its longest send held the channel {}, causing \
-             {} of combined waiting across other messages in {} sends. See Per-message timing.",
-            index + 1,
-            compact_duration(message.longest_block),
-            compact_duration(message.blocked_others),
-            thousands(message.blocking_sends),
+    let routing =
+        if interface_erroring {
+            MissedSendRouting::new(
+            "Sends are being missed, and the interface is failing right now. Fix the interface \
+             first; its failures are counted on the Send outcomes line.",
+            &["The interface comes first because it can be fixed now. That does not prove it \
+               caused the missed sends."],
         )
-    } else if service.is_some_and(|estimate| estimate.headroom_factor() < 1.0) {
-        // Still a projection even with the running schedule as its input: it
-        // divides summed p99 bounds into a requested rate, so "may not" stays
-        // the strongest honest verb.
-        "Missed sends: rendering and the interface write together may not service the requested \
-         rate — see Capacity."
-            .to_owned()
-    } else if active_messages == 1 {
-        // With one active message there is nothing else to hold the channel, so
-        // the blocking branch above can never fire. Saying "no single message
-        // accounts for these" here would be true and useless — it describes the
-        // absence of a cause that was never possible.
-        //
-        // What it must not say is that nothing is holding the channel up.
-        // Something plainly is, or the points would have been reached; what is
-        // ruled out is only *another message* being the cause. Naming the two
-        // candidates that remain is the useful half of that.
-        "Missed sends: this channel has one active message, so no other message is delaying it. \
-         Either that message's own send takes longer than its interval, or the channel is being \
-         woken late. Compare its send-call timing against its interval."
-            .to_owned()
-    } else if failed > 0 {
-        // Cumulative, so this fault may have recovered long ago, and failure
-        // timing is not correlated with miss timing. It remains a useful place
-        // to check only after stronger current and measured evidence has been
-        // exhausted.
-        format!(
-            "Missed sends: {} sends failed earlier in this run, but the timing does not show \
-             whether those failures coincided with these misses — check Send outcomes above.",
-            thousands(failed)
+        } else if serial_oversubscribed {
+            MissedSendRouting::new(
+            "Sends are being missed because the serial line cannot carry this schedule: it asks \
+             for more bytes per second than the baud rate allows. See Capacity.",
+            &["No change elsewhere can fix this. Send less often, send shorter messages, or \
+               raise the baud rate if the device allows it."],
         )
-    } else {
-        let capacity = if service.is_some() {
-            "the application capacity estimate does not point to overload"
+        } else if let Some((index, message)) = measured {
+            // The one branch entitled to state an amount rather than a lead: every
+            // point counted here was attributed while some message's send held the
+            // thread.
+            let attributed: u64 = per_message
+                .iter()
+                .map(|message| message.missed_others)
+                .sum();
+            measured_routing(missed, index, message, attributed)
+        } else if let Some((index, message)) = blocker {
+            let number = index + 1;
+            MissedSendRouting::new(
+                format!(
+                    "Sends are being missed. Check message #{number} first: its sends held up the \
+                 other messages, and its longest took {}.",
+                    compact_duration(message.longest_block),
+                ),
+                &[&format!(
+                    "Message #{number} is named because its sends were seen holding up the other \
+                 messages. That makes it a good place to start, but it is not proof that it \
+                 caused these missed sends."
+                )],
+            )
+        } else if service.is_some_and(|estimate| estimate.headroom_factor() < 1.0) {
+            // Still a projection even with the running schedule as its input: it
+            // divides summed p99 bounds into a requested rate, so "may" stays the
+            // strongest honest verb.
+            MissedSendRouting::new(
+            "Sends are being missed. Rendering and sending each message may take longer than \
+             this rate allows. See Capacity.",
+            &["This is an estimate from recent render and send times, not a measurement of the \
+               missed sends themselves."],
+        )
+        } else if active_messages == 1 {
+            // With one active message there is nothing else to hold the channel, so
+            // the blocking branch above can never fire. What is ruled out is only
+            // *another message* being the cause; the two candidates that remain are
+            // the useful half of that.
+            MissedSendRouting::new(
+            "Sends are being missed. This message's send may take longer than its interval, or \
+             the channel may be waking late. Compare its Send call time with its interval under \
+             Per-message timing.",
+            &["With only one message sending, no other message can be holding it up."],
+        )
+        } else if failed > 0 {
+            // Cumulative, so this fault may have recovered long ago, and failure
+            // timing is not correlated with miss timing. It remains a useful place
+            // to check only after stronger current and measured evidence has been
+            // exhausted.
+            MissedSendRouting::new(
+                format!(
+                "Sends are being missed, and the timing does not show why. {} failed earlier in \
+                 this run; see Send outcomes.",
+                sends(failed)
+            ),
+                &[
+                    "Those failures may be from a problem that has since cleared, so they are a \
+                 clue rather than a cause.",
+                    NO_SEND_IN_PROGRESS,
+                ],
+            )
         } else {
-            "application capacity could not be estimated"
-        };
-        format!(
-            "Missed sends: no message delayed another, and {capacity} — compare render and \
-             send-call timing in Timing & runtime details."
+            MissedSendRouting::new(
+            "Sends are being missed, and the timing does not show why. Compare render and send \
+             times under Timing & runtime details.",
+            &[NO_SEND_IN_PROGRESS],
         )
-    };
+        };
 
-    Some(DecisionSignal {
-        text,
-        tone: SignalTone::Warning,
-    })
+    Some(routing)
 }
 
 #[cfg(test)]
@@ -241,8 +285,6 @@ mod tests {
     use std::time::Duration;
 
     use crate::core::telemetry::MessageTiming;
-
-    use wiredata_ui::diagnostics::SignalTone;
 
     /// The routing exists because the message showing the misses is rarely the
     /// one causing them. Each branch names a place to look, in decisiveness
@@ -270,34 +312,49 @@ mod tests {
         // A *live* interface fault outranks everything because it is actionable
         // now, without claiming that it caused the misses.
         let failing = missed_send_routing(&evidence(12, true, 3, true), &per_message).unwrap();
-        assert!(failing.text.contains("failing right now"), "{failing:?}");
-        assert_eq!(failing.tone, SignalTone::Warning);
+        assert_eq!(
+            failing.text,
+            "Sends are being missed, and the interface is failing right now. Fix the interface \
+             first; its failures are counted on the Send outcomes line."
+        );
+        assert!(
+            failing
+                .hover
+                .text()
+                .contains("That does not prove it caused"),
+            "{failing:?}"
+        );
 
         // The same failure count with no current error is uncorrelated history;
         // it must not hide the stronger delay observation below.
         let recovered = missed_send_routing(&evidence(12, false, 3, false), &per_message).unwrap();
         assert!(
-            recovered.text.contains("check message #2 first")
+            recovered.text.contains("Check message #2 first")
                 && !recovered.text.contains("failed earlier"),
             "historical failures must not hide measured delay evidence: {recovered:?}"
         );
 
-        // A schedule the wire cannot carry. No settings-vs-running qualifier is
-        // needed any more: capacity is calculated from the running schedule, so
-        // an unapplied edit cannot reach this line.
+        // A schedule the wire cannot carry. Capacity is calculated from the
+        // running schedule, so an unapplied edit cannot reach this line.
         let oversubscribed =
             missed_send_routing(&evidence(12, false, 3, true), &per_message).unwrap();
-        assert!(oversubscribed.text.contains("cannot carry this schedule"));
+        assert_eq!(
+            oversubscribed.text,
+            "Sends are being missed because the serial line cannot carry this schedule: it asks \
+             for more bytes per second than the baud rate allows. See Capacity."
+        );
 
-        // The blocking message: routed to, not convicted, and the elapsed hold
-        // is stated separately from the combined waiting it caused — the latter
-        // sums across victims and can exceed the send itself.
+        // The blocking message: routed to, not blamed, and only the elapsed
+        // hold is stated.
         let blocked = missed_send_routing(&evidence(12, false, 0, false), &per_message).unwrap();
         assert_eq!(
             blocked.text,
-            "Missed sends: check message #2 first — its longest send held the channel 120 ms, \
-             causing 430 ms of combined waiting across other messages in 4 sends. See Per-message \
-             timing."
+            "Sends are being missed. Check message #2 first: its sends held up the other \
+             messages, and its longest took 120 ms."
+        );
+        assert!(
+            blocked.hover.text().contains("it is not proof"),
+            "a delay-based lead says it is a lead: {blocked:?}"
         );
 
         // One active message cannot block another, so the blocking branch is
@@ -312,9 +369,11 @@ mod tests {
             &[active, MessageTiming::default()],
         )
         .unwrap();
-        assert!(
-            alone.text.contains("one active message"),
-            "a single-message channel must not be told no message stands out: {alone:?}"
+        assert_eq!(
+            alone.text,
+            "Sends are being missed. This message's send may take longer than its interval, or \
+             the channel may be waking late. Compare its Send call time with its interval under \
+             Per-message timing."
         );
 
         // Two active messages, neither blocking: now the absence really is the
@@ -325,15 +384,20 @@ mod tests {
         };
         let unexplained =
             missed_send_routing(&evidence(12, false, 0, false), &[active, second]).unwrap();
+        assert_eq!(
+            unexplained.text,
+            "Sends are being missed, and the timing does not show why. Compare render and send \
+             times under Timing & runtime details."
+        );
         assert!(
             unexplained
-                .text
-                .contains("application capacity could not be estimated"),
-            "unavailable capacity must not be reported as a passed limit: {unexplained:?}"
+                .hover
+                .text()
+                .contains("That does not mean the channel was idle"),
+            "{unexplained:?}"
         );
 
-        // A non-overloaded estimate is still only an estimate, not proof that
-        // no capacity limit was reached.
+        // A passing estimate is not a finding the line may state.
         let estimated = missed_send_routing(
             &MissedSendEvidence {
                 service: Some(ServiceEstimate {
@@ -347,20 +411,47 @@ mod tests {
             &[active, second],
         )
         .unwrap();
-        assert!(
-            estimated
-                .text
-                .contains("capacity estimate does not point to overload"),
-            "an advisory estimate must stay qualified: {estimated:?}"
+        assert_eq!(
+            estimated, unexplained,
+            "a passing capacity estimate must not change the line"
+        );
+
+        // An estimate that says the rate is too slow is a lead, and says "may".
+        let too_slow = missed_send_routing(
+            &MissedSendEvidence {
+                service: Some(ServiceEstimate {
+                    samples: 20,
+                    summed_p99_upper_bounds: Duration::from_millis(100),
+                    capacity_messages_per_second: 10.0,
+                    utilization: 2.0,
+                }),
+                ..evidence(12, false, 0, false)
+            },
+            &[active, second],
+        )
+        .unwrap();
+        assert_eq!(
+            too_slow.text,
+            "Sends are being missed. Rendering and sending each message may take longer than \
+             this rate allows. See Capacity."
         );
 
         // Only after the current and measured leads are exhausted does an old
         // failure total get its own line.
         let recovered_only =
             missed_send_routing(&evidence(12, false, 3, false), &[active, second]).unwrap();
+        assert_eq!(
+            recovered_only.text,
+            "Sends are being missed, and the timing does not show why. 3 sends failed earlier \
+             in this run; see Send outcomes."
+        );
+        let one_failure =
+            missed_send_routing(&evidence(12, false, 1, false), &[active, second]).unwrap();
         assert!(
-            recovered_only.text.contains("failed earlier in this run"),
-            "the remaining historical clue should still be offered: {recovered_only:?}"
+            one_failure
+                .text
+                .contains(" 1 send failed earlier in this run"),
+            "{one_failure:?}"
         );
 
         // No active message must not fall through the single-message wording.
@@ -368,7 +459,7 @@ mod tests {
             missed_send_routing(&evidence(12, false, 0, false), &[MessageTiming::default()])
                 .unwrap();
         assert!(
-            !none_active.text.contains("one active message"),
+            !none_active.text.contains("This message's send"),
             "zero active messages must not be described as one: {none_active:?}"
         );
     }
@@ -400,9 +491,12 @@ mod tests {
         let all = missed_send_routing(&evidence(9), &per_message).unwrap();
         assert_eq!(
             all.text,
-            "Missed sends: for all 9, Talker was waiting for another message's serial or network \
-             send to finish; it was message #2 every time. Its longest send held the channel 120 \
-             ms. See Per-message timing."
+            "9 scheduled sends were missed, all while the channel was busy sending message #2, \
+             whose longest send took 120 ms."
+        );
+        assert!(
+            !all.hover.text().contains("No cause is known"),
+            "nothing is left unplaced, so the hover does not explain a remainder: {all:?}"
         );
 
         // A recovered failure is only a run-wide lead. It cannot hide the
@@ -415,23 +509,69 @@ mod tests {
             &per_message,
         )
         .unwrap();
-        assert_eq!(with_failure_history.text, all.text);
+        assert_eq!(with_failure_history, all);
 
-        // Three the record cannot place. Unmatched is not idle — a late wake
-        // and work outside the send call leave the same gap as a free thread,
-        // and this line must not pick one of those.
+        // Three the record cannot place. Unmatched is not idle: the line says
+        // only that no cause is known, and the hover says what that means.
         let partial = missed_send_routing(&evidence(12), &per_message).unwrap();
-        assert!(
-            partial.text.contains(
-                "For the other 3, no serial or network send was recorded as being in progress"
-            ),
-            "the shortfall must state only what the timing established: {partial:?}"
+        assert_eq!(
+            partial.text,
+            "12 scheduled sends were missed.\n\
+             9 came due while the channel was busy sending message #2, whose longest send took \
+             120 ms.\n\
+             No cause is known for the remaining 3."
         );
         assert!(
             partial
-                .text
-                .contains("does not mean the channel was idle; the available timing cannot identify the cause"),
-            "the measurement cannot see an idle channel, so it must state that limit: {partial:?}"
+                .hover
+                .text()
+                .contains("That does not mean the channel was idle"),
+            "{partial:?}"
+        );
+
+        // A single missed send reads as one.
+        let single = missed_send_routing(
+            &evidence(1),
+            &[MessageTiming {
+                missed_others: 1,
+                longest_block: Duration::from_millis(120),
+                ..MessageTiming::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            single.text,
+            "1 scheduled send was missed, while the channel was busy sending message #1, whose \
+             longest send took 120 ms."
+        );
+
+        // A message whose send never held the channel has no longest to state.
+        let no_hold = missed_send_routing(
+            &evidence(9),
+            &[MessageTiming {
+                missed_others: 9,
+                ..MessageTiming::default()
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            no_hold.text,
+            "9 scheduled sends were missed, all while the channel was busy sending message #1."
+        );
+
+        // Thousands separators on counts.
+        let big = missed_send_routing(
+            &evidence(12_345),
+            &[MessageTiming {
+                missed_others: 12_345,
+                ..MessageTiming::default()
+            }],
+        )
+        .unwrap();
+        assert!(
+            big.text
+                .starts_with("12,345 scheduled sends were missed, all while"),
+            "{big:?}"
         );
     }
 
@@ -455,59 +595,134 @@ mod tests {
                 ..MessageTiming::default()
             },
         ];
-        let routing = missed_send_routing(
-            &MissedSendEvidence {
-                missed: 12,
-                interface_erroring: false,
-                failed: 0,
-                serial_oversubscribed: false,
-                service: None,
-            },
-            &per_message,
-        )
-        .unwrap();
+        let evidence = |missed| MissedSendEvidence {
+            missed,
+            interface_erroring: false,
+            failed: 0,
+            serial_oversubscribed: false,
+            service: None,
+        };
 
-        // The attributed total, the run total, the largest single share, and the
-        // part that could not be placed — all four, or the arithmetic does not
-        // close for the reader.
-        assert!(
-            routing
-                .text
-                .contains("for 9 of 12, Talker was waiting for another message's serial or network send to finish"),
-            "{routing:?}"
+        // The run total, the attributed total, the largest single share, and
+        // the part that could not be placed — all four, each on its own line
+        // where there is a remainder, or the arithmetic does not close for the
+        // reader.
+        let routing = missed_send_routing(&evidence(12), &per_message).unwrap();
+        assert_eq!(
+            routing.text,
+            "12 scheduled sends were missed.\n\
+             9 came due while the channel was busy sending another message, most of them (5) \
+             while it was sending message #2, whose longest send took 120 ms.\n\
+             No cause is known for the remaining 3."
         );
-        assert!(
-            routing
-                .text
-                .contains("message #2 accounts for the largest share (5)"),
-            "{routing:?}"
+
+        // Every miss placed: nothing is left for "no known cause".
+        let placed = missed_send_routing(&evidence(9), &per_message).unwrap();
+        assert_eq!(
+            placed.text,
+            "9 scheduled sends were missed, all while the channel was busy sending another \
+             message, most of them (5) while it was sending message #2, whose longest send took \
+             120 ms."
         );
-        assert!(routing.text.contains("For the other 3"), "{routing:?}");
     }
 
-    /// The expanded help must keep the exact missed-send count separate from a
-    /// delay-based lead while speaking in terms already visible to a technician.
+    /// Every branch's hover opens with what a missed send is, and keeps to
+    /// terms already visible to a technician.
     #[test]
-    fn missed_send_limits_distinguish_evidence_without_internal_vocabulary() {
-        assert!(MISSED_ROUTING_LIMITS.contains("A count beside a message"));
-        assert!(MISSED_ROUTING_LIMITS.contains("“Check message #…”"));
-        assert!(MISSED_ROUTING_LIMITS
-            .contains("No serial or network send was recorded as being in progress"));
-        assert!(MISSED_ROUTING_LIMITS.contains("current send failure"));
-        assert!(MISSED_ROUTING_LIMITS.contains("application capacity is an estimate"));
+    fn every_missed_send_hover_explains_the_term_without_internal_vocabulary() {
+        let active = |ms| MessageTiming {
+            interval: Duration::from_millis(ms),
+            ..MessageTiming::default()
+        };
+        let evidence =
+            |interface_erroring, failed, serial_oversubscribed, service| MissedSendEvidence {
+                missed: 12,
+                interface_erroring,
+                failed,
+                serial_oversubscribed,
+                service,
+            };
+        let too_slow = Some(ServiceEstimate {
+            samples: 20,
+            summed_p99_upper_bounds: Duration::from_millis(100),
+            capacity_messages_per_second: 10.0,
+            utilization: 2.0,
+        });
+        let measured = MessageTiming {
+            missed_others: 9,
+            longest_block: Duration::from_millis(120),
+            ..active(50)
+        };
+        let blocking = MessageTiming {
+            blocked_others: Duration::from_millis(430),
+            longest_block: Duration::from_millis(120),
+            ..active(50)
+        };
+        let routings = [
+            (evidence(true, 0, false, None), vec![active(50), active(80)]),
+            (evidence(false, 0, true, None), vec![active(50), active(80)]),
+            (evidence(false, 0, false, None), vec![measured, active(80)]),
+            (evidence(false, 0, false, None), vec![blocking, active(80)]),
+            (
+                evidence(false, 0, false, too_slow),
+                vec![active(50), active(80)],
+            ),
+            (evidence(false, 0, false, None), vec![active(50)]),
+            (
+                evidence(false, 3, false, None),
+                vec![active(50), active(80)],
+            ),
+            (
+                evidence(false, 0, false, None),
+                vec![active(50), active(80)],
+            ),
+        ]
+        .map(|(evidence, per_message)| missed_send_routing(&evidence, &per_message).unwrap());
 
-        for internal in [
-            "cadence point",
-            "charged",
-            "interface write",
-            "retained history",
-            "window",
-            "projection",
-        ] {
+        // Eight inputs, eight different lines: every branch is covered.
+        let mut texts: Vec<&str> = routings
+            .iter()
+            .map(|routing| routing.text.as_str())
+            .collect();
+        texts.sort_unstable();
+        texts.dedup();
+        assert_eq!(texts.len(), 8, "{texts:#?}");
+
+        for routing in &routings {
+            let paragraphs: Vec<&str> = routing.hover.text().split("\n\n").collect();
+            assert_eq!(paragraphs[0], MISSED_SEND_HEADING);
+            assert_eq!(paragraphs[1], WHAT_A_MISS_IS);
             assert!(
-                !MISSED_ROUTING_LIMITS.contains(internal),
-                "technician-facing help contains internal term {internal:?}"
+                paragraphs.len() >= 3,
+                "each branch explains its own line: {routing:?}"
             );
+
+            let lowered = routing.hover.text().to_lowercase();
+            let words: Vec<&str> = lowered
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .collect();
+            for internal in [
+                "queue",
+                "thread",
+                "handle",
+                "ring",
+                "charged",
+                "window",
+                "projection",
+                "attributed",
+            ] {
+                assert!(
+                    !words.contains(&internal),
+                    "technician-facing help contains internal term {internal:?}: {routing:?}"
+                );
+            }
+            for internal in ["cadence point", "interface write", "retained history"] {
+                assert!(
+                    !lowered.contains(internal),
+                    "technician-facing help contains internal term {internal:?}: {routing:?}"
+                );
+            }
         }
     }
 }

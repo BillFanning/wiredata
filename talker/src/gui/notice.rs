@@ -10,7 +10,7 @@
 //! This is presentation state only. Nothing here changes what is counted, and
 //! the counted totals stay on screen either way — dismissing the missed-send
 //! routing hides the advice, not the misses, which remain on the send-outcomes
-//! line and keep the card's badge raised.
+//! line, marked ⚠.
 
 /// A count-backed warning the reader has dismissed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

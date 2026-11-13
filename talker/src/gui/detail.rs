@@ -19,7 +19,7 @@ use crate::core::{
 
 use wiredata_ui::{
     diagnostics::{
-        attention_callout, decision_card, dismissible_attention_callout, signal_grid, signal_row,
+        attention_callout, diagnostic_card, dismissible_attention_callout, signal_grid, signal_row,
         SignalTone,
     },
     fonts::bold,
@@ -38,6 +38,7 @@ use super::widgets::{
     show_udp_fields, start_button, LiveUpdateQueueGauge, UppercaseHex,
 };
 use super::{MessageAnalysisCache, MessageDraftAnalysis, MessagePreview, TalkerApp};
+use wiredata_ui::hover::{Hover, ShowHover};
 use wiredata_ui::palette::active as theme_palette;
 // The decision layer this panel renders. Imported wholesale: every item in
 // `diagnostics` exists to be shown here, and the two stay in step as signals
@@ -136,10 +137,9 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
                 summary.suppressed_sends,
                 summary.missed_sends,
             ))
-            .on_hover_text(SENT_MEANING_TOOLTIP);
+            .on_hover(&SENT_MEANING_TOOLTIP);
             if let Some(bytes) = summary.peer_bytes {
-                ui.weak(peer_sent_words(bytes))
-                    .on_hover_text(PEER_SENT_TOOLTIP);
+                ui.weak(peer_sent_words(bytes)).on_hover(&PEER_SENT_TOOLTIP);
             }
             let (timer_detail, timer_hot) = timer_status_detail(summary.timer);
             let timer = egui::RichText::new(format!("Timer: {timer_detail}")).weak();
@@ -148,7 +148,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
             } else {
                 timer
             })
-            .on_hover_text(TIMER_TOOLTIP);
+            .on_hover(&TIMER_TOOLTIP);
 
             // Same timing model as every live readout (ADR-046): the worst
             // value with its sample count, and a percentile only where it
@@ -169,7 +169,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
                     )
                 }
             };
-            ui.weak(timing_text).on_hover_text(TIMING_TOOLTIP);
+            ui.weak(timing_text).on_hover(&TIMING_TOOLTIP);
         });
 }
 
@@ -310,10 +310,10 @@ impl TalkerApp {
 
         // Decision-level diagnostics stay compact; the evidence and caveats
         // remain one click away in the card's details section.
-        let detail_line = |ui: &mut egui::Ui, text: String, hot: bool, tip: &str| {
+        let detail_line = |ui: &mut egui::Ui, text: String, hot: bool, tip: &Hover| {
             let rt = egui::RichText::new(text).weak();
             ui.label(if hot { rt.color(pal.warning) } else { rt })
-                .on_hover_text(tip);
+                .on_hover(tip);
         };
 
         let msgs = telemetry.total_count;
@@ -395,7 +395,8 @@ impl TalkerApp {
         } else if service_samples == 0 {
             format!("{app_label} unmeasured")
         } else if service_samples < MIN_SERVICE_SAMPLES {
-            format!("{app_label} warming {service_samples}/{MIN_SERVICE_SAMPLES}")
+            // "of", not a slash: this row's rates already use "/" for "per".
+            format!("{app_label} warming up ({service_samples} of {MIN_SERVICE_SAMPLES} sends)")
         } else {
             format!("{app_label} estimate unavailable")
         };
@@ -422,7 +423,7 @@ impl TalkerApp {
                 };
                 DecisionSignal {
                     text: format!(
-                        "{} requested / {} sent (~5 s) · {line_capacity} · {app_capacity}",
+                        "{} requested, {} sent (~5 s) · {line_capacity} · {app_capacity}",
                         compact_rate(demand.messages_per_second, "msg/s"),
                         compact_rate(f64::from(mps), "msg/s"),
                     ),
@@ -507,37 +508,29 @@ impl TalkerApp {
                 telemetry.timer.clock_realignments
             ),
         };
-        // The send-outcome tone still escalates the card badge even though the
-        // counts themselves now live above the card: a failing interface must
-        // read as ISSUE there, and the adjacent line carries the reason.
-        let card_tone = diagnostic_card_tone(outcomes.tone, capacity.tone, timer_hot, running);
         // Read before the card so the closure below can stay free of `self`.
         // `showing` mutates — it re-arms a record left over from a previous run
         // — so this is the one call per frame, and dismissal is applied after.
         let missed_notice_showing = self.views[i].notices.missed_sends.showing(missed);
         let mut missed_acknowledged = false;
-        let card_status = match card_tone {
-            SignalTone::Fault => "ISSUE",
-            SignalTone::Warning => "ATTENTION",
-            SignalTone::Healthy => "LIVE",
-            SignalTone::Neutral => "IDLE",
-        };
 
         // Counted facts sit directly beneath the status · interface row, in
         // exactly one place: the run's send outcomes, then what was sent.
         // The card below holds only the readouts that need interpretation.
+        // With no badge on the card (ADR-066), this line's ⚠ is what says the
+        // run had trouble once the missed-send callout is dismissed.
         ui.add(
-            egui::Label::new(
-                egui::RichText::new(&outcomes.text).color(match outcomes.tone {
+            egui::Label::new(egui::RichText::new(send_outcomes_line(&outcomes)).color(
+                match outcomes.tone {
                     SignalTone::Fault => pal.fault,
                     SignalTone::Warning => pal.warning,
                     _ => ui.visuals().text_color(),
-                }),
-            )
+                },
+            ))
             .wrap()
             .sense(egui::Sense::hover()),
         )
-        .on_hover_text(&outcomes_tip);
+        .on_hover(&outcomes_tip);
         detail_line(
             ui,
             format!(
@@ -547,11 +540,11 @@ impl TalkerApp {
                 mps
             ),
             false,
-            THROUGHPUT_TOOLTIP,
+            &THROUGHPUT_TOOLTIP,
         );
         // A TCP client counts what its peer sent (§4.5).
         if let Some(bytes) = telemetry.peer_bytes {
-            detail_line(ui, peer_sent_words(bytes), false, PEER_SENT_TOOLTIP);
+            detail_line(ui, peer_sent_words(bytes), false, &PEER_SENT_TOOLTIP);
         }
 
         // Lifecycle controls sit directly under the basic readouts, matching
@@ -574,28 +567,33 @@ impl TalkerApp {
         self.show_lifecycle_buttons(ui, i, running, iface_drift || run_drift, error.is_some());
         ui.add_space(6.0);
 
-        decision_card(ui, "", card_status, card_tone, |ui| {
+        // No header row: every reason the old badge rose for is marked on its
+        // own row or callout, or on the Send outcomes line above (ADR-066).
+        diagnostic_card(ui, |ui| {
             signal_grid(ui, "send_decisions", |ui| {
+                let cadence_hover = cadence_tooltip(
+                    active_cadence,
+                    &cadence_groups,
+                    timing.deadline_lateness.sample_count(),
+                    cumulative_timing.deadline_lateness.sample_count(),
+                    recent_snapshot_state,
+                )
+                .layout(ui.style());
                 signal_row(
                     ui,
                     "Cadence",
                     &cadence_decision.text,
                     cadence_decision.tone,
-                    cadence_tooltip(
-                        active_cadence,
-                        &cadence_groups,
-                        timing.deadline_lateness.sample_count(),
-                        cumulative_timing.deadline_lateness.sample_count(),
-                        recent_snapshot_state,
-                    ),
+                    cadence_hover,
                 );
+                let capacity_hover = CAPACITY_TOOLTIP.layout(ui.style());
                 signal_row(
-                        ui,
-                        "Capacity",
-                        &capacity.text,
-                        capacity.tone,
-                        "Requested load comes from the running schedule: each message's wire size and interval as the channel is actually sending them. A channel that is not running has none, so it is projected from the settings shown and labelled as such. Sent rate is the rolling five-second average of configured-interface writes that returned success. Serial utilization is a theoretical UART line estimate. Application headroom compares that same requested load with separate render and interface-write p99 bounds. Timing from the last ~10 seconds is preferred after enough observations; timing whose update is ten seconds old is discarded, and a clearly labelled run-wide fallback is used when available. This is an advisory projection, not a hard capacity promise.",
-                    );
+                    ui,
+                    "Capacity",
+                    &capacity.text,
+                    capacity.tone,
+                    capacity_hover,
+                );
             });
 
             // Skipped cadence points name a cause rather than a count: the
@@ -603,10 +601,9 @@ impl TalkerApp {
             // showing the misses is rarely the one causing them (ADR-045).
             //
             // Dismissible because it is advice, not a count: the misses
-            // themselves stay on the send-outcomes line above and keep this
-            // card's badge raised, so acknowledging the routing hides where to
-            // look, never what happened.
-            let mut missed_routing_shown = false;
+            // themselves stay on the send-outcomes line above, marked ⚠, so
+            // acknowledging the routing hides where to look, never what
+            // happened.
             if missed_notice_showing {
                 if let Some(routing) = missed_send_routing(
                     &MissedSendEvidence {
@@ -624,45 +621,61 @@ impl TalkerApp {
                     &telemetry.per_message_timing,
                 ) {
                     ui.add_space(4.0);
+                    let hover = routing.hover.layout(ui.style());
                     missed_acknowledged = dismissible_attention_callout(
                         ui,
                         "missed_send_routing",
                         routing.text,
-                        routing.tone,
-                        MISSED_ROUTING_TOOLTIP,
+                        SignalTone::Warning,
+                        hover,
                     );
-                    missed_routing_shown = true;
                 }
             }
 
             // No unsent callout: the send-outcomes line above the card already
-            // carries the counts and its own tone, and the badge escalates from
-            // the same signal. Repeating it here was the third rendering of one
-            // fact.
+            // carries the counts, its own tone and its ⚠. Repeating it here was
+            // the third rendering of one fact.
             if let Some(line) = serial.filter(|line| line.is_oversubscribed()) {
                 ui.add_space(4.0);
+                let hover = Hover::new(
+                    "The schedule needs more than the serial line can carry at this baud rate.\n\n\
+                     Some sends cannot go out on time, whatever else is changed. Send less \
+                     often, send shorter messages, or raise the baud rate if the device allows \
+                     it.\n\n\
+                     This is a warning, not a block, so a deliberate overload test can still \
+                     run.",
+                )
+                .layout(ui.style());
                 attention_callout(
-                        ui,
-                        "serial_capacity_attention",
-                        format!(
-                            "Serial demand is {} of line capacity · needs {} (baud {})",
-                            percent(line.utilization * 100.0),
-                            compact_rate(line.required_bits_per_second, "bit/s"),
-                            line.minimum_baud(),
-                        ),
-                        SignalTone::Fault,
-                        "The sustained requested payload cannot physically fit at the configured baud. The warning remains advisory so deliberate overload tests are still possible.",
-                    );
+                    ui,
+                    "serial_capacity_attention",
+                    format!(
+                        "Serial demand is {} of line capacity · needs {} (baud {})",
+                        percent(line.utilization * 100.0),
+                        compact_rate(line.required_bits_per_second, "bit/s"),
+                        line.minimum_baud(),
+                    ),
+                    SignalTone::Fault,
+                    hover,
+                );
             }
             if timer_hot {
                 ui.add_space(4.0);
+                let hover = Hover::new(
+                    "Windows refused the channel's request for 1 ms timer resolution.\n\n\
+                     The channel keeps sending, using ordinary waits, which on Windows can end \
+                     up to about 16 ms late.\n\n\
+                     That does not mean any send was late. For what actually happened, see the \
+                     Cadence row and the missed count on the Send outcomes line.",
+                )
+                .layout(ui.style());
                 attention_callout(
-                        ui,
-                        "timer_request_attention",
-                        "Windows 1 ms timer request failed; cadence waits are using the fallback",
-                        SignalTone::Warning,
-                        "The channel continues with ordinary deadline waits. The failed request does not prove that any send was late; inspect measured deadline lateness and Missed cadence points for the observed effect.",
-                    );
+                    ui,
+                    "timer_request_attention",
+                    "Windows 1 ms timer request failed; cadence waits are using the fallback",
+                    SignalTone::Warning,
+                    hover,
+                );
             }
             // The dropped-update callout and its one queue gauge are shown
             // together above the Output pane. Do not repeat either here; the
@@ -678,30 +691,27 @@ impl TalkerApp {
                         // repeated here — they are always visible above the
                         // card, so this section carries only what the compact
                         // readouts leave out.
-                        //
-                        // Shown only while the callout above is: the limits
-                        // qualify that routing, and without it they describe
-                        // nothing on screen.
-                        if missed_routing_shown {
-                            detail_line(
-                                ui,
-                                MISSED_ROUTING_LIMITS.to_owned(),
-                                false,
-                                "How far the missed-send routing above can be trusted.",
-                            );
-                        }
                         match demand {
                             None => detail_line(
                                 ui,
                                 "Capacity: complete all messages to calculate".to_owned(),
                                 false,
-                                "Capacity uses exact compiled wire lengths and active message intervals. Fix the message validation errors first.",
+                                &Hover::new(
+                                    "Capacity needs every message to be complete.\n\n\
+                                     It uses each message's exact size on the wire and its \
+                                     interval. Fix the errors shown in the Messages editor \
+                                     first.",
+                                ),
                             ),
                             Some(demand) if !demand.is_active() => detail_line(
                                 ui,
                                 "Capacity: no active messages".to_owned(),
                                 false,
-                                "Messages with interval 0 are dormant and create no scheduled wire demand.",
+                                &Hover::new(
+                                    "No message is sending on a schedule.\n\n\
+                                     A message with interval 0 is dormant: it is never sent on a \
+                                     schedule, so it adds nothing to the load.",
+                                ),
                             ),
                             Some(demand) => {
                                 let requested = format!(
@@ -735,7 +745,22 @@ impl TalkerApp {
                                         ui,
                                         text,
                                         hot,
-                                        "Calculated, not measured, from the running schedule and the baud the channel actually opened. Each wire byte uses one UART frame: 1 start bit plus the configured data, parity, and stop bits. Above 100%, the sustained requested payload cannot physically fit at the configured baud. At or below 100% is not a real-time guarantee: flow control, adapter/driver buffering, operating-system delays, and same-deadline message bursts can reduce effective headroom. This warning is advisory so deliberate overload tests remain possible.",
+                                        &Hover::new(
+                                            "Serial is how much of the line's capacity the \
+                                             schedule needs. It is calculated, not measured.\n\n\
+                                             It uses the running schedule and the baud rate the \
+                                             channel actually opened. Each byte takes one UART \
+                                             frame on the wire: a start bit, then the configured \
+                                             data, parity and stop bits.\n\n\
+                                             Above 100%, the schedule cannot fit on the line at \
+                                             this baud rate. At or below 100% is still not a \
+                                             guarantee: flow control, adapter and driver \
+                                             buffering, operating system delays, and messages \
+                                             due at the same moment can all reduce the real \
+                                             headroom.\n\n\
+                                             This is a warning, not a block, so a deliberate \
+                                             overload test can still run.",
+                                        ),
                                     );
                                 } else if draft_kind == ConnKind::Serial {
                                     detail_line(
@@ -744,14 +769,28 @@ impl TalkerApp {
                                             "Capacity: requested {requested} · complete Serial setup"
                                         ),
                                         false,
-                                        "Complete the Serial port and line settings before Talker can calculate UART utilization. The requested message and byte rates still come from exact compiled wire lengths and active intervals.",
+                                        &Hover::new(
+                                            "Complete the serial port and line settings to see \
+                                             how much of the line the schedule needs.\n\n\
+                                             The requested message and byte rates are already \
+                                             exact: they come from each message's size on the \
+                                             wire and its interval.",
+                                        ),
                                     );
                                 } else {
                                     detail_line(
                                         ui,
                                         format!("Capacity: requested {requested}"),
                                         false,
-                                        "Calculated, not measured: the exact wire length of each message against its interval, taken from the running schedule where there is one and from the settings shown otherwise. Network link capacity is unknown, so Talker reports requested load without inventing a physical headroom figure.",
+                                        &Hover::new(
+                                            "Requested is calculated, not measured: each \
+                                             message's exact size on the wire against its \
+                                             interval.\n\n\
+                                             It comes from the running schedule, or from the \
+                                             settings shown when the channel is not running.\n\n\
+                                             A network link's capacity is unknown, so Talker \
+                                             states the load without a headroom figure.",
+                                        ),
                                     );
                                 }
 
@@ -773,14 +812,33 @@ impl TalkerApp {
                                             compact_rate(estimate.capacity_messages_per_second, "msg/s"),
                                         ),
                                         estimate.utilization >= 0.8,
-                                        "Advisory projection: the separate render and configured-interface write p99 histogram upper bounds are added, then compared with the aggregate message rate the running schedule is asking for. Timing from the last ~10 seconds is preferred after 20 paired observations. Otherwise run-wide timing is used after it has enough observations; recent timing is discarded once its update is ten seconds old. A channel that is not running is projected from the settings shown, using timing retained from its previous run. It is not a joint p99 or hard capacity promise. A write may return after driver/kernel buffering, and coincident due messages still serialize.",
+                                        &Hover::new(
+                                            "Application headroom estimates how many times \
+                                             faster Talker could build and send messages than the \
+                                             schedule needs.\n\n\
+                                             It adds the 99th-percentile render time to the \
+                                             99th-percentile send-call time, and compares the \
+                                             result with the message rate the running schedule \
+                                             asks for. A channel that is not running is estimated \
+                                             from the settings shown, with timing from its last \
+                                             run.\n\n\
+                                             It uses timing from the last ~10 s once there are 20 \
+                                             sends with both times. Otherwise it uses the whole \
+                                             run, once that has enough; recent timing is no \
+                                             longer used once its update is ten seconds old.\n\n\
+                                             It is an estimate, not a promise. Adding two 99th \
+                                             percentiles is not the same as the 99th percentile \
+                                             of the total. A write can return as soon as the data \
+                                             is in a driver's buffer, and messages due at the \
+                                             same moment still go one after another.",
+                                        ),
                                     );
                                 } else {
                                     let text = if service_samples == 0 {
                                         "Estimated app headroom: run channel to measure".to_owned()
                                     } else if service_samples < MIN_SERVICE_SAMPLES {
                                         format!(
-                                            "Estimated app headroom: warming up ({service_samples}/{MIN_SERVICE_SAMPLES} send attempts)"
+                                            "Estimated app headroom: warming up ({service_samples} of {MIN_SERVICE_SAMPLES} send attempts)"
                                         )
                                     } else {
                                         "Estimated app headroom: unavailable from the observed bounds".to_owned()
@@ -789,29 +847,29 @@ impl TalkerApp {
                                         ui,
                                         text,
                                         false,
-                                        "At least 20 paired render/send-call observations are required before estimating application-service headroom. Slow schedules can use the cumulative run once enough samples exist.",
+                                        &Hover::new(
+                                            "App headroom needs at least 20 sends with both a \
+                                             render time and a send-call time.\n\n\
+                                             A slow schedule can use the whole run's timing once \
+                                             it has enough.",
+                                        ),
                                     );
                                 }
                             }
                         }
 
-                        detail_line(
-                            ui,
-                            timing_text,
-                            false,
-                            TIMING_TOOLTIP,
-                        );
+                        detail_line(ui, timing_text, false, &TIMING_TOOLTIP);
                         detail_line(
                             ui,
                             format!("{timer_prefix}: {timer_detail}"),
                             timer_hot,
-                            TIMER_TOOLTIP,
+                            &TIMER_TOOLTIP,
                         );
                         detail_line(
                             ui,
                             format!("Cadence alignment: {cadence}"),
                             false,
-                            ALIGNMENT_TOOLTIP,
+                            &ALIGNMENT_TOOLTIP,
                         );
                         // No queue gauge here: its one copy sits beside the
                         // live-update warning above Output. That shared queue
@@ -832,7 +890,7 @@ impl TalkerApp {
                         show_per_message_table(ui, &rows);
                     })
                     .header_response
-                    .on_hover_text(PER_MESSAGE_TOOLTIP);
+                    .on_hover(&PER_MESSAGE_TOOLTIP);
             }
         });
 
@@ -890,11 +948,12 @@ impl TalkerApp {
                 });
             }
             if label == "Apply & Restart" && enabled {
-                btn = btn.on_hover_text(
-                    "Stops the current send loop, applies the edited interface \
-                     and messages, and starts again. Interface-only edits can \
-                     also be applied live by pressing Enter in the edited field.",
-                );
+                btn = btn.on_hover(&Hover::new(
+                    "Stops sending, applies your changes to the interface and messages, and \
+                     starts again.\n\n\
+                     A change to the interface alone can also be applied while the channel runs, \
+                     by pressing Enter in the field you changed.",
+                ));
             }
             if btn.clicked() {
                 self.deferred.start = Some(i);
@@ -953,7 +1012,11 @@ impl TalkerApp {
                     self.conn_drafts[i].cadence_alignment == CadenceAlignment::UtcPhase;
                 if ui
                     .checkbox(&mut utc_aligned, "Align sends to UTC interval boundaries")
-                    .on_hover_text(format!("{ALIGNMENT_TOOLTIP} Requires Apply & Restart."))
+                    .on_hover(
+                        &ALIGNMENT_TOOLTIP
+                            .clone()
+                            .with_paragraph("A change takes effect after Apply & Restart."),
+                    )
                     .changed()
                 {
                     self.conn_drafts[i].cadence_alignment = if utc_aligned {
@@ -1318,10 +1381,11 @@ fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
         ui.checkbox(&mut entry.utf16_bom, "BOM");
         ui.separator();
         ui.checkbox(&mut entry.utf16_allow_raw_bytes, "Allow raw bytes")
-            .on_hover_text(
-                "Treat ‹XX› in the text as raw bytes (fuzzing escape \
-                 hatch). When off, ‹ and › are literal Unicode chars.",
-            );
+            .on_hover(&Hover::new(
+                "Treats ‹XX› in the text as one raw byte.\n\n\
+                 This lets you send bytes that are not valid UTF-16, to test how a receiver \
+                 copes. When it is off, ‹ and › are ordinary characters.",
+            ));
     });
     ui.end_row();
     text_changed
@@ -1385,12 +1449,12 @@ fn show_ascii_payload(
                 theme_palette(ui).warning,
                 format!("{} replaced with ?; use UTF-8", summary.count),
             )
-            .on_hover_text(format!(
-                "{} cannot represent: {characters}. Each occurrence will be sent as '?' \
-                 (0x3F). Switch the message Format to UTF-8 (recommended) or UTF-16, \
-                 or insert exact bytes when substitution is not appropriate.",
+            .on_hover(&Hover::from(format!(
+                "{} has no code for: {characters}.\n\n\
+                 Each one will be sent as '?' (0x3F). To send them, switch the message Format to \
+                 UTF-8 (recommended) or UTF-16, or insert the exact bytes you want.",
                 code_page_label(entry.ascii_code_page)
-            ));
+            )));
         }
     });
     ui.end_row();
@@ -1445,12 +1509,12 @@ fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
             }
         });
         ui.separator();
-        ui.label("NMEA checksum:").on_hover_text(
-            "The protocol-internal `*XX` byte at the end of an NMEA \
-             sentence. Distinct from the `Message checksum` row below, \
-             which is an outer checksum wrapped around the complete \
-             rendered message (timestamp + payload + NMEA `*XX`).",
-        );
+        ui.label("NMEA checksum:").on_hover(&Hover::new(
+            "The *XX checksum at the end of an NMEA sentence.\n\n\
+             It is part of the sentence itself. The Message checksum option below is separate: \
+             it adds an outer checksum after the whole message, timestamp and NMEA checksum \
+             included.",
+        ));
         let checksum_before = entry.nmea_checksum_mode;
         ui.radio_value(
             &mut entry.nmea_checksum_mode,
@@ -1490,10 +1554,11 @@ fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
                 .map(|(index, kind)| format!("field {}: {}", index + 1, kind.label()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            live_response.on_hover_text(format!(
-                "Refreshed at every send: {fields}. Typed values are retained in the profile but \
-                 overridden on the wire. Missing fields are added through the last live field."
-            ));
+            live_response.on_hover(&Hover::from(format!(
+                "Fills in the current UTC time at every send: {fields}.\n\n\
+                 Values you type are kept in the profile but replaced on the wire. If the \
+                 sentence has too few fields, more are added so that every time field exists."
+            )));
         } else {
             live_response
                 .on_hover_text("No live UTC field positions are defined for this sentence type.");
@@ -1676,12 +1741,12 @@ fn show_filtered_picker(
 /// get for non-UTF-8 bytes.
 fn show_message_preview(ui: &mut egui::Ui, analysis: &MessageDraftAnalysis) {
     ui.horizontal(|ui| {
-        ui.label("Wire bytes:").on_hover_text(
-            "Literal bytes that would be sent on the wire, rendered \
-                 in a payload-appropriate view. Timestamps use a fixed \
-                 reference instant so the value doesn't tick — the \
-                 actual send uses the wall clock.",
-        );
+        ui.label("Wire bytes:").on_hover(&Hover::new(
+            "The exact bytes this message would put on the wire.\n\n\
+             They are shown in the view that suits the format: text for text formats, hex for \
+             the others. A timestamp uses a fixed time here so the preview does not keep \
+             changing; a real send uses the current time.",
+        ));
         let preview: egui::WidgetText = match &analysis.preview {
             MessagePreview::Ascii {
                 bytes,
@@ -1748,7 +1813,7 @@ fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
                         .strong()
                         .monospace(),
                 )
-                .on_hover_text(SENT_MEANING_TOOLTIP);
+                .on_hover(&SENT_MEANING_TOOLTIP);
             });
         });
 }
@@ -1795,11 +1860,11 @@ fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
     );
     ui.horizontal(|ui| {
         ui.checkbox(&mut entry.checksum_enabled, "Message checksum")
-            .on_hover_text(
-                "Outer checksum appended to the complete rendered message \
-                 (timestamp + payload). Independent of any protocol-internal \
-                 checksum like NMEA's `*XX` — that one is still emitted.",
-            );
+            .on_hover(&Hover::new(
+                "Adds a checksum after the complete message, timestamp and payload included.\n\n\
+                 It is separate from any checksum inside the payload, such as NMEA's *XX, which \
+                 is still sent.",
+            ));
         if entry.checksum_enabled {
             egui::ComboBox::from_id_salt("checksum_algorithm")
                 .selected_text(checksum_label(entry.checksum_algorithm))

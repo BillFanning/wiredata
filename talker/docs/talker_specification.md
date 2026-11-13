@@ -1,13 +1,20 @@
 # Talker — Program Specification
-**Version:** 2.5.3
+**Version:** 2.5.4
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-12) — a console that stops taking output:
+Revision note (2026-11-13) — hover text and the missed-send callout:
 
-- **§9.2 CLI logging (ADR-064)** — stdout log lines go through a bounded queue
-  on a logger thread, as file lines do. A line the console does not take is
-  dropped and counted, where the channel's send thread used to wait for it.
+- **§3.2 Hover text (ADR-065)** — every hover that explains something opens with a bold
+  sentence, then short paragraphs in plain, complete sentences. A hover used
+  to be one dense paragraph.
+- **§3.2 Missed-send routing** — the measured branch states its total, its
+  measured part and its remainder on separate lines, in full sentences. Each
+  branch's hover now explains only that branch; the limits of every kind of
+  evidence used to be listed in **Timing & runtime details**.
+- **§3.2 Diagnostics card (ADR-066)** — the card has no status badge and no
+  header row. The Send outcomes line starts with ⚠ when any deduction is
+  nonzero, where it used to rely on colour and on the badge.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -279,7 +286,8 @@ The **detail pane** (right) shows the selected channel:
     deduction happened (§8.1). These are totals for the current run and remain
     after sending recovers and after Stop. The outcomes are rendered in exactly
     one place: the diagnostics card neither repeats them nor raises a separate
-    unsent callout, though their tone still escalates its badge.
+    unsent callout. When any deduction is nonzero the line starts with ⚠, so
+    its state does not rest on colour alone (ADR-066).
   - *Sent:* `Sent: <total> total · <byte rate> · <msg/s> (~5 s)` — the cumulative
     byte total, retained after Stop, beside the rolling five-second rates, which
     decay to `0.0` at rest while the total stands still. Byte values scale by SI
@@ -338,22 +346,23 @@ The **detail pane** (right) shows the selected channel:
     counts may describe a problem that has cleared, and application headroom
     remains guidance rather than proof.
 
-    The amount-stating branch closes its arithmetic with the total for which
-    Talker was waiting for another message's serial or network send to finish,
-    the largest single share, and the remainder. For the remainder, the callout
-    says no serial or network send was recorded as being in progress. It never
-    calls the channel idle: a late wake, other work, and a genuinely free thread
-    all leave the same gap in this measurement. A message is not counted against
-    its own missed points; a send lasting longer than that message's interval is
-    compared through **Send call** instead.
+    The amount-stating branch closes its arithmetic in full sentences, one line
+    each: the total missed; how many came due while another message was being
+    sent, with the message behind most of them and its longest send; and the
+    remainder, for which no cause is known. It never calls the channel idle: a
+    late wake, other work, and a genuinely free thread all leave the same gap
+    in this measurement. A message is not counted against its own missed
+    points; a send lasting longer than that message's interval is compared
+    through **Send call** instead.
 
-    **Timing & runtime details** presents those limits as four labelled points,
-    using the same message, interval, send-call, failure, and capacity vocabulary
-    as the screen. The retained-history sizing that proves an eligible send was
-    not merely forgotten remains in ADR-051, not in the technician-facing help.
+    The callout's hover opens, in bold, with what a missed send is and how the
+    schedule skips ahead, then explains only the finding on the line: how far it
+    can be trusted, and where its figures are shown. The retained-history sizing
+    that proves an eligible send was not merely forgotten remains in ADR-051,
+    not in the technician-facing help.
     The callout carries a **Dismiss** button, on the rule in §3.2 *Dismissible
     warnings* below. It is advice rather than a count: the misses stay on the
-    send-outcomes line and keep the card's badge raised, so dismissing hides
+    send-outcomes line, marked ⚠, so dismissing hides
     where to look and never what happened.
   - *Per-message timing (ADR-045, amended by ADR-051):* a collapsed table, one
     row per message numbered as in the Messages editor, with seven columns —
@@ -419,6 +428,12 @@ The **detail pane** (right) shows the selected channel:
   it changes nothing that is counted or logged. No other callout is dismissible:
   a live interface fault, an impossible serial schedule, and a failed timer
   request each describe a condition that is still true while it is on screen.
+- **Hover text** (ADR-065) — a hover that explains something opens with one sentence in
+  bold that states the point, followed by short paragraphs set apart by blank
+  lines. It is written in plain, complete sentences, using the names on screen,
+  and explains only what the element it belongs to shows. A short hint (a
+  button's action, a keyboard shortcut, a path) stays one plain line. A
+  separator never reuses `/`, which on these screens means "per".
 - **Lifecycle buttons** — the labeled pair (shared with listener):
   [Start Channel / Apply & Restart / Retry Channel] + [Stop Channel]; the Start
   side's label and enabled state derive from run state, drift, and draft
@@ -718,8 +733,8 @@ updates land in Output, not because the queue is Output-only (ADR-052):
 
 While the dropped-update warning is unacknowledged, the **Output** section
 header itself reads `Output ⚠ <n> dropped` in the warning accent. The pane is
-collapsed by default and this warning no longer raises the diagnostics card's
-badge, so without the marked header a reader could sit in front of the condition
+collapsed by default and the diagnostics card has no badge to raise, so
+without the marked header a reader could sit in front of the condition
 and never see it. The marker and the count carry it; the accent only reinforces
 them.
 

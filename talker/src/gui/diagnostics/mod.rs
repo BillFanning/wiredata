@@ -31,8 +31,9 @@ use crate::core::telemetry::{
     DurationHistogram, MessageTiming, RecentSnapshotState, SendTimingTelemetry, RECENT_WINDOW,
 };
 use crate::core::timing::{ActiveCadence, TimerMode, TimerReason, TimerStatus};
-use wiredata_ui::diagnostics::SignalTone;
+use wiredata_ui::diagnostics::{tone_marker, SignalTone};
 use wiredata_ui::format::{compact_duration, interval as format_interval, percent, thousands};
+use wiredata_ui::hover::Hover;
 
 use super::MessageAnalysisCache;
 
@@ -195,33 +196,6 @@ pub(in crate::gui) struct DecisionSignal {
     pub(in crate::gui) tone: SignalTone,
 }
 
-/// The badge on the diagnostics card.
-///
-/// Every input is something the card itself shows or is shown immediately above
-/// it. Discarded live updates used to raise this badge too, and no longer do:
-/// that shared-queue warning now has one home above Output. A badge reading
-/// ATTENTION over otherwise calm diagnostic rows would make queue pressure look
-/// like a channel problem found by those measurements.
-pub(in crate::gui) fn diagnostic_card_tone(
-    delivery: SignalTone,
-    capacity: SignalTone,
-    timer_request_failed: bool,
-    running: bool,
-) -> SignalTone {
-    if delivery == SignalTone::Fault || capacity == SignalTone::Fault {
-        SignalTone::Fault
-    } else if delivery == SignalTone::Warning
-        || capacity == SignalTone::Warning
-        || timer_request_failed
-    {
-        SignalTone::Warning
-    } else if running {
-        SignalTone::Healthy
-    } else {
-        SignalTone::Neutral
-    }
-}
-
 const NO_MEASUREMENT: &str = "—";
 
 #[cfg(test)]
@@ -231,63 +205,6 @@ mod tests {
 
     use crate::core::telemetry::{DurationHistogram, RecentSnapshotState, SendTimingTelemetry};
     use crate::core::timing::ActiveCadence;
-
-    use wiredata_ui::diagnostics::SignalTone;
-
-    /// The send-outcome counts moved out of the card and above it, but their
-    /// tone still has to reach the badge — otherwise a failing interface reads
-    /// as a calm card. This pins the coupling that survived that move.
-    ///
-    /// It also pins the half that must *not* survive: a run whose only
-    /// complaint is skipped sends still raises the badge from the outcome
-    /// counts, so dismissing the routing callout inside the card cannot make
-    /// the card look clean.
-    #[test]
-    fn send_outcome_tone_still_escalates_the_card_badge() {
-        let failing = send_outcomes(98, 1, 0, 0, 1);
-        assert_eq!(
-            diagnostic_card_tone(failing.tone, SignalTone::Neutral, false, true),
-            SignalTone::Fault
-        );
-
-        let shortfall = send_outcomes(98, 0, 0, 1, 1);
-        assert_eq!(
-            diagnostic_card_tone(shortfall.tone, SignalTone::Neutral, false, true),
-            SignalTone::Warning
-        );
-
-        let missed_only = send_outcomes(98, 0, 0, 0, 2);
-        assert_eq!(
-            diagnostic_card_tone(missed_only.tone, SignalTone::Neutral, false, true),
-            SignalTone::Warning
-        );
-
-        let clean = send_outcomes(100, 0, 0, 0, 0);
-        assert_eq!(
-            diagnostic_card_tone(clean.tone, SignalTone::Neutral, false, true),
-            SignalTone::Healthy
-        );
-    }
-
-    #[test]
-    fn card_tone_surfaces_faults_warnings_and_clean_live_state() {
-        assert_eq!(
-            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Fault, false, true),
-            SignalTone::Fault
-        );
-        assert_eq!(
-            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, true, true),
-            SignalTone::Warning
-        );
-        assert_eq!(
-            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, false, true),
-            SignalTone::Healthy
-        );
-        assert_eq!(
-            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, false, false),
-            SignalTone::Neutral
-        );
-    }
 
     /// A clustered schedule — two fast messages and one slow one — which is the
     /// shape a span renders misleadingly and a grouping renders honestly.
@@ -410,7 +327,7 @@ mod tests {
             "Work per send: awaiting timing data · run max late 1.00 ms"
         );
         assert!(
-            !TIMING_TOOLTIP.contains("snapshot"),
+            !TIMING_TOOLTIP.text().contains("snapshot"),
             "technician-facing timing help names the period, not its transport shape"
         );
 

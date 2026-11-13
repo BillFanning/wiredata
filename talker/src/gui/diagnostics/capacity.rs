@@ -7,6 +7,22 @@
 
 use super::*;
 
+/// Hover text for the Capacity row, one paragraph per figure on it, in order.
+pub(in crate::gui) const CAPACITY_TOOLTIP: Hover = Hover::new(
+    "Capacity compares what the schedule asks for with what the channel can manage.\n\n\
+     Requested is the message rate the running schedule asks for, worked out from each \
+     message's size on the wire and its interval. A channel that is not running has no running \
+     schedule, so the settings shown are used instead, and app headroom is marked \
+     \"projected\".\n\n\
+     Sent is the average over the last five seconds of the messages the interface accepted.\n\n\
+     Serial is how much of the line's capacity at this baud rate the schedule needs. It is \
+     calculated, not measured. A network line's capacity is unknown, so none is shown.\n\n\
+     App headroom estimates how many times faster Talker could build and send messages than \
+     the schedule needs; below 1x, it cannot keep up. It uses timing from the last ~10 s once \
+     there are enough sends, and the whole run otherwise, and says when it does. It is an \
+     estimate, not a promise.",
+);
+
 pub(in crate::gui) fn analyzed_channel_demand(
     message_count: usize,
     analyses: &[MessageAnalysisCache],

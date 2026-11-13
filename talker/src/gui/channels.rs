@@ -7,6 +7,7 @@ use wiredata_ui::{glyphs, palette::Palette, selection};
 use super::draft::ConnKind;
 use super::widgets::{interface_summary, lifecycle_indicator};
 use super::TalkerApp;
+use wiredata_ui::hover::{Hover, ShowHover};
 use wiredata_ui::palette::active as theme_palette;
 
 /// One channel's row data, snapshotted before rendering.
@@ -105,10 +106,11 @@ impl TalkerApp {
         };
         let marker = if self.dirty { " *" } else { "" };
         ui.label(egui::RichText::new(format!("{name}{marker}")).weak())
-            .on_hover_text(
-                "The loaded profile — * means unsaved changes (Ctrl+S saves). \
-                 Rename by saving to a new file via Profile → Save As….",
-            );
+            .on_hover(&Hover::new(
+                "The loaded profile. A * after its name means unsaved changes.\n\n\
+                 Ctrl+S saves. To rename the profile, save it to a new file with Profile → Save \
+                 As….",
+            ));
         ui.separator();
 
         // Snapshot the rows, then render — the click handler mutates
@@ -271,11 +273,11 @@ impl TalkerApp {
                         ui.label(
                             egui::RichText::new(format!("Sent: {}{rate}", row.sent)).weak(),
                         )
-                        .on_hover_text(
-                            "Accepted means the configured-interface write returned success; it \
-                             does not confirm physical-wire or peer delivery. The rate is a \
-                             rolling five-second average of locally accepted messages.",
-                        );
+                        .on_hover(&Hover::new(
+                            "The messages the interface accepted since this channel started.\n\n\
+                             That does not confirm they reached the wire or a receiver. The rate \
+                             is the average over the last five seconds.",
+                        ));
                     }
                     // Line 4: per-severity log counts (since the channel's
                     // last start) — the shared row line (info · warn · err;

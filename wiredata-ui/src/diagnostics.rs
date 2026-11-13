@@ -145,6 +145,18 @@ fn status_badge(ui: &mut Ui, text: WidgetText, tone: SignalTone) -> Response {
         .inner
 }
 
+/// The diagnostic card with no header row: no title and no status badge.
+///
+/// For a card whose every reason for attention is already marked on its own
+/// row or callout (talker ADR-066). A badge there only repeats them, and costs
+/// a row at the top of the card.
+pub fn diagnostic_card<R>(
+    ui: &mut Ui,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<R> {
+    card_frame(ui).show(ui, add_contents)
+}
+
 /// Draw one compact diagnostic card. The caller supplies app-specific rows and any
 /// progressive-disclosure control beneath them.
 pub fn decision_card<R>(
@@ -228,7 +240,7 @@ pub fn signal_row(
 /// the two it is stays in the row's own text and in the card's badge, where a
 /// word already says it. Adding a second glyph would split a distinction the
 /// reader does not have to make at a glance.
-fn tone_marker(tone: SignalTone) -> &'static str {
+pub fn tone_marker(tone: SignalTone) -> &'static str {
     match tone {
         SignalTone::Warning | SignalTone::Fault => "\u{26A0} ",
         SignalTone::Neutral | SignalTone::Healthy => "",

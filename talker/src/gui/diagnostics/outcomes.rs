@@ -6,30 +6,40 @@
 
 use super::*;
 
-pub(in crate::gui) const SENT_MEANING_TOOLTIP: &str =
-    "Sent means the configured-interface write returned success. It does not confirm that serial \
-bits reached the wire, a network packet left the host, or a peer received the data.";
+pub(in crate::gui) const SENT_MEANING_TOOLTIP: Hover = Hover::new(
+    "Sent counts the messages the interface accepted without an error.\n\n\
+     It does not confirm that the bits reached a serial line, that a network packet left this \
+     computer, or that anything received the data.",
+);
 
-pub(in crate::gui) const THROUGHPUT_TOOLTIP: &str =
-    "Total is every byte the interface accepted since Start, including the part of a possibly \
-partial send, and is retained after Stop. The two rates are a rolling five-second average of sent \
-messages and of those bytes. Failed, possibly partial, retry-suppressed, and missed sends are not \
-sent messages. The fixed five-second denominator makes the rates ramp during startup and decay to \
-zero after traffic stops, while the total stands still; they are not instantaneous line rate. Sent \
-means the interface write returned success, not that any peer received the data.";
+pub(in crate::gui) const THROUGHPUT_TOOLTIP: Hover = Hover::new(
+    "The bytes and messages the interface accepted since this channel started.\n\n\
+     The total includes the bytes of a possibly partial send that the interface took before it \
+     failed. It stays on screen after Stop.\n\n\
+     The two rates are averages over the last five seconds. They climb for the first five \
+     seconds after Start and fall to zero over the five seconds after sending stops, while the \
+     total stays put, so they are not the rate on the line at this instant.\n\n\
+     Failed, possibly partial, suppressed and missed sends are not counted as sent messages. \
+     Sent means the interface accepted the data, not that anything received it.",
+);
 
-pub(in crate::gui) const LIVE_UPDATE_QUEUE_TOOLTIP: &str =
-    "Current is how many live updates were waiting the last time the screen checked. The screen \
-then removes them, so it is not the number waiting now. Peak is the largest value seen at one of \
-those checks; a brief higher peak may be missed. A dropped update may affect an Output sample, a \
-counter readout, timer status, or interface error notice. Sending never waits for this queue. \
-Later updates correct the live totals and whether a send failure is still active; final run totals \
-remain exact. Command results use a separate path.";
+pub(in crate::gui) const LIVE_UPDATE_QUEUE_TOOLTIP: Hover = Hover::new(
+    "Live updates bring each channel's progress to this screen.\n\n\
+     The first number is how many updates were waiting the last time the screen checked. The \
+     screen then takes them all, so it is not the number waiting now. Peak is the largest number \
+     seen at one of those checks; a brief higher peak between checks can go unseen.\n\n\
+     A dropped update can leave out an Output sample, a counter, the timer status or an \
+     interface error notice. Later updates correct the live totals and show whether a send \
+     failure is still happening, and the run's final totals are exact.\n\n\
+     Sending never waits for this queue. Command results travel separately.",
+);
 
-pub(in crate::gui) const PEER_SENT_TOOLTIP: &str =
-    "Bytes the TCP peer sent to talker during this run. Talker reads and discards them before \
-each write, so the peer never stalls on a full buffer and closing the connection does not reset \
-it. They are counted, not shown: viewing them is listener's job.";
+pub(in crate::gui) const PEER_SENT_TOOLTIP: Hover = Hover::new(
+    "The bytes the TCP peer sent back to Talker during this run.\n\n\
+     Talker reads and discards them before each write, so the peer never stalls on a full \
+     buffer, and closing the connection does not reset it.\n\n\
+     They are counted but not shown. To see them, use Listener.",
+);
 
 /// The peer-reply readout (§4.5): "peer sent N bytes".
 pub(in crate::gui) fn peer_sent_words(bytes: u64) -> String {
@@ -89,41 +99,68 @@ pub(in crate::gui) fn send_outcomes(
     }
 }
 
-/// The one tooltip for the send-outcomes line: what each term counts, and where
-/// in the send path each deduction happened.
+/// The send-outcomes line as shown: marked with ⚠ when it wants attention, as
+/// a card row is, so the state never rests on its colour alone.
+///
+/// With the card's badge gone (ADR-066) this line is what says a run had
+/// trouble once the missed-send callout is dismissed, so its mark matters.
+pub(in crate::gui) fn send_outcomes_line(outcomes: &DecisionSignal) -> String {
+    format!("{}{}", tone_marker(outcomes.tone), outcomes.text)
+}
+
+/// The one tooltip for the send-outcomes line: what each term counts, one
+/// paragraph each and in the line's own order, so the reader can follow the
+/// subtraction down the hover.
 pub(in crate::gui) fn send_outcomes_tooltip(
     sent: u64,
     failed: u64,
     possibly_partial: u64,
     suppressed: u64,
     missed: u64,
-) -> String {
+) -> Hover {
     let scheduled = sent
         .saturating_add(failed)
         .saturating_add(possibly_partial)
         .saturating_add(suppressed)
         .saturating_add(missed);
-    format!(
-        "{} scheduled counts every cadence point this run's schedule produced, less \
-         the four ways a send does not go out whole. {} failed: the interface write was \
-         attempted and returned an error before accepting any byte. {} possibly partial: \
-         the write returned an error after the interface accepted part of the message, or a \
-         TCP write timed out on Windows, which cannot say how much it sent. The receiver may \
-         hold a fragment; it is never resent, and its accepted bytes are in the byte total. \
-         {} suppressed: after a failure, the send \
-         was withheld during retry backoff and never attempted — these follow failures and \
-         cannot occur without one. {} missed: the runner fell more than one interval \
-         behind, so the cadence point was skipped before any send existed. The remaining \
-         {} sent means the interface write returned success; it does not confirm that \
-         bytes reached the wire or that any peer received them. These totals cover this run \
-         and remain after sending recovers; the channel fault line says what is wrong now.",
-        thousands(scheduled),
-        thousands(failed),
-        thousands(possibly_partial),
-        thousands(suppressed),
-        thousands(missed),
-        thousands(sent),
-    )
+    Hover::from_paragraphs([
+        "Send outcomes shows how every scheduled send in this run ended.".to_owned(),
+        format!(
+            "{} scheduled: every send the schedule called for.",
+            thousands(scheduled)
+        ),
+        format!(
+            "{} failed: the interface was given the message and reported an error before \
+             taking any of it.",
+            thousands(failed)
+        ),
+        format!(
+            "{} possibly partial: the interface reported an error after taking part of the \
+             message, or, on Windows, a TCP write timed out without saying how much it sent. \
+             The receiver may hold a fragment. It is never sent again, and the bytes taken are \
+             in the byte total.",
+            thousands(possibly_partial)
+        ),
+        format!(
+            "{} suppressed: after a failure, Talker waits before trying again, and a send that \
+             comes due during that wait is held back and never tried. These only happen after \
+             a failure.",
+            thousands(suppressed)
+        ),
+        format!(
+            "{} missed: the channel fell more than one interval behind, so it skipped that \
+             scheduled time.",
+            thousands(missed)
+        ),
+        format!(
+            "{} sent: the interface accepted the message. That does not confirm it reached the \
+             wire or that anything received it.",
+            thousands(sent)
+        ),
+        "These are totals for the whole run, so they stay after sending recovers. The \
+         channel's error line says what is wrong now."
+            .to_owned(),
+    ])
 }
 
 #[cfg(test)]
@@ -145,6 +182,7 @@ mod tests {
         );
 
         let tip = send_outcomes_tooltip(1_234_567, 0, 0, 0, 2_400);
+        let tip = tip.text();
         assert!(tip.contains("1,236,967 scheduled"), "{tip}");
         assert!(tip.contains("2,400 missed"), "{tip}");
         assert!(tip.contains("1,234,567 sent"), "{tip}");
@@ -190,6 +228,22 @@ mod tests {
         assert_eq!(partial.tone, SignalTone::Fault);
     }
 
+    /// Amber or red alone is not a state a colour-blind reader can see. A run
+    /// with any trouble is marked in the text too; a clean or empty one is
+    /// not.
+    #[test]
+    fn a_send_outcomes_line_with_trouble_is_marked_without_colour() {
+        let marked = |sent, failed, partial, suppressed, missed| {
+            send_outcomes_line(&send_outcomes(sent, failed, partial, suppressed, missed))
+        };
+        assert!(marked(98, 0, 0, 0, 2).starts_with("\u{26A0} Send outcomes:"));
+        assert!(marked(98, 0, 0, 2, 0).starts_with("\u{26A0} Send outcomes:"));
+        assert!(marked(98, 1, 0, 0, 0).starts_with("\u{26A0} Send outcomes:"));
+        assert!(marked(98, 0, 1, 0, 0).starts_with("\u{26A0} Send outcomes:"));
+        assert!(marked(100, 0, 0, 0, 0).starts_with("Send outcomes:"));
+        assert!(marked(0, 0, 0, 0, 0).starts_with("Send outcomes:"));
+    }
+
     #[test]
     fn a_tcp_peer_s_replies_read_as_bytes_it_sent() {
         assert_eq!(peer_sent_words(0), "Peer sent 0 bytes");
@@ -206,15 +260,33 @@ mod tests {
 
     #[test]
     fn send_outcomes_tooltip_defines_each_term_and_its_limit() {
-        let tip = send_outcomes_tooltip(98, 1, 0, 0, 1);
-        assert!(tip.contains("100 scheduled counts every cadence point"));
+        let hover = send_outcomes_tooltip(98, 1, 0, 0, 1);
+        let paragraphs: Vec<&str> = hover.text().split("\n\n").collect();
+        // One paragraph per term, in the line's own order, between the
+        // heading and the closing note.
+        let terms: Vec<&str> = paragraphs[1..paragraphs.len() - 1]
+            .iter()
+            .map(|paragraph| paragraph.split(':').next().unwrap())
+            .collect();
+        assert_eq!(
+            terms,
+            [
+                "100 scheduled",
+                "1 failed",
+                "0 possibly partial",
+                "0 suppressed",
+                "1 missed",
+                "98 sent"
+            ]
+        );
+        let tip = hover.text();
         // Suppressions are downstream of a failure, never an independent
         // fault — the tooltip has to say so or the two read as peers.
-        assert!(tip.contains("cannot occur without one"));
+        assert!(tip.contains("These only happen after a failure."));
         // The remainder is defined by the equation, but its limit still needs
         // stating: a successful write is not proof of delivery.
-        assert!(tip.contains("does not confirm that bytes reached the wire"));
-        assert!(tip.contains("totals cover this run and remain after sending recovers"));
-        assert!(tip.contains("fault line says what is wrong now"));
+        assert!(tip.contains("That does not confirm it reached the wire"));
+        assert!(tip.contains("totals for the whole run, so they stay after sending recovers"));
+        assert!(tip.contains("error line says what is wrong now"));
     }
 }

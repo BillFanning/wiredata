@@ -116,23 +116,29 @@ pub(in crate::gui) fn per_message_rows(
         .collect()
 }
 
-pub(in crate::gui) const PER_MESSAGE_TOOLTIP: &str =
-    "One row per message, numbered as in the Messages editor. Late is what that message \
-suffered: how long after its own scheduled moment the channel got to it. Longest block and Cost to \
-others are what it cost everything else — the longest single send of this message that held the \
-channel against another, then the waiting that imposed added up across every message delayed and \
-the cadence points others lost outright while this message was sending. Those are three different \
-quantities: the combined wait sums several messages, so it can exceed the send that caused it and \
-is not an elapsed time, and a missed point is a send that never happened rather than a late one. \
-Misses are counted at the moment they are skipped, so they stay attributable when overload gets \
-bad enough that few deadlines are reached at all. Suffering and causing usually land on different \
-rows, and that is the normal shape of a cadence problem: a channel handles its messages one at a \
-time, so a slow infrequent message can delay a fast one badly while recording almost no lateness \
-itself. Read across a row, not down a column. Sends counts writes that succeeded; a timing figure \
-repeats a count only where its own differs — lateness is sampled before retry backoff can withhold \
-a scheduled send, and the send call is timed for writes that failed. Figures cover the whole \
-run, and a percentile appears only where it differs from the worst value; the rolling ten-second \
-view is channel-wide and appears in the Cadence row instead.";
+pub(in crate::gui) const PER_MESSAGE_TOOLTIP: Hover = Hover::new(
+    "One row per message, numbered as in the Messages editor. Read across a row, not down a \
+     column.\n\n\
+     Late is what the message suffered: how long after its scheduled time the channel got to \
+     it.\n\n\
+     Longest block and Cost to others are what the message cost the others. Longest block is \
+     the longest single send of this message that held up another message. Cost to others adds \
+     up how long other messages waited behind it, and counts the sends they missed while it was \
+     sending.\n\n\
+     These are different kinds of figure. The waiting is added up over several messages, so it \
+     can be longer than the send that caused it, and it is not a span of time. A missed send \
+     never happened at all, which is not the same as a late one. Misses are counted as they \
+     happen, so they can still be traced to a message when the channel is too overloaded to \
+     reach many of its scheduled times.\n\n\
+     The message that suffers and the message that causes it are usually on different rows. A \
+     channel sends its messages one at a time, so a slow message that sends rarely can make a \
+     fast one very late while showing almost no lateness itself.\n\n\
+     Sends counts the messages the interface accepted. A timing figure adds its own count only \
+     where it differs: lateness is measured before a send can be held back during a retry wait, \
+     and the send call is also timed for writes that failed.\n\n\
+     Figures cover the whole run. A percentile appears only where it differs from the worst \
+     value. The last ~10 s, for the channel as a whole, is on the Cadence row.",
+);
 
 #[cfg(test)]
 mod tests {

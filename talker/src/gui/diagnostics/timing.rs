@@ -6,40 +6,52 @@
 
 use super::*;
 
-pub(in crate::gui) const TIMING_TOOLTIP: &str = "Recent timing merges up to approximately ten seconds of \
-fixed one-second segments ending at the latest counter update. A slow or dormant schedule can \
-therefore leave the displayed figures unchanged; “updated” states when the figures were computed, \
-not necessarily when their newest send occurred. While running, recent figures are no longer used \
-once their update age reaches ten seconds. After a normal run end, the channel retains exact final \
-timing for the period before stop; an abnormal exit can leave older, non-final timing instead. \
-Deadline lateness runs from a message's monotonic cadence deadline \
-until the runner handles that send; handled retry-suppressed sends are included, while \
-cadence points counted as Missed are not sampled. Render covers payload and timestamp construction. \
-Send call ends when the configured-interface write returns and includes failed attempts; it does \
-not prove physical-wire or peer delivery. The line gives its send count once; a boundary adds a \
-separate count only if its population differs. Render and send call lead with their longest \
-observation, followed by a percentile only when it is different; below a hundred samples it never \
-is. Percentiles are histogram-bucket upper bounds.";
+pub(in crate::gui) const TIMING_TOOLTIP: Hover = Hover::new(
+    "How long each part of a send took.\n\n\
+     Late is how long after its scheduled time the channel got to a send. Sends held back \
+     during a retry wait are included. Missed sends are not, because the channel never got to \
+     them.\n\n\
+     Render is the time taken to build the message, timestamp included. Send call is the time \
+     until the interface accepted the message or reported an error, so failed attempts are \
+     included. Neither shows that the data reached the wire or a receiver.\n\n\
+     The line states its number of sends once. A figure adds its own count only where it covers \
+     a different number of sends. Render and send call show their longest time first; a \
+     percentile follows only when it differs, which takes at least a hundred sends. A \
+     percentile is an upper bound: the true value is at or below it.\n\n\
+     Recent figures cover up to the last ten seconds, ending at the latest update. A slow or \
+     idle schedule can leave them unchanged for a while; \"updated\" says when they were \
+     worked out, not when the newest send happened. While the channel runs, figures are no \
+     longer used once their update is ten seconds old. After a normal stop the channel keeps \
+     its exact timing from the last ~10 s; after an abnormal exit, older timing may be shown \
+     instead.",
+);
 
-pub(in crate::gui) const TIMER_TOOLTIP: &str =
-    "The shortest active interval selects the deadline-wait policy. On \
-Windows, intervals below 32 ms hold the shared process-wide 1 ms timer-resolution request \
-continuously. At 32 ms or longer, the runner requests 1 ms only for the final 32 ms before a \
-waited deadline. An Immediate schedule's first send has \
-no preceding precision window. This channel releases a bounded-window request before rendering \
-and writing, although another channel may keep the process-wide request active. Commands interrupt \
-both wait stages. Other platforms use native deadline waits. This affects wake timing, not \
-timestamp accuracy or physical-wire arrival.";
+pub(in crate::gui) const TIMER_TOOLTIP: Hover = Hover::new(
+    "How the channel waits for each scheduled time.\n\n\
+     The shortest active interval decides. On Windows, with an interval under 32 ms the channel \
+     keeps the 1 ms timer resolution on for as long as it runs. At 32 ms or longer it turns 1 ms \
+     on only for the last 32 ms before each scheduled time, and lets it go before building and \
+     sending the message. The setting is shared, so another channel may still be keeping it \
+     on.\n\n\
+     The first send of an Immediate schedule has no such precise wait before it. A command such \
+     as Stop interrupts the wait.\n\n\
+     Other platforms use their own precise waits. This affects when the channel wakes, not how \
+     accurate its timestamps are or when the data arrives.",
+);
 
-pub(in crate::gui) const ALIGNMENT_TOOLTIP: &str =
-    "Immediate makes every active message due when the interface \
-opens. UTC phase places each first application deadline on the strict next Unix-epoch multiple of \
-its interval, then advances on monotonic deadlines. For example, 1000 ms aligns to whole UTC \
-seconds, while 1500 ms alternates between whole- and half-second phases. When the runner loops, it \
-compares wall clock with its elapsed-time projection no more often than once per second; a \
-displacement of at least 250 ms rebuilds future deadlines without replaying bypassed points or \
-adding scheduler misses. This aligns application deadlines, not completion of an interface write \
-or physical-wire arrival.";
+pub(in crate::gui) const ALIGNMENT_TOOLTIP: Hover = Hover::new(
+    "Cadence alignment decides when each message's first send is due.\n\n\
+     Immediate: every active message is due as soon as the interface opens.\n\n\
+     UTC phase: each message's first send is due at the next UTC time that is a whole multiple \
+     of its interval, counted from the start of 1970. A 1000 ms interval lands on whole UTC \
+     seconds; a 1500 ms interval alternates between whole and half seconds. After that, sends \
+     follow the interval.\n\n\
+     At most once a second, the channel compares the system clock with its own count of \
+     elapsed time. If they differ by 250 ms or more, it re-aligns future sends. It does not send \
+     the times it jumped over, and does not count them as missed.\n\n\
+     This sets when sends are due, not when the interface finishes writing or when the data \
+     arrives.",
+);
 
 pub(in crate::gui) fn timing_detail_text(
     recent: SendTimingTelemetry,

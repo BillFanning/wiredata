@@ -19,6 +19,7 @@ use crate::core::message::{
 
 use super::diagnostics::LIVE_UPDATE_QUEUE_TOOLTIP;
 use super::display::{ChannelDisplay, ControlStyle, DisplayMode};
+use wiredata_ui::hover::{Hover, ShowHover};
 
 /// The runner→UI live-update queue as reported beside its drop warning.
 ///
@@ -596,12 +597,11 @@ fn show_udp_destination_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
         ),
         UdpModeDraft::Multicast => (
             "Multicast group",
-            Some(
-                "IPv4 multicast group address (must be in the 224.0.0.0 – \
-                 239.255.255.255 range). Receivers must subscribe to the same \
-                 group + port to see these packets. Common admin-local picks \
-                 live in 239.x.x.x.",
-            ),
+            Some(Hover::new(
+                "An IPv4 multicast group address, from 224.0.0.0 to 239.255.255.255.\n\n\
+                 Receivers must join the same group and port to see these packets. Addresses in \
+                 239.x.x.x are the usual choice on a local network.",
+            )),
             "239.0.0.1",
             "enter IPv4 multicast address — e.g. 239.0.0.1",
             "udp_multicast_addr",
@@ -610,7 +610,7 @@ fn show_udp_destination_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     };
     let label_resp = ui.label(label);
     if let Some(t) = label_tip {
-        let _ = label_resp.on_hover_text(t);
+        let _ = label_resp.on_hover(&t);
     }
 
     let pair = match mode {
@@ -1916,6 +1916,7 @@ pub(super) fn show_display_pane(
             // record left from a previous run, so calling it again here would be a
             // second mutation in one frame.
             if unacknowledged {
+                let hover = LIVE_UPDATE_QUEUE_TOOLTIP.layout(ui.style());
                 let acknowledged = dismissible_attention_callout(
                     ui,
                     "live_update_drop_attention",
@@ -1924,7 +1925,7 @@ pub(super) fn show_display_pane(
                          readouts may lag"
                     ),
                     SignalTone::Warning,
-                    LIVE_UPDATE_QUEUE_TOOLTIP,
+                    hover,
                 );
                 if acknowledged {
                     dismissed.dismiss(dropped_updates);
@@ -1943,13 +1944,14 @@ pub(super) fn show_display_pane(
             // placement does not make it an Output-only measurement.
             ui.label(
                 egui::RichText::new(format!(
-                    "live update queue at last screen check: {}/{} · peak {} · {} dropped",
+                    // "of", not a slash: "/" on this screen means "per".
+                    "live update queue at last screen check: {} of {} · peak {} · {} dropped",
                     queue.len, queue.capacity, queue.peak, dropped_updates
                 ))
                 .small()
                 .color(ui.visuals().weak_text_color()),
             )
-            .on_hover_text(LIVE_UPDATE_QUEUE_TOOLTIP);
+            .on_hover(&LIVE_UPDATE_QUEUE_TOOLTIP);
             if display.payload_samples_omitted(accepted_total) {
                 // A standing note about how the pane works, not a state to act
                 // on, so it recedes with the theme: no accent, no ⚠, and the
@@ -1962,25 +1964,23 @@ pub(super) fn show_display_pane(
                     .small()
                     .color(ui.visuals().weak_text_color()),
                 )
-                .on_hover_text(format!(
-                    "Above ~{sample_hz:.0} messages/s the Output pane shows a \
-                 rate-limited live sample, not every message, so its \
-                 render cost stays constant at any send rate. This line appears \
-                 only after the locally accepted total proves that one or more \
-                 payload updates were omitted; live-update queue pressure can also omit \
-                 an update. The fact remains visible for the rest of this run. \
-                 Runner-owned cumulative totals remain exact; live readouts can lag \
-                 until a later update, and the final run totals are exact. None of \
-                 these values proves physical-wire or peer delivery."
-                ));
+                .on_hover(&Hover::from(format!(
+                    "Above about {sample_hz:.0} messages a second, Output shows a sample of the \
+                     messages, not every one.\n\n\
+                     That keeps the pane's drawing cost the same at any send rate. This line \
+                     appears once the count of sent messages shows that at least one was left \
+                     out, and stays for the rest of the run. A full live update queue can also \
+                     leave one out.\n\n\
+                     The run's counts are exact; live readouts can lag until a later update. \
+                     None of these figures shows that the data reached the wire or a receiver."
+                )));
                 ui.separator();
             }
             ui.horizontal(|ui| {
-                ui.label("View:").on_hover_text(
-                    "These are display modes — the prepared output bytes are the \
-                 same regardless of which view is selected. The view only \
-                 changes how the buffered bytes are rendered here.",
-                );
+                ui.label("View:").on_hover(&Hover::new(
+                    "The view changes only how Output shows the bytes.\n\n\
+                     What is sent is the same in every view.",
+                ));
                 ui.radio_value(&mut display.mode, DisplayMode::Hex, "Hex");
                 ui.radio_value(&mut display.mode, DisplayMode::Rendered, "Rendered");
                 // Raw comes last so the ctrl-chars sub-options below sit

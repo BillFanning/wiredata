@@ -181,8 +181,8 @@ Ten crates in a Cargo workspace:
 - **`wiredata-ui/`** — internal (`publish = false`) shared GUI **chrome** for the two
   apps (talker ADR-016 / listener ADR-019): the bundled font stack + assets, the named
   color palette (`LIGHT`/`DARK`), the base widget visuals for both themes, shared style
-  tweaks, identical decision-card chrome (talker ADR-041 / listener ADR-033), and pure
-  formatting helpers. Depends **only on `egui`** — never on `talker`, `listener`,
+  tweaks, identical decision-card chrome (talker ADR-041 / listener ADR-033), the
+  hover-text format (talker ADR-065), and pure formatting helpers. Depends **only on `egui`** — never on `talker`, `listener`,
   `eframe`, or any runtime crate. A piece belongs here only if it is purely
   presentational, identical across both apps, and egui-only; app-specific widgets,
   layouts, and view-models stay in the apps.
