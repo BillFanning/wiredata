@@ -1,14 +1,13 @@
 # Talker — Program Specification
-**Version:** 2.5.2
+**Version:** 2.5.3
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-10-01) — a TCP write that timed out:
+Revision note (2026-11-12) — a console that stops taking output:
 
-- **§4.4 / §4.5 possibly partial (ADR-059, amended)** — on Windows, a TCP write
-  that times out counts as possibly partial: Windows reports nothing sent, but
-  part of the message may have gone. Its error says the peer took no data for
-  5 s, in place of Windows' text about a failed connection attempt.
+- **§9.2 CLI logging (ADR-064)** — stdout log lines go through a bounded queue
+  on a logger thread, as file lines do. A line the console does not take is
+  dropped and counted, where the channel's send thread used to wait for it.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -1211,8 +1210,11 @@ selectable at launch:
 - **log file** — enabled or disabled via flag; path is configurable or defaults
   to a platform-appropriate location
 
-The threshold and destinations are fixed for that CLI launch. File writes use a
-non-blocking logger thread rather than the channel's send thread.
+The threshold and destinations are fixed for that CLI launch. File and stdout
+writes each use a non-blocking logger thread rather than the channel's send
+thread. A console can stop taking output, as a classic Windows console window
+does while text in it is selected; a stdout line it does not take is dropped
+and counted, and the run's closing lines say how many (ADR-064).
 
 #### GUI Logging
 

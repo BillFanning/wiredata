@@ -1,14 +1,13 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.25
-**Date:** 2026-10-01
+**Version:** 1.26
+**Date:** 2026-11-12
 **Status:** Accepted
 
-Revision note (2026-10-01) — a TCP write that timed out:
+Revision note (2026-11-12) — a console that stops taking output:
 
-- **ADR-059 (amended)** — on Windows, a TCP write that times out counts as
-  possibly partial, since Windows reports nothing sent but leaves the
-  connection undetermined.
+- **ADR-064** — stdout log lines go through a bounded queue that drops, so a
+  paused console cannot hold up a channel's send thread.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -2636,6 +2635,34 @@ about threefold with load on the machine, so only comparisons within one run cou
 
 **Consequences:** None of these is built until a new same-run measurement crosses
 its threshold.
+
+---
+
+## ADR-064 — The stdout log goes through a bounded queue that drops
+
+**Status:** Accepted 2026-11-12.
+
+**Context:** The thread model gives log writing to a logger thread, so that it
+never blocks a talker thread. File lines went that way. Stdout lines did not:
+the stdout log layer wrote from whichever thread logged, and a channel's
+warnings are logged from its send thread. A console can stop taking output,
+as a classic Windows console window does while text in it is selected, and
+that thread then waits in the middle of its schedule. Listener measured the
+same fault on its receive path (listener ADR-055).
+
+**Decision:** The stdout log layer writes through a bounded queue
+(`CONSOLE_QUEUE_LINES`, 4,096 lines) to its own logger thread. A full queue
+drops the line and counts it, and the CLI's closing lines say how many were
+not shown.
+
+**Boundary:** The CLI's own lines, the health lines, the summary and `--echo`,
+are printed from the main thread, which is not on any send path: when it falls
+behind, the runners drop status updates and count them (ADR-018). They are
+unchanged. An exit with the console still paused waits for it, as before.
+This has not been tried by hand in talker; the measurement is listener's.
+
+**Consequences:** A paused or stalled console costs log lines on the console
+and nothing else. The log file, when enabled, is unaffected.
 
 ---
 

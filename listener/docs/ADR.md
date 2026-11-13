@@ -2154,6 +2154,57 @@ awaits the transport decides. A Channel with reconnect on now restarts after a
 failure inside Listener, with a new pipeline; one with reconnect off stays
 Faulted and says why.
 
+## ADR-055 — Console output goes through a bounded queue that drops
+
+**Status:** Accepted 2026-11-12.
+
+**Context:** Listener wrote to the console from the threads doing the work.
+Each Channel's pipeline wrote its own log lines, and the CLI's loop, which also
+drives reconnect, printed its own. A console can stop taking output: selecting
+text pauses a classic Windows console window, and a pipe stalls when its reader
+does.
+
+Measured on 2026-11-12, with one UDP Channel at 100 datagrams a second and a
+match rule logging a line for each: a text selection held for 118 s stopped
+that Channel's processing for 118.1 s. Nothing was lost, but only because the
+4 MiB socket buffer and the ingest queue held the 755 kB that arrived
+meanwhile. A longer pause, a faster feed or a Serial Channel would lose data.
+The natural moment to select console text is when an error appears.
+
+**Decision:** While Channels run, nothing writes to the console directly.
+
+- Standard output and standard error each have a bounded queue
+  (`CONSOLE_QUEUE_LINES`, 4,096 lines) and a worker thread that writes it out.
+  The stdout log layer and every line the CLI prints go through them.
+- A full queue drops the line and counts it. Nothing waits.
+- The closing lines, the summary among them, are printed directly once the
+  Channels have stopped and the queues are written out, so they are never among
+  the dropped lines. A count of the dropped lines follows them.
+- Talker's stdout log goes through a queue of the same kind (talker ADR-064).
+
+The same test afterwards, with a selection held for about a minute, showed no
+gap longer than 0.11 s between that Channel's log lines over five minutes, and
+all 30,000 datagrams were recorded.
+
+**Boundary:**
+
+- Console output is best-effort. The event log (§118) is the record; it has
+  its own worker and is not affected.
+- An exit with the console still paused waits for it, as it did before. Every
+  Channel has stopped by then.
+- The queue is bounded in lines, not bytes.
+- The GUI prints nothing of its own. Its stdout log goes through the same
+  queue.
+
+**Alternatives considered:** A console sink in `wiredata-log`, which would mark
+the loss in the console itself with a gap line. Not built: that crate owns only
+the log-file mechanism (talker ADR-061), and the count at the end says the same
+thing.
+
+**Consequences:** A paused or stalled console costs console lines and nothing
+else. Listener now depends directly on `tracing-appender`, which the workspace
+already used.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

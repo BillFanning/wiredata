@@ -16,12 +16,12 @@ use clap::Parser;
 
 use crate::config::{describe_channel_errors, templates, ChannelConfig, InterfaceConfig, Profile};
 use crate::core::{ChannelId, ChannelState, RuntimeEvent};
-use crate::diagnostics::{EventLogChange, EventLogStatus};
+use crate::diagnostics::{Console, EventLogChange, EventLogStatus};
 use crate::runtime::{Listener, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT};
 use crate::transport::STALL_WARNING;
 use wiredata_cli::{exit_status, HealthWatch, EXIT_CANNOT_START};
 use wiredata_stop::StopRequests;
-use wiredata_ui::format::compact_duration;
+use wiredata_ui::format::{compact_duration, thousands};
 
 /// Receive and inspect byte-oriented data from serial and network sources.
 #[derive(Parser, Debug)]
@@ -127,16 +127,20 @@ fn recording_note(faults: [u32; 2]) -> String {
 /// Headless CLI entry point: build a Tokio runtime and run the event loop over the
 /// already-parsed arguments (§3). The GUI path is dispatched in [`crate::run`].
 pub fn run(cli: Cli) -> Result<ExitCode> {
-    // §114, §118; non-fatal (§117). Declared first so it is dropped last: the
-    // event log drains and flushes after the runtime has stopped every Channel.
-    let event_log = crate::diagnostics::init_logging();
+    // §114, §118; non-fatal (§117). Both are held until the runtime has
+    // stopped every Channel. While Channels run, every line goes through the
+    // console's queue, so a console that stops taking output holds nothing up.
+    let (event_log, console_guard) = crate::diagnostics::init_logging();
+    let console = console_guard.console();
     let status = event_log.status();
     // A log that has already failed is reported here, so note it as seen: the
     // run's first tick then does not report it a second time.
     let _ = status.tend(Instant::now());
     match (status.folder(), status.problem()) {
-        (_, Some(problem)) => eprintln!("WARNING: the event log is not being saved: {problem}"),
-        (Some(folder), None) => println!("event log: {}", folder.display()),
+        (_, Some(problem)) => console.err(format_args!(
+            "WARNING: the event log is not being saved: {problem}"
+        )),
+        (Some(folder), None) => console.out(format_args!("event log: {}", folder.display())),
         (None, None) => {}
     }
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
@@ -147,9 +151,9 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         wiredata_stop::listen()
     };
     for problem in stop_requests.problems() {
-        eprintln!("WARNING: {problem}");
+        console.err(format_args!("WARNING: {problem}"));
     }
-    let result = runtime.block_on(run_cli(cli, status, &mut stop_requests));
+    let result = runtime.block_on(run_cli(cli, status, &console, &mut stop_requests));
     // A file operation stuck in the blocking pool would otherwise keep the
     // process alive after every Channel has been stopped (§113).
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_LIMIT);
@@ -157,23 +161,72 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     // is waiting on the stop go ahead: it may end the process straight away.
     drop(event_log);
     stop_requests.finish();
-    result
+    // Nothing is left for a slow console to hold up. Write out what is queued,
+    // then the closing lines directly, so the summary cannot be among the
+    // lines a full queue dropped.
+    let not_shown = console.lines_not_shown();
+    drop(console_guard);
+    let end = result?;
+    for line in &end.closing {
+        match line {
+            Closing::Out(line) => println!("{line}"),
+            Closing::Err(line) => eprintln!("{line}"),
+        }
+    }
+    if not_shown > 0 {
+        eprintln!("{}", lines_not_shown_warning(not_shown));
+    }
+    Ok(end.code)
+}
+
+/// The closing warning when the console's queue dropped lines (§114).
+fn lines_not_shown_warning(not_shown: u64) -> String {
+    format!(
+        "WARNING: {} console line{} not shown: the console was not taking output",
+        thousands(not_shown),
+        if not_shown == 1 { " was" } else { "s were" }
+    )
+}
+
+/// How a run ended: its exit code, and the lines that close it. They are
+/// printed once the Channels have stopped and the console's queue is written
+/// out.
+struct RunEnd {
+    code: ExitCode,
+    closing: Vec<Closing>,
+}
+
+/// One closing line, for standard output or standard error.
+enum Closing {
+    Out(String),
+    Err(String),
+}
+
+impl RunEnd {
+    /// The run could not start; what went wrong has been printed.
+    fn cannot_start() -> Self {
+        Self {
+            code: ExitCode::from(EXIT_CANNOT_START),
+            closing: Vec::new(),
+        }
+    }
 }
 
 async fn run_cli(
     cli: Cli,
     event_log: EventLogStatus,
+    console: &Console,
     stop_requests: &mut StopRequests,
-) -> Result<ExitCode> {
-    let configs = match build_channel_configs(&cli) {
+) -> Result<RunEnd> {
+    let configs = match build_channel_configs(&cli, console) {
         Ok(configs) if configs.is_empty() => {
-            eprintln!("ERROR: the profile has no valid channels");
-            return Ok(ExitCode::from(EXIT_CANNOT_START));
+            console.err("ERROR: the profile has no valid channels");
+            return Ok(RunEnd::cannot_start());
         }
         Ok(configs) => configs,
         Err(err) => {
-            eprintln!("ERROR: {}", describe_error(&err));
-            return Ok(ExitCode::from(EXIT_CANNOT_START));
+            console.err(format_args!("ERROR: {}", describe_error(&err)));
+            return Ok(RunEnd::cannot_start());
         }
     };
 
@@ -184,22 +237,28 @@ async fn run_cli(
 
     let mut health = health_watch();
     let mut recording_faults: HashMap<ChannelId, [u32; 2]> = HashMap::new();
-    let (run, stop_early) =
-        start_channels(&mut listener, configs, cli.require_all, &mut health).await;
+    let (run, stop_early) = start_channels(
+        &mut listener,
+        configs,
+        cli.require_all,
+        &mut health,
+        console,
+    )
+    .await;
     if let Some(why) = stop_early {
-        eprintln!("ERROR: {why} — stopping");
+        console.err(format_args!("ERROR: {why} — stopping"));
         listener.shutdown().await;
-        return Ok(ExitCode::from(EXIT_CANNOT_START));
+        return Ok(RunEnd::cannot_start());
     }
     let StartedRun {
         names,
         ids,
         running,
     } = run;
-    println!(
+    console.out(format_args!(
         "listening on {running} of {} channel(s) — press Ctrl-C to stop",
         ids.len()
-    );
+    ));
     // Drive auto-reconnect (§162): the orchestrator has no background loop, so the
     // app ticks it. Channels without reconnect enabled are unaffected. The same
     // tick checks the event log, so a failure that starts mid-run is reported.
@@ -214,16 +273,18 @@ async fn run_cli(
             }
             _ = reconnect.tick() => {
                 listener.reconnect_tick().await;
-                observe_health(&listener, &mut health, &ids, &names).await;
+                observe_health(&listener, &mut health, &ids, &names, console).await;
                 match event_log.tend(Instant::now()) {
                     Some(EventLogChange::StartedFailing(problem)) => {
-                        eprintln!("WARNING: the event log is not being saved: {problem}");
+                        console.err(format_args!(
+                            "WARNING: the event log is not being saved: {problem}"
+                        ));
                     }
                     Some(EventLogChange::Recovered { after }) => {
-                        eprintln!(
+                        console.err(format_args!(
                             "the event log is being saved again after {}",
                             wiredata_cli::describe(after)
-                        );
+                        ));
                     }
                     None => {}
                 }
@@ -238,7 +299,7 @@ async fn run_cli(
                         recording_faults.entry(id).or_default()[slot] += 1;
                     }
                     if let Some(line) = format_event(&event, &names) {
-                        println!("{line}");
+                        console.out(line);
                     }
                 }
                 None => break,
@@ -246,10 +307,11 @@ async fn run_cli(
         }
     }
 
-    println!("stopping ({stop_reason})…");
+    console.out(format_args!("stopping ({stop_reason})…"));
     let outcome = listener.shutdown().await;
+    let mut closing = Vec::new();
     if !outcome.is_complete() {
-        eprintln!(
+        closing.push(Closing::Err(format!(
             "WARNING: finalization incomplete for {}: the end of their recordings may be \
              missing (see the event log)",
             outcome
@@ -258,19 +320,24 @@ async fn run_cli(
                 .map(|name| format!("\"{name}\""))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        )));
     }
-    println!("stopped");
-    println!("summary:");
+    closing.push(Closing::Out("stopped".to_owned()));
+    closing.push(Closing::Out("summary:".to_owned()));
     for (id, line) in health.summary(Instant::now()) {
         let note = recording_note(recording_faults.get(&id).copied().unwrap_or_default());
-        println!("  {line}{note}");
+        closing.push(Closing::Out(format!("  {line}{note}")));
     }
     let lost = event_log.lost_entries();
     if lost > 0 {
-        eprintln!("WARNING: {lost} event log lines were not saved; the log marks where");
+        closing.push(Closing::Err(format!(
+            "WARNING: {lost} event log lines were not saved; the log marks where"
+        )));
     }
-    Ok(ExitCode::from(run_exit_status(&outcome, health.degraded())))
+    Ok(RunEnd {
+        code: ExitCode::from(run_exit_status(&outcome, health.degraded())),
+        closing,
+    })
 }
 
 /// The Channels of a run once their first start has been tried.
@@ -291,6 +358,7 @@ async fn start_channels(
     configs: Vec<ChannelConfig>,
     require_all: bool,
     health: &mut HealthWatch<ChannelId>,
+    console: &Console,
 ) -> (StartedRun, Option<&'static str>) {
     let mut run = StartedRun {
         names: HashMap::new(),
@@ -299,7 +367,7 @@ async fn start_channels(
     };
     for config in configs {
         if let Some(warning) = reconnect_off_warning(&config) {
-            eprintln!("{warning}");
+            console.err(warning);
         }
         let name = config.name.as_str().to_string();
         let retries = config.reconnect.enabled;
@@ -309,13 +377,13 @@ async fn start_channels(
         health.add(id, &name, retries);
         match listener.start(id).await {
             Ok(()) => {
-                println!("started \"{name}\"");
+                console.out(format_args!("started \"{name}\""));
                 health.up(id, Instant::now());
                 run.running += 1;
             }
             Err(err) => {
                 if let Some(line) = health.down(id, &err.to_string(), RETRYING, Instant::now()) {
-                    eprintln!("{line}");
+                    console.err(line);
                 }
             }
         }
@@ -364,6 +432,7 @@ async fn observe_health(
     health: &mut HealthWatch<ChannelId>,
     ids: &[ChannelId],
     names: &HashMap<ChannelId, String>,
+    console: &Console,
 ) {
     let now = Instant::now();
     for &id in ids {
@@ -382,11 +451,11 @@ async fn observe_health(
             _ => None,
         };
         if let Some(line) = line {
-            eprintln!("{line}");
+            console.err(line);
         }
     }
     for line in health.reminders(now) {
-        eprintln!("{line}");
+        console.err(line);
     }
 }
 
@@ -407,7 +476,7 @@ async fn latest_error(listener: &Listener, id: ChannelId, name: &str) -> String 
 
 /// Build the channels to run from the profile or the quick-start flags. Per §71,
 /// invalid channels in a profile are reported and skipped, not fatal.
-fn build_channel_configs(cli: &Cli) -> Result<Vec<ChannelConfig>> {
+fn build_channel_configs(cli: &Cli, console: &Console) -> Result<Vec<ChannelConfig>> {
     if let Some(path) = &cli.profile {
         let profile =
             Profile::load(path).with_context(|| format!("loading profile {}", path.display()))?;
@@ -415,10 +484,10 @@ fn build_channel_configs(cli: &Cli) -> Result<Vec<ChannelConfig>> {
         for (config, (name, result)) in profile.channels.iter().zip(profile.validate()) {
             match result {
                 Ok(()) => valid.push(config.clone()),
-                Err(errors) => eprintln!(
+                Err(errors) => console.err(format_args!(
                     "skipping invalid channel \"{name}\": {}",
                     describe_channel_errors(&errors)
-                ),
+                )),
             }
         }
         return Ok(valid);
@@ -543,6 +612,7 @@ mod tests {
             vec![late, free_udp_channel("AIS")],
             false,
             &mut health,
+            &Console::discard(),
         )
         .await;
         assert_eq!(stop, None);
@@ -557,7 +627,14 @@ mod tests {
         let _events = listener.take_events();
         let (down, _blocker) = blocked_udp_channel("GPS", false);
         let mut health = health_watch();
-        let (_, stop) = start_channels(&mut listener, vec![down], false, &mut health).await;
+        let (_, stop) = start_channels(
+            &mut listener,
+            vec![down],
+            false,
+            &mut health,
+            &Console::discard(),
+        )
+        .await;
         assert_eq!(stop, Some("no channel started, and none will retry"));
         listener.shutdown().await;
     }
@@ -573,6 +650,7 @@ mod tests {
             vec![late, free_udp_channel("AIS")],
             true,
             &mut health,
+            &Console::discard(),
         )
         .await;
         assert_eq!(
@@ -683,7 +761,7 @@ mod tests {
             udp: Some(9000),
             ..base_cli()
         };
-        let configs = build_channel_configs(&cli).unwrap();
+        let configs = build_channel_configs(&cli, &Console::discard()).unwrap();
         assert_eq!(configs.len(), 1);
         match &configs[0].interface {
             InterfaceConfig::Udp(udp) => assert_eq!(udp.port, 9000),
@@ -698,7 +776,7 @@ mod tests {
             baud: 4800,
             ..base_cli()
         };
-        let configs = build_channel_configs(&cli).unwrap();
+        let configs = build_channel_configs(&cli, &Console::discard()).unwrap();
         match &configs[0].interface {
             InterfaceConfig::Serial(serial) => {
                 assert_eq!(serial.port, "COM7");
@@ -722,6 +800,18 @@ mod tests {
         assert_eq!(
             format_event(&RuntimeEvent::DiskSpaceLow(unnamed), &names),
             Some(format!("[{unnamed}] LOW DISK"))
+        );
+    }
+
+    #[test]
+    fn dropped_console_lines_are_counted_in_the_closing_warning() {
+        assert_eq!(
+            lines_not_shown_warning(1),
+            "WARNING: 1 console line was not shown: the console was not taking output"
+        );
+        assert_eq!(
+            lines_not_shown_warning(11_810),
+            "WARNING: 11,810 console lines were not shown: the console was not taking output"
         );
     }
 
@@ -767,7 +857,7 @@ mod tests {
 
     #[test]
     fn no_source_is_an_error() {
-        assert!(build_channel_configs(&base_cli()).is_err());
+        assert!(build_channel_configs(&base_cli(), &Console::discard()).is_err());
     }
 
     #[test]
@@ -788,7 +878,7 @@ mod tests {
             profile: Some(path.clone()),
             ..base_cli()
         };
-        let configs = build_channel_configs(&cli).unwrap();
+        let configs = build_channel_configs(&cli, &Console::discard()).unwrap();
         // The valid channel loads; the unbounded-retention one is skipped.
         assert_eq!(configs.len(), 1);
 

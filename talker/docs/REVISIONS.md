@@ -13,6 +13,13 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-10-01) — a TCP write that timed out:
+
+- **§4.4 / §4.5 possibly partial (ADR-059, amended)** — on Windows, a TCP write
+  that times out counts as possibly partial: Windows reports nothing sent, but
+  part of the message may have gone. Its error says the peer took no data for
+  5 s, in place of Windows' text about a failed connection attempt.
+
 Revision note (2026-10-01) — a TCP peer that has closed:
 
 - **§4.5 TCP client (ADR-059, amended)** — when the reply drain finds that the
@@ -430,6 +437,12 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-10-01) — a TCP write that timed out:
+
+- **ADR-059 (amended)** — on Windows, a TCP write that times out counts as
+  possibly partial, since Windows reports nothing sent but leaves the
+  connection undetermined.
 
 Revision note (2026-10-01) — measured costs recorded:
 

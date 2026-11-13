@@ -10,6 +10,13 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-12) — a failed event log is tried again:
+
+- **§118.** A log file that cannot be opened or written is opened again about
+  once a minute, and the recovered log says how long entries are missing. One
+  failed write, or one failed open of the next day's file, used to end the
+  event log for the rest of the run.
+
 Revision note (2026-11-12) — the end of a Serial stall is reported:
 
 - **§101, §137.** When a reception stall that reached the warning threshold

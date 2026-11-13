@@ -68,7 +68,7 @@ pub fn run() -> anyhow::Result<()> {
     detach_console(); // drop the double-click console before the window opens
                       // §114, §118; non-fatal (§117). Held until the window closes, so the event
                       // log drains and flushes on exit.
-    let event_log = crate::diagnostics::init_logging();
+    let (event_log, _console) = crate::diagnostics::init_logging();
     let event_log_status = event_log.status();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

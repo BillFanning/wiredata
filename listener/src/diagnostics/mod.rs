@@ -6,6 +6,10 @@
 //! ([`DiagnosticLog`], §86/§88 — each severity count-capped, oldest evicted),
 //! and diagnostic logging ([`init_logging`], §114).
 
+mod console;
+
+pub use console::{Console, ConsoleGuard, CONSOLE_QUEUE_LINES};
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -426,15 +430,20 @@ where
 /// Initialize diagnostic logging (§114, §118): stdout filtered by `RUST_LOG`
 /// (default `info`), plus the persistent event log at INFO and above.
 /// Logging failure is non-fatal (§117): the returned [`EventLog`] reports any
-/// problem instead. Call once per process and hold the result until exit.
-pub fn init_logging() -> EventLog {
+/// problem instead. Call once per process and hold both results until exit.
+///
+/// Stdout is written through the returned console's queue, so a console that
+/// stops taking output never holds up the thread that logged.
+pub fn init_logging() -> (EventLog, ConsoleGuard) {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let console = ConsoleGuard::open();
     let stdout = tracing_subscriber::fmt::layer()
         .with_timer(LocalTime)
+        .with_writer(console.console().log_writer())
         .with_filter(filter);
     let folder = event_log_folder();
     let (file, log) = match &folder {
@@ -456,9 +465,12 @@ pub fn init_logging() -> EventLog {
         .try_init()
         .is_err()
     {
-        return EventLog::unavailable(folder, "logging was already set up".to_owned());
+        return (
+            EventLog::unavailable(folder, "logging was already set up".to_owned()),
+            console,
+        );
     }
-    log
+    (log, console)
 }
 
 /// Capturing what reaches the event log, for tests anywhere in the crate.

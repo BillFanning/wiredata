@@ -1,16 +1,16 @@
-# Listener Specification v2.4.3
+# Listener Specification v2.4.4
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-12) — a failed event log is tried again:
+Revision note (2026-11-12) — console output never holds up reception:
 
-- **§118.** A log file that cannot be opened or written is opened again about
-  once a minute, and the recovered log says how long entries are missing. One
-  failed write, or one failed open of the next day's file, used to end the
-  event log for the rest of the run.
+- **§3.1 (ADR-055).** Every line printed while Channels run goes through a
+  bounded queue, and a line the console does not take is dropped and counted.
+  A Channel used to wait for the console: a text selection that paused a
+  console window paused reception with it.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -91,6 +91,12 @@ ADR-046:
   Channel's outcome and every recording gap (§56.1).
 - **At start,** a warning names each recording Channel that has reconnect off.
 - **Channels are named by name,** never by UUID.
+- **Console output never holds up reception** (ADR-055). Every line printed
+  while Channels run, log lines included, goes through a bounded queue. When
+  the console does not take output, lines beyond the queue are dropped and
+  counted, and the closing lines say how many. The final summary is printed
+  after the Channels have stopped and is never dropped. The event log (§118)
+  is the record.
 - **Stop signals.** Ctrl-C, SIGTERM on Linux, and console close, logoff and
   shutdown on Windows all perform the graceful stop of §113.
 - **Exit codes:**

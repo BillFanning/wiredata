@@ -239,7 +239,7 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
     if let Some(log_file) = &args.log_file {
         logging_config.file = Some(resolve_log_file(log_file.as_deref())?);
     }
-    let _log = logging::init(&logging_config, None).context("initializing logging")?;
+    let log = logging::init(&logging_config, None).context("initializing logging")?;
 
     tracing::info!("profile {:?} loaded", profile.name);
     if profile.channels.is_empty() {
@@ -487,10 +487,17 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
     for (id, line) in health.summary(Instant::now()) {
         eprintln!("  {line}{}", counters_note(finals.get(&id), echo));
     }
+    let not_shown = log.console_lines_not_shown();
+    if not_shown > 0 {
+        eprintln!(
+            "WARNING: {not_shown} log line{} not shown: the console was not taking output",
+            if not_shown == 1 { " was" } else { "s were" }
+        );
+    }
     let status = exit_status(stop_incomplete, health.degraded());
     // A held Windows logoff or shutdown goes ahead only once the log has
     // flushed: Windows may end the process straight away.
-    drop(_log);
+    drop(log);
     windows_stop.finish();
     Ok(status)
 }

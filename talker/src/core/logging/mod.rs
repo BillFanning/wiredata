@@ -5,6 +5,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use tracing_appender::non_blocking::{ErrorCounter, NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, reload, util::SubscriberInitExt, Layer, Registry,
 };
@@ -151,6 +152,27 @@ pub enum Rotation {
     Daily,
 }
 
+// ── Console ───────────────────────────────────────────────────────────────────
+
+/// Log lines the stdout queue holds for a console that is slow or paused.
+/// Past this, lines are dropped and counted.
+pub const CONSOLE_QUEUE_LINES: usize = 4_096;
+
+/// `stream` behind a bounded queue and a worker thread, for the stdout log.
+///
+/// A console can stop taking output: selecting text pauses a classic Windows
+/// console window, and a pipe stalls when its reader does. A talker thread
+/// that logged straight to it would wait with it, in the middle of its
+/// schedule. Through the queue it never waits; a full queue drops the line and
+/// counts it.
+fn console_writer(stream: impl std::io::Write + Send + 'static) -> (NonBlocking, WorkerGuard) {
+    NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(CONSOLE_QUEUE_LINES)
+        .thread_name("talker-console")
+        .finish(stream)
+}
+
 // ── Runtime handle ────────────────────────────────────────────────────────────
 
 /// Cloneable handle for changing the minimum log level at runtime. The
@@ -171,7 +193,10 @@ impl LogLevelHandle {
 /// Drop this only when the application is shutting down. Dropping it earlier
 /// will stop file log flushing.
 pub struct LoggingHandle {
-    _guards: Vec<tracing_appender::non_blocking::WorkerGuard>,
+    _guards: Vec<WorkerGuard>,
+    /// Counts the stdout log lines dropped at a full queue; `None` when
+    /// nothing is logged to stdout.
+    console_dropped: Option<ErrorCounter>,
     _runtime_file_guard: Option<wiredata_log::FileSinkGuard>,
     level: LogLevelHandle,
     file_log: Option<FileLogToggle>,
@@ -199,6 +224,14 @@ impl LoggingHandle {
     pub fn gui_log_health(&self) -> Option<GuiLogHealth> {
         self.gui_log_health.clone()
     }
+
+    /// How many log lines stdout did not show because its queue was full: the
+    /// console was not taking output.
+    pub fn console_lines_not_shown(&self) -> u64 {
+        self.console_dropped
+            .as_ref()
+            .map_or(0, |dropped| dropped.dropped_lines() as u64)
+    }
 }
 
 // ── init ──────────────────────────────────────────────────────────────────────
@@ -214,7 +247,8 @@ pub fn init(
     config: &LoggingConfig,
     gui_sender: Option<crossbeam_channel::Sender<LogEvent>>,
 ) -> anyhow::Result<LoggingHandle> {
-    let mut guards: Vec<tracing_appender::non_blocking::WorkerGuard> = vec![];
+    let mut guards: Vec<WorkerGuard> = vec![];
+    let mut console_dropped = None;
     let (gui_layer, gui_log_health) = match gui_sender {
         Some(sender) => {
             let health = GuiLogHealth::new();
@@ -234,7 +268,15 @@ pub fn init(
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync + 'static>> = vec![];
 
     if config.stdout {
-        layers.push(tracing_subscriber::fmt::layer().with_target(false).boxed());
+        let (stdout, guard) = console_writer(std::io::stdout());
+        console_dropped = Some(stdout.error_counter());
+        guards.push(guard);
+        layers.push(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(stdout)
+                .boxed(),
+        );
     }
 
     if !gui_mode {
@@ -291,6 +333,7 @@ pub fn init(
 
     Ok(LoggingHandle {
         _guards: guards,
+        console_dropped,
         _runtime_file_guard: runtime_file_guard,
         level: level_handle,
         file_log,
@@ -320,6 +363,56 @@ fn to_level_filter(level: LogLevel) -> LevelFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Console ───────────────────────────────────────────────────────────────
+
+    /// A console that takes nothing until it is released: what a paused
+    /// console window is to the thread writing to it.
+    struct Paused(std::sync::mpsc::Receiver<()>);
+
+    impl std::io::Write for Paused {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_console_that_takes_no_output_does_not_hold_up_the_thread_that_logs() {
+        use std::io::Write as _;
+        let (release, paused) = std::sync::mpsc::channel();
+        let (mut stdout, guard) = console_writer(Paused(paused));
+        let not_shown = stdout.error_counter();
+
+        // Far more than the queue holds, one write per line as the log layer
+        // makes them. Written directly, the first would wait for the console
+        // and this test would never finish.
+        let lines = CONSOLE_QUEUE_LINES * 3;
+        let started = std::time::Instant::now();
+        for n in 0..lines {
+            stdout
+                .write_all(format!("line {n}\n").as_bytes())
+                .expect("the queue takes or drops every line");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "logging waited on the console"
+        );
+        // The worker holds one line and the queue the rest it has room for.
+        let dropped = not_shown.dropped_lines();
+        assert!(
+            dropped >= lines - CONSOLE_QUEUE_LINES - 1,
+            "{dropped} of {lines} dropped"
+        );
+        assert!(dropped < lines, "some lines were queued");
+
+        // Let the worker end, so the guard has nothing to wait for.
+        drop(release);
+        drop(guard);
+    }
 
     // ── LogLevel ──────────────────────────────────────────────────────────────
 
