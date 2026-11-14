@@ -12,6 +12,13 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-14) — one stuck Channel cannot hold up the others:
+
+- **§91, §113 (ADR-062).** A status request waits at most 300 ms, and a
+  Channel that does not answer is shown with its last status of the current run.
+  A Faulted Channel's own finalization is bounded by the stop grace period. A
+  Begin on a recording already running returns at once.
+
 Revision note (2026-11-14) — TCP receive code removed:
 
 - **§4, §7, §9, §13, §16, §69, §71, §73, §76, §85, §92, §94, §96, §97, §102,

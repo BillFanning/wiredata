@@ -711,7 +711,14 @@ same statement, closing the pause ambiguity.
 
 ## ADR-025 — NMEA construction returns for presentation-only ZDA Marks
 
-**Status:** Accepted 2026-07-17 (spec v2.2).
+**Status:** Accepted 2026-07-17 (spec v2.2). **Corrected 2026-11-14:** "zone
+fields carry the local offset" below was implemented as the ISO 8601 offset,
+local minus UTC, so UTC−5 was written `-05`. NMEA 0183 defines the local zone
+the other way round, as the hours added to local time to get UTC, so UTC−5 is
+`+05` and a zone east of Greenwich is negative, with the minutes taking the
+hours' sign. The zone fields now follow NMEA (spec §50.2). The wording never
+named whose definition applied, and the test pinned the code's own reading,
+so nothing caught it; nothing was checked against an NMEA reader either.
 
 **Context:** ADR-010 removed protocol decoding and Listener's `nmea0183` dependency,
 correctly preserving a byte-stream-only receive path. Timestamped Marks now need an

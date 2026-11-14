@@ -1,16 +1,17 @@
-# Listener Specification v2.4.10
+# Listener Specification v2.4.11
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-14) — one stuck Channel cannot hold up the others:
+Revision note (2026-11-14) — the ZDA zone sign and disk-guard limits:
 
-- **§91, §113 (ADR-062).** A status request waits at most 300 ms, and a
-  Channel that does not answer is shown with its last status of the current run.
-  A Faulted Channel's own finalization is bounded by the stop grace period. A
-  Begin on a recording already running returns at once.
+- **§50.2.** ZDA marks write NMEA's local zone, the hours added to local
+  time to get UTC, so a zone east of Greenwich is negative. They used to
+  write the ISO 8601 offset, the opposite sign.
+- **§56.2, §71.** A disk-guard threshold must be 1 to 90 percent or more
+  than 0 bytes; anything else makes the Channel invalid.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -960,7 +961,7 @@ struct TimestampConfig { include_date: bool, include_millis: bool, include_timez
 ```
 
 - **Record** begins or stops recording **from the match forward**; there is **no pre-match backfill** (§158). Pre-trigger capture is deferred.
-- **Mark** correlates the match into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53). A bare `Mark` (`timestamp = None`) writes a `‹MARK …›` marker line into the view's `.disp`. When `timestamp` is `Some`, `Plain` splices the matched chunk's local arrival time, formatted per `TimestampConfig` (time-of-day always shown; date, milliseconds, and local UTC offset independently toggleable). `NmeaZda` instead splices `$<talker>ZDA,<hhmmss[.sss]>,<dd>,<mm>,<yyyy>,<zone-hours>,<zone-minutes>*XX`: time/date are UTC and zone fields carry the local offset. An offset outside minute precision or the supported ±13:59 range leaves both zone fields empty. Standard two-character talker IDs and custom 1–32-character printable ASCII IDs are accepted; whitespace/control characters and NMEA framing characters `$ ! , *` are invalid. IDs longer than two produce explicitly custom ZDA-shaped output.
+- **Mark** correlates the match into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53). A bare `Mark` (`timestamp = None`) writes a `‹MARK …›` marker line into the view's `.disp`. When `timestamp` is `Some`, `Plain` splices the matched chunk's local arrival time, formatted per `TimestampConfig` (time-of-day always shown; date, milliseconds, and local UTC offset independently toggleable). `NmeaZda` instead splices `$<talker>ZDA,<hhmmss[.sss]>,<dd>,<mm>,<yyyy>,<zone-hours>,<zone-minutes>*XX`: time/date are UTC, and the zone fields are NMEA 0183's local zone: the hours and minutes added to local time to get UTC, which is the opposite sign to an ISO 8601 offset, so a zone east of Greenwich is negative and the minutes take the hours' sign (UTC−5 is `+05,00`; UTC+5:30 is `-05,-30`). An offset outside minute precision or the supported ±13:59 range leaves both zone fields empty. Standard two-character talker IDs and custom 1–32-character printable ASCII IDs are accepted; whitespace/control characters and NMEA framing characters `$ ! , *` are invalid. IDs longer than two produce explicitly custom ZDA-shaped output.
 - `Before` attaches immediately before the match's first byte; `After` attaches immediately after its final byte. `separator` is appended after either style and may contain CR/LF. Rendering honors those controls and resets Raw wrap state, Rendered tab columns, and Hex continuation before subsequent data. The style-generated ZDA has no trailing CR/LF of its own. All styles are text insertions in every view mode, not on-screen byte-range styling (contrast removed `Highlight`, ADR-015).
 - **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes the display view (§50); reception and recording continue.
 
@@ -1142,6 +1143,10 @@ failed free-space check is itself reported, naming the Channel. If `on_low` is
 gap with reason low disk (§56.1), emitting `RecordingStoppedLowDisk` (§137) while
 **reception continues** (§96). It resumes in a new segment once free space is 10%
 above the threshold.
+
+A percentage threshold must be 1 to 90 and a byte threshold more than 0;
+anything else makes the Channel invalid (§71), since a percentage above 90
+could never reach the resume level.
 
 Listener never deletes recordings; retention is the operator's (ADR-043).
 Status/snapshot expose the current recording file, bytes written, the total size
@@ -1377,6 +1382,9 @@ UDP Feed           Valid
 ```
 
 Resources that cannot be validated until Start shall be validated during Start.
+
+Validation includes each recording's disk-guard threshold: 1 to 90 percent, or
+more than 0 bytes (§56.2).
 
 **Strict parsing (ADR-048).** An unknown key, or a missing `schema_version`, is
 a parse error rather than a Channel error: the profile does not load, and the

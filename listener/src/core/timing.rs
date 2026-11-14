@@ -139,8 +139,9 @@ pub fn validate_zda_talker_id(talker: &str) -> Result<(), ZdaTalkerIdError> {
 }
 
 /// Construct an inline `$--ZDA` annotation for `at`, without trailing CR/LF.
-/// The clock/date fields are UTC. Zone fields carry the local UTC offset when
-/// it fits ZDA's conventional signed-hour/minute representation.
+/// The clock/date fields are UTC. The zone fields are NMEA's local zone (the
+/// time added to local time to get UTC; see [`zda_zone_fields`]) when it fits
+/// ZDA's signed-hour/minute range.
 pub fn zda_sentence(
     talker: &str,
     at: SystemTime,
@@ -185,19 +186,31 @@ fn zda_sentence_at(
         .to_string())
 }
 
+/// ZDA's local-zone hours and minutes for `offset`, in NMEA 0183's sense: the
+/// time added to local time to get UTC. That is UTC minus local, the opposite
+/// sign to ISO 8601 and chrono's offset, so a zone east of Greenwich is
+/// negative (§50.2). The minutes take the hours' sign. Both are empty for an
+/// offset that is not a whole number of minutes or is beyond ±13:59.
 fn zda_zone_fields(offset: FixedOffset) -> (String, String) {
-    let seconds = offset.local_minus_utc();
+    let seconds = -offset.local_minus_utc();
     let total_minutes = seconds / 60;
     if seconds % 60 != 0 || total_minutes.unsigned_abs() > 13 * 60 + 59 {
         return (String::new(), String::new());
     }
     let absolute = total_minutes.unsigned_abs();
-    let hours = match total_minutes.cmp(&0) {
-        std::cmp::Ordering::Less => format!("-{:02}", absolute / 60),
-        std::cmp::Ordering::Equal => "00".to_string(),
-        std::cmp::Ordering::Greater => format!("+{:02}", absolute / 60),
-    };
-    (hours, format!("{:02}", absolute % 60))
+    let (hours, minutes) = (absolute / 60, absolute % 60);
+    match total_minutes.cmp(&0) {
+        std::cmp::Ordering::Equal => ("00".to_string(), "00".to_string()),
+        std::cmp::Ordering::Greater => (format!("+{hours:02}"), format!("{minutes:02}")),
+        std::cmp::Ordering::Less => {
+            let minutes = if minutes == 0 {
+                "00".to_string()
+            } else {
+                format!("-{minutes:02}")
+            };
+            (format!("-{hours:02}"), minutes)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,7 +304,7 @@ mod tests {
 
         assert_eq!(
             text.split('*').next().unwrap(),
-            "$RECEIVER_AZDA,003045.123,22,05,2026,-03,30"
+            "$RECEIVER_AZDA,003045.123,22,05,2026,+03,30"
         );
         assert!(!text.contains(['\r', '\n']));
         let parsed = nmea0183::NmeaSentence::parse(&text).unwrap();
@@ -310,7 +323,7 @@ mod tests {
         .unwrap();
         let parsed = nmea0183::NmeaSentence::parse(&text).unwrap();
 
-        assert_eq!(parsed.fields, ["003045", "22", "05", "2026", "-05", "00"]);
+        assert_eq!(parsed.fields, ["003045", "22", "05", "2026", "+05", "00"]);
     }
 
     #[test]
@@ -328,15 +341,39 @@ mod tests {
         assert_eq!(parsed.field(0), Some("235960.800"));
     }
 
+    /// NMEA's zone is the hours added to local time to get UTC, the opposite
+    /// sign to ISO 8601's offset: a zone east of Greenwich is negative, and the
+    /// minutes take the hours' sign.
     #[test]
-    fn zda_zone_fields_cover_zero_positive_and_nonstandard_offsets() {
+    fn zda_zone_fields_follow_the_nmea_sign() {
+        let zone = |hours: &str, minutes: &str| (hours.to_string(), minutes.to_string());
         assert_eq!(
             zda_zone_fields(FixedOffset::east_opt(0).unwrap()),
-            ("00".to_string(), "00".to_string())
+            zone("00", "00")
+        );
+        // US Eastern, UTC-5: add 5 hours to local time to get UTC.
+        assert_eq!(
+            zda_zone_fields(FixedOffset::west_opt(5 * 3600).unwrap()),
+            zone("+05", "00")
+        );
+        // Central Europe, UTC+1.
+        assert_eq!(
+            zda_zone_fields(FixedOffset::east_opt(3600).unwrap()),
+            zone("-01", "00")
+        );
+        // India, UTC+5:30, and the edge of the range, UTC+13:45.
+        assert_eq!(
+            zda_zone_fields(FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap()),
+            zone("-05", "-30")
         );
         assert_eq!(
             zda_zone_fields(FixedOffset::east_opt(13 * 3600 + 45 * 60).unwrap()),
-            ("+13".to_string(), "45".to_string())
+            zone("-13", "-45")
+        );
+        // Newfoundland, UTC-3:30.
+        assert_eq!(
+            zda_zone_fields(FixedOffset::west_opt(3 * 3600 + 30 * 60).unwrap()),
+            zone("+03", "30")
         );
         assert_eq!(
             zda_zone_fields(FixedOffset::east_opt(14 * 3600).unwrap()),
