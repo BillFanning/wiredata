@@ -10,6 +10,16 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-14) — TCP receive code removed:
+
+- **§4, §7, §9, §13, §16, §69, §71, §73, §76, §85, §92, §94, §96, §97, §102,
+  §104, §137, §138, §154, §162, Appendix A (ADR-047).** The TCP Listener and TCP
+  Connection code is removed, no longer only disabled. §16 now points to
+  Appendix A, and the TCP kinds, events, transport contracts and templates are
+  gone from the sections that listed them.
+- **§72.** A saved profile that names a TCP Listener loads without that Channel,
+  with a warning naming it.
+
 Revision note (2026-11-13) — one display view:
 
 - **§11, §48, §50.2, §51, §54, §58, §78 (ADR-060).** A Channel has exactly one

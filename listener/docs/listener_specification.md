@@ -1,19 +1,16 @@
-# Listener Specification v2.4.9
+# Listener Specification v2.4.10
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-14) — TCP receive code removed:
+Revision note (2026-11-14) — one stuck Channel cannot hold up the others:
 
-- **§4, §7, §9, §13, §16, §69, §71, §73, §76, §85, §92, §94, §96, §97, §102,
-  §104, §137, §138, §154, §162, Appendix A (ADR-047).** The TCP Listener and TCP
-  Connection code is removed, no longer only disabled. §16 now points to
-  Appendix A, and the TCP kinds, events, transport contracts and templates are
-  gone from the sections that listed them.
-- **§72.** A saved profile that names a TCP Listener loads without that Channel,
-  with a warning naming it.
+- **§91, §113 (ADR-062).** A status request waits at most 300 ms, and a
+  Channel that does not answer is shown with its last status of the current run.
+  A Faulted Channel's own finalization is bounded by the stop grace period. A
+  Begin on a recording already running returns at once.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -1826,6 +1823,11 @@ Clearing retained data shall not affect:
 
 Status describes current condition.
 
+A Channel answers a status request within 300 ms. One that does not, such as a
+Channel whose recording close is stuck on a removed disk, is shown with the last
+status it gave in the current run, stamped with its current state, so one stuck
+Channel never holds up the status of the others (ADR-062).
+
 Examples:
 
 - Stopped
@@ -2247,6 +2249,10 @@ cancelled, so a finalization that has not finished when the grace expires is
 abandoned: it is logged as "finalization incomplete" (§118), the CLI exits with
 code 4 (§3.1), and the runtime shuts down within a time limit so a stuck thread
 cannot keep the process alive (ADR-043).
+
+A Channel that faults finalizes its recordings under the same grace period, from
+the moment of the fault, and logs "finalization incomplete" the same way if it
+expires (ADR-062).
 
 ---
 

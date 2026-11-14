@@ -2383,6 +2383,37 @@ folder between segment opens is counted from the next open, not at once.
 
 **Consequences:** A check's cost no longer grows with the number of files.
 
+## ADR-062 — One stuck Channel cannot hold up status or recording begins
+
+**Status:** Accepted 2026-11-14.
+
+**Context:** The third review pass found that a Faulted Channel keeps its
+handle while its pipeline task finalizes, with no time limit, and that every
+status request to it waited for the reply with no limit either. A recording
+close stuck on a removed USB disk or a dead network drive therefore froze the
+status of every Channel, since the GUI polls them one at a time, and queued
+Stop behind it; the CLI did not see Ctrl-C meanwhile. Separately, a Begin
+waited up to 2 s for detached stops before checking whether recording was
+already on, so a frequent `Record Begin` rule could hold up reception.
+
+**Decision:**
+
+- A status request waits at most 300 ms (`STATUS_REPLY_WAIT`), send and reply
+  together. On a timeout, snapshot and stats serve the last good answer of the
+  current run, stamped with the Channel's state, or the retained figures when
+  there is none. A stream delta returns nothing, since an old one would repeat
+  bytes.
+- A Faulted Channel's own finalization is bounded by the stop grace period, as
+  a user Stop is, and logs "finalization incomplete" on expiry (§113).
+- A Begin on a recorder that is already running returns at once.
+
+**Boundary:** A stuck Channel still costs up to 300 ms of each poll. A Channel
+that faulted with a stuck close and is then stopped does not set the CLI's
+exit code 4; the error reaches the diagnostics and the event log.
+
+**Consequences:** Every other Channel's status keeps moving while one is
+stuck, and a running Channel slow to answer shows figures at most one poll old.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_
