@@ -34,11 +34,11 @@ const THROUGHPUT_TOOLTIP: Hover = Hover::new(
      Received counts every byte Listener took from the input since Start. It stays \
      on screen after Stop and goes back to zero when the channel starts again.\n\n\
      Throughput is an average over the last five seconds: the bytes that arrived \
-     in the current second and the four seconds before it, divided by five. The \
-     current second is not finished yet, so a steady stream can read a little low. \
-     During the first five seconds after Start the total is still divided by five, \
-     so the figure reads low until those seconds have passed. After Stop it \
-     is zero, while Received stays.\n\n\
+     in the current second and the four seconds before it, divided by the time \
+     they cover, so a steady stream reads the same at any moment. During the \
+     first five seconds after Start it is the average since Start, and the \
+     first second counts as a whole second. After Stop it is zero, while \
+     Received stays.\n\n\
      Throughput is the rate at which Listener received bytes. It is not the speed \
      of the line, how busy the link is, or how full the device's own buffer is.",
 );
@@ -986,10 +986,11 @@ mod tests {
     fn throughput_and_final_snapshot_help_prevent_false_precision() {
         let throughput_hover = THROUGHPUT_TOOLTIP;
         let throughput = throughput_hover.text();
-        // The rate is an average over five seconds, divided by five even
-        // while the window is still filling, and zero once stopped.
-        assert!(throughput.contains("divided by five"));
-        assert!(throughput.contains("still divided by five"));
+        // The rate is an average over five seconds, divided by the time the
+        // window covers (the time since Start while it fills), and zero once
+        // stopped.
+        assert!(throughput.contains("divided by the time they cover"));
+        assert!(throughput.contains("average since Start"));
         assert!(throughput.contains("After Stop it is zero, while Received stays"));
         // It is Listener's receive rate, not the line's.
         assert!(throughput.contains("It is not the speed of the line"));

@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 use egui::{Align, Layout, ScrollArea};
+use wiredata_telemetry::RollingRate;
 use wiredata_ui::diagnostics::{attention_callout, SignalTone};
 use wiredata_ui::selection;
 
@@ -597,22 +598,16 @@ fn trim_log_history(lines: &mut Vec<(String, tracing::Level)>) {
     }
 }
 
-/// Rolling-throughput window, matching Listener's technician-facing rate.
-const RATE_WINDOW_SECS: u64 = 5;
-const RATE_BUCKETS: usize = RATE_WINDOW_SECS as usize;
-
 /// Lightweight bounded throughput estimator for a channel. Deltas from the
-/// cumulative locally accepted message/byte totals are placed in five fixed
-/// one-second buckets, so the displayed rate is a true rolling five-second
-/// average that decays to zero during a quiet period.
+/// cumulative locally accepted message/byte totals feed two shared
+/// [`wiredata_telemetry::RollingRate`] meters, so the displayed rate is a true
+/// rolling five-second average that decays to zero during a quiet period.
 #[derive(Clone, Copy)]
 struct RateTracker {
-    epoch: Instant,
     last_total: u64,
     last_bytes: u64,
-    messages: [u64; RATE_BUCKETS],
-    bytes: [u64; RATE_BUCKETS],
-    newest_sec: u64,
+    messages: RollingRate,
+    bytes: RollingRate,
     per_sec: f32,
     bytes_per_sec: f32,
 }
@@ -624,56 +619,18 @@ impl RateTracker {
 
     fn with_epoch(epoch: Instant) -> Self {
         Self {
-            epoch,
             last_total: 0,
             last_bytes: 0,
-            messages: [0; RATE_BUCKETS],
-            bytes: [0; RATE_BUCKETS],
-            newest_sec: 0,
+            messages: RollingRate::new(epoch),
+            bytes: RollingRate::new(epoch),
             per_sec: 0.0,
             bytes_per_sec: 0.0,
         }
     }
 
-    fn second_at(&self, now: Instant) -> u64 {
-        now.saturating_duration_since(self.epoch).as_secs()
-    }
-
-    fn advance_to(&mut self, second: u64) {
-        if second <= self.newest_sec {
-            return;
-        }
-        let gap = (second - self.newest_sec).min(RATE_BUCKETS as u64);
-        for offset in 1..=gap {
-            let index = ((self.newest_sec + offset) % RATE_BUCKETS as u64) as usize;
-            self.messages[index] = 0;
-            self.bytes[index] = 0;
-        }
-        self.newest_sec = second;
-    }
-
-    fn refresh_rates(&mut self, second: u64) {
-        let mut messages = 0u64;
-        let mut bytes = 0u64;
-        for candidate in second.saturating_sub(RATE_BUCKETS as u64 - 1)..=second {
-            if candidate > self.newest_sec
-                || self.newest_sec.saturating_sub(candidate) >= RATE_BUCKETS as u64
-            {
-                continue;
-            }
-            let index = (candidate % RATE_BUCKETS as u64) as usize;
-            messages = messages.saturating_add(self.messages[index]);
-            bytes = bytes.saturating_add(self.bytes[index]);
-        }
-        self.per_sec = messages as f32 / RATE_WINDOW_SECS as f32;
-        self.bytes_per_sec = bytes as f32 / RATE_WINDOW_SECS as f32;
-    }
-
     fn reset_window(&mut self, now: Instant) {
-        self.epoch = now;
-        self.messages.fill(0);
-        self.bytes.fill(0);
-        self.newest_sec = 0;
+        self.messages.reset(now);
+        self.bytes.reset(now);
         self.per_sec = 0.0;
         self.bytes_per_sec = 0.0;
     }
@@ -696,15 +653,14 @@ impl RateTracker {
             self.last_bytes = 0;
         }
 
-        let second = self.second_at(now);
-        self.advance_to(second);
-        let index = (second % RATE_BUCKETS as u64) as usize;
-        self.messages[index] =
-            self.messages[index].saturating_add(total.saturating_sub(self.last_total));
-        self.bytes[index] = self.bytes[index].saturating_add(bytes.saturating_sub(self.last_bytes));
+        self.messages
+            .record(now, total.saturating_sub(self.last_total));
+        self.bytes
+            .record(now, bytes.saturating_sub(self.last_bytes));
         self.last_total = total;
         self.last_bytes = bytes;
-        self.refresh_rates(second);
+        self.per_sec = self.messages.rate_at(now) as f32;
+        self.bytes_per_sec = self.bytes.rate_at(now) as f32;
     }
 }
 
@@ -2191,9 +2147,10 @@ mod tests {
         let base = Instant::now();
         let mut rate = RateTracker::with_epoch(base);
 
+        // Under a second in, the divisor is one second.
         rate.sample(base + std::time::Duration::from_millis(100), 10, 100, true);
-        assert_eq!(rate.per_sec, 2.0);
-        assert_eq!(rate.bytes_per_sec, 20.0);
+        assert_eq!(rate.per_sec, 10.0);
+        assert_eq!(rate.bytes_per_sec, 100.0);
 
         rate.sample(
             base + std::time::Duration::from_millis(1_100),
@@ -2201,12 +2158,34 @@ mod tests {
             300,
             true,
         );
-        assert_eq!(rate.per_sec, 4.0);
-        assert_eq!(rate.bytes_per_sec, 60.0);
+        // 20 messages and 300 bytes over the 1.1 s since the epoch.
+        assert!((rate.per_sec - 20.0 / 1.1).abs() < 1e-3);
+        assert!((rate.bytes_per_sec - 300.0 / 1.1).abs() < 1e-2);
 
         rate.sample(base + std::time::Duration::from_secs(6), 20, 300, true);
         assert_eq!(rate.per_sec, 0.0);
         assert_eq!(rate.bytes_per_sec, 0.0);
+    }
+
+    #[test]
+    fn a_steady_stream_reads_true_at_any_point_in_the_second() {
+        let base = Instant::now();
+        let mut rate = RateTracker::with_epoch(base);
+        // One 100-byte message every 10 ms is 100 msg/s and 10,000 B/s,
+        // sampled as often as it arrives.
+        for step in 1..=1_000u64 {
+            let now = base + std::time::Duration::from_millis(step * 10);
+            rate.sample(now, step, step * 100, true);
+            if step >= 500 {
+                assert!(
+                    (rate.per_sec - 100.0).abs() <= 1.0,
+                    "at {} ms: {}",
+                    step * 10,
+                    rate.per_sec
+                );
+                assert!((rate.bytes_per_sec - 10_000.0).abs() <= 100.0);
+            }
+        }
     }
 
     #[test]
@@ -2233,8 +2212,8 @@ mod tests {
 
         let first_new_run = base + std::time::Duration::from_secs(2);
         rate.sample(first_new_run, 1, 10, true);
-        assert!((rate.per_sec - 0.2).abs() < f32::EPSILON);
-        assert_eq!(rate.bytes_per_sec, 2.0);
+        assert!((rate.per_sec - 1.0).abs() < f32::EPSILON);
+        assert_eq!(rate.bytes_per_sec, 10.0);
 
         // Repainting the same cumulative snapshot must not count it twice.
         rate.sample(
@@ -2243,8 +2222,9 @@ mod tests {
             10,
             true,
         );
-        assert!((rate.per_sec - 0.2).abs() < f32::EPSILON);
-        assert_eq!(rate.bytes_per_sec, 2.0);
+        // 1 message over the 0.1 s since the new epoch, still read over one second.
+        assert!((rate.per_sec - 1.0).abs() < f32::EPSILON);
+        assert_eq!(rate.bytes_per_sec, 10.0);
     }
 
     fn serial_draft(name: &str) -> ConnDraft {

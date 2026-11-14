@@ -197,8 +197,9 @@ Ten crates in a Cargo workspace:
   platform boundary, not a general shared runtime or scheduling crate; non-Windows
   calls preserve the same RAII shape but make no timer-resolution request.
 - **`wiredata-telemetry/`** — internal (`publish = false`) shared bounded telemetry
-  primitives. It owns the fixed duration-histogram buckets and the ten-segment recent
-  window used by both applications. Measurement boundaries, aggregate report types,
+  primitives. It owns the fixed duration-histogram buckets, the ten-segment recent
+  window and the five-second rolling-rate meter (`RollingRate`) used by both
+  applications. Measurement boundaries, aggregate report types,
   timer policy, chunk-shape telemetry, retention, and presentation stay in their apps.
 - **`wiredata-log/`** — internal (`publish = false`) shared bounded log-file worker
   (talker ADR-061). It owns the worker thread behind a bounded, non-blocking handoff,

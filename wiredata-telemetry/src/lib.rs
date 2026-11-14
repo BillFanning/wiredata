@@ -4,6 +4,10 @@
 //! samples. Recording and recent-window aging therefore remain allocation-free
 //! and bounded independently of run length and sample rate.
 
+mod rate;
+
+pub use rate::{RollingRate, RATE_MIN_SPAN, RATE_WINDOW};
+
 use std::time::{Duration, Instant};
 
 const BUCKET_UPPER_US: [u64; 15] = [

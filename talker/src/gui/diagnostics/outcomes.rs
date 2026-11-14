@@ -16,8 +16,9 @@ pub(in crate::gui) const THROUGHPUT_TOOLTIP: Hover = Hover::new(
     "The bytes and messages the interface accepted since this channel started.\n\n\
      The total includes the bytes of a possibly partial send that the interface took before it \
      failed. It stays on screen after Stop.\n\n\
-     The two rates are averages over the last five seconds. They climb for the first five \
-     seconds after Start and fall to zero over the five seconds after sending stops, while the \
+     The two rates are averages over the last five seconds. For the first five seconds \
+     after Start they average over the time since Start, and the first second counts as a \
+     whole second. They fall to zero over the five seconds after sending stops, while the \
      total stays put, so they are not the rate on the line at this instant.\n\n\
      Failed, possibly partial, withheld and missed sends are not counted as sent messages. \
      Sent means the interface accepted the data, not that anything received it.",
