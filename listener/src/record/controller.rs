@@ -225,19 +225,51 @@ enum Command {
 
 /// State shared by the producer handle and the controller task.
 struct Shared {
-    /// Whether the producer may enqueue. False during a gap.
-    accepting: AtomicBool,
-    /// The producer hit the budget; the gap starts once the queue drains.
-    overflowed: AtomicBool,
+    /// The fields that must change together; see [`Gate`].
+    gate: Mutex<Gate>,
     queued_bytes: AtomicUsize,
-    /// The first byte not recorded in the current gap.
-    gap_start: Mutex<Option<StreamPos>>,
-    state: Mutex<RecordingState>,
     unstable: AtomicBool,
     reports: Mutex<VecDeque<RecorderReport>>,
     /// The file being written and its length, for status (§56.2).
     file: Mutex<Option<PathBuf>>,
     file_len: AtomicU64,
+    /// Test seam: called where the producer and the controller can interleave,
+    /// so a test can pause one side there.
+    #[cfg(test)]
+    hook: Mutex<Option<TestHook>>,
+}
+
+#[cfg(test)]
+type TestHook = Arc<dyn Fn(Checkpoint) + Send + Sync>;
+
+/// The four fields the producer and the controller both move through the
+/// overflow, open and gap transitions, under one lock so every transition is
+/// one step to a reader (listener ADR-043). Held only for plain field updates,
+/// the non-blocking enqueue and the report push, never across an await or I/O.
+struct Gate {
+    state: RecordingState,
+    /// Whether the producer may enqueue. False during a gap.
+    accepting: bool,
+    /// The producer hit the budget; the gap starts once the queue drains.
+    overflowed: bool,
+    /// The first byte not recorded in the current gap.
+    gap_start: Option<StreamPos>,
+}
+
+/// Where the overflow transition can be paused in a test. Each point is inside
+/// the critical section that makes the transition atomic.
+#[cfg(test)]
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Checkpoint {
+    /// `try_record`, after clearing `accepting`.
+    AfterAccepting,
+    /// `try_record`, after setting `overflowed`.
+    AfterOverflowed,
+    /// `try_record`, after setting the Gap state.
+    AfterGapState,
+    /// `Controller::open`, after reading `overflowed` and before acting on it.
+    OpenAfterOverflowCheck,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -247,17 +279,57 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl Shared {
+    fn new() -> Self {
+        Self {
+            gate: Mutex::new(Gate {
+                // Items queue while the first segment opens (§56.1).
+                state: RecordingState::Enabled,
+                accepting: true,
+                overflowed: false,
+                gap_start: None,
+            }),
+            queued_bytes: AtomicUsize::new(0),
+            unstable: AtomicBool::new(false),
+            reports: Mutex::new(VecDeque::new()),
+            file: Mutex::new(None),
+            file_len: AtomicU64::new(0),
+            #[cfg(test)]
+            hook: Mutex::new(None),
+        }
+    }
+
     fn state(&self) -> RecordingState {
-        *lock(&self.state)
+        lock(&self.gate).state
+    }
+
+    #[cfg(test)]
+    fn accepting(&self) -> bool {
+        lock(&self.gate).accepting
+    }
+
+    fn overflowed(&self) -> bool {
+        lock(&self.gate).overflowed
+    }
+
+    fn take_gap_start(&self) -> Option<StreamPos> {
+        lock(&self.gate).gap_start.take()
+    }
+
+    #[cfg(test)]
+    fn checkpoint(&self, point: Checkpoint) {
+        let hook = lock(&self.hook).clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
     }
 
     fn set_state(&self, state: RecordingState) {
-        *lock(&self.state) = state;
+        lock(&self.gate).state = state;
     }
 
     /// Note the first byte not recorded in this gap; later ones change nothing.
     fn note_gap_start(&self, pos: StreamPos) {
-        lock(&self.gap_start).get_or_insert(pos);
+        lock(&self.gate).gap_start.get_or_insert(pos);
     }
 
     fn report(&self, report: RecorderReport) {
@@ -317,23 +389,32 @@ impl<I: RecordItem> Recording<I> {
     /// Offer one item. Never blocks: in a gap the item is dropped, and an item
     /// that would exceed the byte budget starts one (§56.1).
     pub fn try_record(&mut self, item: I, pos: StreamPos) {
-        if !self.shared.state().is_on() {
+        // One critical section: the checks, the overflow transition and the
+        // enqueue, so the controller never sees half of any of them and no
+        // item is enqueued after it has closed the gate.
+        let mut gate = lock(&self.shared.gate);
+        if !gate.state.is_on() {
             return;
         }
-        if !self.shared.accepting.load(Ordering::Acquire) {
-            self.shared.note_gap_start(pos);
+        if !gate.accepting {
+            gate.gap_start.get_or_insert(pos);
             return;
         }
         let cost = item.byte_len() + PER_ITEM_OVERHEAD;
         let queued = self.shared.queued_bytes.load(Ordering::Acquire);
         if queued + cost > self.budget {
-            self.shared.accepting.store(false, Ordering::Release);
-            self.shared.overflowed.store(true, Ordering::Release);
-            self.shared.note_gap_start(pos);
+            gate.accepting = false;
+            #[cfg(test)]
+            self.shared.checkpoint(Checkpoint::AfterAccepting);
+            gate.overflowed = true;
+            #[cfg(test)]
+            self.shared.checkpoint(Checkpoint::AfterOverflowed);
+            gate.gap_start.get_or_insert(pos);
             // Bytes are lost from here, so the gap is reported now: the
             // controller may be stuck in a write that never returns.
-            self.shared
-                .set_state(RecordingState::Gap(GapReason::QueueOverflow));
+            gate.state = RecordingState::Gap(GapReason::QueueOverflow);
+            #[cfg(test)]
+            self.shared.checkpoint(Checkpoint::AfterGapState);
             self.shared.report(RecorderReport::GapOpened {
                 reason: GapReason::QueueOverflow,
                 detail: OVERFLOW_DETAIL.to_owned(),
@@ -381,18 +462,7 @@ where
     let (items_tx, items_rx) = mpsc::unbounded_channel();
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let (terminate_tx, terminate_rx) = oneshot::channel();
-    let shared = Arc::new(Shared {
-        // Items queue while the first segment opens (§56.1).
-        accepting: AtomicBool::new(true),
-        overflowed: AtomicBool::new(false),
-        queued_bytes: AtomicUsize::new(0),
-        gap_start: Mutex::new(None),
-        state: Mutex::new(RecordingState::Enabled),
-        unstable: AtomicBool::new(false),
-        reports: Mutex::new(VecDeque::new()),
-        file: Mutex::new(None),
-        file_len: AtomicU64::new(0),
-    });
+    let shared = Arc::new(Shared::new());
     let controller = Controller {
         source,
         shared: Arc::clone(&shared),
@@ -542,15 +612,26 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
                 // After an overflow the producer stays stopped: the queued
                 // items are written, then the segment ends where the loss
                 // began (`end_after_overflow`).
-                if !self.shared.overflowed.load(Ordering::Acquire) {
-                    self.shared.set_state(RecordingState::Enabled);
-                    self.shared.accepting.store(true, Ordering::Release);
+                {
+                    // One step: either the overflow is seen and left alone, or
+                    // the producer is let in, never both.
+                    let mut gate = lock(&self.shared.gate);
+                    let overflowed = gate.overflowed;
+                    #[cfg(test)]
+                    self.shared.checkpoint(Checkpoint::OpenAfterOverflowCheck);
+                    if !overflowed {
+                        gate.state = RecordingState::Enabled;
+                        gate.accepting = true;
+                    }
                 }
                 Flow::Continue
             }
             Err(OpenError::Terminal(error)) if !self.ever_opened => {
-                self.shared.accepting.store(false, Ordering::Release);
-                self.shared.set_state(RecordingState::Faulted);
+                {
+                    let mut gate = lock(&self.shared.gate);
+                    gate.accepting = false;
+                    gate.state = RecordingState::Faulted;
+                }
                 self.shared.report(RecorderReport::CouldNotBegin {
                     detail: error.to_string(),
                 });
@@ -620,7 +701,7 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
         };
         // The first item after a gap: a recorder that marks gaps writes its line
         // now, so it comes just before the item the recording resumed with.
-        let gap_start = *lock(&self.shared.gap_start);
+        let gap_start = lock(&self.shared.gate).gap_start;
         let marked = match (self.closing_gap, self.gap) {
             (true, Some(reason)) => match gap_start {
                 Some(start) => {
@@ -649,7 +730,7 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
                 if self.closing_gap {
                     self.closing_gap = false;
                     if let Some(reason) = self.gap.take() {
-                        let start = lock(&self.shared.gap_start).take();
+                        let start = self.shared.take_gap_start();
                         self.shared.report(RecorderReport::GapClosed {
                             reason,
                             start,
@@ -674,7 +755,7 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
     /// After an overflow, the queued items precede the lost ones and are
     /// written; once they are, the segment ends and the gap begins.
     async fn end_after_overflow(&mut self, items: &mut mpsc::UnboundedReceiver<Queued<I>>) {
-        if self.shared.overflowed.load(Ordering::Acquire) && items.is_empty() {
+        if self.shared.overflowed() && items.is_empty() {
             self.end_segment().await;
             // The producer reported this gap when the loss began.
             self.gap.get_or_insert(GapReason::QueueOverflow);
@@ -701,7 +782,6 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
                 }
                 // Low disk is a condition, not a fault: it does not count
                 // toward instability, and it waits for space, not a timer.
-                self.shared.accepting.store(false, Ordering::Release);
                 self.retry_at = None;
                 self.enter_gap(
                     GapReason::LowDisk,
@@ -754,7 +834,6 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
         if let Some(start) = start {
             self.shared.note_gap_start(start);
         }
-        self.shared.accepting.store(false, Ordering::Release);
         self.last_fault = Some(detail.clone());
         self.enter_gap(reason, detail, items);
         let now = Instant::now();
@@ -791,7 +870,14 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
         detail: String,
         items: &mut mpsc::UnboundedReceiver<Queued<I>>,
     ) {
-        self.shared.overflowed.store(false, Ordering::Release);
+        // Close the gate in one step, with the gap's state: from here the
+        // producer enqueues nothing, so the drain below sees every item.
+        {
+            let mut gate = lock(&self.shared.gate);
+            gate.accepting = false;
+            gate.overflowed = false;
+            gate.state = RecordingState::Gap(reason);
+        }
         while let Ok(queued) = items.try_recv() {
             self.shared
                 .queued_bytes
@@ -806,7 +892,6 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
             self.shared
                 .report(RecorderReport::GapOpened { reason, detail });
         }
-        self.shared.set_state(RecordingState::Gap(reason));
     }
 
     /// Stop: write the accepted backlog — under the same
@@ -826,9 +911,9 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
         // A gap still open — an overflow not yet ended, a reopen that wrote
         // nothing, or a fault while writing the backlog — ends with the
         // recording.
-        if self.gap.is_some() || self.shared.overflowed.load(Ordering::Acquire) {
+        if self.gap.is_some() || self.shared.overflowed() {
             let reason = self.gap.take().unwrap_or(GapReason::QueueOverflow);
-            let start = lock(&self.shared.gap_start).take();
+            let start = self.shared.take_gap_start();
             self.shared
                 .report(RecorderReport::GapEndedByStop { reason, start });
         }
@@ -1307,5 +1392,252 @@ mod tests {
             written(&segments),
             vec![vec![b"AB".to_vec()], vec![b"EF".to_vec()]]
         );
+    }
+
+    // -- the overflow transition, interleaved with a segment open ----------
+    //
+    // `try_record` overflowing and `Controller::open` finishing both write
+    // the state, `accepting` and `overflowed`, from two threads. These tests
+    // pause one side inside its transition, through the `Checkpoint` seam in
+    // the production code (which exists only under `cfg(test)`), and let the
+    // other side run into it. The pause lasts `HOLD`, so a side that cannot
+    // proceed (because the lock excludes it) is simply released afterwards;
+    // either way the result is checked, and the order that produced it is
+    // fixed by the pause, not by thread timing.
+    //
+    // Interleavings covered, for one producer overflow against one open:
+    //  - the overflow completes before the open starts, or after it ends;
+    //  - the overflow is offered inside the open, between its read of
+    //    `overflowed` and its stores;
+    //  - the producer is paused partway through the overflow (after clearing
+    //    `accepting`, after setting `overflowed`, after setting the Gap state)
+    //    while the open is run.
+    //
+    // What each must leave, whichever side ran first: the handle reads as in
+    // a queue-overflow gap and refuses new items; the one gap is reported
+    // once, starting at the item that did not fit; nothing offered after that
+    // item reaches the segment; and recovery closes the gap with that start.
+    // Before the four fields shared one lock, the second and third paused
+    // orders left `accepting` true or the state Enabled with the gap open.
+    // The tests do not cover two producers, or a controller fault racing the
+    // overflow.
+
+    use std::sync::mpsc as std_mpsc;
+
+    /// How long a paused side waits for the other to act.
+    const HOLD: Duration = Duration::from_millis(150);
+
+    #[derive(Clone, Copy, Debug)]
+    enum Interleave {
+        BeforeOpen,
+        InsideOpen,
+        PausedAt(Checkpoint),
+        AfterOpen,
+    }
+
+    async fn overflow_interleaved_with_open(order: Interleave) {
+        let source = ScriptedSource::new(|_| Ok(None));
+        let segments = Arc::clone(&source.segments);
+        // The controller is stepped by hand, not spawned.
+        let (items_tx, mut items) = mpsc::unbounded_channel();
+        let (commands_tx, mut commands) = mpsc::unbounded_channel();
+        let budget = 230;
+        let shared = Arc::new(Shared::new());
+        let mut controller = Controller {
+            source,
+            shared: Arc::clone(&shared),
+            timings: fast(),
+            segment: None,
+            period: None,
+            gap: None,
+            closing_gap: false,
+            ever_opened: false,
+            low_disk: false,
+            backoff: fast().first_retry,
+            retry_at: Some(Instant::now()),
+            faults: VecDeque::new(),
+            unflushed_since: None,
+            last_fault: None,
+        };
+        let mut recording = Recording {
+            items: items_tx,
+            commands: commands_tx,
+            terminate: None,
+            shared: Arc::clone(&shared),
+            task: tokio::spawn(async { None }),
+            budget,
+            peak_bytes: 0,
+        };
+        // Two items fill the queue to 148 of 230 bytes while the first
+        // segment is still opening.
+        recording.try_record(chunk(&[1; 10]), pos(0));
+        recording.try_record(chunk(&[2; 10]), pos(10));
+
+        let (go_tx, go_rx) = std_mpsc::channel::<()>();
+        let (done_tx, done_rx) = std_mpsc::channel::<()>();
+        let done_rx = Arc::new(Mutex::new(done_rx));
+        let (reached_tx, reached_rx) = std_mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std_mpsc::channel::<()>();
+        let resume_rx = Mutex::new(resume_rx);
+        let go_in_hook = go_tx.clone();
+        let done_in_hook = Arc::clone(&done_rx);
+        // The pause acts once; the recovery open later passes the same point.
+        let fired = AtomicBool::new(false);
+        *lock(&shared.hook) = Some(Arc::new(move |point| match (order, point) {
+            _ if fired.load(Ordering::SeqCst) => {}
+            (Interleave::InsideOpen, Checkpoint::OpenAfterOverflowCheck) => {
+                fired.store(true, Ordering::SeqCst);
+                go_in_hook.send(()).unwrap();
+                let _ = done_in_hook.lock().unwrap().recv_timeout(HOLD);
+            }
+            (Interleave::PausedAt(at), point) if at == point => {
+                fired.store(true, Ordering::SeqCst);
+                reached_tx.send(()).unwrap();
+                let _ = resume_rx.lock().unwrap().recv_timeout(HOLD);
+            }
+            _ => {}
+        }));
+
+        // The producer: this 100-byte item (cost 164) does not fit.
+        let producer = std::thread::spawn(move || {
+            go_rx.recv().unwrap();
+            recording.try_record(chunk(&[3; 100]), pos(20));
+            done_tx.send(()).unwrap();
+            recording
+        });
+        let wait_done = || done_rx.lock().unwrap().recv().unwrap();
+        match order {
+            Interleave::BeforeOpen => {
+                go_tx.send(()).unwrap();
+                wait_done();
+                controller.open_next(&mut items).await;
+            }
+            Interleave::InsideOpen => {
+                controller.open_next(&mut items).await;
+            }
+            Interleave::PausedAt(_) => {
+                go_tx.send(()).unwrap();
+                reached_rx.recv().unwrap();
+                controller.open_next(&mut items).await;
+                let _ = resume_tx.send(());
+            }
+            Interleave::AfterOpen => {
+                controller.open_next(&mut items).await;
+                go_tx.send(()).unwrap();
+                wait_done();
+            }
+        }
+        let mut recording = producer.join().unwrap();
+        let why = format!("{order:?}");
+
+        // Both sides are done and the controller has not yet seen the
+        // command. What a reader of the handle sees must already be one
+        // coherent state.
+        assert_eq!(
+            shared.state(),
+            RecordingState::Gap(GapReason::QueueOverflow),
+            "{why}: state"
+        );
+        assert!(
+            !shared.accepting(),
+            "{why}: the producer must not be accepting"
+        );
+        assert!(shared.overflowed(), "{why}: overflowed");
+        let queued = shared.queued_bytes.load(Ordering::Acquire);
+        recording.try_record(chunk(&[4; 10]), pos(30)); // cost 74: fits, if accepted
+        assert_eq!(
+            shared.queued_bytes.load(Ordering::Acquire),
+            queued,
+            "{why}: an item offered after the loss was accepted"
+        );
+
+        // The controller catches up.
+        while let Ok(command) = commands.try_recv() {
+            controller.on_command(command, &mut items).await;
+        }
+        while let Ok(queued) = items.try_recv() {
+            controller.on_item(queued, &mut items).await;
+        }
+        assert_eq!(
+            shared.state(),
+            RecordingState::Gap(GapReason::QueueOverflow),
+            "{why}: state after catching up"
+        );
+        assert!(!shared.accepting(), "{why}");
+        assert!(!shared.overflowed(), "{why}");
+        assert_eq!(
+            lock(&shared.gate).gap_start.map(|p| p.offset),
+            Some(20),
+            "{why}: the gap starts at the item that did not fit"
+        );
+        assert_eq!(
+            written(&segments),
+            vec![vec![vec![1; 10], vec![2; 10]]],
+            "{why}: only what preceded the loss is in the segment"
+        );
+
+        // Recovery resumes in a new segment and closes the one gap.
+        controller.open_next(&mut items).await;
+        assert_eq!(shared.state(), RecordingState::Enabled, "{why}");
+        assert!(shared.accepting(), "{why}");
+        recording.try_record(chunk(&[5; 10]), pos(40));
+        while let Ok(queued) = items.try_recv() {
+            controller.on_item(queued, &mut items).await;
+        }
+        let reports = recording.take_reports();
+        let opened = reports
+            .iter()
+            .filter(|r| matches!(r, RecorderReport::GapOpened { .. }))
+            .count();
+        assert_eq!(opened, 1, "{why}: one gap, reported once: {reports:?}");
+        let closed: Vec<_> = reports
+            .iter()
+            .filter_map(|r| match r {
+                RecorderReport::GapClosed { reason, start, end } => {
+                    Some((*reason, start.map(|p| p.offset), end.offset))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            closed,
+            vec![(GapReason::QueueOverflow, Some(20), 40)],
+            "{why}"
+        );
+        assert_eq!(
+            written(&segments),
+            vec![vec![vec![1; 10], vec![2; 10]], vec![vec![5; 10]]],
+            "{why}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_before_the_open_leaves_one_coherent_gap() {
+        overflow_interleaved_with_open(Interleave::BeforeOpen).await;
+    }
+
+    #[tokio::test]
+    async fn overflow_inside_the_open_leaves_one_coherent_gap() {
+        overflow_interleaved_with_open(Interleave::InsideOpen).await;
+    }
+
+    #[tokio::test]
+    async fn overflow_paused_after_accepting_leaves_one_coherent_gap() {
+        overflow_interleaved_with_open(Interleave::PausedAt(Checkpoint::AfterAccepting)).await;
+    }
+
+    #[tokio::test]
+    async fn overflow_paused_after_overflowed_leaves_one_coherent_gap() {
+        overflow_interleaved_with_open(Interleave::PausedAt(Checkpoint::AfterOverflowed)).await;
+    }
+
+    #[tokio::test]
+    async fn overflow_paused_after_gap_state_leaves_one_coherent_gap() {
+        overflow_interleaved_with_open(Interleave::PausedAt(Checkpoint::AfterGapState)).await;
+    }
+
+    #[tokio::test]
+    async fn overflow_after_the_open_leaves_one_coherent_gap() {
+        overflow_interleaved_with_open(Interleave::AfterOpen).await;
     }
 }
