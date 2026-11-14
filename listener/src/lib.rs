@@ -31,7 +31,7 @@ pub fn run() -> Result<std::process::ExitCode> {
             // headless mode instead of surfacing a cryptic windowing error.
             Err(e) if cli.is_bare_launch() => Err(anyhow::anyhow!(
                 "could not open the graphical interface ({e}); for headless use pass \
-                 a source (--udp/--tcp/--serial/--profile), or run with --cli"
+                 a source (--udp/--serial/--profile), or run with --cli"
             )),
             Err(e) => Err(e),
         }

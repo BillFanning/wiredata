@@ -1,6 +1,6 @@
 //! Serial transport (spec §14).
 //!
-//! Unlike UDP/TCP, a serial port has no async-native API, so its continuous
+//! Unlike UDP, a serial port has no async-native API, so its continuous
 //! blocking receive loop runs on a **dedicated OS thread** that owns the port
 //! handle (ADR-001 / §97.1). That thread hands data to the async runtime over a
 //! bounded `tokio::sync::mpsc` — the one edge permitted to stall the reader

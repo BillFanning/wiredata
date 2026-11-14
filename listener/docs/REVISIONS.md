@@ -10,6 +10,14 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-13) — one display view:
+
+- **§11, §48, §50.2, §51, §54, §58, §78 (ADR-060).** A Channel has exactly one
+  display view, saved as `display.view`; the `views` list, `DisplayViewId` and
+  the `PauseDisplay` target are gone. Profiles saved with a `views` list still
+  load, keeping the first view and warning if there were more.
+- **§72.** The example profile is removed.
+
 Revision note (2026-11-13) — idle rules, reconnects and gap lines:
 
 - **§50.2, §91, §126, §157 (ADR-030, amended).** Idle rules use an ordinary deadline

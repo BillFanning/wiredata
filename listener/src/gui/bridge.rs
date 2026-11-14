@@ -279,9 +279,6 @@ fn describe_interface(config: &ChannelConfig) -> String {
                 None => endpoint,
             }
         }
-        InterfaceConfig::TcpListener(tcp) => {
-            format!("TCP listener · {}:{}", tcp.bind_address, tcp.port)
-        }
         InterfaceConfig::Serial(serial) => {
             // Conventional serial notation — `9600,8,N,1` — so the line reads
             // the way the settings are written down and spoken, rather than

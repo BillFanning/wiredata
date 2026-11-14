@@ -657,8 +657,8 @@ impl AppState {
     }
 
     /// Fold a forwarded `RuntimeEvent`. Events for Channels we have not registered
-    /// (e.g. runtime-minted TCP connection channels, §16.4) are ignored for now —
-    /// the list shows configured Channels; per-connection views come later.
+    /// (e.g. an id the runtime minted itself) are ignored: the list shows
+    /// configured Channels.
     fn apply_event(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::ChannelStarted(id) => {
@@ -746,7 +746,7 @@ impl AppState {
             }
             // `MessageReceived` no longer drives the list: liveness is byte-based now
             // (ADR-009), refreshed by the periodic snapshot/stats poll like throughput.
-            // Other warning, disk, control-line, match, and TCP-connection events are
+            // Other warning, disk, control-line, and match events are
             // reflected through the periodic snapshot (or land in later panes); the list
             // view does not need them directly. `RuntimeEvent` is `#[non_exhaustive]`,
             // so this wildcard also keeps us forward-compatible.
@@ -1716,7 +1716,7 @@ mod tests {
         let a = ChannelId::new();
         let b = ChannelId::new();
         state.apply(added(a, "a", "UDP"));
-        state.apply(added(b, "b", "TCP"));
+        state.apply(added(b, "b", "Serial"));
 
         state.apply(UiUpdate::ChannelRemoved(a));
         assert_eq!(state.channels().count(), 1);
@@ -1730,7 +1730,7 @@ mod tests {
         let known = ChannelId::new();
         state.apply(added(known, "a", "UDP"));
 
-        // A runtime-minted (e.g. TCP connection) id we never registered.
+        // An id the runtime minted that we never registered.
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(
             ChannelId::new(),
         )));
@@ -1744,7 +1744,7 @@ mod tests {
         let mut state = AppState::default();
         let (a, b, c) = (ChannelId::new(), ChannelId::new(), ChannelId::new());
         state.apply(added(a, "a", "UDP"));
-        state.apply(added(b, "b", "TCP"));
+        state.apply(added(b, "b", "Serial"));
         state.apply(added(c, "c", "Serial"));
         // A duplicate add does not reorder or duplicate.
         state.apply(added(a, "a-again", "UDP"));
@@ -1758,7 +1758,7 @@ mod tests {
         let mut state = AppState::default();
         let (a, b, c) = (ChannelId::new(), ChannelId::new(), ChannelId::new());
         state.apply(added(a, "a", "UDP"));
-        state.apply(added(b, "b", "TCP"));
+        state.apply(added(b, "b", "Serial"));
         state.apply(added(c, "c", "Serial"));
 
         // Middle/last fall back to the one above; the first falls back to the next.
@@ -1778,7 +1778,7 @@ mod tests {
         let mut state = AppState::default();
         let (a, b, c) = (ChannelId::new(), ChannelId::new(), ChannelId::new());
         state.apply(added(a, "a", "UDP"));
-        state.apply(added(b, "b", "TCP"));
+        state.apply(added(b, "b", "Serial"));
         state.apply(added(c, "c", "Serial"));
 
         assert_eq!(state.cycle(a, true), Some(b));

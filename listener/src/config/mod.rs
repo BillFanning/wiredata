@@ -73,7 +73,9 @@ impl Profile {
     /// A Channel has one Display View, saved as `display.view`. A profile
     /// saved when it could have several, as a `views` list, still loads: the
     /// first view is kept, and each warning names a view or a `PauseDisplay`
-    /// target that had to be dropped. Saving writes the current form.
+    /// target that had to be dropped. A Channel that names a TCP Listener is
+    /// left out, with a warning, since this build cannot receive on one.
+    /// Saving writes the current form.
     pub fn from_toml_with_warnings(text: &str) -> Result<(Self, Vec<String>), ConfigError> {
         let mut doc: toml::Table = toml::from_str(text)?;
         match doc.get("schema_version") {
@@ -87,7 +89,14 @@ impl Profile {
             // A wrong type is left to the typed parse, which names it.
             Some(_) => {}
         }
-        let (profile, warnings) = match toml::from_str::<Profile>(text) {
+        // A TCP Listener Channel cannot be parsed, so it is taken out first.
+        let tcp_warnings = legacy::drop_tcp_channels(&mut doc);
+        let first = if tcp_warnings.is_empty() {
+            toml::from_str::<Profile>(text)
+        } else {
+            doc.clone().try_into::<Profile>()
+        };
+        let (profile, mut warnings) = match first {
             Ok(profile) => (profile, Vec::new()),
             Err(error) => {
                 // Only the old shape is rewritten. Any other failure is the
@@ -100,6 +109,7 @@ impl Profile {
                 (profile, upgraded.warnings)
             }
         };
+        warnings.splice(0..0, tcp_warnings);
         check_version(profile.schema_version)?;
         Ok((profile, warnings))
     }
@@ -193,25 +203,14 @@ pub fn validate_channel(
 ) -> Result<(), Vec<ChannelConfigError>> {
     let mut errors = Vec::new();
 
-    // The Channel Kind must match its interface, and a TCP Connection is
-    // runtime-only — it can never appear in a persisted profile (§16.3).
+    // The Channel Kind must match its interface.
     let kind_matches = matches!(
         (channel.kind, &channel.interface),
         (ChannelKind::Serial, InterfaceConfig::Serial(_))
             | (ChannelKind::Udp, InterfaceConfig::Udp(_))
-            | (ChannelKind::TcpListener, InterfaceConfig::TcpListener(_))
     );
-    if channel.kind == ChannelKind::TcpConnection {
-        errors.push(ChannelConfigError::TcpConnectionNotPersistable);
-    } else if !kind_matches {
+    if !kind_matches {
         errors.push(ChannelConfigError::KindInterfaceMismatch);
-    }
-    // Disabled in this release (§4.1, ADR-047): its connections' data cannot be
-    // displayed or recorded yet (ADR-024). The code stays for when it returns.
-    if channel.kind == ChannelKind::TcpListener
-        || matches!(channel.interface, InterfaceConfig::TcpListener(_))
-    {
-        errors.push(ChannelConfigError::TcpListenerUnavailable);
     }
 
     if let InterfaceConfig::Udp(udp) = &channel.interface {
@@ -363,13 +362,6 @@ fn check_version(found: u32) -> Result<(), ConfigError> {
 pub enum ChannelConfigError {
     #[error("channel kind does not match its interface configuration")]
     KindInterfaceMismatch,
-    #[error("TCP Connection channels are runtime-only and cannot be persisted")]
-    TcpConnectionNotPersistable,
-    #[error(
-        "TCP Listener isn't available in this release: received data can't be displayed or \
-         recorded yet"
-    )]
-    TcpListenerUnavailable,
     #[error("multicast UDP requires a multicast group address")]
     MissingMulticastGroup,
     #[error(
@@ -683,22 +675,6 @@ mod tests {
     }
 
     #[test]
-    fn a_tcp_listener_is_not_available_in_this_release() {
-        // §4.1, ADR-047: rejected with the reason, not silently skipped.
-        let err = validate_channel(
-            &templates::tcp_listener_template(),
-            &DefaultConfig::default(),
-        )
-        .unwrap_err();
-        assert_eq!(err, [ChannelConfigError::TcpListenerUnavailable]);
-        assert_eq!(
-            err[0].to_string(),
-            "TCP Listener isn't available in this release: received data can't be displayed \
-             or recorded yet"
-        );
-    }
-
-    #[test]
     fn newer_schema_version_is_refused() {
         let toml = format!("schema_version = {}\nname = \"x\"\n", CURRENT_VERSION + 1);
         assert!(matches!(
@@ -957,11 +933,9 @@ actions = [{ kind = "PauseDisplay", view = 1 }, { kind = "Notify", severity = "E
         ];
         let mut serial = templates::serial_template();
         serial.name = ChannelName::new("serial");
-        let mut tcp = templates::tcp_listener_template();
-        tcp.name = ChannelName::new("tcp");
 
         let mut profile = Profile::new("every type");
-        profile.channels = vec![udp, serial, tcp];
+        profile.channels = vec![udp, serial];
         profile.defaults = DefaultConfig {
             display: Some(DisplayConfig::default()),
             retention: Some(RetentionConfig::with_byte_limit(1_000)),
@@ -984,7 +958,6 @@ actions = [{ kind = "PauseDisplay", view = 1 }, { kind = "Notify", severity = "E
             ("channels.0", "ChannelConfig"),
             ("channels.0.interface", "UdpConfig"),
             ("channels.1.interface", "SerialConfig"),
-            ("channels.2.interface", "TcpListenerConfig"),
             ("channels.0.reconnect", "ReconnectPolicy"),
             ("channels.0.display", "DisplayConfig"),
             ("channels.0.display.view", "DisplayViewConfig"),
@@ -1211,10 +1184,21 @@ actions = [{ kind = "PauseDisplay", view = 1 }, { kind = "Notify", severity = "E
     }
 
     #[test]
-    fn profiles_never_carry_tcp_connection_channels() {
-        let mut channel = templates::tcp_listener_template();
-        channel.kind = ChannelKind::TcpConnection;
-        let err = validate_channel(&channel, &DefaultConfig::default()).unwrap_err();
-        assert!(err.contains(&ChannelConfigError::TcpConnectionNotPersistable));
+    fn a_channel_of_a_tcp_kind_is_left_out_with_a_warning() {
+        let text = "schema_version = 3
+name = \"p\"
+                    [[channels]]
+kind = \"TcpConnection\"
+name = \"conn\"
+                    [channels.interface]
+type = \"Udp\"
+bind_address = \"0.0.0.0\"
+                    port = 1
+mode = \"Unicast\"
+";
+        let (profile, warnings) = Profile::from_toml_with_warnings(text).unwrap();
+        assert!(profile.channels.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("conn"), "{warnings:?}");
     }
 }

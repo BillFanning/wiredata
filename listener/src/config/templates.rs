@@ -1,7 +1,7 @@
 //! Default channel templates (spec §81–§85).
 //!
 //! Templates provide safe, valid, *stopped* starting configurations (§81). They
-//! never open interfaces. Resource-bearing fields (serial port name, UDP/TCP
+//! never open interfaces. Resource-bearing fields (serial port name, UDP
 //! port) are placeholders the user fills in before Start (§71).
 
 use crate::core::{ChannelKind, ChannelName};
@@ -57,28 +57,6 @@ pub fn udp_template() -> ChannelConfig {
             recv_buffer_bytes: None,
             kernel_timestamps: false,
             shared_port: false,
-        }),
-        display: DisplayConfig::default(),
-        raw_recording: RawRecordingConfig::default(),
-        display_recording: DisplayRecordingConfig::default(),
-        retention: default_retention(),
-        reconnect: ReconnectPolicy::default(),
-        match_rules: Vec::new(),
-    }
-}
-
-/// TCP listener (§85): bind 0.0.0.0, no connection cap. Display
-/// here apply to its accepted connection channels (§16.2).
-pub fn tcp_listener_template() -> ChannelConfig {
-    ChannelConfig {
-        id: None,
-        name: ChannelName::new("TCP_Listener"),
-        kind: ChannelKind::TcpListener,
-        interface: InterfaceConfig::TcpListener(TcpListenerConfig {
-            bind_address: "0.0.0.0".to_string(),
-            port: 0,
-            max_connections: None,
-            recv_buffer_bytes: None,
         }),
         display: DisplayConfig::default(),
         raw_recording: RawRecordingConfig::default(),

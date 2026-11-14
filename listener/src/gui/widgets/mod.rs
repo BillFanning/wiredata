@@ -54,7 +54,6 @@ pub(super) enum AddKind {
 }
 
 impl AddKind {
-    /// The TCP Listener is not offered in this release (§4.1, ADR-047).
     pub const ADD_MENU: [Self; 2] = [Self::Udp, Self::Serial];
 
     pub const fn label(self) -> &'static str {
@@ -429,25 +428,6 @@ pub(super) fn edit_interface(
                     ui.end_row();
                 });
         }
-        InterfaceConfig::TcpListener(tcp) => {
-            egui::Grid::new("tcp_grid")
-                .num_columns(2)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label("Binding address");
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut tcp.bind_address)
-                                .id_salt("tcp_bind")
-                                .desired_width(130.0)
-                                .hint_text("0.0.0.0"),
-                        );
-                        ui.label("port");
-                        port_field(ui, "tcp_port", &mut tcp.port);
-                    });
-                    ui.end_row();
-                });
-        }
         InterfaceConfig::Serial(serial) => {
             // One grid so every row's controls begin at the same x, under the
             // port selector — talker's `serial_grid` shape.
@@ -616,12 +596,11 @@ pub(super) fn template_for(kind: AddKind) -> ChannelConfig {
 }
 
 /// Whether a channel's config is missing the minimum needed to start: no serial
-/// port, or a 0 bind port for UDP/TCP. Drives auto-opening the Configure section
+/// port, or a 0 bind port for UDP. Drives auto-opening the Configure section
 /// when such a channel takes focus (task 1).
 pub(super) fn config_incomplete(config: &ChannelConfig) -> bool {
     match &config.interface {
         InterfaceConfig::Udp(u) => u.port == 0,
-        InterfaceConfig::TcpListener(t) => t.port == 0,
         InterfaceConfig::Serial(s) => s.port.trim().is_empty(),
     }
 }

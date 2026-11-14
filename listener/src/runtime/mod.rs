@@ -11,7 +11,7 @@
 //!   (raw recorder, scrollback, display recording, find/triggers, diagnostics).
 //! - [`activity`] — the §166 per-Channel liveness/throughput meter.
 //! - [`matchrule`] — §50.2 Find & Triggers evaluation (BytePattern / Idle).
-//! - [`channel`]/[`tcp`] — per-Channel and TCP-listener task orchestration.
+//! - [`channel`] — per-Channel task orchestration.
 //! - [`build`] — maps validated config to live transports.
 //! - [`listener`] — the [`Listener`] orchestrator: registry, §9 state machine,
 //!   start/stop/apply-pending exposed as async methods (the command surface; ADR-012).
@@ -28,7 +28,6 @@ pub mod pipeline;
 pub mod queue;
 pub mod run_summary;
 pub mod snapshot;
-pub mod tcp;
 pub mod telemetry;
 
 pub use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
@@ -46,7 +45,6 @@ pub use snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, PipelineRequest, QueueDepth,
     ReconnectProgress, RecordingStatus, StreamDelta, TriggeredMatch,
 };
-pub use tcp::{start_tcp_listener, TcpListenerHandle};
 pub use telemetry::{
     ArrivalTimestampSummary, ByteHistogram, ChunkShape, CounterAvailability, DurationHistogram,
     SerialStallSummary, TransportHealth,

@@ -11,10 +11,7 @@
 //! ADR-012). Raw and Display recording are wired for serial/UDP channels from the
 //! independent `raw_recording`/`display_recording` configs (ADR-013); a
 //! recording-enable failure records a diagnostic and emits `RecordingFaulted` without
-//! faulting the Channel (§55) — reception continues. Accepted TCP **connection**
-//! channels run the same stream pipeline as their listener (§16.2); per-connection
-//! recording and snapshots remain deferred (§59 filename templates; the supervisor
-//! keeps no per-connection handle).
+//! faulting the Channel (§55) — reception continues.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,7 +25,6 @@ use crate::config::ChannelConfig;
 use crate::core::{lock_recover, ChannelId, ChannelState, RuntimeEvent};
 use crate::display::DisplayView;
 use crate::transport::serial::{OpenSerialTransport, SerialTransport};
-use crate::transport::tcp::{BoundTcpListenerTransport, TcpListenerTransport};
 use crate::transport::udp::{BoundUdpTransport, UdpTransport};
 use crate::transport::{
     DataTransportRunner, SerialControlCommand, SerialControlHooks, SerialControlLines,
@@ -36,7 +32,7 @@ use crate::transport::{
 };
 
 use super::activity::ChannelActivity;
-use super::build::{build_display_view, build_serial, build_tcp_listener, build_udp, BuildError};
+use super::build::{build_display_view, build_serial, build_udp, BuildError};
 use super::channel::{spawn_monitored_channel, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES};
 use super::pipeline::{
     DisplayPause, DisplayRecordingSettings, PipelineCapacities, RawRecordingSettings,
@@ -45,7 +41,6 @@ use super::run_summary::{ListenerRunSummary, RunEndReason, RunId};
 use super::snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, ReconnectProgress, StreamDelta,
 };
-use super::tcp::{start_tcp_listener, TcpListenerHandle};
 use super::telemetry::{ChunkShape, DurationHistogram, TransportHealth};
 
 /// A minimal [`ChannelSnapshot`] for a stopped/faulted Channel (no live pipeline):
@@ -126,12 +121,6 @@ fn retained_stats(channel: &ManagedChannel) -> ChannelStats {
 /// occasional operator actions.
 const SERIAL_CONTROL_COMMANDS: usize = 8;
 
-/// A live Channel's running tasks. Held by the orchestrator so it can stop them.
-enum ChannelHandle {
-    Data(MonitoredChannel),
-    TcpListener(TcpListenerHandle),
-}
-
 /// Live serial control-line handle held by the orchestrator (§161): the command
 /// inbox to the running serial reader, and the shared cell the reader updates with
 /// the current line state.
@@ -199,14 +188,12 @@ struct ActiveRun {
 enum UnopenedInterface {
     Serial(SerialTransport),
     Udp(UdpTransport),
-    TcpListener(TcpListenerTransport),
 }
 
 /// An opened or bound interface, ready to be wired into a pipeline.
 enum OpenedInterface {
     Serial(OpenSerialTransport),
     Udp(BoundUdpTransport),
-    TcpListener(BoundTcpListenerTransport),
 }
 
 /// A Channel's start, begun by [`Listener::begin_start`] (ADR-052). It owns
@@ -256,11 +243,6 @@ impl StartTicket {
                     .await
                     .map(OpenedInterface::Udp)
                     .map_err(OrchestratorError::Bind),
-                UnopenedInterface::TcpListener(transport) => transport
-                    .bind()
-                    .await
-                    .map(OpenedInterface::TcpListener)
-                    .map_err(OrchestratorError::Bind),
             }
             .map(|interface| (caps, interface)),
         };
@@ -283,7 +265,7 @@ impl OpenedStart {
 /// caller's loop; [`Listener::finish_stop`] lands the result.
 pub struct StopTicket {
     id: ChannelId,
-    handle: Option<ChannelHandle>,
+    handle: Option<MonitoredChannel>,
 }
 
 /// A stop whose drain finished, or was abandoned at the grace period, for
@@ -353,7 +335,6 @@ fn transport_name(interface: &InterfaceConfig) -> &'static str {
     match interface {
         InterfaceConfig::Serial(_) => "serial",
         InterfaceConfig::Udp(_) => "udp",
-        InterfaceConfig::TcpListener(_) => "tcp_listener",
     }
 }
 
@@ -365,7 +346,7 @@ struct ManagedChannel {
     config: ChannelConfig,
     pending: Option<ChannelConfig>,
     state: ChannelState,
-    handle: Option<ChannelHandle>,
+    handle: Option<MonitoredChannel>,
     /// Pause handle for the running Channel's Display View (§11, §48); `None`
     /// while Stopped.
     display_pause: Option<DisplayPause>,
@@ -722,11 +703,8 @@ impl Listener {
     pub async fn snapshot(&self, id: ChannelId) -> Option<ChannelSnapshot> {
         let channel = self.channels.get(&id)?;
         let live = match channel.handle.as_ref() {
-            Some(ChannelHandle::Data(tasks)) => tasks.snapshot().await,
-            // A TCP listener has no pipeline of its own (its connections are
-            // snapshot targets in their own right; per-connection snapshots are
-            // deferred) — serve the retained/lifecycle shell below.
-            Some(ChannelHandle::TcpListener(_)) | None => None,
+            Some(tasks) => tasks.snapshot().await,
+            None => None,
         };
         let mut snap = live.unwrap_or_else(|| retained_snapshot(id, channel));
         snap.state = channel.effective_state();
@@ -746,8 +724,8 @@ impl Listener {
     pub async fn channel_stats(&self, id: ChannelId) -> Option<ChannelStats> {
         let channel = self.channels.get(&id)?;
         let live = match channel.handle.as_ref() {
-            Some(ChannelHandle::Data(tasks)) => tasks.stats().await,
-            Some(ChannelHandle::TcpListener(_)) | None => None,
+            Some(tasks) => tasks.stats().await,
+            None => None,
         };
         let mut stats = live.unwrap_or_else(|| retained_stats(channel));
         stats.state = channel.effective_state();
@@ -758,13 +736,14 @@ impl Listener {
 
     /// Incremental stream bytes since the consumer's cursor (§87, ADR-009): only
     /// what is new, so a live viewer never re-ships the whole retained scrollback
-    /// (up to the 256 KB cap) each poll. `None` when unknown, not running, or a
-    /// TCP listener.
+    /// (up to the 256 KB cap) each poll. `None` when unknown or not running.
     pub async fn stream_delta(&self, id: ChannelId, since: u64) -> Option<StreamDelta> {
-        match self.channels.get(&id)?.handle.as_ref()? {
-            ChannelHandle::Data(tasks) => tasks.stream_delta(since).await,
-            ChannelHandle::TcpListener(_) => None,
-        }
+        self.channels
+            .get(&id)?
+            .handle
+            .as_ref()?
+            .stream_delta(since)
+            .await
     }
 
     pub fn channel_ids(&self) -> Vec<ChannelId> {
@@ -775,7 +754,7 @@ impl Listener {
     /// (§50.2, ADR-012) — the manual counterpart of the match-rule `Record` action,
     /// sharing the pipeline's lazy begin / clean finalize path. `enabled = true`
     /// begins (a no-op if already recording); `false` stops and finalizes. Returns
-    /// `false` when the Channel is unknown, not running, or a TCP listener. The outcome
+    /// `false` when the Channel is unknown or not running. The outcome
     /// is observed via the snapshot's recording state; a begin failure — including no
     /// destination configured, or the destination in use (§121) — records a diagnostic
     /// and raises a `RecordingFaulted` event (§55), leaving the Channel Running.
@@ -794,8 +773,8 @@ impl Listener {
         };
         let settings = self.settings_from(&raw, channel.config.name.as_str());
         match channel.handle.as_ref() {
-            Some(ChannelHandle::Data(tasks)) => tasks.set_recording(enabled, settings).await,
-            _ => false,
+            Some(tasks) => tasks.set_recording(enabled, settings).await,
+            None => false,
         }
     }
 
@@ -820,10 +799,8 @@ impl Listener {
             display_renderer(&channel.config),
         );
         match channel.handle.as_ref() {
-            Some(ChannelHandle::Data(tasks)) => {
-                tasks.set_display_recording(enabled, settings).await
-            }
-            _ => false,
+            Some(tasks) => tasks.set_display_recording(enabled, settings).await,
+            None => false,
         }
     }
 
@@ -1014,11 +991,7 @@ impl Listener {
         match opened {
             Ok((caps, interface)) => {
                 let (handle, serial_control) = self.wire(id, &config, interface, caps, faulted);
-                let display_pause = match &handle {
-                    ChannelHandle::Data(tasks) => Some(tasks.display_pause().clone()),
-                    // A TCP listener has no display itself; its connections do.
-                    ChannelHandle::TcpListener(_) => None,
-                };
+                let display_pause = Some(handle.display_pause().clone());
                 if let Some(channel) = self.channels.get_mut(&id) {
                     channel.handle = Some(handle);
                     channel.display_pause = display_pause;
@@ -1107,7 +1080,10 @@ impl Listener {
     /// channel Stopping, and take its handle out (so the slow drain in `drain_handle`
     /// owns no `&mut self`). Returns the handle to drain (or `None` if there was none,
     /// e.g. a start-time fault). Illegal from any state but Running/Faulted.
-    fn take_for_stop(&mut self, id: ChannelId) -> Result<Option<ChannelHandle>, OrchestratorError> {
+    fn take_for_stop(
+        &mut self,
+        id: ChannelId,
+    ) -> Result<Option<MonitoredChannel>, OrchestratorError> {
         let state = self
             .state(id)
             .ok_or(OrchestratorError::UnknownChannel(id))?;
@@ -1620,9 +1596,6 @@ impl Listener {
         Ok(match interface {
             InterfaceConfig::Serial(serial) => UnopenedInterface::Serial(build_serial(id, serial)?),
             InterfaceConfig::Udp(udp) => UnopenedInterface::Udp(build_udp(id, udp)?),
-            InterfaceConfig::TcpListener(tcp) => {
-                UnopenedInterface::TcpListener(build_tcp_listener(id, tcp)?)
-            }
         })
     }
 
@@ -1636,7 +1609,7 @@ impl Listener {
         interface: OpenedInterface,
         caps: PipelineCapacities,
         faulted: Arc<AtomicBool>,
-    ) -> (ChannelHandle, Option<SerialControl>) {
+    ) -> (MonitoredChannel, Option<SerialControl>) {
         match interface {
             OpenedInterface::Serial(opened) => {
                 // Serial is the one transport whose reader can stall (§97.1); give
@@ -1656,7 +1629,7 @@ impl Listener {
                     .with_notice_sender(notice_tx.clone())
                     .with_control(hooks);
                 let serial_stall_state = opened.stall_state();
-                let handle = ChannelHandle::Data(self.spawn_data(
+                let handle = self.spawn_data(
                     id,
                     opened,
                     config,
@@ -1666,7 +1639,7 @@ impl Listener {
                         serial_stall_state: Some(serial_stall_state),
                         notices: (notice_tx, notice_rx),
                     },
-                ));
+                );
                 (
                     handle,
                     Some(SerialControl {
@@ -1681,7 +1654,7 @@ impl Listener {
                 // UDP is async and never stalls the reader. On Linux the transport
                 // also publishes its cumulative SO_RXQ_OVFL socket-drop counter;
                 // other platforms explicitly report that counter unsupported.
-                let handle = ChannelHandle::Data(self.spawn_data(
+                let handle = self.spawn_data(
                     id,
                     bound,
                     config,
@@ -1691,28 +1664,8 @@ impl Listener {
                         serial_stall_state: None,
                         notices: (notice_tx, notice_rx),
                     },
-                ));
-                (handle, None)
-            }
-            // Per-connection faults stay supervised inside the listener task;
-            // a spontaneous *acceptor* fault sets `faulted` like any other
-            // transport, so polled state reads Faulted and reconnect can
-            // engage (§162).
-            OpenedInterface::TcpListener(bound) => {
-                let max_connections = match &config.interface {
-                    InterfaceConfig::TcpListener(tcp) => tcp.max_connections,
-                    _ => None,
-                };
-                // Per-connection recording is deferred (§59).
-                let handle = start_tcp_listener(
-                    bound.channel_id(),
-                    bound,
-                    caps,
-                    max_connections,
-                    faulted,
-                    self.events_tx.clone(),
                 );
-                (ChannelHandle::TcpListener(handle), None)
+                (handle, None)
             }
         }
     }
@@ -1880,21 +1833,12 @@ fn display_renderer(config: &ChannelConfig) -> DisplayView {
 /// (so its last diagnostics — "Channel stopped", "Raw recording stopped" — are
 /// included). Owns the handle (no `&mut Listener`), so a caller can wrap *this*
 /// in a timeout and, if it fires, still run `Listener::finish_stop` — the
-/// cleanup never depends on the drain completing. `None` for a TCP listener or a
-/// start-time fault (no pipeline).
-async fn drain_handle(handle: Option<ChannelHandle>) -> Option<ChannelSnapshot> {
-    match handle {
-        Some(ChannelHandle::Data(tasks)) => {
-            // `None` if the pipeline task panicked — no final snapshot then,
-            // which callers already tolerate (same as a TCP listener).
-            tasks.stop().await.map(|mut pipeline| pipeline.snapshot())
-        }
-        Some(ChannelHandle::TcpListener(listener)) => {
-            listener.stop().await;
-            None
-        }
-        None => None,
-    }
+/// cleanup never depends on the drain completing. `None` for a start-time fault
+/// (no pipeline).
+async fn drain_handle(handle: Option<MonitoredChannel>) -> Option<ChannelSnapshot> {
+    // `None` if the pipeline task panicked — no final snapshot then, which
+    // callers already tolerate.
+    handle?.stop().await.map(|mut pipeline| pipeline.snapshot())
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
-//! Reading profiles saved when a Channel could carry several Display Views.
+//! Reading profiles saved by an older build: several Display Views per
+//! Channel, and TCP Listener Channels.
 //!
 //! A Channel has one view (§48), saved as `display.view`. Earlier profiles
 //! saved a list, `display.views`, and a `PauseDisplay` action could name one of
@@ -119,4 +120,42 @@ fn upgrade_pause_action(action: &mut Value, who: &str, out: &mut Upgrade) -> boo
             true
         }
     }
+}
+
+/// Remove each Channel that names a TCP Listener, by its `kind` or its
+/// interface `type`, and return one warning per Channel removed.
+///
+/// A TCP Listener Channel is a shape this build no longer has, so the strict
+/// typed parse would refuse the whole profile for it. Removing it first lets
+/// the rest load; the warning names it, so it is not lost silently.
+pub(super) fn drop_tcp_channels(doc: &mut Table) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(channels) = doc.get_mut("channels").and_then(Value::as_array_mut) else {
+        return warnings;
+    };
+    channels.retain(|channel| {
+        let Some(table) = channel.as_table() else {
+            return true;
+        };
+        let kind = table.get("kind").and_then(Value::as_str);
+        let interface = table
+            .get("interface")
+            .and_then(Value::as_table)
+            .and_then(|interface| interface.get("type"))
+            .and_then(Value::as_str);
+        let is_tcp = matches!(kind, Some("TcpListener" | "TcpConnection"))
+            || interface == Some("TcpListener");
+        if is_tcp {
+            let name = table
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("(unnamed)");
+            warnings.push(format!(
+                "channel \"{name}\" is a TCP Listener, which this release does not offer, \
+                 so it was left out"
+            ));
+        }
+        !is_tcp
+    });
+    warnings
 }

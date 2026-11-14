@@ -1,20 +1,16 @@
-//! Serial, UDP, TCP listener, and TCP connection transports.
+//! Serial and UDP transports.
 //!
 //! This is `listener-transport` (spec §128). It owns interface handles and
 //! receive buffers and knows nothing about NMEA, display, or recording formats.
 //! This file defines the **push-based transport contract** (§138, ADR-001): the
-//! types every transport emits and the runner traits the runtime drives; the
-//! concrete Serial/UDP/TCP runners live in the submodules.
-//!
-//! Two output shapes (§138):
-//! - data-bearing sources (Serial, UDP, TCP connection) emit [`ReceivedData`];
-//! - the connection acceptor (TCP listener) emits [`NewConnection`].
+//! types every transport emits and the runner trait the runtime drives; the
+//! concrete Serial/UDP runners live in the submodules. Each data-bearing source
+//! emits [`ReceivedData`].
 //!
 //! There is no pull-based `receive()`. Lifecycle is cancel-then-await: the
 //! runtime cancels the [`CancellationToken`], then awaits completion via
 //! [`TransportJoinHandle`].
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::sync::mpsc::Sender;
@@ -23,7 +19,6 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{ArrivalTimestampStatus, ChannelId, ChunkTime};
 
 pub mod serial;
-pub mod tcp;
 pub mod udp;
 
 pub use serial::{
@@ -31,7 +26,6 @@ pub use serial::{
     SerialTransport,
 };
 pub(crate) use serial::{SerialStallState, STALL_WARNING};
-pub use tcp::{BoundTcpListenerTransport, TcpConnectionTransport, TcpListenerTransport};
 pub use udp::{BoundUdpTransport, UdpMode, UdpTransport};
 
 /// One unit of received data emitted by a data-bearing transport (§104, §138).
@@ -44,31 +38,17 @@ pub use udp::{BoundUdpTransport, UdpMode, UdpTransport};
 pub struct ReceivedData {
     pub channel_id: ChannelId,
     /// The received bytes, appended to the stream verbatim whether the OS delivered
-    /// them as a stream chunk (Serial, TCP) or one whole datagram (UDP, §15).
+    /// them as a stream chunk (Serial) or one whole datagram (UDP, §15).
     pub payload: Vec<u8>,
     pub received_at: ChunkTime,
 }
 
-/// Emitted by a TCP listener when it accepts a client (§16, §138). The runtime
-/// mints the new connection's [`ChannelId`] on receipt — this event carries the
-/// *listener's* id plus the accepted stream and its metadata.
-#[derive(Debug)]
-pub struct NewConnection {
-    pub listener_channel_id: ChannelId,
-    pub remote_addr: SocketAddr,
-    pub accepted_at: ChunkTime,
-    /// The accepted connection (the reason this event exists). `remote_addr` and
-    /// `accepted_at` are metadata, not identity.
-    pub stream: tokio::net::TcpStream,
-}
-
-/// Why a transport's receive/accept loop ended (§94, §101, §111).
+/// Why a transport's receive loop ended (§94, §101, §111).
 #[derive(Debug)]
 pub enum TransportOutcome {
     /// Ended because its cancellation token was triggered — a normal stop (§111).
     Cancelled,
-    /// Ended with no error of its own: TCP EOF (the client closed), or the
-    /// downstream pipeline went away. Whether that is a fault is the caller's
+    /// Ended with no error of its own: the downstream pipeline went away. Whether that is a fault is the caller's
     /// call: a Channel's monitor faults it unless the Channel was being stopped.
     Completed,
     /// Ended on a fatal read/accept error (§94). The reader may have lost data at
@@ -147,7 +127,7 @@ pub enum TransportNotice {
 /// await transport completion uniformly (§138). Joining a blocking thread goes
 /// through an async-observable `oneshot`, so it never blocks a runtime worker.
 pub enum TransportJoinHandle {
-    /// A transport that runs as a Tokio task (UDP, TCP).
+    /// A transport that runs as a Tokio task (UDP).
     Task(tokio::task::JoinHandle<TransportOutcome>),
     /// A transport whose body runs on a dedicated OS thread (Serial); the thread
     /// reports its outcome on this `oneshot`.
@@ -172,21 +152,14 @@ fn unexpected_end(cause: impl std::fmt::Display) -> TransportOutcome {
     TransportOutcome::Faulted(format!("the receive task ended unexpectedly: {cause}"))
 }
 
-/// A data-bearing transport: Serial, UDP, or TCP connection (§138).
+/// A data-bearing transport: Serial or UDP (§138).
 ///
 /// Serial runs its body on a dedicated OS thread, preserving a pending block
-/// with bounded `try_send` retries while the queue is full; UDP/TCP run as
-/// Tokio tasks. `run` consumes the runner, so transports are dispatched by
+/// with bounded `try_send` retries while the queue is full; UDP runs as a
+/// Tokio task. `run` consumes the runner, so transports are dispatched by
 /// value (e.g. via an enum), not as `dyn` trait objects.
 pub trait DataTransportRunner {
     fn run(self, out: Sender<ReceivedData>, cancel: CancellationToken) -> TransportJoinHandle;
-}
-
-/// A connection-accepting transport: the TCP listener (§138). Not a data source
-/// — it emits [`NewConnection`], and the runtime turns each into a TCP
-/// connection channel.
-pub trait ConnectionAcceptorRunner {
-    fn run(self, out: Sender<NewConnection>, cancel: CancellationToken) -> TransportJoinHandle;
 }
 
 #[cfg(test)]

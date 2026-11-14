@@ -164,7 +164,7 @@ clean path and does not foreclose it.
 - Reconciliation covers **data channels** (serial/UDP) via the fault monitor. A
   TCP **listener-acceptor** fault is not reconciled through this flag in v1 (its
   supervisor reports per-connection faults as events); revisit if acceptor faults
-  need to surface as listener state.
+  need to surface as listener state. (TCP receive code removed 2026-11-14, ADR-047.)
 - Live readout of retained content (the stream scrollback / diagnostics under
   ADR-010; originally retained messages / decoded metadata) while a channel runs
   still requires the on-demand snapshot API — built since, and the message-era
@@ -294,7 +294,7 @@ the pipeline formats and routes it without assuming which channel a notice is fo
 The `run()` transport contract is left unchanged — UDP/TCP are async and never
 stall the reader, so their transport implementations do not receive a notice
 sender; serial attaches one via a builder. Terminal outcomes are joined and
-reported by runtime monitors outside that transport contract (ADR-020).
+reported by runtime monitors outside that transport contract (ADR-020). (TCP receive code removed 2026-11-14, ADR-047.)
 
 The live-stall notice path is **advisory and bounded** (`TRANSPORT_NOTICES`, 16):
 the serial reader uses `try_send` and drops on full, named explicitly because the
@@ -407,6 +407,7 @@ troubleshooting view, three ways:
   returning empty on a 100 ms cancellation timeout. A read can split a sentence
   anywhere; boundaries track OS buffering and timing, never content. So a Messages-
   or chunk-segmented viewer diverges between serial and UDP for the same data.
+(TCP receive code removed 2026-11-14, ADR-047.)
 
 The spec already defines the right source — `DisplaySource::Stream` (§18/§41), the
 verbatim pre-extraction bytes — but it was never surfaced: the chunk path (§53/§142)
@@ -714,6 +715,7 @@ live Serial receive loop. `TransportFaulted` is sent by the runtime monitor only
 after joining a failed transport and awaits queue capacity; TCP connection
 supervision uses the same helper. `run_channel` remains alive until both ingest and
 notice senders close, so it drains the terminal cause before retaining diagnostics.
+(TCP receive code removed 2026-11-14, ADR-047.)
 
 **Consequences.** Reception throughput and cancellation behavior are unchanged:
 only a post-reception monitor may wait. A full advisory queue can delay fault
@@ -730,7 +732,7 @@ its adoption by talker in talker ADR-027.
 **Decision:** Keep transport kind structural in the GUI. `+ Add` chooses the UDP, TCP,
 or Serial template, in that shared order. Configure Connection edits the selected
 template's parameters and never replaces its `InterfaceConfig` variant. Runtime-created
-TCP Connection Channels remain governed by their TCP Listener parent.
+TCP Connection Channels remain governed by their TCP Listener parent. (TCP receive code removed 2026-11-14, ADR-047.)
 
 **Consequences:** This records existing listener behavior rather than adding a new
 runtime path. Both apps now present one ordinary transport choice and the same Add-menu
@@ -858,7 +860,7 @@ chunk spent between transport delivery and pipeline processing. Its UDP, TCP, an
 Serial transports also constructed the payload vector before calling
 `ChunkTime::now`, so a large copy was omitted from any downstream userland-delay
 measurement. Calling that timestamp true wire arrival would overstate what a
-portable userland receiver can know.
+portable userland receiver can know. (TCP receive code removed 2026-11-14, ADR-047.)
 
 **Decision:** Every data transport captures `ChunkTime` immediately after its OS read
 returns and before copying the payload into its owned vector. `ChannelPipeline::ingest`
@@ -1247,7 +1249,7 @@ the thing being configured and the adapter it binds to.
 editor is **Configure interface**, matching Talker (talker ADR-044) and the
 `InterfaceConfig` type both applications already use. Host-adapter references say
 **network interface** or **NIC** explicitly, so the bind help cannot be read as
-describing the channel's configured endpoint.
+describing the channel's configured endpoint. (TCP receive code removed 2026-11-14, ADR-047.)
 
 Byte rates use the shared `human_byte_rate` helper rather than a hardcoded
 `kB/s`, so a fast channel reads `1.2 MB/s` and a stopped one reads `0.0 B/s`,
@@ -1820,6 +1822,13 @@ is down, and exits with a code a supervisor can act on.
 **Status:** Accepted 2026-09-30. Amends §1, §16, §68, §73, §76, §85, §153, §154,
 §162 and Appendix A; builds on ADR-024.
 
+**Amended 2026-11-14 (task G6):** the code is removed, not kept as the decision
+below says. A profile that names a TCP Listener loads without that Channel and
+with a warning naming it. This reverses the rejection of "hide the TCP Listener
+but keep loading it" below: what the user sees is the same as before, the Channel
+left out with a message, while the profile no longer fails to load or carries a
+kind the code cannot run. The text below is the decision as first made.
+
 **Context:** A TCP Listener accepts connections, but their data cannot be
 displayed or recorded (ADR-024). Offering it invites the belief that data is
 being captured. It also lacks what a shared network needs: its template binds
@@ -2155,7 +2164,7 @@ has ended.
   A pipeline that is gone returns no final snapshot, so the Channel's retained
   diagnostics do not show it.
 - A TCP connection, disabled in this release (§4.1), is supervised separately:
-  there `Completed` is still a client that closed.
+  there `Completed` is still a client that closed. (TCP receive code removed 2026-11-14, ADR-047.)
 
 **Consequences:** `Completed` no longer means "not a fault" on its own; whoever
 awaits the transport decides. A Channel with reconnect on now restarts after a

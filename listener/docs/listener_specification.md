@@ -1,17 +1,19 @@
-# Listener Specification v2.4.8
+# Listener Specification v2.4.9
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-13) — one display view:
+Revision note (2026-11-14) — TCP receive code removed:
 
-- **§11, §48, §50.2, §51, §54, §58, §78 (ADR-060).** A Channel has exactly one
-  display view, saved as `display.view`; the `views` list, `DisplayViewId` and
-  the `PauseDisplay` target are gone. Profiles saved with a `views` list still
-  load, keeping the first view and warning if there were more.
-- **§72.** The example profile is removed.
+- **§4, §7, §9, §13, §16, §69, §71, §73, §76, §85, §92, §94, §96, §97, §102,
+  §104, §137, §138, §154, §162, Appendix A (ADR-047).** The TCP Listener and TCP
+  Connection code is removed, no longer only disabled. §16 now points to
+  Appendix A, and the TCP kinds, events, transport contracts and templates are
+  gone from the sections that listed them.
+- **§72.** A saved profile that names a TCP Listener loads without that Channel,
+  with a warning naming it.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -140,25 +142,20 @@ Channel types:
 
 - Serial Channel
 - UDP Channel
-- TCP Listener Channel
-- TCP Connection Channel
 
 For user-created Serial and UDP Channels, the `+ Add` template chooses the
 transport kind. Configure Interface edits that kind's parameters but does not
-replace it with another transport. TCP Connection Channels remain runtime-created
-children of a TCP Listener Channel — *Connection* names an accepted peer session,
-never the configured endpoint, which is why the editor is Configure Interface.
+replace it with another transport. *Connection* never names the configured
+endpoint, which is why the editor is Configure Interface.
 
-**The TCP Listener and TCP Connection kinds are disabled in this release**
-(ADR-047): their received data cannot yet be displayed or recorded (ADR-024).
-They are not offered by `+ Add` or `--tcp`, and profile validation rejects a TCP
-Listener Channel (§71). §16 describes the design they return to.
+TCP Listener and TCP Connection Channels do not exist in this release (ADR-047).
+A profile that names one loads without it, and a warning names the Channel (§72).
 
 ### 4.2 Byte Stream
 
 A Byte Stream is an ordered sequence of received bytes.
 
-Serial and TCP Connection Channels produce Byte Streams.
+Serial Channels produce Byte Streams.
 
 ### 4.3 Stream
 
@@ -217,7 +214,6 @@ A Runtime Object exists only while Listener is running and is not persisted in P
 
 Examples:
 
-- TCP Connection Channels
 - Display History (stream scrollback)
 - Active file handles
 - Runtime warnings/errors
@@ -317,8 +313,6 @@ Supported Channel Kinds:
 enum ChannelKind {
     Serial,
     Udp,
-    TcpListener,
-    TcpConnection,
 }
 ```
 
@@ -352,7 +346,6 @@ Examples:
 
 - Opening serial port
 - Binding UDP socket
-- Creating TCP listener
 
 ### 8.3 Running
 
@@ -412,11 +405,7 @@ Faulted → Starting   (auto-reconnect only, after a backoff delay)
 
 Auto-reconnect is configured per Channel (`ReconnectPolicy`, §80.1) and is
 **disabled by default**, preserving the manual-recovery semantics above. It
-applies to Serial (covering USB hot-plug, §14.4) and UDP Channels. (It would
-apply to TCP Listener Channels, which are disabled in this release, §4.1.) It
-does **not** apply to TCP Connection Channels: the listener accepts connections
-and does not dial out (TCP client mode is deferred, Appendix A), so a dropped
-client simply ends. Each attempt emits a reconnect event (§137); after
+applies to Serial (covering USB hot-plug, §14.4) and UDP Channels. Each attempt emits a reconnect event (§137); after
 `max_attempts` (if set) the Channel remains Faulted.
 
 A successful reconnect does not end the sequence until the Channel has stayed
@@ -504,7 +493,6 @@ Examples:
 - Serial stop bits
 - Serial flow control
 - UDP bind port
-- TCP listener port
 
 When such a change is made while a Channel is Running:
 
@@ -522,11 +510,6 @@ Start Channel
 ```
 
 The byte counter (§25) resets only because the interface was stopped and started.
-
-Restarting a TCP Listener terminates all of its TCP Connection Channels (they are
-runtime-only — §16.3). A `TcpClientDisconnected` event (§137) shall be emitted for
-each terminated connection. Nothing is restored on restart; new connections are
-accepted fresh.
 
 ---
 
@@ -648,77 +631,8 @@ synthetic zero (§101).
 
 ## 16. TCP Listener and TCP Connection Channels
 
-_Disabled in this release (ADR-047)._ A TCP Listener is not offered by `+ Add`
-or `--tcp`, and profile validation rejects one: "TCP Listener isn't available
-in this release: received data can't be displayed or recorded yet." This section
-describes the design it returns to, together with ADR-024's surfacing and these
-prerequisites for shared networks: a default connection cap, TCP keepalive with
-idle, interval and probe count set for each OS, and per-connection handling of
-accept errors with rate-limited logging.
-
-### 16.1 TCP Listener Channel
-
-A TCP Listener Channel shall listen on a configured TCP address and port.
-
-The operating system TCP stack handles the TCP handshake. Listener does not send application-level acknowledgement to allow a client to transmit.
-
-A TCP Listener Channel is responsible for:
-
-- Accepting incoming client connections
-- Monitoring listener status
-- Creating TCP Connection Channels
-
-The TCP Listener Channel does not directly receive application data.
-
-When `max_connections` (§76) is configured and reached, the listener shall reject
-new incoming connections, preserve existing connections, and raise a
-`ConnectionRejected` warning (§93). Reaching the limit shall not fault the
-listener.
-
-### 16.2 TCP Connection Channel
-
-Each accepted TCP client connection shall be represented by a separate TCP Connection Channel.
-
-Each TCP Connection Channel shall have:
-
-- Independent Byte Stream
-- Independent Display Configuration
-- Independent Recording Configuration
-- Independent runtime state
-
-Data from different TCP clients shall not be merged into a common Byte Stream.
-
-_Scope (ADR-024; parked by user decision 2026-07-11):_ these independence
-requirements are architectural — each accepted connection runs its own full
-pipeline today. Their **user-facing surfacing is deferred** (Appendix A): the spec
-exposes connection channels through connect/disconnect lifecycle events only,
-with no per-connection snapshot, stream view, recording, or match rules, and
-`recv_buffer_bytes` (§76) is not yet applied to accepted sockets.
-
-### 16.3 TCP Connection Persistence
-
-TCP Connection Channels are runtime objects.
-
-TCP Connection Channels shall not be stored in:
-
-- Profiles
-- Configuration files
-- Project files
-
-Only TCP Listener Channel configuration is persisted.
-
-### 16.4 TCP Client Connection Model
-
-Use Model A:
-
-```text
-TCP Listener Channel
-  ├─ TCP Connection Channel: client A
-  ├─ TCP Connection Channel: client B
-  └─ TCP Connection Channel: client C
-```
-
-Each connection is displayed and processed separately.
+TCP receive is deferred (Appendix A, ADR-047). This release has no TCP Listener
+or TCP Connection Channel.
 
 ---
 
@@ -790,7 +704,7 @@ enabled, the recording timestamp sidecar (§57).
 
 > **Precision is not accuracy.** A finer timestamp resolution selects how finely a
 > time is displayed and stored; it does not guarantee timing accuracy. Post-read
-> Serial/TCP/UDP times include OS scheduling and driver-buffering jitter. Linux
+> Serial/UDP times include OS scheduling and driver-buffering jitter. Linux
 > software UDP timestamps can remove the post-receive userland scheduling portion,
 > but remain kernel/software, datagram-granular times rather than per-byte or hardware
 > wire times. See §133.
@@ -1414,7 +1328,6 @@ Profiles may contain:
 
 Profiles shall not contain:
 
-- TCP Connection Channels
 - Active connections
 - Display History (stream scrollback)
 - Active Recordings
@@ -1464,13 +1377,9 @@ Examples:
 GPS Receiver       Invalid: COM4 missing
 AIS Receiver       Valid
 UDP Feed           Valid
-TCP Feed           Invalid: TCP Listener isn't available in this release
 ```
 
 Resources that cannot be validated until Start shall be validated during Start.
-
-Validation shall reject a TCP Listener Channel with "TCP Listener isn't available
-in this release: received data can't be displayed or recorded yet" (ADR-047).
 
 **Strict parsing (ADR-048).** An unknown key, or a missing `schema_version`, is
 a parse error rather than a Channel error: the profile does not load, and the
@@ -1535,6 +1444,10 @@ struct ChannelConfig {
 The `extraction` and `decoder` fields are removed (there is no Message
 Extraction or decoding); `schema_version` bumps for this breaking change (§72.1).
 
+A Channel that names a TCP Listener (`kind = "TcpListener"` or `"TcpConnection"`,
+or `interface.type = "TcpListener"`) is left out when the profile loads, with a
+warning naming it (ADR-047).
+
 ### 72.1 Schema Version Compatibility
 
 `schema_version` is a single monotonically increasing `u32`. Each binary knows
@@ -1562,11 +1475,8 @@ define whether the older breaking schema is migrated or refused.
 enum InterfaceConfig {
     Serial(SerialConfig),
     Udp(UdpConfig),
-    TcpListener(TcpListenerConfig), // rejected by validation in this release (§16)
 }
 ```
-
-There is no persisted `TcpConnectionConfig`.
 
 ## 74. Serial Configuration
 
@@ -1610,16 +1520,7 @@ The OS may grant less receive buffer than requested (Linux caps it at
 
 ## 76. TCP Listener Configuration
 
-_Disabled in this release (§16)._
-
-```rust
-struct TcpListenerConfig {
-    bind_address: String,
-    port: u16,
-    max_connections: Option<u32>,
-    recv_buffer_bytes: Option<usize>,    // SO_RCVBUF for accepted connections
-}
-```
+Removed with TCP receive (ADR-047); deferred, Appendix A.
 
 ### 76.1 Network Live Adjustment (troubleshooting)
 
@@ -1835,16 +1736,7 @@ Display: Raw + Hex
 
 ## 85. TCP Listener Template
 
-_Not offered in this release (§16)._ When the TCP Listener returns, its template
-gains a default connection cap. Defaults as they stood:
-
-```text
-Kind: TCP Listener
-Name: TCP Listener
-Bind Address: 0.0.0.0
-Max Connections: unset
-Recording: Disabled
-```
+Removed with TCP receive (ADR-047); deferred, Appendix A.
 
 ---
 
@@ -2018,8 +1910,6 @@ Examples:
 
 - Channel Started
 - Channel Stopped
-- TCP Client Connected
-- TCP Client Disconnected
 - Recording Enabled
 - Recording Disabled
 - Profile Loaded
@@ -2043,7 +1933,6 @@ Examples:
 
 - COM port not found
 - COM port access denied
-- TCP bind failure
 - UDP bind failure
 - Recording file creation failure
 
@@ -2066,7 +1955,6 @@ Failures shall be isolated to the smallest affected subsystem whenever practical
 Examples:
 
 - Recording Failure faults Recording but does not stop Reception.
-- TCP client failure does not stop the TCP Listener.
 - One Channel failure does not stop other Channels.
 
 ---
@@ -2096,8 +1984,7 @@ Listener uses a hybrid runtime model.
   `Sender::try_send`; on `Full`, they preserve the pending block and retry at a bounded
   cadence while observing cancellation.
 - Transport abstractions are push-based. Data-bearing transports emit
-  `ReceivedData`; TCP Listener transports emit `NewConnection`.
-- The runtime mints `ChannelId` values for accepted TCP connections.
+  `ReceivedData`.
 
 Consequences:
 
@@ -2234,7 +2121,7 @@ diagnostic and runtime event are omitted and no metric changes.
 
 ## 102. Processing Pipeline
 
-All Channels share one stream pipeline. UDP datagrams and serial/TCP byte chunks differ only in how the transport reads them; both become `ReceivedData` (§138):
+All Channels share one stream pipeline. UDP datagrams and serial byte chunks differ only in how the transport reads them; both become `ReceivedData` (§138):
 
 ```text
 Receive Bytes (chunk / datagram)
@@ -2273,8 +2160,6 @@ Transport owns:
 
 - Serial handles
 - UDP sockets
-- TCP listener sockets
-- TCP connection sockets
 - Transport receive buffers
 - The per-open Serial stall-state cell and its episode begin/complete boundaries
 
@@ -2608,8 +2493,6 @@ Owns:
 
 - Serial transport
 - UDP transport
-- TCP listener transport
-- TCP connection transport
 - `ReceivedData`
 - Per-open Serial stall state and reader-side episode measurement boundaries
 
@@ -2719,8 +2602,6 @@ pub struct ChannelName(String);
 pub enum ChannelKind {
     Serial,
     Udp,
-    TcpListener,
-    TcpConnection,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2813,8 +2694,6 @@ pub enum RuntimeEvent {
     RecordingFaulted(ChannelId, RecordingTap),
     RecordingStarted(ChannelId, RecordingTap), // one recording lane began OK (§50.2); clears that lane's prior fault
     WarningRaised(ChannelId),
-    TcpClientConnected(ChannelId),
-    TcpClientDisconnected(ChannelId),
     // Live-adjustment additions
     ReceptionStalled(ChannelId, Duration),    // §101/ADR-007: dedicated, replaces the WarningRaised overload
     ReceptionResumed(ChannelId, Duration),    // §101: a stall that raised ReceptionStalled ended; its full length
@@ -2850,24 +2729,15 @@ Per ADR-001 (§97.1), transports are push-based and split by output shape. These
 are internal runtime contracts, not stable public traits — a public transport
 trait would become a plugin seam, and plugin architecture is deferred
 (Appendix A). The required shape is what matters, not the exact spelling: data
-sources emit `ReceivedData`; connection acceptors emit `NewConnection`.
+sources emit `ReceivedData`.
 
 ```rust
-// Data-bearing sources: Serial, UDP, TCP Connection.
-// Serial runs its body on a dedicated OS thread; UDP/TCP on a Tokio task.
+// Data-bearing sources: Serial, UDP.
+// Serial runs its body on a dedicated OS thread; UDP on a Tokio task.
 pub trait DataTransportRunner {
     fn run(
         self,
         out: tokio::sync::mpsc::Sender<ReceivedData>,
-        cancel: tokio_util::sync::CancellationToken,
-    ) -> TransportJoinHandle;
-}
-
-// Connection-accepting source: TCP Listener. Not a data source.
-pub trait ConnectionAcceptorRunner {
-    fn run(
-        self,
-        out: tokio::sync::mpsc::Sender<NewConnection>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> TransportJoinHandle;
 }
@@ -2886,7 +2756,7 @@ cancels the token, then awaits completion via `TransportJoinHandle`.
 ```rust
 pub struct ReceivedData {
     pub channel_id: ChannelId,
-    // One read: a stream chunk (serial / TCP), or exactly one UDP datagram,
+    // One read: a stream chunk (serial), or exactly one UDP datagram,
     // whose boundary is preserved as a recording detail (§15).
     pub payload: Vec<u8>,
     pub received_at: ChunkTime,
@@ -2902,15 +2772,6 @@ pub struct ChunkTime {
 }
 
 pub enum ArrivalTimestampSource { PostRead, KernelSoftware }
-
-pub struct NewConnection {
-    pub listener_channel_id: ChannelId,
-    pub remote_addr: std::net::SocketAddr,
-    pub accepted_at: ChunkTime,
-    // The emitted value also carries the accepted stream (the reason it exists);
-    // remote_addr / accepted_at are metadata, not identity. The runtime mints the
-    // new connection's ChannelId on receipt.
-}
 ```
 
 ## 139. Message Extractor Trait
@@ -3021,11 +2882,10 @@ Recommended implementation order (for the strip to stream-only, follow ADR-010's
 4. byte-bounded retention / stream scrollback
 5. UDP transport
 6. serial transport
-7. TCP listener/connection transport
-8. raw recording (`.raw`), then rendering + display recording (`.disp`)
-9. stream find/triggers (`BytePattern` across chunks, `Idle`)
-10. config/schema + profiles (v1 refusal)
-11. CLI, then GUI
+7. raw recording (`.raw`), then rendering + display recording (`.disp`)
+8. stream find/triggers (`BytePattern` across chunks, `Idle`)
+9. config/schema + profiles (v1 refusal)
+10. CLI, then GUI
 
 Do not start with GUI.
 
@@ -3062,7 +2922,6 @@ Required tests:
 - Display recording reflects the rendered view
 - File rotation (hourly/daily, clean boundary, filesystem-safe name)
 - Display Pause behavior
-- TCP Connection Channel creation
 - State transitions
 - Queue overflow handling (single backpressure edge; consumers drop/fault)
 - Failure isolation
@@ -3109,9 +2968,7 @@ A user shall be able to:
 
 ## 154. TCP Connections
 
-_Deferred with the TCP Listener (§16)._ When it returns, a TCP Listener shall
-accept incoming clients, create one TCP Connection Channel per client, keep
-client streams independent, and avoid persisting TCP Connection Channels.
+Removed with TCP receive (ADR-047); deferred, Appendix A.
 
 ## 155. Stream Find and Triggers
 
@@ -3179,7 +3036,6 @@ Profile loading shall not:
 
 - Start Channels.
 - Begin recording.
-- Restore TCP Connection Channels.
 - Restore runtime state.
 
 A user shall be able to register one profile to resume on GUI launch, and cancel
@@ -3208,7 +3064,7 @@ affect reception or Recording (§14.2–§14.3).
 With auto-reconnect enabled on a Serial or UDP Channel, a transport fault shall
 trigger automatic re-Start with backoff (`Faulted → Starting`, §9.1), bounded by
 `max_attempts`. With it disabled (the default), a Faulted Channel stays Faulted.
-TCP Connection Channels shall not auto-reconnect. The GUI shall show the choice
+The GUI shall show the choice
 and the attempt in words (§9.1).
 
 ## 163. File Rotation
@@ -3264,10 +3120,11 @@ Deferred (ADR-023/ADR-024/ADR-047):
 
 - Multiple simultaneous Display Views per Channel (§48 — one view with switchable
   modes ships; per-view render state would be required for independent pause)
-- The TCP Listener and TCP Connection Channels (§16, ADR-047). They return with
-  ADR-024's surfacing — per-connection snapshots/stream view, per-connection
+- The TCP Listener and TCP Connection Channels (§16, ADR-047). The code was
+  removed and returns with the feature, together with ADR-024's surfacing —
+  per-connection snapshots/stream view, per-connection
   recording (needs §59 filename templating), per-connection match rules, and
-  `recv_buffer_bytes` on accepted sockets — and with a default connection cap,
+  `recv_buffer_bytes` on accepted sockets — and a default connection cap,
   per-OS keepalive timings, and per-connection accept-error handling
 - Export (§60–§64)
 - Network live adjustment: receive buffer and multicast membership without a
@@ -3321,7 +3178,7 @@ Fan-out (Display / Raw Recording / Display Recording / Find)
 
 ## B.3 TCP
 
-_Deferred with the TCP Listener (§16)._
+_Deferred with the TCP Listener (Appendix A); no code exists for it._
 
 ```text
 TCP Listener Channel
@@ -3352,5 +3209,4 @@ this specification**, not agent advice, and remain in their authoritative locati
 - *Immutable received chunks, GUI out of core* — §103 and listener [`ADR.md`](ADR.md)
   ADR-010 (decoders and Messages are removed).
 - *Display formatting must not affect Raw Recording* — §5.6 / §53–§54.
-- *Runtime TCP Connection Channels are not persisted* — the TCP transport sections.
 

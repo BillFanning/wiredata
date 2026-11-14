@@ -49,8 +49,7 @@ pub struct ChannelConfig {
 
 /// Opt-in auto-reconnect policy (§9.1, §162). When `enabled`, a Channel that
 /// faults while it was meant to be Running is automatically re-Started with
-/// exponential backoff. Applies to Serial/UDP/TCP-Listener Channels, never TCP
-/// Connection Channels (the listener does not dial out).
+/// exponential backoff. Applies to Serial and UDP Channels.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReconnectPolicy {
@@ -94,14 +93,12 @@ impl Default for ReconnectPolicy {
     }
 }
 
-/// Interface configuration (§73). There is no persisted `TcpConnectionConfig` —
-/// connection channels are runtime-only (§16.3).
+/// Interface configuration (§73).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum InterfaceConfig {
     Serial(SerialConfig),
     Udp(UdpConfig),
-    TcpListener(TcpListenerConfig),
 }
 
 /// Serial interface configuration (§74). Uses the listener-level §80.1 enums
@@ -198,19 +195,6 @@ pub struct UdpConfig {
 /// enough to ride out a pause in reading at the 1,000 datagrams a second the
 /// headroom target sends (ADR-048).
 pub const DEFAULT_RECV_BUFFER_BYTES: usize = 4 * 1024 * 1024;
-
-/// TCP listener interface configuration (§76).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TcpListenerConfig {
-    pub bind_address: String,
-    pub port: u16,
-    #[serde(default)]
-    pub max_connections: Option<u32>,
-    /// SO_RCVBUF in bytes for accepted connections (§167); `None` = OS default.
-    #[serde(default)]
-    pub recv_buffer_bytes: Option<usize>,
-}
 
 /// Display configuration: the Channel's one view (§48, §78).
 ///

@@ -517,9 +517,9 @@ fn build_channel_configs(cli: &Cli, console: &Console) -> Result<Vec<ChannelConf
 }
 
 /// One line for a runtime event, naming the Channel (§3.1). An id with no name
-/// (a TCP connection) is shown as its UUID. Lifecycle events give no line: the
-/// health watch reports a Channel going down, its reminders and its recovery,
-/// instead of a line for every retry.
+/// is shown as its UUID. Lifecycle events give no line: the health watch
+/// reports a Channel going down, its reminders and its recovery, instead of a
+/// line for every retry.
 fn format_event(event: &RuntimeEvent, names: &HashMap<ChannelId, String>) -> Option<String> {
     let label = |id: &ChannelId| names.get(id).cloned().unwrap_or_else(|| id.to_string());
     Some(match event {
@@ -546,10 +546,6 @@ fn format_event(event: &RuntimeEvent, names: &HashMap<ChannelId, String>) -> Opt
             label(id),
             compact_duration(*dur),
         ),
-        RuntimeEvent::TcpClientConnected(id) => format!("[{}] TCP client connected", label(id)),
-        RuntimeEvent::TcpClientDisconnected(id) => {
-            format!("[{}] TCP client disconnected", label(id))
-        }
         RuntimeEvent::ControlLinesChanged(id) => format!("[{}] control lines changed", label(id)),
         RuntimeEvent::DiskSpaceLow(id) => format!("[{}] LOW DISK", label(id)),
         RuntimeEvent::RecordingStoppedLowDisk(id) => {
@@ -791,8 +787,8 @@ mod tests {
 
     #[test]
     fn events_name_the_channel_rather_than_its_uuid() {
-        // §3.1: output names Channels by name. An id with no name (a TCP
-        // connection) falls back to the UUID.
+        // §3.1: output names Channels by name. An id with no name falls
+        // back to the UUID.
         let id = crate::core::ChannelId::new();
         let names = std::collections::HashMap::from([(id, "GPS feed".to_owned())]);
         assert_eq!(

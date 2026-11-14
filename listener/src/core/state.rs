@@ -1,13 +1,11 @@
 //! Channel kinds and the lifecycle/state enums (spec §7, §8, §11, §12, §130),
 //! plus the §9 state-transition rules.
 
-/// The four supported Channel kinds (§7).
+/// The supported Channel kinds (§7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChannelKind {
     Serial,
     Udp,
-    TcpListener,
-    TcpConnection,
 }
 
 /// Channel lifecycle state (§8).

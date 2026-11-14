@@ -1,11 +1,11 @@
-//! Integration tests: profile load/save behavior (spec §70, §159, §16.3).
+//! Integration tests: profile load/save behavior (spec §70, §159).
 //! Black-box — public API only.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use listener::config::{templates, HexGrouping, Profile, RetentionConfig};
-use listener::core::{ChannelKind, ChannelState};
+use listener::core::ChannelState;
 use listener::runtime::Listener;
 
 /// A unique temp path per call. Tests in one binary run concurrently, so the
@@ -22,10 +22,7 @@ fn temp_profile_path() -> PathBuf {
 #[test]
 fn profile_round_trips_through_a_toml_file() {
     let mut profile = Profile::new("integration workspace");
-    profile.channels = vec![
-        templates::udp_template(),
-        templates::tcp_listener_template(),
-    ];
+    profile.channels = vec![templates::udp_template(), templates::serial_template()];
 
     let path = temp_profile_path();
     profile.save(&path).unwrap();
@@ -41,10 +38,7 @@ fn loading_a_profile_does_not_start_channels() {
     // channel or begins recording. There is no runtime state to restore
     // (message numbers, connections): the schema has no place for it (§159).
     let mut profile = Profile::new("workspace");
-    profile.channels = vec![
-        templates::udp_template(),
-        templates::tcp_listener_template(),
-    ];
+    profile.channels = vec![templates::udp_template(), templates::serial_template()];
 
     let path = temp_profile_path();
     profile.save(&path).unwrap();
@@ -156,15 +150,29 @@ byte_limit = 65536
 }
 
 #[test]
-fn profiles_cannot_contain_tcp_connection_channels() {
-    // §16.3: TCP Connection channels are runtime-only and never persisted.
-    let mut connection = templates::tcp_listener_template();
-    connection.kind = ChannelKind::TcpConnection;
+fn a_profile_that_names_a_tcp_listener_loads_without_it() {
+    // TCP Listener Channels are no longer offered. A profile saved with one
+    // still loads: the Channel is left out and a warning names it.
     let mut profile = Profile::new("workspace");
-    profile.channels = vec![connection];
+    profile.channels = vec![templates::udp_template()];
+    let text = format!(
+        "{}
+[[channels]]
+kind = \"TcpListener\"
+name = \"old_tcp\"
+         [channels.interface]
+type = \"TcpListener\"
+bind_address = \"0.0.0.0\"
+         port = 7000
+max_connections = 4
+",
+        profile.to_toml().unwrap()
+    );
 
-    let results = profile.validate();
-    assert!(results[0].1.is_err());
+    let (loaded, warnings) = Profile::from_toml_with_warnings(&text).unwrap();
+    assert_eq!(loaded, profile);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("old_tcp"), "{warnings:?}");
 }
 
 #[test]

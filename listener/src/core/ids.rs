@@ -1,8 +1,7 @@
 //! Channel and configuration identifiers (spec §129, §80.1).
 //!
 //! `ChannelId` is a runtime object minted while Listener runs (§97.1: the
-//! runtime mints `ChannelId`s, including one per accepted TCP
-//! connection). `StableConfigId` is the persisted identity stored in a profile
+//! runtime mints `ChannelId`s). `StableConfigId` is the persisted identity stored in a profile
 //! (§72, `ChannelConfig::id`).
 
 use std::fmt;

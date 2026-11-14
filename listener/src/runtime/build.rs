@@ -13,12 +13,11 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 
 use crate::config::schema::{
     DataBits as CfgDataBits, DisplayViewConfig, FlowControl as CfgFlowControl, Parity as CfgParity,
-    SerialConfig, StopBits as CfgStopBits, TcpListenerConfig, UdpConfig,
+    SerialConfig, StopBits as CfgStopBits, UdpConfig,
 };
 use crate::core::ChannelId;
 use crate::display::DisplayView;
 use crate::transport::serial::SerialTransport;
-use crate::transport::tcp::TcpListenerTransport;
 use crate::transport::udp::UdpTransport;
 
 /// A configuration could not be realized as a runtime object.
@@ -154,15 +153,6 @@ pub fn build_udp(channel_id: ChannelId, config: &UdpConfig) -> Result<UdpTranspo
         transport = transport.with_shared_port();
     }
     Ok(transport)
-}
-
-/// Build an unbound TCP listener transport (§16, §76).
-pub fn build_tcp_listener(
-    channel_id: ChannelId,
-    config: &TcpListenerConfig,
-) -> Result<TcpListenerTransport, BuildError> {
-    let addr = socket_addr(&config.bind_address, config.port)?;
-    Ok(TcpListenerTransport::new(channel_id, addr))
 }
 
 #[cfg(test)]

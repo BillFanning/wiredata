@@ -436,7 +436,7 @@ impl ChannelPipeline {
     pub fn new(channel_id: ChannelId, caps: PipelineCapacities) -> Self {
         Self {
             channel_id,
-            // A Channel without a configured name (a TCP connection) is named
+            // A Channel without a configured name is named
             // by its UUID; `with_channel_name` replaces it.
             channel_name: channel_id.to_string(),
             stream_generation: NEXT_STREAM_GENERATION.fetch_add(1, Ordering::Relaxed),

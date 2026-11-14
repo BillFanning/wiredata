@@ -2,18 +2,17 @@
 //! Channel lifecycle (spec §10, §97, §110, §111).
 //!
 //! `spawn_monitored_channel` is the runtime's per-Channel setup for a single
-//! data-bearing transport (Serial, UDP, or an accepted TCP connection): it
-//! creates the bounded Transport→Pipeline queue (§97.2), spawns the pipeline
-//! task, hands the transport its `out` sender, and adds the fault monitor. The
-//! returned `MonitoredChannel` owns the cancellation tokens and join handles
-//! for shutdown.
+//! data-bearing transport (Serial or UDP): it creates the bounded
+//! Transport→Pipeline queue (§97.2), spawns the pipeline task, hands the
+//! transport its `out` sender, and adds the fault monitor. The returned
+//! `MonitoredChannel` owns the cancellation tokens and join handles for
+//! shutdown.
 //!
 //! `spawn_channel_tasks` is the lower-level primitive: it takes an externally
-//! supplied event sender (so many channels can share one event stream, as the
-//! TCP listener supervisor does) and returns the raw `ChannelTasks`. A
-//! test-only `start_data_channel`/`RunningChannel` wrapper runs one standalone
-//! channel with its own event receiver, so the spawn/monitor/stop paths are
-//! testable without a `Listener` registry.
+//! supplied event sender (so many channels can share one event stream) and
+//! returns the raw `ChannelTasks`. A test-only `start_data_channel`/`RunningChannel` wrapper runs one standalone channel
+//! with its own event receiver, so the spawn/monitor/stop paths are testable
+//! without a `Listener` registry.
 //!
 //! Two shutdown paths:
 //! - graceful (§110): stop reception first, then let the pipeline drain the
@@ -62,12 +61,13 @@ pub(crate) struct MatchSetup {
     /// stop/start within a session (§88). Empty for a first start.
     pub(crate) prior_diagnostics: Vec<crate::diagnostics::Diagnostic>,
     /// The configured Channel name, for diagnostics and the event log (§118).
-    /// `None` names the Channel by its UUID (a TCP connection has no name).
+    /// `None` names the Channel by its UUID.
     pub(crate) channel_name: Option<String>,
 }
 
 impl MatchSetup {
-    /// No Match Rules (standalone and per-connection channels for now).
+    /// No Match Rules (test-only standalone channels).
+    #[cfg(test)]
     pub(crate) fn none() -> Self {
         Self {
             rules: Vec::new(),
@@ -131,8 +131,8 @@ async fn record_fault_cause(
 }
 
 /// The transport + pipeline tasks for one Channel. A plain holder, destructured
-/// by [`spawn_monitored_channel`] and the TCP listener supervisor (which each do
-/// their own transport-outcome monitoring).
+/// by [`spawn_monitored_channel`], which does its own transport-outcome
+/// monitoring.
 pub(crate) struct ChannelTasks {
     pub(crate) channel_id: ChannelId,
     pub(crate) transport_cancel: CancellationToken,
@@ -354,8 +354,7 @@ impl MonitoredChannel {
 
 /// Like [`spawn_channel_tasks`] but adds a fault monitor that awaits the
 /// transport outcome and emits `ChannelFaulted` if it ended on a fault (§94,
-/// §101). Used for standalone and orchestrated data channels; the TCP supervisor
-/// does its own per-connection monitoring instead.
+/// §101). Used for standalone and orchestrated data channels.
 ///
 /// `faulted` is the shared per-channel fault flag (listener ADR-006): the
 /// detached monitor cannot mutate the method-based orchestrator's state, so it

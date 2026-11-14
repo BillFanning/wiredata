@@ -1,4 +1,4 @@
-//! Integration tests: loopback UDP/TCP channels driven through the runtime
+//! Integration tests: loopback UDP channels driven through the runtime
 //! orchestrator (spec §153–§155). Black-box — public API only. v2.0 is stream-
 //! only: there are no Messages, so tests assert on the verbatim stream scrollback
 //! and byte-based liveness via on-demand snapshots (ADR-010).
@@ -8,7 +8,6 @@ use std::time::Duration;
 use listener::config::InterfaceConfig;
 use listener::core::{ChannelId, ChannelState, RuntimeEvent};
 use listener::runtime::{ChannelSnapshot, Listener};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Receiver;
 
 /// Reserve a loopback port for a channel to bind, without the classic
@@ -47,10 +46,6 @@ fn free_udp_port() -> u16 {
     reserve_port(|p| std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok())
 }
 
-fn free_tcp_port() -> u16 {
-    reserve_port(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
-}
-
 /// Poll a running channel's snapshot until `pred` is satisfied, or time out.
 /// Replaces the v1 `MessageReceived`-event wait — liveness is byte-based now.
 async fn await_snapshot(
@@ -81,21 +76,6 @@ async fn stream_bytes(listener: &Listener, id: ChannelId) -> Vec<u8> {
         .await
         .map(|d| d.bytes.to_vec())
         .unwrap_or_default()
-}
-
-/// Await the next `TcpClientConnected` event, with a timeout.
-async fn next_connection(events: &mut Receiver<RuntimeEvent>) -> ChannelId {
-    let wait = async {
-        loop {
-            match events.recv().await.expect("event stream closed") {
-                RuntimeEvent::TcpClientConnected(id) => return id,
-                _ => continue,
-            }
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), wait)
-        .await
-        .expect("timed out waiting for a connection")
 }
 
 async fn stop(listener: &mut Listener, id: ChannelId) {
@@ -395,35 +375,6 @@ async fn udp_channel_match_rule_fires_an_action_and_is_observable() {
     assert_eq!(fired, 1, "{:#?}", snap.diagnostics.warnings);
 
     stop(&mut listener, id).await;
-}
-
-#[tokio::test]
-async fn tcp_listener_accepts_a_client_and_receives_data() {
-    let port = free_tcp_port();
-    let mut config = listener::config::templates::tcp_listener_template();
-    if let InterfaceConfig::TcpListener(tcp) = &mut config.interface {
-        tcp.bind_address = "127.0.0.1".to_string();
-        tcp.port = port;
-    }
-
-    let mut listener = Listener::with_default_capacities();
-    let mut events = listener.take_events().unwrap();
-    let id = listener.add_channel(config);
-    listener.start(id).await.unwrap();
-
-    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    // A fresh connection channel is minted, distinct from the listener (§16.4).
-    let conn_id = next_connection(&mut events).await;
-    assert_ne!(conn_id, id);
-
-    client.write_all(b"sentence\n").await.unwrap();
-
-    // Stopping the listener terminates its connections (§13). (Per-connection
-    // snapshots are deferred, so we assert the lifecycle here.)
-    stop(&mut listener, id).await;
-    assert_eq!(listener.state(id), Some(ChannelState::Stopped));
 }
 
 #[tokio::test]
