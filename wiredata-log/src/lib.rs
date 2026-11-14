@@ -1428,9 +1428,7 @@ mod tests {
             emit(&writer, b"ordinary event");
             completed_tx.send(()).unwrap();
         });
-        let completed_without_tracker = completed_rx
-            .recv_timeout(Duration::from_millis(250))
-            .is_ok();
+        let completed_without_tracker = completed_rx.recv_timeout(Duration::from_secs(30)).is_ok();
         drop(tracker_guard);
         producer.join().unwrap();
 

@@ -662,6 +662,26 @@ fn service_control_lines(
     channel_id: ChannelId,
     next_line_poll: &mut Instant,
 ) {
+    service_control_lines_at(
+        Instant::now(),
+        reader,
+        ctl,
+        lines,
+        channel_id,
+        next_line_poll,
+    );
+}
+
+/// [`service_control_lines`] with the clock passed in, so the poll cadence is
+/// testable without waiting on wall-clock time.
+fn service_control_lines_at(
+    now: Instant,
+    reader: &mut impl BlockingReader,
+    ctl: &mut SerialControlHooks,
+    lines: &mut SerialControlLines,
+    channel_id: ChannelId,
+    next_line_poll: &mut Instant,
+) {
     let mut changed = false;
     while let Ok(cmd) = ctl.commands.try_recv() {
         let applied = match cmd {
@@ -672,7 +692,6 @@ fn service_control_lines(
     }
     // A just-applied command re-polls immediately (fresh feedback on lines a
     // driven RTS/DTR may loop back); otherwise honor the cadence.
-    let now = Instant::now();
     if !changed && now < *next_line_poll {
         return;
     }
@@ -996,14 +1015,13 @@ mod tests {
         cancel.cancel();
     }
 
-    #[tokio::test]
-    async fn input_line_polling_is_throttled_not_per_read() {
-        // The four input-line ioctls used to run before EVERY read — at high chunk
-        // rates, more driver round-trips than the data itself. They are now gated
-        // to CONTROL_LINE_POLL_INTERVAL. The idle ControlReader turns a read
-        // around in ~1 ms, so ~150 ms of loop means ~150 reads: per-read polling
-        // would count ~150; the throttle allows the initial poll plus one due
-        // refresh (a generous ceiling absorbs scheduler jitter).
+    #[test]
+    fn input_line_polling_is_throttled_not_per_read() {
+        // The four input-line ioctls are gated to CONTROL_LINE_POLL_INTERVAL,
+        // not run before every read. The loop calls `service_control_lines_at`
+        // once per read; this drives it with a synthetic clock, one call per
+        // simulated millisecond, so the count does not depend on how fast the
+        // machine runs.
         #[derive(Clone, Default)]
         struct CountingReader {
             inner: ControlReader,
@@ -1025,43 +1043,53 @@ mod tests {
             }
         }
 
-        let reader = CountingReader::default();
+        let mut reader = CountingReader::default();
         let polls = reader.input_polls.clone();
         let (_cmd_tx, cmd_rx) = mpsc::channel(8);
         let (ev_tx, _ev_rx) = mpsc::channel(8);
-        let cancel = CancellationToken::new();
-        let (tx, _rx) = mpsc::channel(8);
-        let hooks = SerialControlHooks {
+        let mut hooks = SerialControlHooks {
             commands: cmd_rx,
             state: Arc::new(Mutex::new(SerialControlLines::default())),
             events: ev_tx,
         };
-        let loop_cancel = cancel.clone();
-        let handle = std::thread::spawn(move || {
-            run_blocking_receive_loop(
-                ChannelId::new(),
-                reader,
-                tx,
-                loop_cancel,
-                STALL_WARNING,
-                SerialReceiveHooks {
-                    control: Some(hooks),
-                    ..SerialReceiveHooks::default()
-                },
-            )
-        });
+        let mut lines = SerialControlLines::default();
+        let cid = ChannelId::new();
+        let start = Instant::now();
+        let mut next_line_poll = start;
+        let mut call = |at_ms: u64| {
+            service_control_lines_at(
+                start + Duration::from_millis(at_ms),
+                &mut reader,
+                &mut hooks,
+                &mut lines,
+                cid,
+                &mut next_line_poll,
+            );
+        };
+        let interval_ms = CONTROL_LINE_POLL_INTERVAL.as_millis() as u64;
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        cancel.cancel();
-        handle.join().unwrap();
-
-        let count = *polls.lock().unwrap();
-        assert!(count >= 1, "the initial input-line poll must happen");
-        assert!(
-            count <= 5,
-            "input polling must follow the ~10 Hz cadence, not per-read \
-             (got {count} polls in ~150 ms of ~1 ms reads)"
+        // One call per simulated 1 ms read, for just under one interval: the
+        // initial poll happens, and no other.
+        for ms in 0..interval_ms {
+            call(ms);
+        }
+        assert_eq!(
+            *polls.lock().unwrap(),
+            1,
+            "only the initial poll within one interval of 1 ms reads"
         );
+
+        // The first read at or after the interval polls once more.
+        call(interval_ms);
+        assert_eq!(*polls.lock().unwrap(), 2, "one due refresh");
+
+        // And a further interval of reads adds exactly one.
+        for ms in interval_ms + 1..2 * interval_ms {
+            call(ms);
+        }
+        assert_eq!(*polls.lock().unwrap(), 2);
+        call(2 * interval_ms);
+        assert_eq!(*polls.lock().unwrap(), 3);
     }
 
     #[tokio::test]

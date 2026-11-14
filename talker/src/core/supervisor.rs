@@ -1290,9 +1290,9 @@ mod tests {
         samples: &mut Vec<PayloadSample>,
         mut done: impl FnMut(&TalkerSupervisor) -> bool,
     ) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !done(sup) {
-            assert!(Instant::now() < deadline, "condition not reached in 5 s");
+            assert!(Instant::now() < deadline, "condition not reached in 30 s");
             samples.extend(sup.poll());
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1608,7 +1608,10 @@ mod tests {
         );
         // No polls while the 1 ms every-send cadence overfills the
         // STATUS_QUEUE_CAP lane (256 + margin sends).
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // The deadline is only a failure guard for a runner that never
+        // starts: the loop ends as soon as the count is reached, however
+        // slowly a loaded machine schedules the 1 ms cadence.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while sent.lock().unwrap().len() <= STATUS_QUEUE_CAP + 16 {
             assert!(Instant::now() < deadline, "interface never saturated");
             std::thread::sleep(Duration::from_millis(5));

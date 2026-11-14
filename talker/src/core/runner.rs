@@ -2770,15 +2770,21 @@ mod tests {
     }
 
     #[test]
-    fn send_failure_reports_connection_error_and_keeps_running() {
+    fn send_failure_reports_send_failed_and_keeps_running() {
         let (_, handle, id) = spawn_runner(&[msg("AB", 10)], true);
-        std::thread::sleep(Duration::from_millis(40));
+        // Wait on the status itself; the timeout is only a failure guard.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut saw_error = false;
-        for s in handle.status_rx.try_iter() {
-            if let TalkerStatus::SendFailed { channel, message } = s {
-                assert_eq!(channel, id, "errors carry the stable id");
-                assert!(message.contains("mock send failure"));
-                saw_error = true;
+        while !saw_error {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match handle.status_rx.recv_timeout(remaining) {
+                Ok(TalkerStatus::SendFailed { channel, message }) => {
+                    assert_eq!(channel, id, "errors carry the stable id");
+                    assert!(message.contains("mock send failure"));
+                    saw_error = true;
+                }
+                Ok(_) => {}
+                Err(_) => break,
             }
         }
         assert!(saw_error, "expected at least one SendFailed");
@@ -2974,12 +2980,12 @@ mod tests {
         });
         let handle = spawn_interface_runner(interface, None);
 
-        // Let the episode open (first failure) and some fires get withheld,
-        // then heal the interface: the next backoff retry closes the episode.
-        std::thread::sleep(Duration::from_millis(50));
-        fail.store(false, std::sync::atomic::Ordering::SeqCst);
-
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Wait until the episode is open (first failure) and a fire has been
+        // withheld, as the live counters say, then heal the interface: the
+        // next backoff retry closes the episode. The deadline is only a
+        // failure guard.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut healed = false;
         let mut recovered = None;
         while recovered.is_none() {
             assert!(
@@ -2987,15 +2993,24 @@ mod tests {
                 "expected a SendRecovered after the interface healed"
             );
             for s in handle.status_rx.try_iter() {
-                if let TalkerStatus::SendRecovered {
-                    failures, withheld, ..
-                } = s
-                {
-                    recovered = Some((failures, withheld));
+                match s {
+                    TalkerStatus::Counters {
+                        failed_sends,
+                        withheld_sends,
+                        ..
+                    } if !healed && failed_sends >= 1 && withheld_sends >= 1 => {
+                        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+                        healed = true;
+                    }
+                    TalkerStatus::SendRecovered {
+                        failures, withheld, ..
+                    } => recovered = Some((failures, withheld)),
+                    _ => {}
                 }
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+        assert!(healed, "recovery cannot precede the heal");
         let (failures, withheld) = recovered.unwrap();
         assert!(failures >= 1, "the reported first failure is counted");
         assert!(
