@@ -881,10 +881,659 @@ impl<'a> TimerReconciler<'a> {
     }
 }
 
+/// The mutable state of one run, so each step of the loop can be read on its
+/// own: command handling, one due fire, and the final delivery. The loop in
+/// [`run_loop`] only decides which of them happens next.
+struct RunState<'a> {
+    who: &'a RunnerIdentity,
+    interface: Box<dyn Interface>,
+    current_config: Option<InterfaceConfig>,
+    schedule: Schedule,
+    control_tx: &'a Option<Sender<RunnerControlStatus>>,
+    status_tx: &'a Sender<TalkerStatus>,
+    notify: &'a Option<StatusNotify>,
+    policy: ObserverPolicy,
+    started_at: SystemTime,
+    started_mono: Instant,
+    total_count: u64,
+    total_bytes: u64,
+    failed_sends: u64,
+    possibly_partial_sends: u64,
+    peer_bytes: u64,
+    send_failure_episodes: u64,
+    withheld_sends: u64,
+    send_timing: SendTimingRecorder,
+    // Lane rate limits (ADR-018): `None` = nothing emitted yet, so the first
+    // send always produces both a sample and counters (instant first paint).
+    last_sample: Option<Instant>,
+    // Sample rotation: the scheduler breaks grid ties by lowest index, so an
+    // aligned multi-message schedule would sample message 0 forever if the
+    // lane just took the first due send. Skip a repeat of the last sampled
+    // message while due — but never longer than one full cycle, so a
+    // single-active-message schedule still samples.
+    last_sampled_index: Option<usize>,
+    repeats_skipped_while_due: u64,
+    // Per-message send counts, indexed by the message's position in the
+    // compiled schedule. The resize is defensive; the schedule's size is
+    // fixed at compile time.
+    per_message_counts: Vec<u64>,
+    // Per-message timing on the same index basis, including which message's
+    // sends delayed the others (ADR-045).
+    per_message_timing: MessageTimingRecorder,
+    // Timer guard, policy-edge notification, counter invalidation, and dropped
+    // observer accounting advance as one state machine. SetInterval re-evaluates
+    // its policy on the next loop pass.
+    timer: TimerReconciler<'a>,
+    // The current failing episode, if any (bounded-backoff retry policy —
+    // see [`RETRY_BACKOFF_INITIAL`]). `None` while sends are succeeding.
+    episode: Option<FailureEpisode>,
+    // The current off-cadence episode, if any. `None` while every scheduled
+    // send is being reached. Independent of `episode` above: a channel can miss
+    // its cadence with a perfectly healthy interface, and can fail every write
+    // while keeping perfect cadence.
+    miss_episode: Option<MissEpisode>,
+    // Renders that returned nothing for an index the schedule handed out. Per
+    // run rather than per slot, because a runner outlives no run but its own.
+    render_faults: InternalFaultTally,
+    // Missing confirmed configuration during handle replacement is a separate
+    // invariant from rendering, so its first occurrence must not suppress the
+    // render invariant's first report (ADR-054).
+    retry_config_faults: InternalFaultTally,
+}
+
+impl<'a> RunState<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        who: &'a RunnerIdentity,
+        interface: Box<dyn Interface>,
+        current_config: Option<InterfaceConfig>,
+        schedule: Schedule,
+        started_at: SystemTime,
+        started_mono: Instant,
+        control_tx: &'a Option<Sender<RunnerControlStatus>>,
+        status_tx: &'a Sender<TalkerStatus>,
+        notify: &'a Option<StatusNotify>,
+        policy: ObserverPolicy,
+    ) -> Self {
+        let message_count = schedule.len();
+        Self {
+            who,
+            interface,
+            current_config,
+            schedule,
+            control_tx,
+            status_tx,
+            notify,
+            policy,
+            started_at,
+            started_mono,
+            total_count: 0,
+            total_bytes: 0,
+            failed_sends: 0,
+            possibly_partial_sends: 0,
+            peer_bytes: 0,
+            send_failure_episodes: 0,
+            withheld_sends: 0,
+            send_timing: SendTimingRecorder::default(),
+            last_sample: None,
+            last_sampled_index: None,
+            repeats_skipped_while_due: 0,
+            per_message_counts: vec![0; message_count],
+            per_message_timing: MessageTimingRecorder::new(message_count),
+            timer: TimerReconciler::new(who, status_tx, notify),
+            episode: None,
+            miss_episode: None,
+            render_faults: InternalFaultTally::default(),
+            retry_config_faults: InternalFaultTally::default(),
+        }
+    }
+
+    /// Apply one queued command and report whether the run goes on.
+    fn on_command(&mut self, cmd: TalkerCommand) -> Flow {
+        match cmd {
+            TalkerCommand::Stop => Flow::Stop,
+            TalkerCommand::UpdateInterface { id, config } => {
+                let execution = match self.current_config.as_ref() {
+                    Some(current) => match self.interface.reconfigure(current, &config) {
+                        Ok(true) => CommandExecution::Applied,
+                        Ok(false) => match config.open() {
+                            Ok(new) => {
+                                self.interface = new;
+                                CommandExecution::Applied
+                            }
+                            Err(e) => CommandExecution::Failed(format!("{e:#}")),
+                        },
+                        Err(e) => CommandExecution::Failed(format!("{e:#}")),
+                    },
+                    None => match config.open() {
+                        Ok(new) => {
+                            self.interface = new;
+                            CommandExecution::Applied
+                        }
+                        Err(e) => CommandExecution::Failed(format!("{e:#}")),
+                    },
+                };
+                match &execution {
+                    CommandExecution::Applied => {
+                        self.current_config = Some(config);
+                        // A fresh interface deserves an immediate attempt:
+                        // pull the next retry forward. The episode's counts
+                        // stay — only a successful send closes it (and
+                        // reports what was lost).
+                        if let Some(ep) = self.episode.as_mut() {
+                            ep.next_attempt = Instant::now();
+                            ep.handle_needs_recovery = false;
+                            // The explicit update supersedes any automatic
+                            // replacement earlier in this episode.
+                            ep.handle_replaced = false;
+                        }
+                        tracing::info!(
+                            channel = self.who.id.as_u64(),
+                            "channel {} interface updated",
+                            self.who.label
+                        );
+                    }
+                    CommandExecution::Failed(message) => {
+                        tracing::warn!(
+                            channel = self.who.id.as_u64(),
+                            "channel {} interface update failed: {message}",
+                            self.who.label,
+                        );
+                    }
+                }
+                emit_control(
+                    self.control_tx,
+                    self.notify,
+                    RunnerControlStatus::CommandCompleted {
+                        channel: self.who.id,
+                        id,
+                        target: CommandTarget::Interface,
+                        execution,
+                    },
+                );
+                Flow::Continue
+            }
+            TalkerCommand::SetInterval {
+                id,
+                index,
+                interval_ms,
+            } => {
+                let execution = if self
+                    .schedule
+                    .set_interval(index, interval_ms, Instant::now())
+                {
+                    CommandExecution::Applied
+                } else {
+                    CommandExecution::Failed(format!(
+                        "message {} is outside the {}-message schedule",
+                        index + 1,
+                        self.schedule.len()
+                    ))
+                };
+                emit_control(
+                    self.control_tx,
+                    self.notify,
+                    RunnerControlStatus::CommandCompleted {
+                        channel: self.who.id,
+                        id,
+                        target: CommandTarget::MessageInterval(index),
+                        execution,
+                    },
+                );
+                Flow::Continue
+            }
+        }
+    }
+
+    /// Everything that happens between applying commands and polling the
+    /// schedule: the wall-clock check and the timer policy.
+    fn reconcile_before_poll(&mut self) {
+        if let Some(step) = self.schedule.reconcile_wall_clock(Instant::now()) {
+            tracing::info!(
+                channel = self.who.id.as_u64(),
+                realignments = self.schedule.clock_realignments(),
+                "{}",
+                clock_step_line(&self.who.label, step)
+            );
+        }
+
+        // Reconcile continuous intent only after applying queued interval
+        // changes. Windowed intent is finalized once `poll` supplies the next
+        // deadline; dormant/ordinary schedules release before they block.
+        self.timer.reconcile_schedule(
+            self.schedule.active_cadence(),
+            self.schedule.cadence_alignment(),
+            self.schedule.clock_realignments(),
+        );
+    }
+
+    /// Handle one due fire: account for its lateness, apply the retry gate,
+    /// render and send unless withheld, then emit counters if they are due.
+    fn on_due(&mut self, index: usize, scheduled_for: Instant, interval: Duration, missed: u64) {
+        // A bounded-window request has done its job once the deadline
+        // wait returns. Rendering and clock reads do not benefit from
+        // holding it through the send call.
+        self.timer.before_due();
+        let due_handled_at = Instant::now();
+        self.send_timing.record_deadline_lateness(
+            due_handled_at,
+            due_handled_at.saturating_duration_since(scheduled_for),
+        );
+        self.per_message_timing
+            .record_due(index, scheduled_for, due_handled_at);
+        // Order matters: `record_due` settles which send this tick's
+        // backlog belongs to, and the missed points belong to the
+        // same one.
+        self.per_message_timing
+            .record_misses(index, scheduled_for, interval, missed);
+        // Report falling off cadence and returning to it, and nothing
+        // in between. The first miss is reported for the same reason
+        // the first failed send is: it is the moment the reader could
+        // have acted, and every later one says only "still".
+        match observe_misses(&mut self.miss_episode, missed, due_handled_at) {
+            MissReport::FellBehind(now_missed) => tracing::warn!(
+                channel = self.who.id.as_u64(),
+                "{}",
+                missed_line(
+                    &self.who.label,
+                    index,
+                    interval,
+                    due_handled_at.saturating_duration_since(scheduled_for),
+                    now_missed
+                )
+            ),
+            // Not "back to normal": this is a statement about cadence
+            // points only. Sends can still be failing or withheld by
+            // retry backoff while every point is reached, and that
+            // episode reports itself separately.
+            MissReport::BackOnSchedule { missed, length } => tracing::info!(
+                channel = self.who.id.as_u64(),
+                "{}",
+                back_on_schedule_line(&self.who.label, MISS_RECOVERY_SETTLE, missed, length)
+            ),
+            MissReport::Silent => {}
+        }
+        let backoff_withheld = self
+            .episode
+            .as_ref()
+            .is_some_and(|ep| due_handled_at < ep.next_attempt);
+        let needs_recovery = self
+            .episode
+            .as_ref()
+            .is_some_and(|ep| ep.handle_needs_recovery);
+        let mut reopen_withheld = false;
+        if !backoff_withheld && needs_recovery {
+            reopen_withheld = self.prepare_retry();
+        }
+        if backoff_withheld || reopen_withheld {
+            // Backoff gate: this due fire is withheld — counted, but
+            // not rendered or written. A retry-edge fire may have tried
+            // to reopen the handle first. The scheduler has already
+            // advanced, consistent with the stall policy (cadence over
+            // count).
+            if backoff_withheld {
+                if let Some(ep) = self.episode.as_mut() {
+                    ep.withheld += 1;
+                }
+            }
+            self.withheld_sends += 1;
+        } else if !self.render_and_send(index) {
+            // Nothing was rendered, so there is nothing to count; the counters
+            // lane waits for the next due fire.
+            return;
+        }
+
+        self.emit_counters_if_due();
+    }
+
+    /// Try to bring a failed handle back before this due fire's send. Returns
+    /// whether the fire is withheld because the reopen failed.
+    fn prepare_retry(&mut self) -> bool {
+        match self.interface.prepare_retry(self.current_config.as_ref()) {
+            Ok(handle_replaced) => {
+                // If the following send fails it sets this back to
+                // true in the ordinary failure branch below.
+                if let Some(ep) = self.episode.as_mut() {
+                    ep.handle_needs_recovery = false;
+                    ep.handle_replaced |= handle_replaced;
+                }
+                false
+            }
+            Err(e) => {
+                // No interface write was attempted, so this due fire
+                // is withheld rather than failed. It has no render or
+                // send-call timing either; reopen work is outside
+                // both measurement boundaries.
+                if let Some(ep) = self.episode.as_mut() {
+                    ep.active_error = format!("{e:#}");
+                    ep.withheld += 1;
+                    ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
+                    ep.next_attempt = Instant::now() + ep.backoff;
+                    if e.downcast_ref::<MissingRetryConfiguration>().is_some() {
+                        if let Some(line) = self.retry_config_faults.report(
+                            &self.who.label,
+                            "recovery had no confirmed interface settings",
+                            "That send was withheld; automatic reopen cannot proceed \
+                             until the interface is updated or the channel is restarted",
+                        ) {
+                            tracing::error!("{line}");
+                        }
+                    } else {
+                        tracing::debug!(
+                            channel = self.who.id.as_u64(),
+                            "channel {} interface still unavailable ({} failed sends, \
+                             {} withheld while retrying): {e:#}",
+                            self.who.label,
+                            ep.failures,
+                            ep.withheld
+                        );
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// Render and write one due message. Returns `false` when the schedule had
+    /// nothing to render for `index`, which skips the rest of the due fire.
+    fn render_and_send(&mut self, index: usize) -> bool {
+        let render_started = Instant::now();
+        let Some(payload) = self.schedule.render(index) else {
+            // `poll` obtains this index from the same immutable-size
+            // schedule. Stay panic-free if that invariant ever
+            // changes — and report it as talker disagreeing with
+            // itself rather than anything about the link (ADR-054).
+            //
+            // Tallied like the supervisor's: this sits on the send
+            // path, so a broken invariant would otherwise emit a
+            // line at every due point, which on a 10 ms cadence is
+            // a hundred a second for as long as the run lasts.
+            if let Some(line) = self.render_faults.report(
+                &self.who.label,
+                format!("message {} could not be built", index + 1),
+                "That send was skipped; the channel is still running",
+            ) {
+                tracing::error!("{line}");
+            }
+            return false;
+        };
+        let render_finished = Instant::now();
+        self.send_timing.record_render_duration(
+            render_finished,
+            render_finished.saturating_duration_since(render_started),
+        );
+        self.per_message_timing.record_render(
+            index,
+            render_finished.saturating_duration_since(render_started),
+        );
+
+        let send_started = Instant::now();
+        let send_result = self.interface.send(&payload);
+        self.peer_bytes += self.interface.take_peer_bytes();
+        let send_finished = Instant::now();
+        self.send_timing.record_send_duration(
+            send_finished,
+            send_finished.saturating_duration_since(send_started),
+        );
+        // Recorded for a failed send too: a write that blocked and
+        // then errored held the thread just as long.
+        self.per_message_timing
+            .record_send(index, send_started, send_finished);
+        match send_result {
+            Ok(()) => self.on_send_ok(index, payload, send_finished),
+            Err(e) => self.on_send_failed(&e, send_finished),
+        }
+        true
+    }
+
+    fn on_send_ok(&mut self, index: usize, payload: Vec<u8>, send_finished: Instant) {
+        if let Some(ep) = self.episode.take() {
+            // "Withheld" is defined on the send-outcomes
+            // line and nowhere the log reader can see, so
+            // this states what happened to those sends.
+            // A replaced handle names what it reconnected
+            // to (ADR-059, §4.5).
+            let replaced = match self.current_config.as_ref() {
+                Some(InterfaceConfig::Serial(config)) if ep.handle_replaced => {
+                    Some(format!("reopened serial port {}", config.port))
+                }
+                Some(InterfaceConfig::TcpClient(config)) if ep.handle_replaced => {
+                    Some(format!("reconnected to {}", config.address))
+                }
+                _ => None,
+            };
+            tracing::info!(
+                channel = self.who.id.as_u64(),
+                "{}",
+                recovery_line(
+                    &self.who.label,
+                    send_finished.saturating_duration_since(ep.since),
+                    replaced.as_deref(),
+                    ep.failures - ep.possibly_partial,
+                    ep.possibly_partial,
+                    ep.withheld
+                )
+            );
+            self.timer.emit(TalkerStatus::SendRecovered {
+                channel: self.who.id,
+                failures: ep.failures,
+                withheld: ep.withheld,
+            });
+        }
+        self.total_count += 1;
+        self.total_bytes += payload.len() as u64;
+        if index >= self.per_message_counts.len() {
+            self.per_message_counts.resize(index + 1, 0);
+        }
+        self.per_message_counts[index] += 1;
+        // The payload observer lane is rate-limited and
+        // best-effort (ADR-018): a full receiver drops the
+        // sample rather than backpressuring send cadence.
+        let now = Instant::now();
+        let due = self
+            .last_sample
+            .is_none_or(|t| now - t >= self.policy.sample_interval);
+        if due {
+            let repeat = self.last_sampled_index == Some(index) && self.schedule.len() > 1;
+            if !repeat || self.repeats_skipped_while_due >= self.schedule.len() as u64 {
+                self.last_sample = Some(now);
+                self.last_sampled_index = Some(index);
+                self.repeats_skipped_while_due = 0;
+                let replacement_wire_offsets =
+                    self.schedule.replacement_wire_offsets(index).to_vec();
+                self.timer.emit(TalkerStatus::SendSample {
+                    channel: self.who.id,
+                    message_index: index,
+                    payload,
+                    replacement_wire_offsets,
+                });
+            } else {
+                self.repeats_skipped_while_due += 1;
+            }
+        }
+    }
+
+    fn on_send_failed(&mut self, e: &anyhow::Error, send_finished: Instant) {
+        // A write that failed after the interface accepted
+        // part of the message is possibly partial (§4.4,
+        // ADR-059). Its bytes count as wire bytes; the
+        // message is never resent.
+        let written = e
+            .downcast_ref::<PartialWrite>()
+            .map(|partial| partial.written);
+        match written {
+            Some(written) => {
+                self.possibly_partial_sends += 1;
+                self.total_bytes += written as u64;
+            }
+            None => self.failed_sends += 1,
+        }
+        let partial = u64::from(written.is_some());
+        match self.episode.as_mut() {
+            // Edge-triggered: only the episode's first failure is
+            // reported (warn + `SendFailed`); it opens the episode.
+            None => {
+                self.send_failure_episodes += 1;
+                let message = format!("{e:#}");
+                tracing::warn!(
+                    channel = self.who.id.as_u64(),
+                    "{}",
+                    send_failed_line(&self.who.label, &message)
+                );
+                self.episode = Some(FailureEpisode {
+                    active_error: message.clone(),
+                    failures: 1,
+                    possibly_partial: partial,
+                    withheld: 0,
+                    backoff: RETRY_BACKOFF_INITIAL,
+                    next_attempt: Instant::now() + RETRY_BACKOFF_INITIAL,
+                    handle_needs_recovery: true,
+                    handle_replaced: false,
+                    since: send_finished,
+                });
+                self.timer.emit(TalkerStatus::SendFailed {
+                    channel: self.who.id,
+                    message,
+                });
+            }
+            // A failed retry deepens the backoff; no re-report.
+            Some(ep) => {
+                ep.active_error = format!("{e:#}");
+                ep.failures += 1;
+                ep.possibly_partial += partial;
+                ep.handle_needs_recovery = true;
+                ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
+                ep.next_attempt = Instant::now() + ep.backoff;
+                tracing::debug!(
+                    channel = self.who.id.as_u64(),
+                    "channel {} send still failing ({} failures so far): {e:#}",
+                    self.who.label,
+                    ep.failures
+                );
+            }
+        }
+    }
+
+    /// Cumulative outcomes remain observable even when every due
+    /// send is failing or withheld. This lane is rate-limited
+    /// and best-effort, so it cannot slow the scheduler hot path.
+    fn emit_counters_if_due(&mut self) {
+        let now = Instant::now();
+        if self.timer.counters_due(now, self.policy.counter_interval) {
+            let drops_so_far = self.timer.dropped_statuses();
+            self.per_message_timing
+                .set_schedule(self.schedule.message_demand());
+            let status = TalkerStatus::Counters {
+                channel: self.who.id,
+                totals: Box::new(RunTotals {
+                    total_count: self.total_count,
+                    total_bytes: self.total_bytes,
+                    per_message_counts: self.per_message_counts.clone(),
+                    per_message_timing: self.per_message_timing.snapshot(),
+                    dropped_statuses: drops_so_far,
+                    missed_sends: self.schedule.missed_sends(),
+                    failed_sends: self.failed_sends,
+                    possibly_partial_sends: self.possibly_partial_sends,
+                    peer_bytes: peer_sent(self.current_config.as_ref(), self.peer_bytes),
+                    withheld_sends: self.withheld_sends,
+                    timing: self.send_timing.snapshot_at(now),
+                    timer: self.timer.status(),
+                }),
+                send_failure_episodes: self.send_failure_episodes,
+                active_send_error: self.episode.as_ref().map(|ep| ep.active_error.clone()),
+                captured_at: now,
+                final_snapshot: false,
+            };
+            self.timer.emit(status);
+        }
+    }
+
+    /// Select the deadline the next interruptible wait should end at.
+    fn prepare_wait(&mut self, until: Instant) -> Instant {
+        self.timer.prepare_wait(Instant::now(), until)
+    }
+
+    /// Deliver the run's end: release the timer, log the final cadence state,
+    /// then send the exact final counters and the run summary.
+    fn finish(mut self, end_reason: RunEndReason) {
+        // Stop paying the platform timer-resolution cost before the exact final
+        // status delivery, which may briefly wait for a full observer queue.
+        let (timer_status, dropped_statuses) = self.timer.finish();
+
+        // Final counters (ADR-018): the rate-limited lane can be up to one
+        // interval stale when the runner stops — emit once more so the observer's
+        // totals are exact at rest. A **blocking** send, deliberately: the runner
+        // is exiting so cadence no longer matters, and this is the one status
+        // that must not be lost to a momentarily full queue ("exact at rest" is
+        // a promise, not best-effort). The owner keeps draining a stopped
+        // runner's receiver until the thread exits (supervisor `poll`/`join_all`,
+        // the CLI's funnel loop), and a dropped receiver returns an error
+        // immediately — so this cannot hang.
+        let finished_mono = Instant::now();
+        let finished_at = SystemTime::now();
+        let missed_sends = self.schedule.missed_sends();
+        // A run that stops mid-episode never reaches a settle window, so the log
+        // would otherwise end on the warning with no total against it. The run's
+        // own figure is stated rather than the episode's: it is exact, channel-wide,
+        // and the same number the completed-run summary carries.
+        if self.miss_episode.is_some() {
+            tracing::warn!(
+                channel = self.who.id.as_u64(),
+                "{}",
+                stopped_behind_line(&self.who.label, missed_sends)
+            );
+        }
+        self.per_message_timing
+            .set_schedule(self.schedule.message_demand());
+        let totals = RunTotals {
+            total_count: self.total_count,
+            total_bytes: self.total_bytes,
+            per_message_counts: self.per_message_counts,
+            per_message_timing: self.per_message_timing.snapshot(),
+            dropped_statuses,
+            missed_sends,
+            failed_sends: self.failed_sends,
+            possibly_partial_sends: self.possibly_partial_sends,
+            peer_bytes: peer_sent(self.current_config.as_ref(), self.peer_bytes),
+            withheld_sends: self.withheld_sends,
+            timing: self.send_timing.snapshot_at(finished_mono),
+            timer: timer_status,
+        };
+        let _ = self.status_tx.send(TalkerStatus::Counters {
+            channel: self.who.id,
+            totals: Box::new(totals.clone()),
+            send_failure_episodes: self.send_failure_episodes,
+            active_send_error: self.episode.as_ref().map(|ep| ep.active_error.clone()),
+            captured_at: finished_mono,
+            final_snapshot: true,
+        });
+        if let Some(n) = self.notify {
+            n();
+        }
+        emit_control(
+            self.control_tx,
+            self.notify,
+            RunnerControlStatus::RunFinished {
+                channel: self.who.id,
+                summary: Box::new(RunSummary {
+                    run_id: self.who.run_id,
+                    channel: self.who.id,
+                    label: self.who.label.clone(),
+                    started_at: self.started_at,
+                    finished_at,
+                    elapsed: finished_mono.saturating_duration_since(self.started_mono),
+                    end_reason,
+                    totals,
+                }),
+            },
+        );
+    }
+}
+
 fn run_loop(
     who: &RunnerIdentity,
-    mut interface: Box<dyn Interface>,
-    mut current_config: Option<InterfaceConfig>,
+    interface: Box<dyn Interface>,
+    current_config: Option<InterfaceConfig>,
     mut schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     observer: RunnerObserver,
@@ -901,513 +1550,46 @@ fn run_loop(
         notify,
         policy,
     } = observer;
-    let mut total_count = 0u64;
-    let mut total_bytes = 0u64;
-    let mut failed_sends = 0u64;
-    let mut possibly_partial_sends = 0u64;
-    let mut peer_bytes = 0u64;
-    let mut send_failure_episodes = 0u64;
-    let mut withheld_sends = 0u64;
-    let mut send_timing = SendTimingRecorder::default();
-    // Lane rate limits (ADR-018): `None` = nothing emitted yet, so the first
-    // send always produces both a sample and counters (instant first paint).
-    let mut last_sample: Option<Instant> = None;
-    // Sample rotation: the scheduler breaks grid ties by lowest index, so an
-    // aligned multi-message schedule would sample message 0 forever if the
-    // lane just took the first due send. Skip a repeat of the last sampled
-    // message while due — but never longer than one full cycle, so a
-    // single-active-message schedule still samples.
-    let mut last_sampled_index: Option<usize> = None;
-    let mut repeats_skipped_while_due = 0u64;
-    // Per-message send counts, indexed by the message's position in the
-    // compiled schedule. The resize is defensive; the schedule's size is
-    // fixed at compile time.
-    let mut per_message_counts: Vec<u64> = vec![0; schedule.len()];
-    // Per-message timing on the same index basis, including which message's
-    // sends delayed the others (ADR-045).
-    let mut per_message_timing = MessageTimingRecorder::new(schedule.len());
-
-    let handle = |cmd: TalkerCommand,
-                  interface: &mut Box<dyn Interface>,
-                  current_config: &mut Option<InterfaceConfig>,
-                  schedule: &mut Schedule,
-                  episode: &mut Option<FailureEpisode>|
-     -> Flow {
-        match cmd {
-            TalkerCommand::Stop => Flow::Stop,
-            TalkerCommand::UpdateInterface { id, config } => {
-                let execution = match current_config.as_ref() {
-                    Some(current) => match interface.reconfigure(current, &config) {
-                        Ok(true) => CommandExecution::Applied,
-                        Ok(false) => match config.open() {
-                            Ok(new) => {
-                                *interface = new;
-                                CommandExecution::Applied
-                            }
-                            Err(e) => CommandExecution::Failed(format!("{e:#}")),
-                        },
-                        Err(e) => CommandExecution::Failed(format!("{e:#}")),
-                    },
-                    None => match config.open() {
-                        Ok(new) => {
-                            *interface = new;
-                            CommandExecution::Applied
-                        }
-                        Err(e) => CommandExecution::Failed(format!("{e:#}")),
-                    },
-                };
-                match &execution {
-                    CommandExecution::Applied => {
-                        *current_config = Some(config);
-                        // A fresh interface deserves an immediate attempt:
-                        // pull the next retry forward. The episode's counts
-                        // stay — only a successful send closes it (and
-                        // reports what was lost).
-                        if let Some(ep) = episode.as_mut() {
-                            ep.next_attempt = Instant::now();
-                            ep.handle_needs_recovery = false;
-                            // The explicit update supersedes any automatic
-                            // replacement earlier in this episode.
-                            ep.handle_replaced = false;
-                        }
-                        tracing::info!(
-                            channel = who.id.as_u64(),
-                            "channel {} interface updated",
-                            who.label
-                        );
-                    }
-                    CommandExecution::Failed(message) => {
-                        tracing::warn!(
-                            channel = who.id.as_u64(),
-                            "channel {} interface update failed: {message}",
-                            who.label,
-                        );
-                    }
-                }
-                emit_control(
-                    &control_tx,
-                    &notify,
-                    RunnerControlStatus::CommandCompleted {
-                        channel: who.id,
-                        id,
-                        target: CommandTarget::Interface,
-                        execution,
-                    },
-                );
-                Flow::Continue
-            }
-            TalkerCommand::SetInterval {
-                id,
-                index,
-                interval_ms,
-            } => {
-                let execution = if schedule.set_interval(index, interval_ms, Instant::now()) {
-                    CommandExecution::Applied
-                } else {
-                    CommandExecution::Failed(format!(
-                        "message {} is outside the {}-message schedule",
-                        index + 1,
-                        schedule.len()
-                    ))
-                };
-                emit_control(
-                    &control_tx,
-                    &notify,
-                    RunnerControlStatus::CommandCompleted {
-                        channel: who.id,
-                        id,
-                        target: CommandTarget::MessageInterval(index),
-                        execution,
-                    },
-                );
-                Flow::Continue
-            }
-        }
-    };
-
-    // Timer guard, policy-edge notification, counter invalidation, and dropped
-    // observer accounting advance as one state machine. SetInterval re-evaluates
-    // its policy on the next loop pass.
-    let mut timer = TimerReconciler::new(who, &status_tx, &notify);
-
-    // The current failing episode, if any (bounded-backoff retry policy —
-    // see [`RETRY_BACKOFF_INITIAL`]). `None` while sends are succeeding.
-    let mut episode: Option<FailureEpisode> = None;
-
-    // The current off-cadence episode, if any. `None` while every scheduled
-    // send is being reached. Independent of `episode` above: a channel can miss
-    // its cadence with a perfectly healthy interface, and can fail every write
-    // while keeping perfect cadence.
-    let mut miss_episode: Option<MissEpisode> = None;
-
-    // Renders that returned nothing for an index the schedule handed out. Per
-    // run rather than per slot, because a runner outlives no run but its own.
-    let mut render_faults = InternalFaultTally::default();
-    // Missing confirmed configuration during handle replacement is a separate
-    // invariant from rendering, so its first occurrence must not suppress the
-    // render invariant's first report (ADR-054).
-    let mut retry_config_faults = InternalFaultTally::default();
+    let mut run = RunState::new(
+        who,
+        interface,
+        current_config,
+        schedule,
+        started_at,
+        started_mono,
+        &control_tx,
+        &status_tx,
+        &notify,
+        policy,
+    );
 
     let end_reason = 'run: loop {
         // Drain anything already queued so back-to-back sends can't starve
         // command handling.
         for cmd in cmd_rx.try_iter() {
-            if let Flow::Stop = handle(
-                cmd,
-                &mut interface,
-                &mut current_config,
-                &mut schedule,
-                &mut episode,
-            ) {
+            if let Flow::Stop = run.on_command(cmd) {
                 break 'run RunEndReason::StopCommand;
             }
         }
 
-        if let Some(step) = schedule.reconcile_wall_clock(Instant::now()) {
-            tracing::info!(
-                channel = who.id.as_u64(),
-                realignments = schedule.clock_realignments(),
-                "{}",
-                clock_step_line(&who.label, step)
-            );
-        }
-
-        // Reconcile continuous intent only after applying queued interval
-        // changes. Windowed intent is finalized once `poll` supplies the next
-        // deadline; dormant/ordinary schedules release before they block.
-        timer.reconcile_schedule(
-            schedule.active_cadence(),
-            schedule.cadence_alignment(),
-            schedule.clock_realignments(),
-        );
+        run.reconcile_before_poll();
 
         let poll_at = Instant::now();
-        match schedule.poll(poll_at) {
+        match run.schedule.poll(poll_at) {
             Tick::Due {
                 index,
                 scheduled_for,
                 interval,
                 missed,
-            } => {
-                // A bounded-window request has done its job once the deadline
-                // wait returns. Rendering and clock reads do not benefit from
-                // holding it through the send call.
-                timer.before_due();
-                let due_handled_at = Instant::now();
-                send_timing.record_deadline_lateness(
-                    due_handled_at,
-                    due_handled_at.saturating_duration_since(scheduled_for),
-                );
-                per_message_timing.record_due(index, scheduled_for, due_handled_at);
-                // Order matters: `record_due` settles which send this tick's
-                // backlog belongs to, and the missed points belong to the
-                // same one.
-                per_message_timing.record_misses(index, scheduled_for, interval, missed);
-                // Report falling off cadence and returning to it, and nothing
-                // in between. The first miss is reported for the same reason
-                // the first failed send is: it is the moment the reader could
-                // have acted, and every later one says only "still".
-                match observe_misses(&mut miss_episode, missed, due_handled_at) {
-                    MissReport::FellBehind(now_missed) => tracing::warn!(
-                        channel = who.id.as_u64(),
-                        "{}",
-                        missed_line(
-                            &who.label,
-                            index,
-                            interval,
-                            due_handled_at.saturating_duration_since(scheduled_for),
-                            now_missed
-                        )
-                    ),
-                    // Not "back to normal": this is a statement about cadence
-                    // points only. Sends can still be failing or withheld by
-                    // retry backoff while every point is reached, and that
-                    // episode reports itself separately.
-                    MissReport::BackOnSchedule { missed, length } => tracing::info!(
-                        channel = who.id.as_u64(),
-                        "{}",
-                        back_on_schedule_line(&who.label, MISS_RECOVERY_SETTLE, missed, length)
-                    ),
-                    MissReport::Silent => {}
-                }
-                let backoff_withheld = episode
-                    .as_ref()
-                    .is_some_and(|ep| due_handled_at < ep.next_attempt);
-                let needs_recovery = episode.as_ref().is_some_and(|ep| ep.handle_needs_recovery);
-                let mut reopen_withheld = false;
-                if !backoff_withheld && needs_recovery {
-                    match interface.prepare_retry(current_config.as_ref()) {
-                        Ok(handle_replaced) => {
-                            // If the following send fails it sets this back to
-                            // true in the ordinary failure branch below.
-                            if let Some(ep) = episode.as_mut() {
-                                ep.handle_needs_recovery = false;
-                                ep.handle_replaced |= handle_replaced;
-                            }
-                        }
-                        Err(e) => {
-                            // No interface write was attempted, so this due fire
-                            // is withheld rather than failed. It has no render or
-                            // send-call timing either; reopen work is outside
-                            // both measurement boundaries.
-                            if let Some(ep) = episode.as_mut() {
-                                ep.active_error = format!("{e:#}");
-                                ep.withheld += 1;
-                                ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
-                                ep.next_attempt = Instant::now() + ep.backoff;
-                                if e.downcast_ref::<MissingRetryConfiguration>().is_some() {
-                                    if let Some(line) = retry_config_faults.report(
-                                        &who.label,
-                                        "recovery had no confirmed interface settings",
-                                        "That send was withheld; automatic reopen cannot proceed \
-                                         until the interface is updated or the channel is restarted",
-                                    ) {
-                                        tracing::error!("{line}");
-                                    }
-                                } else {
-                                    tracing::debug!(
-                                        channel = who.id.as_u64(),
-                                        "channel {} interface still unavailable ({} failed sends, \
-                                         {} withheld while retrying): {e:#}",
-                                        who.label,
-                                        ep.failures,
-                                        ep.withheld
-                                    );
-                                }
-                            }
-                            reopen_withheld = true;
-                        }
-                    }
-                }
-                if backoff_withheld || reopen_withheld {
-                    // Backoff gate: this due fire is withheld — counted, but
-                    // not rendered or written. A retry-edge fire may have tried
-                    // to reopen the handle first. The scheduler has already
-                    // advanced, consistent with the stall policy (cadence over
-                    // count).
-                    if backoff_withheld {
-                        if let Some(ep) = episode.as_mut() {
-                            ep.withheld += 1;
-                        }
-                    }
-                    withheld_sends += 1;
-                } else {
-                    let render_started = Instant::now();
-                    let Some(payload) = schedule.render(index) else {
-                        // `poll` obtains this index from the same immutable-size
-                        // schedule. Stay panic-free if that invariant ever
-                        // changes — and report it as talker disagreeing with
-                        // itself rather than anything about the link (ADR-054).
-                        //
-                        // Tallied like the supervisor's: this sits on the send
-                        // path, so a broken invariant would otherwise emit a
-                        // line at every due point, which on a 10 ms cadence is
-                        // a hundred a second for as long as the run lasts.
-                        if let Some(line) = render_faults.report(
-                            &who.label,
-                            format!("message {} could not be built", index + 1),
-                            "That send was skipped; the channel is still running",
-                        ) {
-                            tracing::error!("{line}");
-                        }
-                        continue;
-                    };
-                    let render_finished = Instant::now();
-                    send_timing.record_render_duration(
-                        render_finished,
-                        render_finished.saturating_duration_since(render_started),
-                    );
-                    per_message_timing.record_render(
-                        index,
-                        render_finished.saturating_duration_since(render_started),
-                    );
-
-                    let send_started = Instant::now();
-                    let send_result = interface.send(&payload);
-                    peer_bytes += interface.take_peer_bytes();
-                    let send_finished = Instant::now();
-                    send_timing.record_send_duration(
-                        send_finished,
-                        send_finished.saturating_duration_since(send_started),
-                    );
-                    // Recorded for a failed send too: a write that blocked and
-                    // then errored held the thread just as long.
-                    per_message_timing.record_send(index, send_started, send_finished);
-                    match send_result {
-                        Ok(()) => {
-                            if let Some(ep) = episode.take() {
-                                // "Withheld" is defined on the send-outcomes
-                                // line and nowhere the log reader can see, so
-                                // this states what happened to those sends.
-                                // A replaced handle names what it reconnected
-                                // to (ADR-059, §4.5).
-                                let replaced = match current_config.as_ref() {
-                                    Some(InterfaceConfig::Serial(config)) if ep.handle_replaced => {
-                                        Some(format!("reopened serial port {}", config.port))
-                                    }
-                                    Some(InterfaceConfig::TcpClient(config))
-                                        if ep.handle_replaced =>
-                                    {
-                                        Some(format!("reconnected to {}", config.address))
-                                    }
-                                    _ => None,
-                                };
-                                tracing::info!(
-                                    channel = who.id.as_u64(),
-                                    "{}",
-                                    recovery_line(
-                                        &who.label,
-                                        send_finished.saturating_duration_since(ep.since),
-                                        replaced.as_deref(),
-                                        ep.failures - ep.possibly_partial,
-                                        ep.possibly_partial,
-                                        ep.withheld
-                                    )
-                                );
-                                timer.emit(TalkerStatus::SendRecovered {
-                                    channel: who.id,
-                                    failures: ep.failures,
-                                    withheld: ep.withheld,
-                                });
-                            }
-                            total_count += 1;
-                            total_bytes += payload.len() as u64;
-                            if index >= per_message_counts.len() {
-                                per_message_counts.resize(index + 1, 0);
-                            }
-                            per_message_counts[index] += 1;
-                            // The payload observer lane is rate-limited and
-                            // best-effort (ADR-018): a full receiver drops the
-                            // sample rather than backpressuring send cadence.
-                            let now = Instant::now();
-                            let due = last_sample.is_none_or(|t| now - t >= policy.sample_interval);
-                            if due {
-                                let repeat =
-                                    last_sampled_index == Some(index) && schedule.len() > 1;
-                                if !repeat || repeats_skipped_while_due >= schedule.len() as u64 {
-                                    last_sample = Some(now);
-                                    last_sampled_index = Some(index);
-                                    repeats_skipped_while_due = 0;
-                                    let replacement_wire_offsets =
-                                        schedule.replacement_wire_offsets(index).to_vec();
-                                    timer.emit(TalkerStatus::SendSample {
-                                        channel: who.id,
-                                        message_index: index,
-                                        payload,
-                                        replacement_wire_offsets,
-                                    });
-                                } else {
-                                    repeats_skipped_while_due += 1;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // A write that failed after the interface accepted
-                            // part of the message is possibly partial (§4.4,
-                            // ADR-059). Its bytes count as wire bytes; the
-                            // message is never resent.
-                            let written = e
-                                .downcast_ref::<PartialWrite>()
-                                .map(|partial| partial.written);
-                            match written {
-                                Some(written) => {
-                                    possibly_partial_sends += 1;
-                                    total_bytes += written as u64;
-                                }
-                                None => failed_sends += 1,
-                            }
-                            let partial = u64::from(written.is_some());
-                            match episode.as_mut() {
-                                // Edge-triggered: only the episode's first failure is
-                                // reported (warn + `SendFailed`); it opens the episode.
-                                None => {
-                                    send_failure_episodes += 1;
-                                    let message = format!("{e:#}");
-                                    tracing::warn!(
-                                        channel = who.id.as_u64(),
-                                        "{}",
-                                        send_failed_line(&who.label, &message)
-                                    );
-                                    episode = Some(FailureEpisode {
-                                        active_error: message.clone(),
-                                        failures: 1,
-                                        possibly_partial: partial,
-                                        withheld: 0,
-                                        backoff: RETRY_BACKOFF_INITIAL,
-                                        next_attempt: Instant::now() + RETRY_BACKOFF_INITIAL,
-                                        handle_needs_recovery: true,
-                                        handle_replaced: false,
-                                        since: send_finished,
-                                    });
-                                    timer.emit(TalkerStatus::SendFailed {
-                                        channel: who.id,
-                                        message,
-                                    });
-                                }
-                                // A failed retry deepens the backoff; no re-report.
-                                Some(ep) => {
-                                    ep.active_error = format!("{e:#}");
-                                    ep.failures += 1;
-                                    ep.possibly_partial += partial;
-                                    ep.handle_needs_recovery = true;
-                                    ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
-                                    ep.next_attempt = Instant::now() + ep.backoff;
-                                    tracing::debug!(
-                                        channel = who.id.as_u64(),
-                                        "channel {} send still failing ({} failures so far): {e:#}",
-                                        who.label,
-                                        ep.failures
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Cumulative outcomes remain observable even when every due
-                // send is failing or withheld. This lane is rate-limited
-                // and best-effort, so it cannot slow the scheduler hot path.
-                let now = Instant::now();
-                if timer.counters_due(now, policy.counter_interval) {
-                    let drops_so_far = timer.dropped_statuses();
-                    per_message_timing.set_schedule(schedule.message_demand());
-                    timer.emit(TalkerStatus::Counters {
-                        channel: who.id,
-                        totals: Box::new(RunTotals {
-                            total_count,
-                            total_bytes,
-                            per_message_counts: per_message_counts.clone(),
-                            per_message_timing: per_message_timing.snapshot(),
-                            dropped_statuses: drops_so_far,
-                            missed_sends: schedule.missed_sends(),
-                            failed_sends,
-                            possibly_partial_sends,
-                            peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
-                            withheld_sends,
-                            timing: send_timing.snapshot_at(now),
-                            timer: timer.status(),
-                        }),
-                        send_failure_episodes,
-                        active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
-                        captured_at: now,
-                        final_snapshot: false,
-                    });
-                }
-            }
+            } => run.on_due(index, scheduled_for, interval, missed),
             // Nothing due yet: block on the command channel until the next
             // fire deadline. Wakes instantly for a command, exactly on time
             // for the schedule, and detects a dropped handle.
             Tick::Wait(until) => {
-                let wait_until = timer.prepare_wait(Instant::now(), until);
+                let wait_until = run.prepare_wait(until);
                 match cmd_rx.recv_deadline(wait_until) {
                     Ok(cmd) => {
-                        if let Flow::Stop = handle(
-                            cmd,
-                            &mut interface,
-                            &mut current_config,
-                            &mut schedule,
-                            &mut episode,
-                        ) {
+                        if let Flow::Stop = run.on_command(cmd) {
                             break 'run RunEndReason::StopCommand;
                         }
                     }
@@ -1421,13 +1603,7 @@ fn run_loop(
             // so block indefinitely — zero wakeups.
             Tick::Idle => match cmd_rx.recv() {
                 Ok(cmd) => {
-                    if let Flow::Stop = handle(
-                        cmd,
-                        &mut interface,
-                        &mut current_config,
-                        &mut schedule,
-                        &mut episode,
-                    ) {
+                    if let Flow::Stop = run.on_command(cmd) {
                         break 'run RunEndReason::StopCommand;
                     }
                 }
@@ -1436,76 +1612,7 @@ fn run_loop(
         }
     };
 
-    // Stop paying the platform timer-resolution cost before the exact final
-    // status delivery, which may briefly wait for a full observer queue.
-    let (timer_status, dropped_statuses) = timer.finish();
-
-    // Final counters (ADR-018): the rate-limited lane can be up to one
-    // interval stale when the runner stops — emit once more so the observer's
-    // totals are exact at rest. A **blocking** send, deliberately: the runner
-    // is exiting so cadence no longer matters, and this is the one status
-    // that must not be lost to a momentarily full queue ("exact at rest" is
-    // a promise, not best-effort). The owner keeps draining a stopped
-    // runner's receiver until the thread exits (supervisor `poll`/`join_all`,
-    // the CLI's funnel loop), and a dropped receiver returns an error
-    // immediately — so this cannot hang.
-    let finished_mono = Instant::now();
-    let finished_at = SystemTime::now();
-    let missed_sends = schedule.missed_sends();
-    // A run that stops mid-episode never reaches a settle window, so the log
-    // would otherwise end on the warning with no total against it. The run's
-    // own figure is stated rather than the episode's: it is exact, channel-wide,
-    // and the same number the completed-run summary carries.
-    if miss_episode.is_some() {
-        tracing::warn!(
-            channel = who.id.as_u64(),
-            "{}",
-            stopped_behind_line(&who.label, missed_sends)
-        );
-    }
-    per_message_timing.set_schedule(schedule.message_demand());
-    let totals = RunTotals {
-        total_count,
-        total_bytes,
-        per_message_counts,
-        per_message_timing: per_message_timing.snapshot(),
-        dropped_statuses,
-        missed_sends,
-        failed_sends,
-        possibly_partial_sends,
-        peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
-        withheld_sends,
-        timing: send_timing.snapshot_at(finished_mono),
-        timer: timer_status,
-    };
-    let _ = status_tx.send(TalkerStatus::Counters {
-        channel: who.id,
-        totals: Box::new(totals.clone()),
-        send_failure_episodes,
-        active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
-        captured_at: finished_mono,
-        final_snapshot: true,
-    });
-    if let Some(n) = &notify {
-        n();
-    }
-    emit_control(
-        &control_tx,
-        &notify,
-        RunnerControlStatus::RunFinished {
-            channel: who.id,
-            summary: Box::new(RunSummary {
-                run_id: who.run_id,
-                channel: who.id,
-                label: who.label.clone(),
-                started_at,
-                finished_at,
-                elapsed: finished_mono.saturating_duration_since(started_mono),
-                end_reason,
-                totals,
-            }),
-        },
-    );
+    run.finish(end_reason);
 }
 
 /// The run's peer-reply total, for a transport that reads its peer: only the
