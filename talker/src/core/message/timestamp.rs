@@ -1,13 +1,14 @@
 //! Per-message ISO 8601 timestamp (spec §5.4).
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the timestamp prepended to a message's wire output.
 ///
 /// Time-of-day (`HH:MM:SS`) is always present; the date, milliseconds, and
-/// timezone designator are independently toggleable. A message carries a
-/// timestamp only when [`MessageConfig::timestamp`] is `Some`.
+/// zone designator are independently toggleable. The time is the computer's
+/// local time unless [`Self::utc`] is set. A message carries a timestamp only
+/// when [`MessageConfig::timestamp`] is `Some`.
 ///
 /// [`MessageConfig::timestamp`]: super::MessageConfig
 #[non_exhaustive]
@@ -18,33 +19,55 @@ pub struct TimestampConfig {
     pub include_date: bool,
     #[serde(default)]
     pub include_millis: bool,
+    /// Append the zone designator: `Z` when [`Self::utc`], else the local
+    /// offset (`-05:00`).
     #[serde(default)]
     pub include_timezone: bool,
+    /// Write UTC instead of the computer's local time.
+    #[serde(default)]
+    pub utc: bool,
 }
 
 impl TimestampConfig {
     /// Number of ASCII bytes produced by [`Self::format`]. All timestamp
     /// components are fixed-width, so this is independent of the instant.
     pub(crate) const fn wire_len(&self) -> usize {
-        8 + if self.include_date { 11 } else { 0 }
-            + if self.include_millis { 4 } else { 0 }
-            + if self.include_timezone { 1 } else { 0 }
+        let zone = if !self.include_timezone {
+            0
+        } else if self.utc {
+            1
+        } else {
+            6
+        };
+        8 + if self.include_date { 11 } else { 0 } + if self.include_millis { 4 } else { 0 } + zone
     }
 
-    /// Format `now` (UTC) as an ISO 8601 timestamp per this configuration.
+    /// Format `now` as an ISO 8601 timestamp per this configuration: UTC when
+    /// [`Self::utc`], otherwise the computer's local time at that instant.
     pub fn format(&self, now: DateTime<Utc>) -> String {
-        let mut s = String::new();
+        let local = now.with_timezone(&Local).offset().fix();
+        self.format_at(now, local)
+    }
+
+    /// [`Self::format`] with the local offset given, so the zone is not read
+    /// from the machine.
+    pub(crate) fn format_at(&self, now: DateTime<Utc>, local: FixedOffset) -> String {
+        let mut pattern = String::with_capacity(20);
         if self.include_date {
-            s.push_str(&now.format("%Y-%m-%dT").to_string());
+            pattern.push_str("%Y-%m-%dT");
         }
-        s.push_str(&now.format("%H:%M:%S").to_string());
+        pattern.push_str("%H:%M:%S");
         if self.include_millis {
-            s.push_str(&now.format("%.3f").to_string());
+            pattern.push_str("%.3f");
         }
         if self.include_timezone {
-            s.push('Z');
+            pattern.push_str(if self.utc { "Z" } else { "%:z" });
         }
-        s
+        if self.utc {
+            now.format(&pattern).to_string()
+        } else {
+            now.with_timezone(&local).format(&pattern).to_string()
+        }
     }
 }
 
@@ -61,54 +84,118 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn full_timestamp() {
-        let cfg = TimestampConfig {
-            include_date: true,
-            include_millis: true,
-            include_timezone: true,
-        };
-        assert_eq!(cfg.format(sample()), "2026-05-22T14:30:45.123Z");
+    fn zone(seconds: i32) -> FixedOffset {
+        FixedOffset::east_opt(seconds).unwrap()
+    }
+
+    fn cfg(date: bool, millis: bool, tz: bool, utc: bool) -> TimestampConfig {
+        TimestampConfig {
+            include_date: date,
+            include_millis: millis,
+            include_timezone: tz,
+            utc,
+        }
     }
 
     #[test]
-    fn date_time_timezone_no_millis() {
-        let cfg = TimestampConfig {
-            include_date: true,
-            include_millis: false,
-            include_timezone: true,
-        };
-        assert_eq!(cfg.format(sample()), "2026-05-22T14:30:45Z");
+    fn utc_full_timestamp() {
+        assert_eq!(
+            cfg(true, true, true, true).format_at(sample(), zone(-4 * 3600)),
+            "2026-05-22T14:30:45.123Z"
+        );
     }
 
     #[test]
-    fn time_and_millis_only() {
-        let cfg = TimestampConfig {
-            include_date: false,
-            include_millis: true,
-            include_timezone: false,
-        };
-        assert_eq!(cfg.format(sample()), "14:30:45.123");
+    fn utc_without_designator_ignores_the_local_zone() {
+        assert_eq!(
+            cfg(false, true, false, true).format_at(sample(), zone(5 * 3600)),
+            "14:30:45.123"
+        );
+        assert_eq!(
+            cfg(true, false, true, true).format_at(sample(), zone(5 * 3600)),
+            "2026-05-22T14:30:45Z"
+        );
     }
 
     #[test]
-    fn time_only_is_the_default() {
-        assert_eq!(TimestampConfig::default().format(sample()), "14:30:45");
+    fn local_negative_offset_with_designator() {
+        assert_eq!(
+            cfg(true, true, true, false).format_at(sample(), zone(-4 * 3600)),
+            "2026-05-22T10:30:45.123-04:00"
+        );
+    }
+
+    #[test]
+    fn local_half_hour_offset_can_change_the_date() {
+        assert_eq!(
+            cfg(true, false, true, false).format_at(sample(), zone(9 * 3600 + 1800)),
+            "2026-05-23T00:00:45+09:30"
+        );
+        assert_eq!(
+            cfg(false, false, true, false).format_at(sample(), zone(5 * 3600 + 1800)),
+            "20:00:45+05:30"
+        );
+    }
+
+    #[test]
+    fn local_without_designator() {
+        assert_eq!(
+            cfg(false, false, false, false).format_at(sample(), zone(-4 * 3600)),
+            "10:30:45"
+        );
+        assert_eq!(
+            cfg(true, true, false, false).format_at(sample(), zone(-4 * 3600)),
+            "2026-05-22T10:30:45.123"
+        );
+    }
+
+    #[test]
+    fn time_only_local_is_the_default() {
+        assert_eq!(
+            TimestampConfig::default().format_at(sample(), zone(-4 * 3600)),
+            "10:30:45"
+        );
+    }
+
+    #[test]
+    fn format_agrees_with_the_machine_local_offset() {
+        let local = sample().with_timezone(&Local).offset().fix();
+        let c = cfg(true, true, true, false);
+        assert_eq!(c.format(sample()), c.format_at(sample(), local));
+        assert!(
+            c.format(sample()).ends_with(&local.to_string()),
+            "{}",
+            c.format(sample())
+        );
     }
 
     #[test]
     fn wire_len_matches_every_formatted_shape() {
-        for include_date in [false, true] {
-            for include_millis in [false, true] {
-                for include_timezone in [false, true] {
-                    let cfg = TimestampConfig {
-                        include_date,
-                        include_millis,
-                        include_timezone,
-                    };
-                    assert_eq!(cfg.wire_len(), cfg.format(sample()).len());
+        for date in [false, true] {
+            for millis in [false, true] {
+                for tz in [false, true] {
+                    for utc in [false, true] {
+                        for offset in [0, -4 * 3600, 5 * 3600 + 1800] {
+                            let c = cfg(date, millis, tz, utc);
+                            assert_eq!(
+                                c.wire_len(),
+                                c.format_at(sample(), zone(offset)).len(),
+                                "{c:?} at {offset}"
+                            );
+                        }
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn utc_defaults_off_and_round_trips_through_toml() {
+        let c: TimestampConfig = toml::from_str("include_timezone = true").unwrap();
+        assert!(!c.utc);
+        let c = cfg(true, false, true, true);
+        let text = toml::to_string(&c).unwrap();
+        assert!(text.contains("utc = true"), "{text}");
+        assert_eq!(toml::from_str::<TimestampConfig>(&text).unwrap(), c);
     }
 }

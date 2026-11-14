@@ -15,6 +15,13 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-13) — "withheld" in place of "suppressed":
+
+- **§3.2 Send outcomes, §4.4** — a send held back during a retry wait is
+  called *withheld*, on screen, in the run summary (`withheld_sends`) and in
+  the code. It was called *suppressed* there, while the log lines already said
+  *withheld*; one name now serves everywhere. Nothing is counted differently.
+
 Revision note (2026-11-13) — hover text and the missed-send callout:
 
 - **§3.2 Hover text (ADR-065)** — every hover that explains something opens with a bold
@@ -458,6 +465,18 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-11-14) — consolidation:
+
+- **ADR-041, ADR-047 and ADR-049** each state one whole decision now. ADR-041 is
+  the diagnostics card, absorbing the card rows of ADR-044 and all of ADR-066;
+  ADR-047 is the deadline-wait policy, absorbing ADR-034 and ADR-040; ADR-049 is
+  the palette, absorbing ADR-050. The absorbed numbers remain as one-line pointers.
+- **ADR-012** is retired, and **ADR-013** is rewritten to the current profile
+  rule: refuse a version mismatch, never migrate. The text they replaced is in
+  [REVISIONS.md](REVISIONS.md#retired-decisions).
+- Pointers and stale facts are corrected in ADR-005, 007, 008, 017, 021, 023,
+  032, 033, 035, 038, 039, 044, 045, 046, 048, 052, 056, 061, 062 and 065.
 
 Revision note (2026-11-14) — consolidation:
 

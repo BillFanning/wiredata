@@ -12,6 +12,14 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-14) — the ZDA zone sign and disk-guard limits:
+
+- **§50.2.** ZDA marks write NMEA's local zone, the hours added to local
+  time to get UTC, so a zone east of Greenwich is negative. They used to
+  write the ISO 8601 offset, the opposite sign.
+- **§56.2, §71.** A disk-guard threshold must be 1 to 90 percent or more
+  than 0 bytes; anything else makes the Channel invalid.
+
 Revision note (2026-11-14) — one stuck Channel cannot hold up the others:
 
 - **§91, §113 (ADR-062).** A status request waits at most 300 ms, and a

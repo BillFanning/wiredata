@@ -966,6 +966,7 @@ mod tests {
                 include_date: true,
                 include_millis: true,
                 include_timezone: true,
+                utc: true,
             }),
             checksum: None,
         };
@@ -1122,6 +1123,7 @@ mod tests {
             interval_ms: 1000,
             timestamp: Some(TimestampConfig {
                 include_millis: true,
+                utc: true,
                 ..Default::default()
             }),
             checksum: None,
@@ -1246,6 +1248,7 @@ mod tests {
                 include_date: true,
                 include_millis: true,
                 include_timezone: true,
+                utc: true,
             }),
             checksum: Some(ChecksumConfig {
                 algorithm: ChecksumAlgorithm::Crc16Kermit,

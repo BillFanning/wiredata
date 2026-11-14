@@ -1,17 +1,17 @@
-# Listener Specification v2.4.11
+# Listener Specification v2.4.12
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-14) — the ZDA zone sign and disk-guard limits:
+Revision note (2026-11-14) — times are local unless they say UTC:
 
-- **§50.2.** ZDA marks write NMEA's local zone, the hours added to local
-  time to get UTC, so a zone east of Greenwich is negative. They used to
-  write the ISO 8601 offset, the opposite sign.
-- **§56.2, §71.** A disk-guard threshold must be 1 to 90 percent or more
-  than 0 bytes; anything else makes the Channel invalid.
+- **§54, §56.1 (ADR-063).** Gap times, in a `‹GAP …›` line and in a gap
+  record, are ISO 8601 local time with milliseconds and offset. They had a
+  space for the `T` and no offset.
+- **§91.** States the rule, and that the GUI shows a completed run's start
+  and finish in local time.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -1048,8 +1048,9 @@ timestamping is the per-match Mark, §50.2.)
 **Gap lines** (ADR-059). When recording resumes after a gap that lost bytes
 (§56.1), the new `.disp` segment starts with one line,
 `‹GAP <reason> · <start> to <end> · not recorded›`, where `<start>` is the first lost
-byte's arrival time and `<end>` the first resumed byte's, both local time with
-milliseconds. It is written only when bytes were actually lost, only with the
+byte's arrival time and `<end>` the first resumed byte's, both ISO 8601 local time
+with milliseconds and the offset from UTC, such as `2026-11-13T14:02:04.000-05:00`
+(ADR-063). It is written only when bytes were actually lost, only with the
 recording's **Mark gaps** option on (the default, `mark_gaps`, §79), and never into a
 Raw Recording, which stays byte-exact (§53).
 
@@ -1106,7 +1107,7 @@ any state → Stopping → Off
   retry to 5 minutes and raises a lasting "recording unstable" fault, which stays
   until recording is stopped.
 - **The gap record** holds the stream offsets (§25) and wall-clock times at both
-  ends, and the reason. A recording that ends records manual stop or shutdown
+  ends, and the reason. The times are written as in a gap line (§54). A recording that ends records manual stop or shutdown
   timeout the same way. Gap records go to the event log (§118) and to
   diagnostics (§93); `RecordingFaulted(ChannelId, RecordingTap)` (§137) is emitted
   when a gap starts. A Display Recording also marks a gap that lost bytes with a
@@ -1830,6 +1831,11 @@ Clearing retained data shall not affect:
 ## 91. Status
 
 Status describes current condition.
+
+Times of day are the computer's local time unless they say UTC (ADR-063). A time
+written to a file or a log carries its offset from UTC; a time shown only on
+screen does not. The GUI shows a completed run's start and finish in local time,
+and the copied report states them in UTC under keys that say so.
 
 A Channel answers a status request within 300 ms. One that does not, such as a
 Channel whose recording close is stuck on a removed disk, is shown with the last

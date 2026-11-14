@@ -2156,6 +2156,29 @@ exit code 4; the error reaches the diagnostics and the event log.
 **Consequences:** Every other Channel's status keeps moving while one is
 stuck, and a running Channel slow to answer shows figures at most one poll old.
 
+## ADR-063 — Listener follows the workspace time policy
+
+**Status:** Accepted 2026-11-14.
+
+**Context:** Talker ADR-067 sets one policy for every time of day in both
+apps: local unless a format, a labelled option or the feature's name says UTC,
+with a zone on whatever is written to a file, a log or the wire.
+
+**Decision:** Listener follows it. Two things changed. Gap times, in the
+`‹GAP …›` line of a Display Recording and in the gap records of the event log
+and diagnostics, are ISO 8601 local time with milliseconds and offset
+(`2026-11-13T14:02:04.000-05:00`); they had a space for the `T` and no offset.
+The GUI shows a finished run's start and end in local time; it showed UTC.
+
+**Boundary:** Already in line and unchanged: event-log and console lines
+(local with offset), plain timestamp marks (local, with an optional offset),
+rotating file names (local), the timestamp sidecar (Unix time) and ZDA marks
+(UTC fields, NMEA's zone sign, ADR-025). The copied run report keeps its
+`started_utc=` and `finished_utc=` keys.
+
+**Consequences:** A time read from any listener file can be placed without
+knowing the computer's zone or the season.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

@@ -1,20 +1,14 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.28
+**Version:** 1.29
 **Date:** 2026-11-14
 **Status:** Accepted
 
-Revision note (2026-11-14) — consolidation:
+Revision note (2026-11-14) — the time policy:
 
-- **ADR-041, ADR-047 and ADR-049** each state one whole decision now. ADR-041 is
-  the diagnostics card, absorbing the card rows of ADR-044 and all of ADR-066;
-  ADR-047 is the deadline-wait policy, absorbing ADR-034 and ADR-040; ADR-049 is
-  the palette, absorbing ADR-050. The absorbed numbers remain as one-line pointers.
-- **ADR-012** is retired, and **ADR-013** is rewritten to the current profile
-  rule: refuse a version mismatch, never migrate. The text they replaced is in
-  [REVISIONS.md](REVISIONS.md#retired-decisions).
-- Pointers and stale facts are corrected in ADR-005, 007, 008, 017, 021, 023,
-  032, 033, 035, 038, 039, 044, 045, 046, 048, 052, 056, 061, 062 and 065.
+- **ADR-067** — one policy for every time of day in both apps: local unless
+  a format, a labelled option or the feature's name says UTC; a zone on
+  whatever is written to a file, a log or the wire.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -2627,6 +2621,64 @@ alone answers the usual question. Listener's hovers follow the same format.
 ## ADR-066 — The diagnostics card has no status badge
 
 **Merged into ADR-041 on 2026-11-14.** The card has no status badge and no header row, and the Send outcomes line starts with ⚠ when any deduction is nonzero; ADR-041 states both. Text in [REVISIONS.md](REVISIONS.md#retired-decisions).
+
+---
+
+## ADR-067 — Times are local unless they say UTC
+
+**Status:** Accepted 2026-11-14. Workspace-level: it governs talker, listener
+and the shared crates (listener ADR-063 points here).
+
+**Context:** Times of day had grown up piecemeal. Talker's message timestamp
+was always UTC, with an optional `Z`, so an unmarked `14:30:45` on the wire was
+UTC without saying so. Talker's console and file log lines were UTC; listener's
+were local with an offset. Both GUIs showed a finished run's start and end in
+UTC. Listener's gap lines were local with no offset. And listener's ZDA marks
+had written the zone with ISO 8601's sign where NMEA's applies (listener
+ADR-025, corrected). The user set the rule: every time is the computer's local
+time unless it is explicitly UTC. A ship's computer is usually set to UTC, and
+there local time is UTC, so the rule costs nothing where UTC matters most.
+
+**Decision:**
+
+1. **One clock.** Every time of day comes from the computer's clock. Neither
+   app has a time source of its own; accuracy is the computer's time sync.
+2. **Instants and durations are kept apart.** When something happened comes
+   from the wall clock. Durations, intervals, timeouts and rates come from the
+   monotonic clock, which never jumps. A schedule uses the wall clock only
+   when it is defined by a wall-clock boundary: UTC-aligned sends (ADR-037),
+   listener's hourly and daily file rotation, and log rollover at local
+   midnight.
+3. **Local by default.** An instant is shown and written in the computer's
+   local time zone unless an external format defines it as UTC (NMEA UTC
+   fields, Unix epoch time), the user chooses UTC with a labelled option, or
+   the feature's name says UTC.
+4. **A zone on whatever leaves the screen.** A time written to a file, a log,
+   a report or the wire carries its zone: the ISO 8601 offset for local time
+   (`-05:00`), `Z` for UTC. Three exceptions: times shown only on screen;
+   rotating file names, which are local and cannot sensibly hold an offset;
+   and a message timestamp or plain mark, whose format the user chooses.
+5. **One format for wiredata's own records.** Log lines, reports and gap
+   lines use ISO 8601 with milliseconds.
+6. **A zone's sign follows the format that owns the field.** ISO 8601's sign,
+   local minus UTC, everywhere except inside an NMEA field, which follows NMEA
+   0183. A spec that borrows a field cites its owner's definition.
+7. **Daylight saving follows the computer.** The offsets of rule 4 keep the
+   repeated autumn hour unambiguous. An hourly recording file holds both of
+   those hours, and the skipped spring hour has no file.
+
+**What this changed in talker:** the message timestamp is local unless its UTC
+option is on, and its zone option appends `Z` or the local offset (spec §5.4);
+console and file log lines are local with an offset and milliseconds (§9.2);
+the GUI shows a finished run's start and end in local time. The copied run
+report keeps its `started_utc=` and `finished_utc=` keys: they say UTC.
+
+**Boundary:** The policy sets how times are written, not how accurate they
+are. It adds no UTC option where none was asked for.
+
+**Consequences:** An unmarked time anywhere in wiredata is local. A reader on
+another computer, or in another season, can still place any time read from a
+file.
 
 ---
 

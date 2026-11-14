@@ -285,6 +285,12 @@ I/O shape (see talker ADR-002 vs listener ADR-001):
 - `core::channel` (talker) manages a **collection** of channels from day one — there is
   no single-channel shortcut to refactor away later.
 - Prefer passing shared config by value through channels over `Mutex` where avoidable.
+- **Times are local unless they say UTC** (talker ADR-067). A time of day is the
+  computer's local time unless a format defines it as UTC, the user chose a
+  labelled UTC option, or the feature's name says UTC. Anything written to a
+  file, a log or the wire carries its zone (an ISO 8601 offset, or `Z`).
+  Durations and timeouts use the monotonic clock. A zone's sign follows the
+  format that owns the field: ISO 8601 everywhere, NMEA inside NMEA fields.
 
 ### Error handling
 

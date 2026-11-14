@@ -165,8 +165,8 @@ const TIMESTAMP_SIDECAR_TOOLTIP: Hover = Hover::new(
 const MARK_GAPS_HOVER: Hover = Hover::new(
     "Writes one line into the Display recording where recording resumed after \
      received bytes were lost.\n\n\
-     The line reads like ‹GAP the recording queue overflowed · 2026-11-13 14:02:11.250 \
-     to 2026-11-13 14:02:19.730 · not recorded›. It gives the reason and the local \
+     The line reads like ‹GAP the recording queue overflowed · 2026-11-13T14:02:11.250-05:00 \
+     to 2026-11-13T14:02:19.730-05:00 · not recorded›. It gives the reason and the local \
      times of the first lost block and of the first block recorded again.\n\n\
      It goes only in the .disp file, just before the text recording resumed with. \
      The Raw recording never gets it, so a .raw file stays exactly the bytes \

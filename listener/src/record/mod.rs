@@ -100,11 +100,17 @@ impl GapMark {
     }
 }
 
-/// A wall-clock instant in local time, to the millisecond, for gap records.
+/// A wall-clock instant as ISO 8601 local time with milliseconds and the zone's
+/// offset (`2026-11-13T14:02:04.000-05:00`), for gap records.
 pub fn local_time(at: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Local>::from(at)
-        .format("%Y-%m-%d %H:%M:%S%.3f")
-        .to_string()
+    iso_with_offset(chrono::DateTime::<chrono::Local>::from(at))
+}
+
+fn iso_with_offset<Tz: chrono::TimeZone>(at: chrono::DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    at.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string()
 }
 
 /// Writes received chunks verbatim, exactly as received (§53, §142).
@@ -561,5 +567,41 @@ mod tests {
         assert_eq!(recording.state(), RecordingState::Enabled);
         let _ = recording.finalize().await;
         assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[cfg(test)]
+mod local_time_tests {
+    use super::*;
+    use chrono::{FixedOffset, TimeZone};
+
+    #[test]
+    fn iso_shape_at_fixed_offsets() {
+        for (secs, text) in [
+            (-5 * 3600, "-05:00"),
+            (0, "+00:00"),
+            (5 * 3600 + 1800, "+05:30"),
+            (-(9 * 3600 + 1800), "-09:30"),
+        ] {
+            let at = FixedOffset::east_opt(secs)
+                .unwrap()
+                .with_ymd_and_hms(2026, 11, 13, 14, 2, 4)
+                .unwrap();
+            assert_eq!(
+                iso_with_offset(at),
+                format!("2026-11-13T14:02:04.000{text}")
+            );
+        }
+    }
+
+    #[test]
+    fn local_time_is_the_local_formatter_of_the_same_instant() {
+        let at =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_250);
+        let expected = chrono::DateTime::<chrono::Local>::from(at)
+            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+            .to_string();
+        assert_eq!(local_time(at), expected);
+        assert_eq!(expected.len(), "2026-11-13T14:02:04.000-05:00".len());
     }
 }

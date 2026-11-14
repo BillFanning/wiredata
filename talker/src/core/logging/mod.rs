@@ -152,6 +152,22 @@ pub enum Rotation {
     Daily,
 }
 
+// ── Timestamps ────────────────────────────────────────────────────────────────
+
+/// Log line timestamps in local time with the UTC offset and milliseconds,
+/// such as `2026-09-30T08:14:03.512-04:00`.
+struct LocalTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(
+            w,
+            "{}",
+            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+        )
+    }
+}
+
 // ── Console ───────────────────────────────────────────────────────────────────
 
 /// Log lines the stdout queue holds for a console that is slow or paused.
@@ -342,6 +358,7 @@ pub fn init(
         layers.push(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
+                .with_timer(LocalTime)
                 .with_ansi(stdout_takes_colour())
                 .with_writer(stdout)
                 .boxed(),
@@ -356,6 +373,7 @@ pub fn init(
     if let Some(sink) = start_file_sink(config.file.as_ref(), gui_mode)? {
         layers.push(
             tracing_subscriber::fmt::layer()
+                .with_timer(LocalTime)
                 .with_ansi(false)
                 .with_writer(sink.writer)
                 .boxed(),
@@ -481,6 +499,52 @@ mod tests {
         // Let the worker end, so the guard has nothing to wait for.
         drop(release);
         drop(guard);
+    }
+
+    // ── Timestamps ────────────────────────────────────────────────────────────
+
+    /// A `Write` into a shared buffer, for reading back a formatted line.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A line opens with local time, milliseconds and a `+hh:mm`/`-hh:mm`
+    /// offset, then the level.
+    #[test]
+    fn a_log_line_opens_with_local_time_and_its_offset() {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_timer(LocalTime)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || tracing::info!("stamped"));
+
+        let line = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let stamp = line.split_whitespace().next().unwrap();
+        let b = stamp.as_bytes();
+        assert_eq!(stamp.len(), 29, "{line}");
+        let digits_at = |range: std::ops::Range<usize>| b[range].iter().all(u8::is_ascii_digit);
+        assert!(digits_at(0..4) && b[4] == b'-' && digits_at(5..7) && b[7] == b'-');
+        assert!(digits_at(8..10) && b[10] == b'T' && digits_at(11..13) && b[13] == b':');
+        assert!(digits_at(14..16) && b[16] == b':' && digits_at(17..19) && b[19] == b'.');
+        assert!(digits_at(20..23), "{line}");
+        assert!(b[23] == b'+' || b[23] == b'-', "{line}");
+        assert!(
+            digits_at(24..26) && b[26] == b':' && digits_at(27..29),
+            "{line}"
+        );
+        assert!(line.contains("INFO") && line.contains("stamped"), "{line}");
     }
 
     // ── LogLevel ──────────────────────────────────────────────────────────────

@@ -1,14 +1,16 @@
 # Talker — Program Specification
-**Version:** 2.5.5
+**Version:** 2.5.6
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-13) — "withheld" in place of "suppressed":
+Revision note (2026-11-14) — times are local unless they say UTC:
 
-- **§3.2 Send outcomes, §4.4** — a send held back during a retry wait is
-  called *withheld*, on screen, in the run summary (`withheld_sends`) and in
-  the code. It was called *suppressed* there, while the log lines already said
-  *withheld*; one name now serves everywhere. Nothing is counted differently.
+- **§5.4 (ADR-067)** — a message timestamp is the computer's local time unless
+  its new **UTC** option is on, and **Zone** appends `Z` or the local offset.
+  It was always UTC, with an optional `Z`.
+- **§9.2** — console and log-file lines are stamped in local time with an
+  offset and milliseconds. They were UTC with microseconds.
+- **§8.1** — the GUI shows a completed run's start and finish in local time.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -646,15 +648,23 @@ Timestamp configuration is per-message and includes independently toggleable com
 - **Date** (YYYY-MM-DD) — include or exclude
 - **Time-of-day** (HH:MM:SS) — always included when the timestamp is enabled
 - **Milliseconds** (.mmm) — include or exclude
-- **Timezone designation** (e.g., `Z` for UTC) — include or exclude
+- **UTC** — off by default. The timestamp is the computer's local time unless
+  this is on (ADR-067)
+- **Zone** — include or exclude the zone designator: `Z` when UTC is on,
+  otherwise the local offset from UTC in ISO 8601 form, such as `-04:00`
 
-Example forms (all representing the same moment):
+Example forms (all representing the same moment, on a computer four hours
+behind UTC):
 ```
-2026-05-21T14:30:45.123Z     (date + time + ms + timezone)
-2026-05-21T14:30:45Z         (date + time + timezone, no ms)
-14:30:45.123                 (time + ms only, no date or timezone)
-14:30:45                     (time only)
+2026-05-21T10:30:45.123-04:00   (local: date + time + ms + zone)
+2026-05-21T14:30:45.123Z        (UTC: date + time + ms + zone)
+2026-05-21T14:30:45Z            (UTC: date + time + zone, no ms)
+10:30:45.123                    (local: time + ms only)
+10:30:45                        (local: time only)
 ```
+
+Without the zone designator a timestamp does not say which zone it is in; a
+computer set to UTC, as a ship's usually is, sends UTC either way.
 
 The timestamp is prepended to the payload. The outer checksum (Section 5.5), if enabled, covers the complete wire output including the prepended timestamp.
 
@@ -1067,6 +1077,8 @@ telemetry shows what the run achieved.
   channel slot. Apply & Restart discards predecessor sampled telemetry so it cannot
   alter the replacement's counters, but drains the predecessor's reliable completion
   tail. Thus polling order cannot make an older run replace a newer completion.
+- The GUI shows a completed run's start and finish in local time. The copied
+  report states them in UTC, under keys that say so (ADR-067).
 - Retention is bounded to one summary and one per-message count vector per channel.
   It is not profile data or an on-disk history. Loading a profile creates fresh slots
   and clears it. Wall-clock values can reflect system-clock steps; elapsed duration
@@ -1132,6 +1144,11 @@ Logging uses the `tracing` facade with `tracing-subscriber` for dispatch. Log le
 | INFO | Channel opened/closed, profile loaded, send started/stopped, a channel returning to schedule |
 | DEBUG | Repeated retry detail useful while diagnosing a persistent fault |
 | TRACE | Finest-grained application and dependency diagnostics |
+
+Console and log-file lines are stamped with the computer's local time in ISO 8601
+form, with milliseconds and the offset from UTC, as in
+`2026-11-14T09:05:00.123-05:00` (ADR-067). The GUI's Log pane shows local time of
+day.
 
 #### Edge-triggered channel conditions
 

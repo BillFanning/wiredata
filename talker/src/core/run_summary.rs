@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Local, SecondsFormat, Utc};
 
 use super::{
     channel::ChannelId,
@@ -112,6 +112,16 @@ impl RunSummary {
 
     pub fn finished_utc(&self) -> String {
         format_utc(self.finished_at)
+    }
+
+    /// Start time as the computer's local time, for the screen: no offset.
+    pub fn started_local(&self) -> String {
+        format_local(self.started_at)
+    }
+
+    /// Finish time as the computer's local time, for the screen: no offset.
+    pub fn finished_local(&self) -> String {
+        format_local(self.finished_at)
     }
 
     /// Stable multiline text intended for clipboard export and issue reports.
@@ -337,6 +347,12 @@ fn format_utc(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+fn format_local(time: SystemTime) -> String {
+    DateTime::<Local>::from(time)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
 fn optional_us(duration: Option<Duration>) -> String {
     duration
         .map(|value| value.as_micros().to_string())
@@ -484,6 +500,18 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn local_times_are_for_the_screen_and_carry_no_zone() {
+        let summary = summary();
+        for text in [summary.started_local(), summary.finished_local()] {
+            assert_eq!(text.len(), 19, "{text}");
+            assert_eq!(&text[4..5], "-");
+            assert_eq!(&text[10..11], " ");
+            assert!(!text.contains('Z') && !text.contains('+'), "{text}");
+        }
+        assert!(summary.started_utc().ends_with('Z'));
     }
 
     #[test]

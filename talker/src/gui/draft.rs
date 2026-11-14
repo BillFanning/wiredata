@@ -417,6 +417,7 @@ pub struct ScheduleDraft {
     pub ts_date: bool,
     pub ts_millis: bool,
     pub ts_timezone: bool,
+    pub ts_utc: bool,
     // checksum
     pub checksum_enabled: bool,
     pub checksum_algorithm: ChecksumAlgorithm,
@@ -454,12 +455,13 @@ impl Default for ScheduleDraft {
             nmea_sentence_filter: String::new(),
             interval_ms: "1000".to_string(),
             timestamp_enabled: false,
-            // Minimal HH:MM:SS by default — Date / Milliseconds / Z (UTC)
+            // Minimal HH:MM:SS by default — Date / Milliseconds / UTC / Zone
             // are opt-in. New users overwhelmingly want a short timestamp;
             // power users can flip the extras on per-message.
             ts_date: false,
             ts_millis: false,
             ts_timezone: false,
+            ts_utc: false,
             checksum_enabled: false,
             checksum_algorithm: ChecksumAlgorithm::default(),
             checksum_wrong: false,
@@ -521,6 +523,7 @@ impl From<&MessageConfig> for ScheduleDraft {
             d.ts_date = ts.include_date;
             d.ts_millis = ts.include_millis;
             d.ts_timezone = ts.include_timezone;
+            d.ts_utc = ts.utc;
         }
         if let Some(cs) = &m.checksum {
             d.checksum_enabled = true;
@@ -584,6 +587,7 @@ impl ScheduleDraft {
             include_date: self.ts_date,
             include_millis: self.ts_millis,
             include_timezone: self.ts_timezone,
+            utc: self.ts_utc,
         });
         let checksum = self.checksum_enabled.then_some(ChecksumConfig {
             algorithm: self.checksum_algorithm,
@@ -766,6 +770,7 @@ mod tests {
                 include_date: true,
                 include_millis: false,
                 include_timezone: true,
+                utc: true,
             }),
             checksum: Some(ChecksumConfig {
                 algorithm: ChecksumAlgorithm::Crc16Modbus,

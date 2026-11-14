@@ -122,6 +122,15 @@ impl ListenerRunSummary {
         format_utc(self.finished_at)
     }
 
+    /// Local time for the screen, without an offset.
+    pub fn started_local(&self) -> String {
+        format_local(self.started_at)
+    }
+
+    pub fn finished_local(&self) -> String {
+        format_local(self.finished_at)
+    }
+
     /// Stable multiline text intended for clipboard export and issue reports.
     pub fn to_report_text(&self) -> String {
         let mut out = String::with_capacity(2_048);
@@ -184,6 +193,12 @@ impl ListenerRunSummary {
 
 fn format_utc(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn format_local(time: SystemTime) -> String {
+    DateTime::<chrono::Local>::from(time)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 fn write_duration_histogram(out: &mut String, name: &str, histogram: DurationHistogram) {
@@ -302,6 +317,15 @@ mod tests {
     use super::super::telemetry::{ArrivalTimestampSummary, SerialStallSummary};
     use super::*;
     use crate::core::ArrivalTimestampSource;
+
+    #[test]
+    fn the_screen_times_are_local_without_an_offset_and_the_report_stays_utc() {
+        let s = summary();
+        let local = s.started_local();
+        assert_eq!(local.len(), "2026-11-13 14:02:04".len());
+        assert!(!local.contains('T') && !local.contains('Z') && !local.contains('+'));
+        assert!(s.to_report_text().contains("started_utc="));
+    }
 
     fn summary() -> ListenerRunSummary {
         let mut chunk_shape = ChunkShape::default();

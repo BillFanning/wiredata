@@ -942,8 +942,12 @@ mod tests {
         assert_eq!(files[0], b"ABCD", "what was recorded before the gap");
         assert_eq!(
             String::from_utf8(files[1].clone()).unwrap(),
-            "\u{2039}GAP the recording queue overflowed \u{b7} 2026-11-13 14:02:04.000 to \
-             2026-11-13 14:02:12.000 \u{b7} not recorded\u{203a}\nGH",
+            format!(
+                "\u{2039}GAP the recording queue overflowed \u{b7} {} to {} \u{b7} not \
+                 recorded\u{203a}\nGH",
+                crate::record::local_time(at(4).at),
+                crate::record::local_time(at(12).at)
+            ),
             "the line goes first in the new file, then the item recording resumed with"
         );
         let _ = std::fs::remove_dir_all(&dir);

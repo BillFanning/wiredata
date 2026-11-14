@@ -91,8 +91,8 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &ListenerRunSummary) {
             });
             ui.weak(format!(
                 "Started {} · finished {}",
-                summary.started_utc(),
-                summary.finished_utc()
+                summary.started_local(),
+                summary.finished_local()
             ));
             ui.weak(format!(
                 "Ingest queue peak {} of {} · {} warnings · {} errors{}",

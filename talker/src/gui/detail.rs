@@ -121,8 +121,8 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
             });
             ui.weak(format!(
                 "Started {} · finished {}",
-                summary.started_utc(),
-                summary.finished_utc(),
+                summary.started_local(),
+                summary.finished_local(),
             ));
             // Same shape as the live send-outcomes line: the aggregate, then
             // its parts in parentheses.
@@ -1828,13 +1828,25 @@ fn show_timestamp_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
         entry.ts_date,
         entry.ts_millis,
         entry.ts_timezone,
+        entry.ts_utc,
     );
     ui.horizontal(|ui| {
         ui.checkbox(&mut entry.timestamp_enabled, "Timestamp");
         if entry.timestamp_enabled {
             ui.checkbox(&mut entry.ts_date, "Date");
             ui.checkbox(&mut entry.ts_millis, "Milliseconds");
-            ui.checkbox(&mut entry.ts_timezone, "Z (UTC)");
+            ui.checkbox(&mut entry.ts_utc, "UTC").on_hover(&Hover::new(
+                "Writes the timestamp in UTC instead of the computer's local time.\n\n\
+                 With this off, the timestamp is the time the computer's clock shows. \
+                 On a computer set to UTC, as a ship's often is, the two are the same.",
+            ));
+            ui.checkbox(&mut entry.ts_timezone, "Zone")
+                .on_hover(&Hover::new(
+                    "Ends the timestamp with the zone it is in.\n\n\
+                 That is Z when UTC is on, and otherwise the computer's offset from \
+                 UTC, such as -05:00.\n\n\
+                 Without it, whoever reads the timestamp cannot tell which zone it is in.",
+                ));
         }
     });
     before
@@ -1843,6 +1855,7 @@ fn show_timestamp_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
             entry.ts_date,
             entry.ts_millis,
             entry.ts_timezone,
+            entry.ts_utc,
         )
 }
 
