@@ -20,9 +20,9 @@ the same as talker's ADR-001.
 
 **Authoritative text:** spec §97.1 (with §97.2 blocking-to-async handoff, §99 backpressure, §111 shutdown). Summarized here so the decision is discoverable from the ADR index.
 
-**Decision:** A hybrid runtime. Tokio owns orchestration — command handling, cancellation, bounded queues, fan-out, async-native network I/O, shutdown. Continuous blocking serial receive loops run on dedicated OS threads that own the interface handle and hand data to the async side through bounded `tokio::sync::mpsc` channels (`try_send`, with a bounded retry loop while the queue is full — see ADR-007's refinement: the retry loop lets the stall notice fire mid-stall and observes cancellation). `spawn_blocking` is reserved for bounded, finite operations (open/close, file create/flush, port enumeration) — never for continuous receive loops. Transports are push-based: data-bearing transports emit `ReceivedData`, TCP listeners emit `NewConnection`.
+**Decision:** A hybrid runtime. Tokio owns orchestration — command handling, cancellation, bounded queues, fan-out, async-native network I/O, shutdown. Continuous blocking serial receive loops run on dedicated OS threads that own the interface handle and hand data to the async side through bounded `tokio::sync::mpsc` channels (`try_send`, with a bounded retry loop while the queue is full — see ADR-007's refinement: the retry loop lets the stall notice fire mid-stall and observes cancellation). `spawn_blocking` is reserved for bounded, finite operations (open/close, file create/flush, port enumeration) — never for continuous receive loops. Transports are push-based: data-bearing transports emit `ReceivedData`. (TCP listeners once emitted `NewConnection`; the TCP code was removed by ADR-047.)
 
-**Contrast with `talker`:** talker deliberately uses **no** async runtime (talker ADR-002 — `std::thread` + `crossbeam-channel`), because it manages a bounded set of *outbound* senders against synchronous `serialport`/`eframe` APIs. Listener faces the opposite shape: many *inbound* network sources, async-native socket I/O, and dynamic TCP-connection fan-in — where Tokio's orchestration earns its keep. The two crates therefore reach opposite conclusions for the same reason (fit the runtime to the I/O shape), and that divergence is intentional.
+**Contrast with `talker`:** talker deliberately uses **no** async runtime (talker ADR-002 — `std::thread` + `crossbeam-channel`), because it manages a bounded set of *outbound* senders against synchronous `serialport`/`eframe` APIs. Listener faces the opposite shape: many *inbound* network sources and async-native socket I/O — where Tokio's orchestration earns its keep. The two crates therefore reach opposite conclusions for the same reason (fit the runtime to the I/O shape), and that divergence is intentional.
 
 **Consequences:**
 - `blocking_send` backpressure can stall a serial reader → UART/driver overrun, reported as transport-specific loss (§99, §101).
@@ -33,17 +33,7 @@ the same as talker's ADR-001.
 
 ## ADR-002 — Messages are immutable; decoders are read-only
 
-> **Superseded by ADR-010 (spec v2.0):** Messages and decoders are removed. The
-> surviving principles live on as §103 (received chunks are immutable, shared via
-> `Arc`) and §5.4/§5.5 (display/recording never alter received bytes).
-
-**Authoritative context:** spec Part on Messages/Decoders (§131–§135, §140; removed in v2.0).
-
-**Decision:** A `Message` is immutable once emitted by the extractor. Decoders never mutate Messages — they only produce read-only annotations (protocol metadata, integrity metadata). Display formatting never affects what is recorded (Raw Recording is independent of rendering).
-
-**Consequences:**
-- Multiple downstream consumers (display, recording, decoding) can share Messages without coordination or copying.
-- Raw recording fidelity is guaranteed regardless of decoder or display behavior.
+**Retired 2026-11-14.** Messages and decoders were removed by ADR-010; their surviving principles are spec §103 (received chunks are immutable and shared) and §5.4 and §5.5 (display and recording never alter received bytes). Text in [REVISIONS.md](REVISIONS.md#retired-decisions).
 
 ---
 
@@ -69,37 +59,7 @@ the same as talker's ADR-001.
 
 ## ADR-005 — Delimiter extraction emits a Message at every delimiter, including empty payloads
 
-> **Obsolete under ADR-010 (spec v2.0):** delimiter extraction is removed entirely;
-> there is nothing to emit. Kept for historical context only.
-
-**Authoritative context:** spec §21 (delimiter extraction; removed in v2.0) and §150 (the
-required "consecutive delimiters" test). The spec mandated the test but did not
-prescribe the outcome, so the behavior was fixed here.
-
-**Decision:** `DelimiterExtractor` completes a Message at **every** delimiter
-occurrence, even when no payload bytes precede it. Consecutive delimiters
-therefore yield empty-payload Messages, and a leading delimiter yields a leading
-empty Message — mirroring standard string-split semantics (`"a\n\nb".split` →
-`["a", "", "b"]`). When `include_delimiter` is true the "empty" Message still
-contains the delimiter bytes; when false its payload is zero-length. Un-terminated
-trailing bytes are an incomplete Message and are discarded at `finish` (§112),
-not emitted as a final empty Message.
-
-**Rationale:** Listener is a forensic receive-side tool — "bad data is often the
-most important data" (§37). Silently collapsing runs of delimiters would hide the
-on-wire structure (e.g. stray blank lines, double CRLFs) that an operator is
-often looking for. Emit-on-every-delimiter is deterministic (§125), matches the
-"extraction defines structure" principle (§5.2), and is the simplest rule to
-reason about. A downstream decoder marks an empty/`$`-less Message as it sees fit
-(§37); extraction does not pre-judge meaning.
-
-**Consequences:**
-- A noisy source can produce many empty Messages; they consume Message Numbers
-  and retention slots like any other Message. Bounding pathological cases
-  (oversized un-terminated buffers, §119/§124) is a separate config/runtime
-  concern, not an extractor responsibility.
-- This rule is observable behavior and is pinned by unit tests in
-  `extract/delimiter.rs`.
+**Retired 2026-11-14.** Delimiter extraction was removed by ADR-010, so there is nothing left to emit. Text in [REVISIONS.md](REVISIONS.md#retired-decisions).
 
 ## ADR-006 — Runtime observability & fault-state ownership
 
@@ -383,88 +343,36 @@ a live snapshot pane); (4) breadth by mapping snapshot fields to panes.
 
 ---
 
-## ADR-009 — The live viewer is fed from the verbatim pre-extraction byte stream (`DisplaySource::Stream`)
+## ADR-009 — The live viewer is fed from the verbatim byte stream
 
-**Status:** Accepted. **Context:** spec §17 (per-Channel Stream vs Message Mode),
-§18 (Stream Mode: continuous bytes, no Message Numbers/timestamps, "displayed as a
-stream"), §41 (`DisplaySource { Stream, Messages }` — a Display View operates on
-either stream data or completed Messages), §24 (in Message Mode with delimiter
-exclusion, CRLF "need not remain in the Message payload"), §53/§142 (the
-pre-extraction chunk path, `write_chunk` — bytes "exactly as received"), §99.1
-(non-blocking distribution order), §88 (retention is Message-**count** based);
-ADR-006 (snapshots are the pull surface) and ADR-008 (the GUI↔runtime bridge).
+**Status:** Accepted. Trimmed 2026-11-14 to the decision that survives; ADR-010 removed
+the Message half this entry was written beside, and ADR-011 replaced its delivery.
 
-**Problem.** The live viewer was wired only to the **Messages** display source —
-extracted, numbered, decoded frames. That is the wrong source for a wire
-troubleshooting view, three ways:
-- **Delimiter extraction strips the terminator** (§24). For NMEA the `\r\n` that
-  *defines* each sentence is consumed by the extractor, so the viewer literally
-  cannot show what is on the wire.
-- **Stream-Mode channels produce no Messages at all** (`StreamExtractor` emits
-  nothing — the generic serial default), so their viewer is empty.
-- **Chunk boundaries are arbitrary.** Non-UDP reads return "whatever the OS has,
-  when it has it" — capped at a 4 KB (serial) / 8 KB (TCP) buffer, with serial also
-  returning empty on a 100 ms cancellation timeout. A read can split a sentence
-  anywhere; boundaries track OS buffering and timing, never content. So a Messages-
-  or chunk-segmented viewer diverges between serial and UDP for the same data.
-(TCP receive code removed 2026-11-14, ADR-047.)
+**Context:** The live viewer was first wired to extracted, numbered Messages, which is
+the wrong source for wire troubleshooting. Delimiter extraction strips the terminator
+that defines each NMEA sentence, so the viewer could not show what is on the wire.
+Stream-mode channels produced no Messages at all. And non-UDP reads return whatever
+the OS has when it has it, so a read can split a sentence anywhere, and a view
+segmented by Messages or chunks diverged between serial and UDP for the same data.
 
-The spec already defines the right source — `DisplaySource::Stream` (§18/§41), the
-verbatim pre-extraction bytes — but it was never surfaced: the chunk path (§53/§142)
-fed only raw *recording*, not the viewer.
+**Decision:** The live viewer is fed from the verbatim pre-extraction byte stream.
+A bounded per-Channel byte ring is appended in `Pipeline::ingest`, a non-blocking tap
+alongside the raw recorder (§53, §99.1). The GUI renders it as one continuous,
+selectable view through the `DisplayView` renderer: Rendered honors the data's real
+CR/LF (§44), Hex is a bytes-per-line dump, Raw shows control pictures.
+Concatenating chunks in arrival order reconstructs the exact wire stream regardless of
+read-chunk boundaries, because nothing is reframed. Serial and UDP therefore behave
+identically, and every Channel has a working viewer.
 
-**Decision.** Feed the live viewer from the **verbatim pre-extraction byte stream**.
-Maintain a bounded per-Channel byte ring, appended in `Pipeline::ingest` *before*
-extraction — a second non-blocking pre-extraction tap alongside the raw recorder
-(§53/§99.1), **independent of the Channel's extraction config**. Surface its tail in
-`ChannelSnapshot` (ADR-006 pull surface), cloned only for the on-screen Channel. The
-GUI renders the tail as one continuous, selectable view through the existing
-`DisplayView` renderer: Rendered honors the data's real CR/LF (terminal semantics,
-§44), Hex is a bytes-per-line dump, Raw shows control pictures. Concatenating chunks
-in arrival order reconstructs the exact wire stream regardless of read-chunk
-boundaries — the reassembly an extractor must do across buffers (§21) is unnecessary
-here because nothing is reframed. This makes serial and UDP behave identically and
-gives **every** Channel a working viewer.
+**Why not the alternatives.** Rendering from extracted Messages loses the delimiters
+and segments on arbitrary frame boundaries. A pseudo-stream built from Message history
+has the same source defect. Reusing the raw-recording path would write to disk, where
+the viewer needs an in-memory, bounded tail.
 
-The work is phased. Phase 1: the verbatim Stream viewer becomes the default — and,
-for now, only — viewer. Phase 2: the per-view `DisplaySource` **Stream ↔ Messages**
-switch (§41), which restores the Messages-source view (decoded, numbered,
-`[type]`-tagged, match-highlighted). Until then the Messages machinery keeps running
-for decoding, Match Rules, diagnostics, and message-framed recording — it is simply
-not rendered.
-
-**Why not the alternatives.**
-- *Render from extracted Messages (the prior direction).* Loses the delimiters under
-  delimiter extraction (§24), shows nothing under Stream extraction, and segments on
-  arbitrary frame/chunk boundaries — none of which is the wire.
-- *Concatenate the Messages display history into a pseudo-stream (an interim hack).*
-  Same source defect: CRLF-stripped frames run together with no breaks. Wrong layer.
-- *Reuse the raw-recording path.* That writes to disk; the viewer needs an in-memory,
-  bounded, snapshot-cloneable tail. Same data, different sink.
-
-**Consequences.**
-- A new bounded byte ring per Channel, capped by **bytes** (~128 KB default) — there
-  are no Message boundaries to count, so §88's count-based retention does not apply.
-  Trivial CPU/memory; always-on even for Stream-Mode channels.
-- Stream Mode has no Message Numbers or timestamps (§18): the Stream viewer drops the
-  per-message prefix (timestamp / # / `[type]`), and "Recent messages (N)" becomes a
-  byte count. Match-rule highlighting (message-number-keyed, §50.2/§165) and
-  Display-View pause move to the deferred Messages view.
-- The snapshot grows by the tail clone (≤ cap), polled at the ADR-006 cadence (5 Hz)
-  for the selected Channel only. _(Superseded by ADR-011: at the eventual ~1 MB cap
-  this 5 Hz full-buffer clone was **not** negligible — it is replaced by incremental
-  `StreamDelta` fetches, and the snapshot no longer carries the tail.)_
-- The recently built Messages-based viewer (line-virtualized per-message log) is set
-  aside, to return behind the §41 source switch.
-
-**Build order (small, reversible first):** (1) byte ring + `ChannelSnapshot` field +
-GUI render + revert the interim hack [this step]; (2) the per-view
-`DisplaySource::Stream/Messages` switch (§41), restoring the Messages view; (3)
-Stream-view pause and optional byte/line gutters.
-
-> **Superseded by ADR-010 (spec v2.0).** ADR-009 phases 1–2 shipped, but v2.0 then
-> removed the Message half entirely, so the phase-2 "Messages source" is gone. The
-> Stream viewer ADR-009 introduced is now the *only* viewer.
+**Consequences:** The ring is capped by bytes, since there are no Message boundaries to
+count. Stream view has no per-message prefix or numbers (§18). How the tail reaches
+the GUI is ADR-011's decision, and ADR-010 holds the removal of the Messages source
+this entry once planned to restore.
 
 ---
 
@@ -530,7 +438,7 @@ A second, parallel command enum on top of a working method API + a GUI transport
 - *Keep it as documentation only.* Leaves an exported, untested type that reads as load-bearing and re-accretes the drift on the next audit.
 
 **Consequences.**
-- `core::RuntimeCommand` and its `pub use` are gone; `DisplayViewId` is no longer imported by `core::command` (only `RuntimeEvent`'s `MatchRuleId` remains). No functional change — nothing referenced the enum (160 lib + 6 profile + 7 integration tests, clippy `-D warnings`, fmt all unchanged-green after removal).
+- `core::RuntimeCommand` and its `pub use` are gone; `DisplayViewId` (since removed by ADR-060) is no longer imported by `core::command` (only `RuntimeEvent`'s `MatchRuleId` remains). No functional change — nothing referenced the enum (160 lib + 6 profile + 7 integration tests, clippy `-D warnings`, fmt all unchanged-green after removal).
 - The live-control work (§165, mid-run recording) is unambiguously specified by this ADR: add `Listener` methods + the `run_channel` command channel — not a `RuntimeCommand` variant. *(Mid-run recording shipped this way: `Listener::set_recording` → `PipelineRequest::SetRecording`, commit `ae7e541`; Display recording followed with `set_display_recording` → `SetDisplayRecording`, and the match-rule `Record { Display | Both }` actions drive the same pipeline paths. Live match-rule toggle / `MarkNow` remain to do.)*
 - **Supersedes** the ADR-008 note that the bridge would "align `RuntimeCommand` with §136 and dispatch it." It won't; `UiCommand` is that bridge.
 - Spec §136 is amended to document the method-API command surface in place of the enum (version-bumped with a revision note, per the workspace versioning rule).
@@ -667,34 +575,42 @@ The live viewer was rebasing `TriggeredMatch.byte_offset` (stream space) onto it
 - The live viewer and the `.disp` now agree byte-for-byte for Rendered/Raw content (the viewer re-renders the accumulated buffer, which was always boundary-free).
 - Pinned by: `stream_renderer_is_chunking_invariant`, `stream_renderer_rejoins_a_split_utf8_character`, `stream_renderer_hex_separates_across_chunks_and_tabs_keep_columns`, `stream_renderer_defers_an_annotation_for_a_carried_byte`, and the pipeline-level `disp_is_the_exact_rendered_stream_across_read_boundaries`.
 
-## ADR-019 — GUI chrome moves to the shared `wiredata-ui` crate
+## ADR-019 — GUI chrome lives in the shared `wiredata-ui` crate
 
-**Status:** Accepted. **Context:** the GUI merge — talker adopts listener's look and feel, and both apps will eventually offer the same light/dark themes. Counterpart of talker ADR-016, which holds the full rationale and the scope rule.
+**Status:** Accepted. Rewritten 2026-11-14 to state the current decision.
 
-**Decision.** Listener's GUI **chrome** — the bundled font stack (`gui/fonts.rs`), the named color palette (`gui/theme.rs`), the base widget visuals and style tweaks (the body of `apply_style`), and `widgets::format::human_bytes` — moved verbatim into the new internal workspace crate **`wiredata-ui`** (egui-only, `publish = false`). The listener modules remain as thin re-exports, so every call site is unchanged. The palette carries both `LIGHT` and `DARK` instances — several light values (e.g. the then-named `WARNING_AMBER`/`INFO_GREY` consts, now `Palette` fields `warning_amber`/`info_grey`) are unreadable on a dark backdrop. *(Follow-up, same series:)* listener since gained the theme toggle: `gui/theme.rs` became theme-aware — same names as small functions that read a UI-thread-written mirror of the active egui theme (set at startup restore and by the ◐ header button; persisted under the same `dark_mode` storage key talker uses), picking `LIGHT` or `DARK` live. The pure color helpers (`status_color` etc.) stay argument-free that way. Stream-view content colors remain user-chosen per view (`ColorScheme` offers both light and dark schemes) — deliberately not coupled to the chrome theme.
+**Context:** The GUI merge made talker adopt listener's look and feel, and both apps
+offer the same light and dark themes. Counterpart of talker ADR-016, which holds the
+full rationale and the scope rule.
+
+**Decision.** Listener's GUI **chrome** is the internal workspace crate
+**`wiredata-ui`** (egui-only, `publish = false`), shared with talker: the bundled font
+stack, the named palette with `LIGHT` and `DARK` instances (four role-named accents,
+talker ADR-049), the base widget visuals and style tweaks, and
+`human_bytes`. Listener imports `wiredata_ui` paths directly.
+
+- `wiredata_ui::palette::active(ui)` returns the active theme's palette. Pure helpers
+  such as `status_color` and `recording_indicator` take `&Palette`, so they are
+  unit-testable without a `Ui`.
+- The header theme toggle is `wiredata_ui::style::theme_toggle_button`. The choice is
+  persisted under the same `dark_mode` storage key talker uses.
+- `wiredata_ui::selection` owns the selected and compact channel tabs, shared row
+  emphasis, and the complete tab-to-page edge. The apps supply the selected card
+  rectangle and its real scroll viewport. The shared painter mirrors egui's resizer
+  hover and drag stroke and detours around a tab only when the whole card and both
+  rounded turns are visible; a clipped selection gets a straight page divider.
+  Historical warning and error counts recede identically on background tabs, while
+  app-owned lifecycle glyphs and live faults stay saturated.
+- Stream-view content colours stay user-chosen per view (`ColorScheme` offers light and
+  dark schemes), deliberately not coupled to the chrome theme.
 
 **Consequences.**
-- `listener/assets/fonts/` moved to `wiredata-ui/assets/fonts/` (README and licenses included); the font rationale doc lives there now.
-- Anything app-specific stays put: view-models, widgets with runtime knowledge, the stream-view `ColorScheme` (user-chosen content colors are not chrome).
-- A change to the shared look lands in both apps by construction — the drift risk that motivated the crate is gone.
-
-**Follow-up (2026-07-16, chrome dedup — counterpart of the talker ADR-016 follow-up).**
-The transitional re-export shims (`gui/fonts.rs`, `gui/widgets/format.rs`) and the
-`gui/theme.rs` global theme mirror were retired: call sites import `wiredata_ui`
-paths directly, `wiredata_ui::palette::active(ui)` replaces the atomic mirror (the
-pure helpers `status_color` / `recording_indicator` now take `&Palette`, keeping
-them unit-testable without a `Ui`), and the header theme toggle is the shared
-`wiredata_ui::style::theme_toggle_button`.
-
-**Follow-up (selected-channel continuity).** `wiredata-ui::selection` now owns the
-selected/full and compact channel tabs, shared row emphasis, and the complete
-tab-to-page edge. The apps supply the selected card rectangle and
-its real scroll viewport. The shared painter mirrors egui's resizer hover/drag stroke
-and detours around a tab only when the whole card and both rounded turns are visible;
-a clipped selection gets a straight page divider. Historical warning/error counts
-recede identically on background tabs, while app-owned lifecycle glyphs and live
-faults remain saturated. This is chrome, not channel state, so both apps use one
-implementation and one set of geometry tests.
+- The font assets, their README and licenses, and the font rationale doc live in
+  `wiredata-ui/assets/fonts/`.
+- Anything app-specific stays put: view-models, widgets with runtime knowledge, and the
+  stream-view `ColorScheme`. Selection is chrome, not channel state.
+- A change to the shared look lands in both apps by construction, which removes the
+  drift risk that motivated the crate.
 
 ## ADR-020 — Terminal transport fault causes use lossless post-reception delivery
 
@@ -729,14 +645,13 @@ removed simply closes the receiver and releases the send. Pinned by
 **Status:** Accepted 2026-07-15. **Context:** the existing Add-template GUI model and
 its adoption by talker in talker ADR-027.
 
-**Decision:** Keep transport kind structural in the GUI. `+ Add` chooses the UDP, TCP,
-or Serial template, in that shared order. Configure Connection edits the selected
-template's parameters and never replaces its `InterfaceConfig` variant. Runtime-created
-TCP Connection Channels remain governed by their TCP Listener parent. (TCP receive code removed 2026-11-14, ADR-047.)
+**Decision:** Keep transport kind structural in the GUI. `+ Add` chooses the UDP or
+Serial template (TCP was removed by ADR-047). Configure interface edits the selected
+template's parameters and never replaces its `InterfaceConfig` variant.
 
 **Consequences:** This records existing listener behavior rather than adding a new
-runtime path. Both apps now present one ordinary transport choice and the same Add-menu
-order. Reconfiguration, profiles, and the schema are unchanged. A focused GUI test
+runtime path. Both apps now present one ordinary transport choice and the same relative
+Add-menu order. Reconfiguration, profiles, and the schema are unchanged. A focused GUI test
 pins the menu labels and order.
 
 ## ADR-022 — Recorder stops retire detached from the acquisition loop
@@ -770,48 +685,29 @@ deferred until something needs it. Pinned by
 
 ## ADR-023 — One Display View per Channel
 
-**Status:** Accepted 2026-07-16 (spec v2.1). **Corrected 2026-11-13 by ADR-060:**
-the `views` list this entry kept for forward compatibility is gone; a Channel's
-one view is saved as `display.view`. **Context:** spec §48 promised multiple
-simultaneous Display Views per Channel, but the runtime and GUI have only ever used
-the first view: scrollback pause gating keyed on `display_views.first()`, and the
-detail pane surfaced one view. A non-primary view could be *marked* paused but had no
-per-view stream state to freeze — the abstraction cost complexity (a `Vec` of views
-threaded through the pipeline, snapshots, and config) without delivering the feature.
+**Status:** Accepted 2026-07-16 (spec v2.1). Rewritten 2026-11-14 to state the current
+decision; ADR-060 holds the profile change.
 
-**Decision:** v2.1 makes one **logical** Display View per Channel normative, with
-Raw / Rendered / Hex as that view's switchable modes — matching talker's single
-Output pane, so the two apps present the same display model. The profile schema's
-`views` list stays (additive forward-compatibility); entries beyond the first are
-ignored. Multiple simultaneous views are deferred to Appendix A: reviving them
-requires per-view render/pause state, not just config plumbing.
+**Context:** Spec §48 promised multiple simultaneous Display Views per Channel, but the
+runtime and GUI have only ever used the first view: scrollback pause gating keyed on
+`display_views.first()`, and the detail pane surfaced one view. A non-primary view could
+be *marked* paused but had no per-view stream state to freeze — the abstraction cost
+complexity (a `Vec` of views threaded through the pipeline, snapshots, and config)
+without delivering the feature.
+
+**Decision:** One **logical** Display View per Channel is normative, with Raw / Rendered
+/ Hex as that view's switchable modes — matching talker's single Output pane, so the two
+apps present the same display model. The view is saved as `display.view` (ADR-060, which
+also holds the loader for older profiles that carried a `views` list). Multiple
+simultaneous views are deferred to Appendix A: reviving them requires per-view
+render/pause state, not just config plumbing.
 
 **Consequences:** "The view is paused" and "the Channel's display is paused" are the
-same statement, closing the pause ambiguity. Internal `Vec` shapes may simplify
-opportunistically; no behavior changes now (the code already lived this way).
+same statement, closing the pause ambiguity.
 
 ## ADR-024 — TCP Connection-Channel surfacing is deferred scope
 
-**Status:** Accepted 2026-07-16 (spec v2.1; parked by user decision 2026-07-11).
-**Context:** every accepted TCP connection runs a full pipeline (Model A, §16.4),
-but the supervisor drops its request handle — so connections surface only
-connect/disconnect lifecycle events: no per-connection snapshot, stream view,
-recording (blocked on §59 filename templating), or match rules, and
-`recv_buffer_bytes` is not applied to accepted sockets. The spec read as if the
-full per-connection surface existed.
-
-**Decision:** Record the shipped boundary as normative v2.1 scope. §16.2's
-independence requirements remain the architecture; their user-facing surfacing is
-Appendix-A deferred until a real TCP-inspection need promotes it (UC1 today is
-serial/UDP). When promoted, the design direction stays what the TODO records: the
-supervisor retains per-connection handles in a registry keyed by the minted
-`ChannelId`, `Listener::snapshot`/`stream_delta` route through it, and the GUI
-decides between sub-tabs and dynamic top-level channels.
-
-**Consequences:** The spec no longer promises an inspection surface the runtime
-doesn't expose. The full-pipeline-per-connection cost is acknowledged as paying for
-recording-readiness and §16.2 independence, not for visibility; a lighter
-per-connection pipeline is an option if promotion is far off.
+**Merged into ADR-047 on 2026-11-14.** Surfacing TCP connections was deferred scope, and the TCP code that made the question live is removed; ADR-047 holds both. Text in [REVISIONS.md](REVISIONS.md#retired-decisions).
 
 ## ADR-025 — NMEA construction returns for presentation-only ZDA Marks
 
@@ -891,7 +787,8 @@ bytes change.
 
 ## ADR-027 — Recent receive timing uses a fixed segmented window
 
-**Status:** Accepted 2026-07-19.
+**Status:** Accepted 2026-07-19. The local-implementation paragraph was superseded by
+ADR-032, which moved the helper into `wiredata-telemetry`.
 
 **Context:** ADR-026's cumulative post-read histogram preserves completed-run truth,
 but a long healthy history can dilute a new queueing or task-scheduling slowdown. Raw
@@ -906,11 +803,7 @@ recent window for warm-up and p99, while retaining the cumulative maximum as the
 run-wide outlier. Stop preserves both final summaries with the channel's other retained
 state.
 
-The implementation remains local to Listener. Talker uses the same deliberately small
-algorithm and matching boundary tests, but `wiredata-ui` is presentation-only and
-neither existing core crate is a valid owner for runtime telemetry. A new shared crate
-for this one helper would add more architecture than reuse; extraction can be revisited
-if additional non-GUI consumers emerge.
+
 
 **Consequences:** Recent degradation becomes visible without retaining samples,
 increasing event traffic, or changing the O(1) stats/snapshot shape. The window is an
@@ -968,6 +861,8 @@ make Mark and recording times hard to interpret.
 The Serial reader accumulates every Transport-to-Pipeline backpressure episode's
 duration and publishes count, total, maximum, and active state; its existing 250 ms
 warning remains an advisory possible-loss threshold, not the accounting threshold.
+ADR-034 later moved these Serial figures to the reader's authoritative state and
+made the cumulative values completed-only, with active time reported separately.
 Linux UDP enables `SO_RXQ_OVFL`, unwraps the kernel's 32-bit cumulative counter into a
 run-local `u64`, and reports supported zero separately from unsupported. Other
 platforms remain explicitly unsupported because no equivalent attributable
@@ -988,43 +883,32 @@ hardware or per-byte timing. Serial stall duration is evidence of risk, not a lo
 byte estimate. The only profile addition defaults off, so schema version 3 remains
 unchanged.
 
-## ADR-030 — Idle rules wait on exact deadlines with bounded Windows precision
+## ADR-030 — Idle rules wait on one ordinary deadline
 
-**Status:** Accepted 2026-07-19 (spec v2.2.1). **Amended 2026-11-13:** the
-exact-deadline wait stands; the Windows precision window, the 1 ms request,
-the lateness histograms and the wait counts are removed. The user judged
-about 16 ms of possible lateness on Windows acceptable for a rule that fires
-on a quiet stream, against a timer request, two histograms, a summary and a
-GUI readout kept only for it. Idle rules now use one ordinary deadline wait
-on every platform. The text below records the decision as first made.
+**Status:** Accepted 2026-07-19 (spec v2.2.1). Rewritten 2026-11-14 to the decision as
+amended on 2026-11-13. The first-made text, with its Windows precision window, is in
+[REVISIONS.md](REVISIONS.md#retired-decisions).
 
-**Context:** Idle rules were evaluated by a shared 250 ms maintenance tick, adding up
-to one tick of avoidable lateness before executor or OS wake jitter. Receiving data is
+**Context:** Idle rules were evaluated by a shared 250 ms maintenance tick, adding up to
+one tick of avoidable lateness before executor or OS wake jitter. Receiving data is
 event-driven and gains nothing from a finer timer period, but an explicitly configured
-timer condition should target its own monotonic deadline. Holding a Windows 1 ms
-request for an entire quiet channel would pay a continuous power cost.
+timer condition should target its own monotonic deadline. A Windows 1 ms request held
+near each deadline was first built, with two lateness histograms, a timer summary and a
+GUI readout. The user judged about 16 ms of possible lateness on Windows acceptable for a
+rule that fires on a quiet stream, against all of that kept for it alone.
 
-**Decision:** The pipeline computes the earliest armed Idle-rule deadline for each
-select pass and waits directly on it. New data, commands, or cancellation discard the
-future and recompute it; only a completed deadline wait records a timer-policy sample
-and evaluates rules. Each firing records nonnegative monotonic lateness in cumulative
-and ten-segment recent histograms. Recorder maintenance remains on its independent
-250 ms tick.
-
-On Windows, a deadline more than 32 ms away first waits natively to the final window,
-then holds the shared 1 ms RAII guard through the deadline and releases it immediately
-after wake. Linux and macOS use one native Tokio deadline wait. The internal
-`wiredata-timing` crate owns only the process-wide refcounted Windows begin/end calls
-and minimized-window throttling opt-out shared with Talker; Listener owns its rule,
-window, and telemetry policy. Successful requests, failed requests, and native waits
-are counted separately. There is no spin wait or dedicated timing thread.
+**Decision:** The pipeline computes the earliest armed Idle-rule deadline for each select
+pass and waits directly on it, with one ordinary deadline wait on every platform. New
+data, commands, or cancellation discard the future and recompute it; only a completed
+deadline wait evaluates rules. Recorder maintenance remains on its independent 250 ms
+tick. Listener makes no timer-resolution request and keeps no lateness histograms; it
+calls `wiredata-timing` only for the minimized-window throttling opt-out it shares with
+Talker.
 
 **Consequences:** Idle evaluation no longer carries intentional 250 ms polling delay,
-while ordinary receive paths make no timer-resolution request. Windows precision is
-held only near a real rule deadline and composes safely with Talker in the shared
-mechanism. Wake accuracy still depends on executor and OS scheduling, and no timer
-policy improves arrival timestamps. macOS App Nap remains a separate activity-policy
-question rather than a resolution-call analog.
+and ordinary receive paths make no timer-resolution request. On Windows an Idle rule can
+fire about 16 ms late, and that is accepted. No timer policy improves arrival timestamps.
+macOS App Nap remains a separate activity-policy question.
 
 ## ADR-031 — Completed Listener runs retain one bounded truth snapshot
 
@@ -1041,7 +925,7 @@ unique increasing `RunId`, paired wall-clock start, and monotonic start. Stop or
 terminal transport fault captures finish time and monotonic elapsed duration, then
 builds a self-contained `ListenerRunSummary` before the final snapshot is consumed.
 It owns exact bytes/chunks, diagnostics counts, match-boundary saves, cumulative and
-recent timing, Idle timer policy, transport health, ingest/Raw-recorder queue peaks,
+recent timing, transport health, ingest/Raw-recorder queue peaks,
 end reason, and a `final_snapshot_complete` flag. Raw-recorder queue history is
 retained before task retirement so teardown cannot erase its peak.
 
@@ -1070,7 +954,7 @@ bucket edge or rollover rule is corrected in only one application.
 dependency-free `wiredata-telemetry` crate. It owns the cumulative duration histogram
 and bounded ten-by-one-second recent-window engine. Listener continues to expose the
 cumulative type through `runtime::telemetry` and keeps all application aggregates and
-measurement policy local: `ByteHistogram`, `ChunkShape`, transport/timer summaries,
+measurement policy local: `ByteHistogram`, `ChunkShape`, transport summaries,
 pipeline boundaries, stats/snapshots, completed-run retention, and GUI presentation.
 The separate `wiredata-timing` crate continues to own only process timer-resolution
 mechanics.
@@ -1083,7 +967,8 @@ its window semantics and all other consequences remain in force.
 
 ## ADR-033 — Diagnostics lead with decisions without overstating receive health
 
-**Status:** Accepted 2026-07-20.
+**Status:** Accepted 2026-07-20. **Amended 2026-11-14:** absorbs ADR-057; the card has
+no badge.
 
 **Context:** Listener exposes transport-specific counters, queue pressure, handoff
 and pipeline timing, chunk shape, timer policy, recorder state, and retained-run
@@ -1102,9 +987,16 @@ that is the actual evidence; it never claims no loss or maps unsupported to zero
 Pressure summarizes existing ingest/recorder queue and backpressure evidence without
 inventing missing counts. Pipeline summarizes existing handoff and processing timing
 while retaining warm-up, incomplete-final-snapshot, and measurement-boundary caveats.
-The card badge distinguishes live monitoring, retained last-run evidence, and a
-channel that has not produced run telemetry; it does not turn absent evidence into a
-healthy state.
+The card has no title and no status badge: it starts with the Transport row and is
+drawn with `wiredata_ui::diagnostics::diagnostic_card`, and the shared crate has no
+badge at all. A badge once summed the card up as live monitoring, retained last-run
+evidence, or no run telemetry yet. It rose only from the Transport and Pressure rows,
+which already mark themselves with ⚠ when they want attention, and kernel drops and
+Serial stalls have their own callouts. Its calm words were said elsewhere:
+monitoring by the Channel status at the top of the pane, last run by the Pipeline
+row's "~final 10 s", and awaiting data by the rows' own "awaiting". Absent evidence is
+never turned into a healthy state. Talker removed its badge for the same reason
+(talker ADR-041).
 
 An **Attention** callout appears only when existing state derives an operator-relevant
 exception. It is GUI presentation, not a runtime `Diagnostic`: it creates no event,
@@ -1249,7 +1141,8 @@ the thing being configured and the adapter it binds to.
 editor is **Configure interface**, matching Talker (talker ADR-044) and the
 `InterfaceConfig` type both applications already use. Host-adapter references say
 **network interface** or **NIC** explicitly, so the bind help cannot be read as
-describing the channel's configured endpoint. (TCP receive code removed 2026-11-14, ADR-047.)
+describing the channel's configured endpoint. No TCP session exists now (ADR-047), so Listener has no *connection* at all; the
+vocabulary rule stands for if one returns.
 
 Byte rates use the shared `human_byte_rate` helper rather than a hardcoded
 `kB/s`, so a fast channel reads `1.2 MB/s` and a stopped one reads `0.0 B/s`,
@@ -1293,8 +1186,7 @@ something the maximum does not.
 Three consequences follow from applying one rule everywhere:
 
 - **The noun is the measurement's, not the transport's.** Handoff and Processing
-  count chunks; Idle-rule lateness counts firings. The row that reported firings
-  as an unlabelled integer now names them.
+  count chunks.
 - **The superlative is not always "worst".** Read gaps report the *longest*: a
   quiet source is not a fault, and `worst` would imply one.
 - **Chunk sizes obey it too.** A median or percentile appears only when reads
@@ -1319,71 +1211,87 @@ names the boundary and the tooltip defines it, and the row now carries counts
 that earn the space. No measurement, telemetry type, snapshot surface, or profile
 schema changes; this is presentation only.
 
-## ADR-038 — Hex grouping is rendering; line length is layout
+## ADR-038 — Hex grouping is rendering; line length is layout; a Mark takes its own row
 
-**Status:** Accepted 2026-08-05.
+**Status:** Accepted 2026-08-05. **Amended 2026-11-14:** states the whole Hex layout
+decision. It absorbs ADR-040, ADR-041 and ADR-042, which each corrected the one before.
 
-**Context:** `HexGrouping { bytes_per_group, groups_per_line }` (§45) was
-specified, persisted, `#[serde(default)]`-ed, and pinned by a profile round-trip
-test — and read by nothing. Both places that built a `DisplayView` hardcoded
-`hex_bytes_per_line: 16`, and no GUI control set the field, so a profile could
-express a grouping that the viewer and the `.disp` both ignored.
+**Context:** `HexGrouping { bytes_per_group, groups_per_line }` (§45) was specified,
+persisted, and pinned by a profile round-trip test, yet read by nothing: both places that
+built a `DisplayView` hardcoded `hex_bytes_per_line: 16`, and no GUI control set the
+field. Mapping the config onto the existing line length would not have delivered §45,
+because `bytes_per_group` means bytes *run together* between separators (`41424344` at
+four), which the renderer could not express.
 
-The obvious fix — map the config onto the existing `hex_bytes_per_line` — does
-not deliver what §45 asks for. `bytes_per_group` means bytes *run together*
-between separators (`41424344` at four), which the renderer could not express:
-it emitted one separator between every cell. Line length alone would have left
-the setting half-implemented in a way no readout would reveal.
+Hex is a fixed-width grid, and the grid is the reason to read it: byte *N* sits at a
+predictable column, so a reader can follow one field down a column. Two things threaten
+that, and each produced a defect. A wrap done by a generic character splitter cannot
+know a separator from a digit, so it stranded separators and cut bytes in half. And a
+`Mark` (§50.2) is text of arbitrary width: counted as one cell it overran the pane, and
+spliced into a byte row it pushed everything after it to an unpredictable column. The
+`NmeaZda` style makes it concrete: `$GPZDA,120000.00,08,08,2026,00,00*4F` is about 37
+columns, more than an entire row of data at 80 columns.
 
-**Decision:** Split the two halves by where they belong.
+**Decision:** Split the halves by where they belong.
 
-- **`bytes_per_group` is rendering.** `DisplayView` gains
-  `hex_bytes_per_group`; `render_hex` runs that many bytes together and
-  separates only groups. It therefore reaches the `.disp` — the recorded stream
-  is the rendered stream, and the spacing is part of what was rendered.
-- **`groups_per_line` is layout.** It sets the viewer's line length and never
-  reaches a recording: ADR-018 holds that `.disp` is never hard-wrapped, so
-  `build_display_view` passes `hex_bytes_per_line: 0` unconditionally while the
-  GUI passes a real length. The flag is the mechanism, not the code path — a
-  `0` means "do not wrap", which is what the recorder's view always carries.
-- **`groups_per_line: 0` stays "fit to the display width" (§45)** — a question
-  only a viewer that knows its own width can answer, so the renderer is told not
-  to wrap and the pane wraps what it gets.
+- **`bytes_per_group` is rendering.** `DisplayView` has `hex_bytes_per_group`;
+  `render_hex` runs that many bytes together and separates only groups. It therefore
+  reaches the `.disp`: the recorded stream is the rendered stream, and the spacing is
+  part of what was rendered. A zero resolves to 1 everywhere, since no group can be
+  empty.
+- **`groups_per_line` is layout.** It sets the viewer's line length and never reaches a
+  recording: ADR-018 holds that `.disp` is never hard-wrapped, so `build_display_view`
+  passes `hex_bytes_per_line: 0` ("do not wrap"), while the GUI passes a real length.
+- **Fit-to-width (`groups_per_line: 0`) resolves to whole bytes before rendering.** `G`
+  groups of `B` bytes occupy `G × B × 2` digits plus `G − 1` separators, so the largest
+  `G` fitting `cols` columns is `(cols + 1) / (2B + 1)`. The renderer then wraps at that
+  many bytes and the character splitter has nothing left to cut. A configured group
+  count is clamped to what fits rather than overflowed, and when not one whole group
+  fits the fallback is whole bytes. The splitter and the resolver read one
+  `MIN_WRAP_COLS`, so they cannot disagree on width.
+- **A line is bounded by both the byte budget and the pane's columns.** The renderer
+  tracks the columns it has written, not only the cells, and ends a line when the next
+  cell would not fit the pane or the byte budget is spent, whichever comes first. A byte
+  is two columns, an annotation is as wide as its text, and a separator counts where one
+  is emitted. `rebuild_rows`, which already receives the pane width, attaches it to the
+  view, so a Hex line length can never be supplied without its column bound; the bound is
+  tied to the line-length request, so the recorder's view still emits the exact rendered
+  stream at any width (§54).
+- **A Mark in Hex takes its own row, at the marked byte.** The byte run ends, the `Mark`
+  text occupies its own line, and bytes resume on a fresh row and a fresh group. The break
+  is at the marked byte, not the next row boundary, because a `Mark` identifies a byte and
+  placing it only near the right row would answer a coarser question. This costs a short
+  row, which is self-explaining: the reason for it is on the line below. `Mark` text that
+  already ends in CR/LF gets no second break. Removing Marks from Hex was rejected: it is
+  the mode for binary protocols, where "when did this pattern occur" is asked, and rule
+  behaviour that changes with the display mode is a matrix the user would carry.
+- **A group never breaks at a read boundary.** `HexCursor` carries group position across
+  chunks alongside line position, so a transport's read sizes are not visible in the
+  spacing.
+- **The row cache's rebuild key includes grouping and the resolved line length**, so a
+  changed setting restyles existing scrollback rather than only new bytes. A mark is
+  admitted only inside the window, half-open like `delta_annotations`, so a mark on a
+  delta boundary is spliced once.
 
-Two rules keep the output stable under things the reader did not choose:
+**Boundary.** A `Mark` wider than the whole pane still overruns and is cut by the
+character splitter. That cuts annotation text, never a byte, and is stated rather than
+absorbed. The `.disp` follows the display, so a Hex recording carries Marks on their own
+lines. It was never byte-exact; that is `.raw`, whose sidecar (`.raw.idx`, ADR-039) is
+the precise, non-perturbing way to timestamp bytes.
 
-- **A group never breaks at a read boundary.** The `HexCursor` carries group
-  position across chunks alongside line position, so a transport's read sizes
-  are not observable in the spacing (`hex_grouping_is_chunking_invariant`).
-- **An annotation stands apart and resets the group.** Running a Mark into the
-  bytes on either side (`4142‹T›4344`) would hide both, and letting it count as
-  a group member would shift every column below it.
+**Known structural risk.** Hex still wraps in two stages: cell-aware rendering followed by
+a generic character splitter, which remains for the text modes, where a character *is*
+the unit. Two successive defects have lived in the seam between them. If this path is
+touched again, the renderer should return final rows and `split_stream_rows` should not
+see Hex at all.
 
-The line wrap is done by the renderer rather than by splitting rendered text at
-a computed column count. The arithmetic works out to the same width, but the
-splitter cannot know that the character at the boundary is a separator, so it
-stranded one at the head of every continuation line.
-
-*Amended 2026-08-05 (ADR-040): as first written this held only for a configured
-group count. Fit-to-width — the default — still passed a zero line length and
-let the character splitter cut the row, so the guarantee above described half the
-feature. ADR-040 resolves fit-to-width to a byte count before rendering, which
-makes the sentence true for both paths.*
-
-**Consequences:** A GUI control under Configure display sets both halves, in the
-units §45 and the schema use (bytes per group, groups per line) with the
-resulting bytes-per-line shown alongside so the reader does not multiply. The
-setting persists through `ViewPrefs` like the other view presentation fields —
-the field already round-tripped through TOML, so what this closes is the write
-side. A zero `bytes_per_group` resolves to 1 everywhere rather than erroring:
-no group can be empty, and the config has no way to mean otherwise.
-
-**Found while testing:** the row cache spliced a Mark twice when its byte landed
-exactly on a delta boundary. `rebuild_rows` admitted a mark at one *past* the
-window end — a `Before` whose byte had not arrived — so it rendered ahead of its
-byte and again when that byte turned up in the next delta. The bound is now
-half-open, matching `delta_annotations`, and pinned across all three modes and
-four chunk sizes by `a_mark_on_a_delta_boundary_splices_once`.
+**Consequences:** One invariant holds and is tested across grouping, line setting, pane
+width, Mark width and placement: no pane width, grouping or annotation ever splits a
+byte, and a byte row is only bytes and separators. A GUI control under Configure display
+sets both halves in the units §45 and the schema use (bytes per group, groups per line),
+with the resulting bytes per line shown alongside. The setting persists through
+`ViewPrefs` like the other view presentation fields; the field already round-tripped
+through TOML, so what this closed was the write side.
 
 ## ADR-039 — A sidecar offset is a position in a file, not a count for a run
 
@@ -1437,167 +1345,20 @@ append test reported offsets `0, 0, 2` where the file holds `0, 5, 7`.
 
 ## ADR-040 — Fit-to-width resolves to whole bytes before rendering
 
-**Status:** Accepted 2026-08-05. Amends ADR-038; from external review.
-
-**Context:** ADR-038 put Hex wrapping in the renderer, where a cell boundary is
-known, and said so as though it covered the feature. It covered one half. A
-configured `groups_per_line` produced a real line length; fit-to-width — the
-*default* — passed zero, meaning "do not wrap", and left the row to
-`split_stream_rows`, which cuts at a raw monospace column.
-
-That column does not respect cells. A row could arrive as `" 03 04 0"`: a
-separator stranded at the head, and a byte delivered as `0` here and `A` on the
-next row. The comment above the renderer construction claimed the cell-aware
-guarantee for the whole Hex path, so the code read as though this were handled.
-
-A second defect sat beside it. The row cache's rebuild key was channel, mode,
-control-character rendering and pane width. Grouping was absent, so changing
-bytes-per-group restyled only newly arriving bytes and left the existing
-scrollback in the old shape until an unrelated change forced a rebuild — a
-setting that appeared not to work.
-
-**Decision:** Fit-to-width becomes a byte count *before* rendering. `G` groups of
-`B` bytes occupy `G × B × 2` digits plus `G − 1` separators, so the largest `G`
-fitting `cols` columns is `(cols + 1) / (2B + 1)`. The renderer then wraps at
-that many bytes and the splitter has nothing left to cut.
-
-Two edges follow from refusing to return an oversized line, since an oversized
-line is precisely what re-engages the splitter:
-
-- **A configured group count is clamped, not overflowed.** Asking for sixteen
-  groups in a pane holding four shows four. The alternative is showing sixteen
-  broken ones, and the control's help now states the reduction.
-- **When not one whole group fits, the fallback is whole bytes** — not one group
-  anyway. A byte is the smallest unit that can be wrapped without misreporting
-  the data.
-
-Both the splitter and the resolver read one `MIN_WRAP_COLS`, so the width the
-renderer wraps to and the width the splitter would cut at cannot disagree.
-
-Grouping and resolved line length join the row cache's rebuild key.
-
-**Consequences:** One invariant now holds and is tested directly rather than
-asserted in prose: **no pane width or grouping splits a byte.**
-`no_pane_width_or_grouping_ever_splits_a_hex_byte` sweeps four group sizes, four
-line settings and eight pane widths over all 256 byte values, checking every row
-is whole hex groups joined by single spaces, with no leading or trailing
-separator, and that the rows still reconstruct the stream exactly. It was
-confirmed to fail against the previous behaviour, reporting `" 03 04 0"`.
-
-`split_stream_rows` remains character-based and still wraps the text modes, where
-a character *is* the unit. The comment at the call site now says which stage owns
-which, instead of claiming the stronger boundary for both.
+**Merged into ADR-038 on 2026-11-14.** The Hex layout rules this entry added or corrected are stated in ADR-038. Text in [REVISIONS.md](REVISIONS.md#retired-decisions).
 
 ## ADR-041 — A Hex line is bounded by columns, not by cells
 
-**Status:** Accepted 2026-08-06. Amends ADR-040; from external review.
-
-**Context:** ADR-040 resolved fit-to-width to a byte count so the renderer,
-which knows cell boundaries, would do the wrapping. It held for bytes and broke
-for Marks.
-
-The renderer wrapped when its *cell* count reached the line's byte budget, and
-an inline `Mark` (§50.2) counts as one cell while occupying as many columns as
-its text. A line correct by cell count could therefore be far wider than the
-pane, and the oversized line went to `split_stream_rows` — which is exactly the
-re-engagement ADR-040 set out to prevent. At eight columns with one byte per
-group, a `[T]` before the second byte rendered `41 [T] 42` and came back as
-`41 [T] 4` and `2`.
-
-The test that was supposed to cover this passed no annotations, so
-`no_pane_width_or_grouping_ever_splits_a_hex_byte` proved the invariant only in
-the case that was never at risk. Its name claimed the general result.
-
-**Decision:** The renderer tracks the columns it has written, not only the cells,
-and ends a line when the next cell would not fit the pane **or** the byte budget
-is spent — whichever comes first. A byte is two columns; an annotation is as
-wide as its text; a separator counts where one is emitted.
-
-The pane width is attached to the view by `rebuild_rows`, which already receives
-`wrap_cols`, rather than by the GUI call site. The two settings cannot then be
-supplied apart: a view carrying a Hex line length but no column bound is the
-exact configuration that produced this defect, and it is now unconstructible on
-the path that matters. The column bound is tied to the line-length request, so
-the recorder's view — which asks for no line length — still emits the exact
-rendered stream at any width (§54).
-
-An annotation wider than the whole pane still overruns, because there is
-nowhere for it to go. That cuts Mark text, never a byte, and is stated rather
-than silently absorbed.
-
-**Consequences:** the invariant — no pane width, grouping or annotation
-splits a byte — is checked across all four dimensions crossed, and was
-confirmed capable of failing before the fix.
-
-A reference implementation must be configured as the thing it references. The
-one-shot comparison for the incremental row cache was not, so the equality it
-asserted could be satisfied by both sides being wrong, and for Hex at a narrow
-pane both sides were. That is a property of any such pairing, not of this
-one.
-
-**Known structural risk.** Hex still wraps in two stages: cell-aware rendering
-followed by a generic character splitter. Two successive defects have now lived
-in the seam between them. If this path is touched again, the renderer should
-return final rows and `split_stream_rows` should not see Hex at all.
+**Merged into ADR-038 on 2026-11-14.** The Hex layout rules this entry added or corrected are stated in ADR-038. Text in [REVISIONS.md](REVISIONS.md#retired-decisions).
 
 ## ADR-042 — In Hex, a Mark takes a row of its own
 
-**Status:** Accepted 2026-08-08.
-
-**Context:** ADR-041 made an annotated Hex line fit the pane, which fixed the
-byte being cut in half. It did not address why the annotation was hard to place
-to begin with.
-
-Hex is a fixed-width grid, and the grid is the reason to read it: byte *N* sits
-at a predictable column, so a reader can follow one field down a column across
-many rows. A `Mark` is text of arbitrary width. Splicing it into a byte row
-pushes everything after it to an unpredictable column and forces an early wrap,
-so row lengths stop matching. The result was correct — no byte was split — and
-still destroyed the affordance the mode exists for.
-
-The `NmeaZda` style makes it concrete: `$GPZDA,120000.00,08,08,2026,00,00*4F`
-is about 37 columns. At 80 columns with one byte per group a row holds roughly
-26 bytes, so one `Mark` costs more than an entire row of data.
-
-Removing `Mark`s from Hex was considered and rejected. Hex is the mode used for
-binary protocols, which is exactly where "when did this pattern occur" is asked;
-and rule behaviour that silently changes with the display mode is a matrix the
-user has to carry.
-
-**Decision:** In Hex, an annotation is a row, not a cell. The byte run ends, the
-`Mark` text occupies its own line, and bytes resume on a fresh row and a fresh
-group.
-
-The break is **at the marked byte**, not at the next row boundary. A `Mark`
-identifies a byte; placing it only near the right row would answer a coarser
-question than the one asked. This costs a short row, which is acceptable because
-the row is self-explaining — the reason for it is on the line immediately below.
-
-`Mark` text that already ends in CR/LF gets no second break, so a multi-line
-annotation still renders as written.
-
-**Consequences:** the column-width interaction that produced ADR-041's defect
-cannot recur for byte rows, because no annotation shares one. The invariant a
-byte row can now assert is stronger than "its hex tokens are whole bytes": a
-byte row is *only* bytes and separators, and the property test asserts that
-across grouping, pane width, `Mark` width and placement.
-
-ADR-041's column bound is kept. It is no longer the thing standing between a
-`Mark` and a split byte, but it remains the renderer enforcing "never wider than
-the pane" for itself rather than trusting the resolved byte count to agree.
-
-A `Mark` wider than the pane still overruns and is cut by the character
-splitter. That cuts annotation text, never a byte, and is the one overrun this
-design accepts.
-
-The `.disp` recording follows the display, as it always has: a Hex recording now
-carries `Mark`s on their own lines. It was never byte-exact — that is `.raw`,
-whose sidecar (`.raw.idx`, ADR-039) remains the precise, non-perturbing way to
-timestamp bytes.
+**Merged into ADR-038 on 2026-11-14.** The Hex layout rules this entry added or corrected are stated in ADR-038. Text in [REVISIONS.md](REVISIONS.md#retired-decisions).
 
 ## ADR-043 — A recording continues across faults as numbered segments with recorded gaps
 
-**Status:** Accepted 2026-09-30. Amends §56.1, §56.2 and §59.
+**Status:** Accepted 2026-09-30. Amends §56.1, §56.2 and §59. **Amended 2026-11-14:**
+absorbs ADR-059.
 
 **Context:** §56.1 made a recording fault terminal until a person re-enabled
 recording. That suits troubleshooting with someone at the screen. It does not
@@ -1632,8 +1393,8 @@ independently.
 - **Gap record:** the stream offsets (§25, not file offsets) and wall-clock times
   at both ends, and a reason: open failure, write failure, queue overflow, low
   disk or destination missing. A recording end records manual stop or shutdown
-  timeout the same way. Gaps go to the event log (ADR-044) and diagnostics only;
-  there is no separate gaps file.
+  timeout the same way. Gaps go to the event log (ADR-044) and diagnostics, and a Display
+  Recording also marks them in its file (below); there is no separate gaps file.
 - **Retry:** 1 s, doubling to 30 s. **Anti-thrash:** a third fault within 10
   minutes stretches the retry to 5 minutes and raises a lasting "recording
   unstable" fault, which stays until recording is stopped.
@@ -1668,6 +1429,18 @@ independently.
   Display-only recordings are guarded too. With `StopRecording`, the recording
   enters a Gap with reason low disk and resumes in a new segment once free space
   is 10% above the threshold.
+- **A Display Recording marks its gaps.** `RecordingStopReason` is gone, and a stop
+  always writes the accepted backlog, then finalizes. When a Display Recording resumes
+  after a gap that lost bytes, the new segment starts with one line, `‹GAP <reason> ·
+  <start> to <end> · not recorded›` (§54), in the style of the `‹MARK›` lines but with
+  no leading newline, since a resumed segment is always a fresh file. It is a
+  per-recording choice, **Mark gaps** (`mark_gaps`), on by default, because after a long
+  run a gap is what a reader most needs to find; a profile saved before the option
+  existed loads with it on. A Raw Recording never gets the line: `.raw` stays exactly the
+  bytes received (§53). No line is written for a gap that lost no bytes, or for one still
+  open when recording stops; the event log reports both. The controller stays generic
+  over its items: the recorder side writes the line, through a hook Raw recorders leave
+  empty.
 - **Retention is external.** Listener never deletes recordings. Status shows the
   total size of the recording's files and the destination's free space.
 - **Queues are sized in bytes:** 8 MiB per recording, with a fixed allowance per
@@ -1817,54 +1590,61 @@ Task Scheduler task in `deploy/` are examples.
 **Consequences:** A headless listener outlives a late device, says loudly what
 is down, and exits with a code a supervisor can act on.
 
-## ADR-047 — The TCP Listener is disabled; UDP states its bind scope and can request a shared port
+## ADR-047 — The TCP Listener was removed; UDP states its bind scope and can request a shared port
 
-**Status:** Accepted 2026-09-30. Amends §1, §16, §68, §73, §76, §85, §153, §154,
-§162 and Appendix A; builds on ADR-024.
+**Status:** Accepted 2026-09-30. Amends §1, §16, §68, §73, §76, §85, §153, §154, §162 and
+Appendix A. **Amended 2026-11-14 (task G6):** the TCP code is removed rather than
+disabled, and ADR-024, which deferred surfacing TCP connections, is absorbed here.
 
-**Amended 2026-11-14 (task G6):** the code is removed, not kept as the decision
-below says. A profile that names a TCP Listener loads without that Channel and
-with a warning naming it. This reverses the rejection of "hide the TCP Listener
-but keep loading it" below: what the user sees is the same as before, the Channel
-left out with a message, while the profile no longer fails to load or carries a
-kind the code cannot run. The text below is the decision as first made.
+**Context:** A TCP Listener accepted connections, but their data could not be displayed
+or recorded. Every accepted connection ran a full pipeline, but the supervisor dropped
+its request handle, so connections surfaced only connect and disconnect events: no
+per-connection snapshot, stream view, recording (blocked on §59 filename templating) or
+match rules, and `recv_buffer_bytes` was not applied to accepted sockets. Offering it
+invited the belief that data was being captured. It also lacked what a shared network
+needs: its template bound all interfaces with no connection cap, there was no keepalive,
+and any accept error faulted the Channel. The spec read as if the full per-connection
+surface existed.
 
-**Context:** A TCP Listener accepts connections, but their data cannot be
-displayed or recorded (ADR-024). Offering it invites the belief that data is
-being captured. It also lacks what a shared network needs: its template binds
-all interfaces with no connection cap, there is no keepalive, and any accept
-error faults the Channel. For UDP, a second program cannot bind the same
-broadcast or multicast port, which users sometimes need, and "0.0.0.0" does not
-tell a reader that the socket is reachable from the network.
+For UDP, a second program cannot bind the same broadcast or multicast port, which users
+sometimes need, and "0.0.0.0" does not tell a reader that the socket is reachable from
+the network.
 
 **Decision:**
 
-- **The TCP Listener is disabled.** It is gone from `+ Add` and `--tcp`, and
-  profile validation rejects it: "TCP Listener isn't available in this release:
-  received data can't be displayed or recorded yet." The code stays. When it
-  returns, alongside ADR-024's surfacing, it needs a default connection cap,
-  keepalive with idle, interval and probe count set for each OS, and
-  per-connection handling of accept errors with rate-limited logging.
+- **The TCP Listener was removed, not disabled.** It is gone from `+ Add` and `--tcp`,
+  and the TCP Listener and TCP Connection code is deleted. A profile that names a TCP
+  Listener loads without that Channel and with a warning naming it. The CLI prints the
+  warning and the GUI shows it on the profile status line.
+- **Re-adding TCP needs a new decision.** The direction it would start from is
+  ADR-024's: a supervisor that retains per-connection handles in a registry keyed by the
+  minted `ChannelId`, with `Listener::snapshot` and `stream_delta` routed through it, and
+  the GUI choosing between sub-tabs and dynamic top-level channels. It would also need a
+  default connection cap, keepalive with idle, interval and probe count set for each OS,
+  and per-connection handling of accept errors with rate-limited logging.
 - **Bind scope in words.** The UDP editor lists local addresses, and labels the
-  all-interfaces choice "All interfaces (reachable from the network)". The
-  Channel header shows the scope.
-- **"Request shared port"** is a per-Channel UDP option, off by default and
-  offered for broadcast and multicast only. It sets the platform's address-reuse
-  option before binding, and status reports whether the OS applied it.
+  all-interfaces choice "All interfaces (reachable from the network)". The Channel
+  header shows the scope.
+- **"Request shared port"** is a per-Channel UDP option, off by default and offered for
+  broadcast and multicast only. It sets the platform's address-reuse option before
+  binding, and status reports whether the OS applied it.
 
-**Boundary:** This targets shared networks, not untrusted ones: there is no
-source allow-list. Sharing is not offered for unicast, where the OS delivers
-each datagram to only one of the sharing sockets.
+**Boundary:** This targets shared networks, not untrusted ones: there is no source
+allow-list. Sharing is not offered for unicast, where the OS delivers each datagram to
+only one of the sharing sockets.
 
 **Alternatives considered:**
 
-- **Hide the TCP Listener but keep loading it:** Rejected. Nothing is deployed,
-  so there are no profiles to protect, and a loadable but hidden kind is harder
-  to explain than an absent one.
+- **Disable the TCP Listener but keep its code and keep loading profiles that name it:**
+  chosen first, when this entry was written with a profile naming one rejected at
+  validation, and replaced on 2026-11-14. What the user sees is the same, the Channel
+  left out with a message, while the profile no longer fails to load and no code carries
+  a kind that cannot run.
 - **Build the connection view now:** Out of scope for this remediation.
 
-**Consequences:** Every Channel kind offered can display and record what it
-receives. A UDP Channel says in words who can reach it.
+**Consequences:** Every Channel kind offered can display and record what it receives. A
+UDP Channel says in words who can reach it. The spec no longer promises an inspection
+surface the runtime does not have.
 
 ## ADR-048 — Profiles load strictly and runtime capacities are bounded
 
@@ -2251,23 +2031,7 @@ multicast join interface is a separate, open question.
 
 ## ADR-057 — The Receive diagnostics card has no status badge
 
-**Status:** Accepted 2026-11-13. Amends ADR-033, whose card carried the badge.
-
-**Context:** Talker removed its card badge (talker ADR-066) once every reason
-it rose for was found marked elsewhere. Listener's badge rose only from the
-Transport and Pressure rows. Both mark themselves with ⚠ when they want
-attention, and kernel drops and Serial stalls also have their own callouts.
-Its calm words were said elsewhere as well: MONITORING by the Channel status
-at the top of the pane, LAST RUN by the Pipeline row's "~final 10 s", and
-AWAITING DATA by the rows' own "awaiting".
-
-**Decision:** The card is drawn with `wiredata_ui::diagnostics::diagnostic_card`,
-with no title and no badge. `wiredata-ui` no longer has a badge at all.
-
-**Boundary:** ADR-033's other decisions stand: the three rows, the bounded
-claims, and the callouts.
-
-**Consequences:** The card starts with the Transport row, a row higher.
+**Merged into ADR-033 on 2026-11-14.** The card has no title and no status badge; ADR-033 states it. Text in [REVISIONS.md](REVISIONS.md#retired-decisions).
 
 ## ADR-058 — A reconnect sequence ends only after 60 s up
 
@@ -2297,36 +2061,7 @@ faults is treated as recovered each time.
 
 ## ADR-059 — Display recordings mark their gaps; fault-finalization is gone
 
-**Status:** Accepted 2026-11-13. Completes ADR-043.
-
-**Context:** §142 still said a recorder's `finalize` would "write the
-truncation marker (for faults)", driven by a `RecordingStopReason`. ADR-043
-had already turned recording faults into gaps that continue in a new segment:
-nothing ended a recording with a fault, every `finalize` ignored its reason,
-and no recorder wrote a marker. A gap was recorded only in the event log and
-diagnostics, so a `.disp` file read on its own showed no sign of one.
-
-**Decision:**
-
-- `RecordingStopReason` and the `finalize` parameter are removed; a stop
-  always writes the accepted backlog, then finalizes.
-- When a Display Recording resumes after a gap that lost bytes, the new
-  segment starts with one line, `‹GAP <reason> · <start> to <end> · not
-  recorded›` (§54), in the style of the `‹MARK›` lines but with no leading
-  newline, since a resumed segment is always a fresh file.
-- It is a per-recording choice, **Mark gaps** (`mark_gaps`), on by default:
-  after a long run, a gap is what a reader most needs to find. A profile
-  saved before the option existed loads with it on.
-- A Raw Recording never gets the line: `.raw` stays exactly the bytes
-  received (§53).
-
-**Boundary:** No line is written for a gap that lost no bytes, or for a gap
-still open when recording stops; the event log reports both, as before. The
-controller stays generic over its items: the recorder side writes the line,
-through a hook Raw recorders leave empty.
-
-**Consequences:** A `.disp` file says where its gaps are without the event
-log beside it.
+**Merged into ADR-043 on 2026-11-14.** A Display Recording marks its gaps, and a stop always finalizes; ADR-043 states both. Text in [REVISIONS.md](REVISIONS.md#retired-decisions).
 
 ## ADR-060 — One display view, in the profile as well as the runtime
 

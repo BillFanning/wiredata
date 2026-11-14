@@ -1,6 +1,8 @@
 # Listener — documentation revision history
 
 Superseded revision notes for [listener_specification.md](listener_specification.md), newest first.
+It also holds the full text of ADR entries retired or merged out of [ADR.md](ADR.md),
+under Retired decisions.
 
 They are kept out of the specification itself so that document states **current
 behaviour** and carries its version in one place. Each entry records what changed
@@ -382,3 +384,337 @@ Revision v1.1.1:
   corrected the layout that nested `nmea0183` (it is a top-level sibling crate).
 No runtime, data-model, or schema changes from v1.1 — the packaging decision does not
 alter the normative module boundaries or behavior.
+
+
+---
+
+## Retired decisions
+
+The full text of ADR entries that were retired, or merged into another entry, on
+2026-11-14, in number order. [ADR.md](ADR.md) keeps each number with one line that says
+why and where the decision lives now. Nothing here is normative.
+
+### ADR-002 — Messages are immutable; decoders are read-only
+
+> **Superseded by ADR-010 (spec v2.0):** Messages and decoders are removed. The
+> surviving principles live on as §103 (received chunks are immutable, shared via
+> `Arc`) and §5.4/§5.5 (display/recording never alter received bytes).
+
+**Authoritative context:** spec Part on Messages/Decoders (§131–§135, §140; removed in v2.0).
+
+**Decision:** A `Message` is immutable once emitted by the extractor. Decoders never mutate Messages — they only produce read-only annotations (protocol metadata, integrity metadata). Display formatting never affects what is recorded (Raw Recording is independent of rendering).
+
+**Consequences:**
+- Multiple downstream consumers (display, recording, decoding) can share Messages without coordination or copying.
+- Raw recording fidelity is guaranteed regardless of decoder or display behavior.
+
+### ADR-005 — Delimiter extraction emits a Message at every delimiter, including empty payloads
+
+> **Obsolete under ADR-010 (spec v2.0):** delimiter extraction is removed entirely;
+> there is nothing to emit. Kept for historical context only.
+
+**Authoritative context:** spec §21 (delimiter extraction; removed in v2.0) and §150 (the
+required "consecutive delimiters" test). The spec mandated the test but did not
+prescribe the outcome, so the behavior was fixed here.
+
+**Decision:** `DelimiterExtractor` completes a Message at **every** delimiter
+occurrence, even when no payload bytes precede it. Consecutive delimiters
+therefore yield empty-payload Messages, and a leading delimiter yields a leading
+empty Message — mirroring standard string-split semantics (`"a\n\nb".split` →
+`["a", "", "b"]`). When `include_delimiter` is true the "empty" Message still
+contains the delimiter bytes; when false its payload is zero-length. Un-terminated
+trailing bytes are an incomplete Message and are discarded at `finish` (§112),
+not emitted as a final empty Message.
+
+**Rationale:** Listener is a forensic receive-side tool — "bad data is often the
+most important data" (§37). Silently collapsing runs of delimiters would hide the
+on-wire structure (e.g. stray blank lines, double CRLFs) that an operator is
+often looking for. Emit-on-every-delimiter is deterministic (§125), matches the
+"extraction defines structure" principle (§5.2), and is the simplest rule to
+reason about. A downstream decoder marks an empty/`$`-less Message as it sees fit
+(§37); extraction does not pre-judge meaning.
+
+**Consequences:**
+- A noisy source can produce many empty Messages; they consume Message Numbers
+  and retention slots like any other Message. Bounding pathological cases
+  (oversized un-terminated buffers, §119/§124) is a separate config/runtime
+  concern, not an extractor responsibility.
+- This rule is observable behavior and is pinned by unit tests in
+  `extract/delimiter.rs`.
+
+### ADR-024 — TCP Connection-Channel surfacing is deferred scope
+
+**Status:** Accepted 2026-07-16 (spec v2.1; parked by user decision 2026-07-11).
+**Context:** every accepted TCP connection runs a full pipeline (Model A, §16.4),
+but the supervisor drops its request handle — so connections surface only
+connect/disconnect lifecycle events: no per-connection snapshot, stream view,
+recording (blocked on §59 filename templating), or match rules, and
+`recv_buffer_bytes` is not applied to accepted sockets. The spec read as if the
+full per-connection surface existed.
+
+**Decision:** Record the shipped boundary as normative v2.1 scope. §16.2's
+independence requirements remain the architecture; their user-facing surfacing is
+Appendix-A deferred until a real TCP-inspection need promotes it (UC1 today is
+serial/UDP). When promoted, the design direction stays what the TODO records: the
+supervisor retains per-connection handles in a registry keyed by the minted
+`ChannelId`, `Listener::snapshot`/`stream_delta` route through it, and the GUI
+decides between sub-tabs and dynamic top-level channels.
+
+**Consequences:** The spec no longer promises an inspection surface the runtime
+doesn't expose. The full-pipeline-per-connection cost is acknowledged as paying for
+recording-readiness and §16.2 independence, not for visibility; a lighter
+per-connection pipeline is an option if promotion is far off.
+
+ADR-030 was rewritten in place on 2026-11-14 to the current decision. The entry as it stood
+before, with its 2026-11-13 amendment, read:
+
+### ADR-030 — Idle rules wait on exact deadlines with bounded Windows precision (first-made text)
+
+**Status:** Accepted 2026-07-19 (spec v2.2.1). **Amended 2026-11-13:** the
+exact-deadline wait stands; the Windows precision window, the 1 ms request,
+the lateness histograms and the wait counts are removed. The user judged
+about 16 ms of possible lateness on Windows acceptable for a rule that fires
+on a quiet stream, against a timer request, two histograms, a summary and a
+GUI readout kept only for it. Idle rules now use one ordinary deadline wait
+on every platform. The text below records the decision as first made.
+
+**Context:** Idle rules were evaluated by a shared 250 ms maintenance tick, adding up
+to one tick of avoidable lateness before executor or OS wake jitter. Receiving data is
+event-driven and gains nothing from a finer timer period, but an explicitly configured
+timer condition should target its own monotonic deadline. Holding a Windows 1 ms
+request for an entire quiet channel would pay a continuous power cost.
+
+**Decision:** The pipeline computes the earliest armed Idle-rule deadline for each
+select pass and waits directly on it. New data, commands, or cancellation discard the
+future and recompute it; only a completed deadline wait records a timer-policy sample
+and evaluates rules. Each firing records nonnegative monotonic lateness in cumulative
+and ten-segment recent histograms. Recorder maintenance remains on its independent
+250 ms tick.
+
+On Windows, a deadline more than 32 ms away first waits natively to the final window,
+then holds the shared 1 ms RAII guard through the deadline and releases it immediately
+after wake. Linux and macOS use one native Tokio deadline wait. The internal
+`wiredata-timing` crate owns only the process-wide refcounted Windows begin/end calls
+and minimized-window throttling opt-out shared with Talker; Listener owns its rule,
+window, and telemetry policy. Successful requests, failed requests, and native waits
+are counted separately. There is no spin wait or dedicated timing thread.
+
+**Consequences:** Idle evaluation no longer carries intentional 250 ms polling delay,
+while ordinary receive paths make no timer-resolution request. Windows precision is
+held only near a real rule deadline and composes safely with Talker in the shared
+mechanism. Wake accuracy still depends on executor and OS scheduling, and no timer
+policy improves arrival timestamps. macOS App Nap remains a separate activity-policy
+question rather than a resolution-call analog.
+
+### ADR-040 — Fit-to-width resolves to whole bytes before rendering
+
+**Status:** Accepted 2026-08-05. Amends ADR-038; from external review.
+
+**Context:** ADR-038 put Hex wrapping in the renderer, where a cell boundary is
+known, and said so as though it covered the feature. It covered one half. A
+configured `groups_per_line` produced a real line length; fit-to-width — the
+*default* — passed zero, meaning "do not wrap", and left the row to
+`split_stream_rows`, which cuts at a raw monospace column.
+
+That column does not respect cells. A row could arrive as `" 03 04 0"`: a
+separator stranded at the head, and a byte delivered as `0` here and `A` on the
+next row. The comment above the renderer construction claimed the cell-aware
+guarantee for the whole Hex path, so the code read as though this were handled.
+
+A second defect sat beside it. The row cache's rebuild key was channel, mode,
+control-character rendering and pane width. Grouping was absent, so changing
+bytes-per-group restyled only newly arriving bytes and left the existing
+scrollback in the old shape until an unrelated change forced a rebuild — a
+setting that appeared not to work.
+
+**Decision:** Fit-to-width becomes a byte count *before* rendering. `G` groups of
+`B` bytes occupy `G × B × 2` digits plus `G − 1` separators, so the largest `G`
+fitting `cols` columns is `(cols + 1) / (2B + 1)`. The renderer then wraps at
+that many bytes and the splitter has nothing left to cut.
+
+Two edges follow from refusing to return an oversized line, since an oversized
+line is precisely what re-engages the splitter:
+
+- **A configured group count is clamped, not overflowed.** Asking for sixteen
+  groups in a pane holding four shows four. The alternative is showing sixteen
+  broken ones, and the control's help now states the reduction.
+- **When not one whole group fits, the fallback is whole bytes** — not one group
+  anyway. A byte is the smallest unit that can be wrapped without misreporting
+  the data.
+
+Both the splitter and the resolver read one `MIN_WRAP_COLS`, so the width the
+renderer wraps to and the width the splitter would cut at cannot disagree.
+
+Grouping and resolved line length join the row cache's rebuild key.
+
+**Consequences:** One invariant now holds and is tested directly rather than
+asserted in prose: **no pane width or grouping splits a byte.**
+`no_pane_width_or_grouping_ever_splits_a_hex_byte` sweeps four group sizes, four
+line settings and eight pane widths over all 256 byte values, checking every row
+is whole hex groups joined by single spaces, with no leading or trailing
+separator, and that the rows still reconstruct the stream exactly. It was
+confirmed to fail against the previous behaviour, reporting `" 03 04 0"`.
+
+`split_stream_rows` remains character-based and still wraps the text modes, where
+a character *is* the unit. The comment at the call site now says which stage owns
+which, instead of claiming the stronger boundary for both.
+
+### ADR-041 — A Hex line is bounded by columns, not by cells
+
+**Status:** Accepted 2026-08-06. Amends ADR-040; from external review.
+
+**Context:** ADR-040 resolved fit-to-width to a byte count so the renderer,
+which knows cell boundaries, would do the wrapping. It held for bytes and broke
+for Marks.
+
+The renderer wrapped when its *cell* count reached the line's byte budget, and
+an inline `Mark` (§50.2) counts as one cell while occupying as many columns as
+its text. A line correct by cell count could therefore be far wider than the
+pane, and the oversized line went to `split_stream_rows` — which is exactly the
+re-engagement ADR-040 set out to prevent. At eight columns with one byte per
+group, a `[T]` before the second byte rendered `41 [T] 42` and came back as
+`41 [T] 4` and `2`.
+
+The test that was supposed to cover this passed no annotations, so
+`no_pane_width_or_grouping_ever_splits_a_hex_byte` proved the invariant only in
+the case that was never at risk. Its name claimed the general result.
+
+**Decision:** The renderer tracks the columns it has written, not only the cells,
+and ends a line when the next cell would not fit the pane **or** the byte budget
+is spent — whichever comes first. A byte is two columns; an annotation is as
+wide as its text; a separator counts where one is emitted.
+
+The pane width is attached to the view by `rebuild_rows`, which already receives
+`wrap_cols`, rather than by the GUI call site. The two settings cannot then be
+supplied apart: a view carrying a Hex line length but no column bound is the
+exact configuration that produced this defect, and it is now unconstructible on
+the path that matters. The column bound is tied to the line-length request, so
+the recorder's view — which asks for no line length — still emits the exact
+rendered stream at any width (§54).
+
+An annotation wider than the whole pane still overruns, because there is
+nowhere for it to go. That cuts Mark text, never a byte, and is stated rather
+than silently absorbed.
+
+**Consequences:** the invariant — no pane width, grouping or annotation
+splits a byte — is checked across all four dimensions crossed, and was
+confirmed capable of failing before the fix.
+
+A reference implementation must be configured as the thing it references. The
+one-shot comparison for the incremental row cache was not, so the equality it
+asserted could be satisfied by both sides being wrong, and for Hex at a narrow
+pane both sides were. That is a property of any such pairing, not of this
+one.
+
+**Known structural risk.** Hex still wraps in two stages: cell-aware rendering
+followed by a generic character splitter. Two successive defects have now lived
+in the seam between them. If this path is touched again, the renderer should
+return final rows and `split_stream_rows` should not see Hex at all.
+
+### ADR-042 — In Hex, a Mark takes a row of its own
+
+**Status:** Accepted 2026-08-08.
+
+**Context:** ADR-041 made an annotated Hex line fit the pane, which fixed the
+byte being cut in half. It did not address why the annotation was hard to place
+to begin with.
+
+Hex is a fixed-width grid, and the grid is the reason to read it: byte *N* sits
+at a predictable column, so a reader can follow one field down a column across
+many rows. A `Mark` is text of arbitrary width. Splicing it into a byte row
+pushes everything after it to an unpredictable column and forces an early wrap,
+so row lengths stop matching. The result was correct — no byte was split — and
+still destroyed the affordance the mode exists for.
+
+The `NmeaZda` style makes it concrete: `$GPZDA,120000.00,08,08,2026,00,00*4F`
+is about 37 columns. At 80 columns with one byte per group a row holds roughly
+26 bytes, so one `Mark` costs more than an entire row of data.
+
+Removing `Mark`s from Hex was considered and rejected. Hex is the mode used for
+binary protocols, which is exactly where "when did this pattern occur" is asked;
+and rule behaviour that silently changes with the display mode is a matrix the
+user has to carry.
+
+**Decision:** In Hex, an annotation is a row, not a cell. The byte run ends, the
+`Mark` text occupies its own line, and bytes resume on a fresh row and a fresh
+group.
+
+The break is **at the marked byte**, not at the next row boundary. A `Mark`
+identifies a byte; placing it only near the right row would answer a coarser
+question than the one asked. This costs a short row, which is acceptable because
+the row is self-explaining — the reason for it is on the line immediately below.
+
+`Mark` text that already ends in CR/LF gets no second break, so a multi-line
+annotation still renders as written.
+
+**Consequences:** the column-width interaction that produced ADR-041's defect
+cannot recur for byte rows, because no annotation shares one. The invariant a
+byte row can now assert is stronger than "its hex tokens are whole bytes": a
+byte row is *only* bytes and separators, and the property test asserts that
+across grouping, pane width, `Mark` width and placement.
+
+ADR-041's column bound is kept. It is no longer the thing standing between a
+`Mark` and a split byte, but it remains the renderer enforcing "never wider than
+the pane" for itself rather than trusting the resolved byte count to agree.
+
+A `Mark` wider than the pane still overruns and is cut by the character
+splitter. That cuts annotation text, never a byte, and is the one overrun this
+design accepts.
+
+The `.disp` recording follows the display, as it always has: a Hex recording now
+carries `Mark`s on their own lines. It was never byte-exact — that is `.raw`,
+whose sidecar (`.raw.idx`, ADR-039) remains the precise, non-perturbing way to
+timestamp bytes.
+
+### ADR-057 — The Receive diagnostics card has no status badge
+
+**Status:** Accepted 2026-11-13. Amends ADR-033, whose card carried the badge.
+
+**Context:** Talker removed its card badge (talker ADR-066) once every reason
+it rose for was found marked elsewhere. Listener's badge rose only from the
+Transport and Pressure rows. Both mark themselves with ⚠ when they want
+attention, and kernel drops and Serial stalls also have their own callouts.
+Its calm words were said elsewhere as well: MONITORING by the Channel status
+at the top of the pane, LAST RUN by the Pipeline row's "~final 10 s", and
+AWAITING DATA by the rows' own "awaiting".
+
+**Decision:** The card is drawn with `wiredata_ui::diagnostics::diagnostic_card`,
+with no title and no badge. `wiredata-ui` no longer has a badge at all.
+
+**Boundary:** ADR-033's other decisions stand: the three rows, the bounded
+claims, and the callouts.
+
+**Consequences:** The card starts with the Transport row, a row higher.
+
+### ADR-059 — Display recordings mark their gaps; fault-finalization is gone
+
+**Status:** Accepted 2026-11-13. Completes ADR-043.
+
+**Context:** §142 still said a recorder's `finalize` would "write the
+truncation marker (for faults)", driven by a `RecordingStopReason`. ADR-043
+had already turned recording faults into gaps that continue in a new segment:
+nothing ended a recording with a fault, every `finalize` ignored its reason,
+and no recorder wrote a marker. A gap was recorded only in the event log and
+diagnostics, so a `.disp` file read on its own showed no sign of one.
+
+**Decision:**
+
+- `RecordingStopReason` and the `finalize` parameter are removed; a stop
+  always writes the accepted backlog, then finalizes.
+- When a Display Recording resumes after a gap that lost bytes, the new
+  segment starts with one line, `‹GAP <reason> · <start> to <end> · not
+  recorded›` (§54), in the style of the `‹MARK›` lines but with no leading
+  newline, since a resumed segment is always a fresh file.
+- It is a per-recording choice, **Mark gaps** (`mark_gaps`), on by default:
+  after a long run, a gap is what a reader most needs to find. A profile
+  saved before the option existed loads with it on.
+- A Raw Recording never gets the line: `.raw` stays exactly the bytes
+  received (§53).
+
+**Boundary:** No line is written for a gap that lost no bytes, or for a gap
+still open when recording stops; the event log reports both, as before. The
+controller stays generic over its items: the recorder side writes the line,
+through a hook Raw recorders leave empty.
+
+**Consequences:** A `.disp` file says where its gaps are without the event
+log beside it.

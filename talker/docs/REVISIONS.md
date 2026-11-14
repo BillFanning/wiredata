@@ -2,6 +2,8 @@
 
 Superseded revision notes for
 [talker_specification.md](talker_specification.md) and [ADR.md](ADR.md), newest first.
+It also holds the full text of ADR entries retired or merged out of ADR.md, under
+Retired decisions.
 
 They are kept out of the specification itself so that document states **current
 behaviour** and carries its version in one place. Each entry records what changed
@@ -457,6 +459,26 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 
 ## Architecture Decision Record
 
+Revision note (2026-11-14) — consolidation:
+
+- **ADR-041, ADR-047 and ADR-049** each state one whole decision now. ADR-041 is
+  the diagnostics card, absorbing the card rows of ADR-044 and all of ADR-066;
+  ADR-047 is the deadline-wait policy, absorbing ADR-034 and ADR-040; ADR-049 is
+  the palette, absorbing ADR-050. The absorbed numbers remain as one-line pointers.
+- **ADR-012** is retired, and **ADR-013** is rewritten to the current profile
+  rule: refuse a version mismatch, never migrate. The text they replaced is in
+  [REVISIONS.md](REVISIONS.md#retired-decisions).
+- Pointers and stale facts are corrected in ADR-005, 007, 008, 017, 021, 023,
+  032, 033, 035, 038, 039, 044, 045, 046, 048, 052, 056, 061, 062 and 065.
+
+Revision note (2026-11-13) — hover text:
+
+- **ADR-065** — a hover that explains something opens with a bold sentence,
+  then short paragraphs in plain sentences. The format lives in `wiredata-ui`
+  so listener can share it.
+- **ADR-066** — the diagnostics card loses its status badge and header row;
+  the Send outcomes line is marked ⚠ instead.
+
 Revision note (2026-11-12) — a console that stops taking output:
 
 - **ADR-064** — stdout log lines go through a bounded queue that drops, so a
@@ -723,3 +745,259 @@ ADR-039 through ADR-042:
   adding a dormant telemetry heartbeat. Capacity, Cadence, and detailed Timing now
   consume one freshness classification, and expired recent timing cannot silently
   drive measured headroom.
+
+
+---
+
+## Retired decisions
+
+The full text of ADR entries that were retired, or merged into another entry, on
+2026-11-14, in number order. [ADR.md](ADR.md) keeps each number with one line that
+says why and where the decision lives now. Nothing here is normative.
+
+### ADR-012 — Binary field types
+
+**Status:** Superseded by the spec v2.0 message-format model (see ADR-015 context and the message-format summary in [`AGENTS.md`](../../AGENTS.md)). Spec v2.0 removed the typed-binary-field concept: arbitrary byte sequences are now entered in **Hex** format, and structured data is built through the UTF-8/UTF-16/ASCII/NMEA formats. `core::data` and the `BinaryField` enum were never carried into the v2.0 codebase. This ADR is retained for historical context.
+
+**Context:** The spec originally deferred the exact set of binary field types. At the time, a concrete decision was needed before the planned data-construction module could be implemented.
+
+**Decision:** Binary data is constructed as an ordered sequence of typed fields. Supported types are: `u8`, `u16`, `u24`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f32`, `f64`, and raw bytes (arbitrary hex). Byte order is selectable per field — big-endian (default) or little-endian.
+
+**Rationale for `u24`:** Three-byte unsigned integers appear frequently in sonar, audio, and oceanographic equipment. Without `u24`, users must construct them manually from raw bytes, which is error-prone. The implementation cost is low.
+
+**Rationale for big-endian default:** The majority of marine and survey instruments use big-endian (network byte order). Defaulting to big-endian reduces misconfiguration for the primary target audience.
+
+**Consequences:**
+- The planned data-construction module would have implemented a `BinaryField` enum with one variant per type plus `RawBytes(Vec<u8>)`.
+- Each field carries a `ByteOrder` enum (`BigEndian` | `LittleEndian`).
+- `u24` requires manual encoding (write the 3 most-significant bytes of a `u32`); no standard Rust primitive maps directly to it.
+- Binary message definitions are saved in profiles as an ordered list of field descriptors.
+
+### ADR-013 — Profile schema versioning and migration strategy (first design)
+
+ADR-013 was rewritten in place on 2026-11-14 to the current rule: refuse a version
+mismatch, never migrate. Its first body, with the updates that had accumulated,
+read:
+
+> **Context:** Profile structs will gain new fields as `talker` evolves. Old profile files must load cleanly in newer versions of the program, and users must be warned rather than silently harmed when loading a profile from a newer version.
+>
+> **Decision:** A two-layer strategy:
+>
+> **Layer 1 — `#[serde(default)]` on all profile fields.** Every field has a sensible default. Old profiles missing newly added optional fields load without error. This handles the common case with zero migration code.
+>
+> **Layer 2 — `version: u32` in the profile header, starting at `1`.** Load behavior:
+> - Version matches current: load normally.
+> - Version is older: run a versioned migration function, fill in defaults, log a warning, optionally rewrite at the new version.
+> - Version is newer than the binary understands: refuse to load, warn the user.
+>
+> The version number increments only on breaking schema changes that `serde(default)` cannot handle alone, keeping migration functions minimal.
+>
+> **Consequences:**
+> - All profile structs annotated with `#[serde(default)]` from the first commit.
+> - A `PROFILE_SCHEMA_VERSION: u32` constant is defined in `core::profile` and checked on every load.
+> - Migration functions live in `core::profile::migration` as a match on `(from_version, current_version)`.
+> - The `#[non_exhaustive]` attribute is used on profile enums to prevent external code from exhaustively matching on them, enabling future variant addition without breaking changes.
+>
+> **Update (v2.0, 2026-05-22):** The spec v2.0 upgrade restructured the profile schema (nested channels, each owning an interface and a list of messages). Rather than write a v1→v2 migration, the project chose a **clean break**: `CURRENT_VERSION` is `2`, and `Profile::load` refuses any profile whose version differs from it — newer versions are rejected as unsupported (Layer 2 as designed), and **older versions (v1) are also rejected**, with an error instructing the user to recreate the profile. The reasoning: v1 had no released users, so migration code would have been dead weight maintained forever. Layer 1 (`#[serde(default)]` on every field) still stands and handles all *additive* schema changes within v2. The `core::profile::migration` module was therefore never created; when a breaking v3 change arrives, a migration step and version-downgrade handling are reinstated at that point.
+>
+> **Update (2026-09-30):** Schema 3 (ADR-057) is again a clean break rather than a migration: nothing is deployed, so there are no version-2 profiles to carry forward. ADR-062 narrows Layer 1: a missing field still takes its default, but an unknown key or a missing `version` is now refused.
+
+### ADR-034 — Explicit Precise mode uses bounded deadline-resolution windows
+
+**Status:** Accepted 2026-07-19 (spec v2.3). **The bounded window stands; the
+per-channel choice is superseded by ADR-047 (2026-08-03)** — the mechanism below
+is unchanged, but it is now selected from the schedule rather than configured.
+
+**Context:** ADR-017's automatic Windows 1 ms request fixes high-rate schedules, but
+a slow schedule can still wake several milliseconds late on the default Windows
+timer tick. That jitter is visible when a payload prints milliseconds even though
+the cadence is only 1 Hz. Timestamp formatting is not a reliable proxy for user
+intent: a millisecond field may be informational, while a static payload may still
+need a tighter trigger. Holding 1 ms resolution throughout every slow run would pay
+the power cost while almost all of each interval is idle. Wall-clock phase alignment
+is a separate semantic choice and must not be implied by a timer-resolution control.
+
+**Decision:** `ChannelConfig` gains an additive, default-Standard `TimingMode` with
+Standard and Precise choices. It is a run-fixed setting: GUI edits are prepared and
+applied through Apply & Restart, and CLI profile runs pass the same value to the
+runner. Standard preserves ADR-017 exactly. Any active schedule whose shortest
+interval is below 32 ms continues to hold the Windows request continuously in either
+mode.
+
+For a slower Precise schedule on Windows, each runner uses a two-stage interruptible
+wait. It first waits until `deadline - 32 ms` without a request, then acquires the
+existing process-refcounted RAII guard for the final `recv_deadline`. The guard is
+released as soon as the deadline is due, before dynamic rendering or the synchronous
+send call. Commands interrupt both stages; changed deadlines are recomputed on the
+next loop. Nearby windows naturally overlap through the process refcount, and a
+dormant schedule reaches its indefinite command wait with no guard held. On
+non-Windows targets, Precise deliberately remains one native deadline wait with no
+extra staging wake.
+
+Timer telemetry carries both configured mode and active reason (`HighRate` or
+`PrecisionWindow`). A Windows request outcome remains stable between precision
+windows so the GUI does not flicker back to Standard. Repeated per-window OS-call
+logging is suppressed; a failed request is warned on the state transition and stays
+visible in telemetry.
+
+**Consequences:** Slow Precise schedules spend only their final deadline windows at
+requested 1 ms resolution; a lone 1 Hz deadline is approximately a 3.2% duty cycle,
+while close or interleaved deadlines can make the effective duty cycle higher. There
+is no spin wait and no dedicated timing thread. Precise can reduce Windows wake
+quantization, but cannot remove scheduler load, rendering cost, blocking interface
+cost, or hardware/driver buffering. `TimingMode` does not itself align sends or make
+`SystemTime` more accurate; ADR-037 adds alignment as a separate explicit choice.
+The new profile field is backward-compatible through `serde(default)`, so profile
+schema version 2 remains unchanged.
+
+### ADR-040 — Timer lifecycle is explicit; Precise windows stay bounded
+
+**Status:** Accepted 2026-07-20.
+
+**Context:** A review questioned whether ADR-034's final-window policy changes
+`timeBeginPeriod`/`timeEndPeriod` too often near the 32 ms high-rate threshold: a
+50 ms cadence stages for 18 ms and can make about twenty matched request/release
+pairs per second. The proposed remedy was to hold resolution continuously whenever
+the 32 ms window occupied at least half the interval. That would replace known time
+outside the higher-resolution policy with an unmeasured reduction in API-call churn.
+Microsoft documents that multiple matched calls are supported and advises requesting
+resolution immediately before timer use and releasing it immediately afterward
+([`timeBeginPeriod`](https://learn.microsoft.com/en-us/windows/win32/api/timeapi/nf-timeapi-timebeginperiod));
+its
+[energy guidance](https://learn.microsoft.com/en-us/windows-hardware/test/assessments/results-for-the-idle-energy-efficiency-assessment)
+likewise says to restore the lower frequency when the precise task completes. The
+runner separately spread guard acquisition, staging, due-time release, final release,
+status derivation, notification, counter invalidation, and observer-drop accounting
+across a large send loop and positional helper calls.
+
+**Decision:** Retain ADR-034's bounded policy. Any schedule whose shortest active
+interval is strictly below `HIGH_RATE_THRESHOLD` (32 ms) holds the shared request
+continuously in either timing mode. A Precise schedule at or above that threshold
+uses the final `PRECISION_WINDOW`; Standard uses its native wait. The process-wide
+refcount means an overlapping holder naturally prevents redundant underlying OS
+transitions. Expanding continuous holding without measured evidence is rejected.
+
+Independently, the runner encapsulates timer lifecycle in a `TimerReconciler`. It
+owns the current intent, guard, derived status, timer-edge notification endpoints,
+counter refresh instant, and observer-drop count. Schedule reconciliation, wait
+preparation, bounded-window due release, and final release are explicit methods. An
+interrupted precision-window wait retains its guard until the recomputed wait plan
+decides whether the deadline is still inside the window; a transition from continuous
+to windowed releases immediately. The guard is always dropped before rendering and
+sending for a windowed cadence and before final blocking status delivery. A named
+`TimerStatusInput` groups the status derivation context instead of another positional
+argument list.
+
+**Consequences:** A 50 ms Precise run deliberately releases its guard for the first
+18 ms and holds it for the final 32 ms of each interval when no other runner holds the
+process request. This minimizes known high-resolution duty time; API-call overhead can
+be revisited only with timing or energy evidence. Dormant schedules still release
+before their indefinite wait. Linux and macOS still use one native deadline wait and
+make no platform timer request. Isolated tests pin high-rate continuous retention,
+near-threshold staging, due/idle release, timer-edge notification, counter
+invalidation, and drop accounting. The Talker specification now incorporates the
+reconciler without changing profiles, wire formats, or ADR-034's wake policy.
+
+### ADR-050 — Four accents, and colour never carries a state alone
+
+**Status:** Accepted 2026-08-06. Completes the accessibility work of ADR-049.
+
+**Context:** The palette held ten colours. Five were greys — `idle`, `info`,
+`event`, `count_info`, `line_low`, at 120/80/60/110/150 in the light theme. Two
+were ambers a shade apart (`warning`, `reconnecting`). Two were greens meaning
+the same thing in different places (`running`, `line_high`).
+
+None of that was free, and the cost is not the count. Every colour must stay
+distinguishable from every other, so the burden is **pairs**: ten colours is
+forty-five pairs, four is six. Three of those pairs were checked against a
+red-green deficiency during ADR-049 and two failed. The pair count was not a
+theoretical budget — it was the surface a real defect had been living on.
+
+**Decision — four accents:** `fault`, `warning`, `running`, `idle`. They are the
+same four states `SignalTone { Fault, Warning, Healthy, Neutral }` already names;
+the palette and the tone enum had been describing one set of states in two
+vocabularies.
+
+What replaced the removed fields is not another colour:
+
+- **The greys became `Visuals::weak_text_color` and `text_color`.** They encoded
+  *emphasis*, not meaning, and emphasis is something the theme already defines.
+  A palette re-deciding it produces four values that must track two.
+- **`reconnecting` folded into `warning`**, `line_high` into `running`,
+  `line_low` into `idle`. Each pair meant one thing in two places — an asserted
+  line *is* active, a reconnecting channel *does* need attention.
+
+Each collapse was checked against the same test before it was made: **is the
+state still legible with the colour removed?** In every case it was, because the
+readout already said it in words — a log line is formatted `[time] [LEVEL]
+message`, the severity counts read "3 warn", the diagnostics list prefixes
+`INFO `/`WARN `/`ERROR `. That is not a coincidence. It is the rule the palette
+now states:
+
+> Colour reinforces a state. It never carries one alone.
+
+The readouts that survived ADR-049's review were exactly the ones already obeying
+it; the ones that failed were the ones that did not.
+
+**Found during the reduction:** `status_glyph` mapped Running *and* Reconnecting
+to `●`. In the detail pane that is harmless — it prints `status_label` beside the
+glyph. But the channel list shows the glyph and the channel's *name*, so on the
+one surface built for scanning many channels at once, a reconnecting channel and
+a healthy one were the same mark separated by green against amber: the exact pair
+confirmed indistinguishable a day earlier. Reconnecting now has `◐`, half-filled
+between a solid dot and an empty one, which is also what the state is.
+
+**Consequences:** Both applications change appearance in the log panel, the
+diagnostics list, and the channel-list counts, where four greys became two theme
+emphases. That flattens some hierarchy; it is the one part of this that tests
+cannot judge, and it is filed to be looked at.
+
+**Correction (2026-08-06, from external review).** This entry originally cited
+two tests as evidence for the decision, and both proved less than it claimed —
+one asserted that an array built from four named fields had four elements, the
+other that blue was a colour's largest channel. A ratchet over a simulated
+red-green deficiency replaced them and was removed in turn: it did not
+reproduce the original defect, because red and amber differ in lightness even
+where their hue collapses.
+
+The durable policy, which is what this entry should have stated instead of a
+test list: **four semantic accents, each distinct from the others, and colour
+never carrying a state alone.** The first half is mechanically checkable and is
+checked. The second is the one that actually delivers accessibility, and it is
+enforced where the states are rendered — every one carries a glyph or a word.
+Whether the accents are *comfortable* remains a visual review with a human
+looking at both themes; no metric available here substitutes for that, and
+pretending otherwise is how the removed tests came to exist.
+
+### ADR-066 — The diagnostics card has no status badge
+
+**Status:** Accepted 2026-11-13. Amends ADR-041, whose card carried the badge.
+
+**Context:** The card's top row held one word, ISSUE, ATTENTION, LIVE or
+IDLE, summing up the card. Asked what it was for, the user pointed out that
+the callouts below it already say what is wrong. Checked case by case, every
+reason the badge rose for was already marked: missed sends by their callout
+and the Send outcomes count, a live failure by the error line and its
+callout, capacity by ⚠ on the Capacity row, an impossible serial schedule and
+a refused timer by their own callouts. The badge said *that* something was
+wrong but not *what*, and took a row at the top of the card to do it.
+
+One reason was carried only by colour: the Send outcomes line turned amber or
+red with no mark, and after the missed-send callout is dismissed it is the
+only place that says the run missed sends. With the badge gone, that line had
+to say it without colour.
+
+**Decision:**
+
+- Talker's card is drawn with `wiredata_ui::diagnostics::diagnostic_card`,
+  which has no header row: no title, no badge.
+- The Send outcomes line starts with ⚠ (`tone_marker`, the mark the card rows
+  use) when any deduction is nonzero.
+
+**Boundary:** Listener's card keeps `decision_card` and its badge until the
+same case-by-case check is done for listener's reasons. The channel list's
+status glyphs and severity counts are unaffected.
+
+**Consequences:** The card starts with its first readout, a row higher. A
+reader who scanned for one word now reads the ⚠ marks, which say what is
+wrong as well as that something is.
