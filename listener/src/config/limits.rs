@@ -5,7 +5,10 @@
 //! 50 MiB: a 16 MiB receive queue, two 8 MiB recording queues, 16 MiB of
 //! scrollback and about 2 MiB of diagnostics (ADR-048).
 
-use super::{MatchCondition, MatchRule, ReconnectPolicy, RetentionConfig, MIN_SIZE_CAP};
+use super::{
+    DiskGuard, DiskThreshold, MatchCondition, MatchRule, ReconnectPolicy, RetentionConfig,
+    MIN_SIZE_CAP,
+};
 
 /// Stream scrollback per Channel (§71, §88).
 pub const MAX_SCROLLBACK_BYTES: usize = 16 * 1024 * 1024;
@@ -54,6 +57,13 @@ pub enum LimitError {
          ({MIN_SIZE_CAP} bytes)"
     )]
     SizeCap { recording: &'static str, found: u64 },
+    #[error(
+        "{recording} recording's low-disk threshold of {found} percent is outside 1–90; \
+         recording resumes only at 10% above it, so a higher one never resumes"
+    )]
+    DiskGuardPercent { recording: &'static str, found: u8 },
+    #[error("{recording} recording's low-disk threshold must be more than 0 bytes")]
+    DiskGuardBytes { recording: &'static str },
     #[error("{what} of {found} is outside 1–{max}")]
     Capacity {
         what: &'static str,
@@ -130,6 +140,22 @@ pub fn size_cap_error(recording: &'static str, size_cap: Option<u64>) -> Option<
     size_cap
         .filter(|&found| found < MIN_SIZE_CAP)
         .map(|found| LimitError::SizeCap { recording, found })
+}
+
+/// A recording's low-disk threshold that cannot work (§56.2, §71). Resuming
+/// takes 1.1 times the threshold free, so a percentage over 90 could never
+/// resume and 0 bytes could never count as low.
+pub fn disk_guard_error(recording: &'static str, guard: Option<DiskGuard>) -> Option<LimitError> {
+    match guard?.min_free {
+        DiskThreshold::Percent { percent } if !(1..=90).contains(&percent) => {
+            Some(LimitError::DiskGuardPercent {
+                recording,
+                found: percent,
+            })
+        }
+        DiskThreshold::Bytes { bytes: 0 } => Some(LimitError::DiskGuardBytes { recording }),
+        _ => None,
+    }
 }
 
 /// A queue capacity must hold something and stay within its bound.
@@ -255,6 +281,49 @@ mod tests {
                 recording: "display",
                 found: MIN_SIZE_CAP - 1
             })
+        );
+    }
+
+    #[test]
+    fn a_disk_guard_threshold_must_be_one_the_guard_can_act_on() {
+        use super::super::LowDiskAction;
+        let guard = |min_free| {
+            Some(DiskGuard {
+                min_free,
+                on_low: LowDiskAction::Warn,
+            })
+        };
+        let percent = |percent| guard(DiskThreshold::Percent { percent });
+        assert_eq!(disk_guard_error("raw", None), None);
+        for ok in [1, 50, 90] {
+            assert_eq!(disk_guard_error("raw", percent(ok)), None, "{ok}");
+        }
+        for bad in [0, 91, 100, 101, 255] {
+            assert_eq!(
+                disk_guard_error("display", percent(bad)),
+                Some(LimitError::DiskGuardPercent {
+                    recording: "display",
+                    found: bad
+                }),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            disk_guard_error("raw", guard(DiskThreshold::Bytes { bytes: 1 })),
+            None
+        );
+        assert_eq!(
+            disk_guard_error("raw", guard(DiskThreshold::Bytes { bytes: u64::MAX })),
+            None
+        );
+        assert_eq!(
+            disk_guard_error("raw", guard(DiskThreshold::Bytes { bytes: 0 })),
+            Some(LimitError::DiskGuardBytes { recording: "raw" })
+        );
+        assert_eq!(
+            disk_guard_error("raw", percent(95)).unwrap().to_string(),
+            "raw recording's low-disk threshold of 95 percent is outside 1–90; \
+             recording resumes only at 10% above it, so a higher one never resumes"
         );
     }
 

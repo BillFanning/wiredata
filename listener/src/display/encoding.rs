@@ -130,6 +130,10 @@ fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
         return 0; // nothing but continuation bytes — invalid, not incomplete
     }
     let lead = bytes[i - 1];
+    // 0xC0, 0xC1 and 0xF5..: no valid sequence starts with them.
+    if matches!(lead, 0xC0 | 0xC1 | 0xF5..=0xFF) {
+        return 0;
+    }
     let need = match lead {
         b if b & 0x80 == 0x00 => 1,
         b if b & 0xE0 == 0xC0 => 2,
@@ -233,6 +237,22 @@ mod tests {
             decode_with_offsets(&bytes, DisplayEncoding::Utf16Le),
             [('A', 0), ('😀', 2)]
         );
+    }
+
+    /// No valid sequence starts with these bytes, so a chunk ending in one has
+    /// nothing to wait for: it decodes to U+FFFD at once.
+    #[test]
+    fn a_trailing_byte_that_can_never_lead_is_not_held_back() {
+        for lead in [0xC0, 0xC1, 0xF5, 0xF6, 0xF7] {
+            assert_eq!(incomplete_tail(&[b'a', lead], DisplayEncoding::Utf8), 0);
+            assert_eq!(
+                decode(&[b'a', lead], DisplayEncoding::Utf8),
+                vec!['a', '\u{FFFD}']
+            );
+        }
+        // The nearest bytes that can lead are still held back.
+        assert_eq!(incomplete_tail(&[0xC2], DisplayEncoding::Utf8), 1);
+        assert_eq!(incomplete_tail(&[0xF4], DisplayEncoding::Utf8), 1);
     }
 
     #[test]

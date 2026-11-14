@@ -204,6 +204,17 @@ pub enum UiUpdate {
     LocalAddresses(Result<Vec<LocalAddress>, String>),
 }
 
+/// Run file work on the blocking pool and await it, so a slow disk or network
+/// share occupies a blocking thread and not an async worker. A panic in the
+/// work comes back as an error message.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|err| format!("the file work did not finish: {err}"))
+}
+
 /// Whether a registered profile can resume (ADR-045). It must still be where it
 /// was registered, load, and have only valid channels; and every folder a
 /// channel records to when it starts must carry its destination marker
@@ -822,13 +833,17 @@ impl Driver {
                 // bytes that arrived while it was off-screen.
                 self.selected = id;
             }
-            UiCommand::SaveProfile(path) => self.save_profile(path),
-            UiCommand::LoadProfile(path) => self.load_profile(path),
+            UiCommand::SaveProfile(path) => self.save_profile(path).await,
+            UiCommand::LoadProfile(path) => self.load_profile(path).await,
             UiCommand::CheckResume(path) => {
-                let checked = resume_check(&path).map(|(profile, _)| profile.name);
+                let checked_path = path.clone();
+                let checked = match run_blocking(move || resume_check(&checked_path)).await {
+                    Ok(checked) => checked.map(|(profile, _)| profile.name),
+                    Err(why) => Err(why),
+                };
                 self.push(UiUpdate::ResumeChecked(path, checked));
             }
-            UiCommand::Resume(path) => self.resume(path),
+            UiCommand::Resume(path) => self.resume(path).await,
             UiCommand::ListLocalAddresses => {
                 self.push(UiUpdate::LocalAddresses(local_addresses()));
             }
@@ -842,18 +857,19 @@ impl Driver {
     /// configs from the authoritative `Listener` in `self.channels` order; a missing
     /// config (a channel removed mid-flight) is skipped. Non-fatal: an I/O or
     /// serialization error is reported via `ProfileError`, not a panic.
-    fn save_profile(&mut self, path: std::path::PathBuf) {
+    async fn save_profile(&mut self, path: std::path::PathBuf) {
         let mut profile = Profile::new(profile_name_from_path(&path));
         profile.channels = self
             .channels
             .iter()
             .filter_map(|id| self.listener.config(*id).cloned())
             .collect();
-        match profile.save(&path) {
-            Ok(()) => {
+        let saving = path.clone();
+        match run_blocking(move || profile.save(&saving).map_err(|err| err.to_string())).await {
+            Ok(Ok(())) => {
                 self.push(UiUpdate::ProfileSaved(path));
             }
-            Err(err) => {
+            Ok(Err(err)) | Err(err) => {
                 self.push(UiUpdate::ProfileError(format!("save failed: {err}")));
             }
         }
@@ -869,8 +885,12 @@ impl Driver {
     /// Resume a registered profile (ADR-045): check it again — the countdown
     /// gave a drive time to go — then load it and start every channel. A
     /// channel that cannot start is reported and left to its reconnect policy.
-    fn resume(&mut self, path: std::path::PathBuf) {
-        let (profile, warnings) = match resume_check(&path) {
+    async fn resume(&mut self, path: std::path::PathBuf) {
+        let checking = path.clone();
+        let (profile, warnings) = match run_blocking(move || resume_check(&checking))
+            .await
+            .and_then(|checked| checked)
+        {
             Ok(checked) => checked,
             Err(why) => {
                 self.push(UiUpdate::ResumeChecked(path, Err(why)));
@@ -891,10 +911,15 @@ impl Driver {
     /// Replace the workspace with the profile at `path` (§70): every Channel
     /// is stopped and removed first, and the profile's Channels are registered
     /// Stopped (load never starts a channel).
-    fn load_profile(&mut self, path: std::path::PathBuf) {
-        let (profile, warnings) = match Profile::load_with_warnings(&path) {
-            Ok(loaded) => loaded,
-            Err(err) => {
+    async fn load_profile(&mut self, path: std::path::PathBuf) {
+        let loading = path.clone();
+        let loaded = run_blocking(move || {
+            Profile::load_with_warnings(&loading).map_err(|err| err.to_string())
+        })
+        .await;
+        let (profile, warnings) = match loaded {
+            Ok(Ok(loaded)) => loaded,
+            Ok(Err(err)) | Err(err) => {
                 self.push(UiUpdate::ProfileError(format!("load failed: {err}")));
                 return;
             }
@@ -1283,6 +1308,36 @@ mod tests {
         );
         cmd_tx.send(UiCommand::Shutdown).await.unwrap();
         handle.await.unwrap();
+    }
+
+    /// File work goes to the blocking pool: on a one-thread runtime another
+    /// task keeps running while the work waits. Run on the loop itself, the
+    /// work would hold the only thread and the ticker would not advance.
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_work_runs_off_the_loop() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        let ticks = Arc::new(AtomicU32::new(0));
+        let ticking = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                ticking.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+        let seen = ticks.clone();
+        let (start, end) = (ticks.clone(), ticks.clone());
+        let before = run_blocking(move || {
+            let first = start.load(Ordering::SeqCst);
+            while end.load(Ordering::SeqCst) < first + 3 {
+                std::thread::yield_now();
+            }
+            first
+        })
+        .await
+        .unwrap();
+        assert!(seen.load(Ordering::SeqCst) >= before + 3);
+        ticker.abort();
     }
 
     #[tokio::test]

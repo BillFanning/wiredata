@@ -283,6 +283,14 @@ pub fn validate_channel(
         .chain(limits::size_cap_error(
             "display",
             channel.display_recording.size_cap,
+        ))
+        .chain(limits::disk_guard_error(
+            "raw",
+            channel.raw_recording.disk_guard,
+        ))
+        .chain(limits::disk_guard_error(
+            "display",
+            channel.display_recording.disk_guard,
         ));
     errors.extend(limits.map(ChannelConfigError::Limit));
 
@@ -1077,6 +1085,29 @@ actions = [{ kind = "PauseDisplay", view = 1 }, { kind = "Notify", severity = "E
             ChannelConfigError::Limit(limits[2].clone()).to_string(),
             "reconnect multiplier 20 is outside 1.0–10"
         );
+    }
+
+    #[test]
+    fn a_disk_guard_threshold_the_guard_cannot_act_on_skips_the_channel() {
+        let with = |min_free| {
+            let mut channel = templates::udp_template();
+            channel.raw_recording.disk_guard = Some(DiskGuard {
+                min_free,
+                on_low: LowDiskAction::Warn,
+            });
+            validate_channel(&channel, &DefaultConfig::default())
+        };
+        assert_eq!(with(DiskThreshold::Percent { percent: 90 }), Ok(()));
+        assert_eq!(with(DiskThreshold::Bytes { bytes: 1 }), Ok(()));
+        let errors = with(DiskThreshold::Percent { percent: 91 }).unwrap_err();
+        assert_eq!(
+            errors,
+            vec![ChannelConfigError::Limit(LimitError::DiskGuardPercent {
+                recording: "raw",
+                found: 91
+            })]
+        );
+        assert!(with(DiskThreshold::Bytes { bytes: 0 }).is_err());
     }
 
     #[test]
