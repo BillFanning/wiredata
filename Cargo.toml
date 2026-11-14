@@ -45,7 +45,9 @@ fs4 = "1"
 eframe = { version = "0.34", default-features = false, features = [
     "default_fonts",
     "persistence",          # save/restore window state
-    "accesskit",            # accessibility support
+    # No "accesskit": neither app is a screen-reader tool, and on Linux it
+    # pulled in the unmaintained zbus/zvariant stack (RUSTSEC-2026-0370..0372).
+    # Keyboard navigation does not depend on it.
     "glow",                 # OpenGL renderer (required for run_native)
 ] }
 egui = "0.34"

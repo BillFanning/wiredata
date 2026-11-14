@@ -21,6 +21,17 @@ ignore = [
     # `cargo deny check` to confirm).
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # zvariant, zbus_names and zvariant_derive are unmaintained (advisories of
+    # 2026-11). Linux targets only: `rfd`'s file dialogs reach the desktop's
+    # file picker through the XDG portal (`ashpd`), which runs over zbus.
+    # Unmaintained, not vulnerable; neither app uses them directly. The other
+    # way out, rfd's GTK3 backend, would make every Linux build need the GTK3
+    # development libraries. A new vulnerability in these crates has a new ID
+    # and still fails. Remove these when rfd/ashpd move off them: cargo-deny
+    # warns once an entry matches nothing.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
 
 [licenses]
