@@ -1026,7 +1026,7 @@ impl ChannelPipeline {
         let suffix = byte_offset
             .map(|n| format!(" offset={n}"))
             .unwrap_or_default();
-        // Framed with explicit newlines: the recorder appends verbatim now
+        // Framed with explicit newlines: the recorder appends verbatim
         // (ADR-018), so the marker provides its own line breaks.
         let text = format!("\n\u{2039}MARK rule={rule_id}{suffix}\u{203a}\n");
         let channel_id = self.channel_id;
@@ -1194,8 +1194,7 @@ impl ChannelPipeline {
 
     /// Stop the Raw recording on a `Record { Stop }` (§50.2, §56): the recorder
     /// retires **detached** — draining its accepted backlog and closing the file
-    /// must not stall reception (§142's never-block-the-producer rule; a slow
-    /// disk here used to back the bounded ingest queue up into the transport).
+    /// must not stall reception (§142's never-block-the-producer rule; ADR-022).
     /// The stop outcome is reported when the retirement completes. A no-op if
     /// none is active. Also clears a prior begin-fault so the state reads
     /// "off" again, not ⚠.
@@ -1404,7 +1403,7 @@ impl ChannelPipeline {
                     compact_duration(STALL_WARNING),
                 )));
                 // The matching event (§137); advisory, non-blocking like the rest.
-                // Dedicated `ReceptionStalled` (v1.2) so observers can tell a stall
+                // A dedicated `ReceptionStalled` event lets observers tell a stall
                 // apart from any other warning (ADR-007).
                 if let Some(events) = &self.events {
                     let _ =
@@ -1898,11 +1897,6 @@ impl ChannelPipeline {
         }
     }
 
-    /// Build an owned, point-in-time snapshot of the *small* observable state (§137,
-    /// ADR-006): the Display's pause state, diagnostics, recent match firings, recording
-    /// state, liveness, and the stream's end offset. The scrollback bytes are **not**
-    /// included — they are fetched incrementally via [`stream_delta`](Self::stream_delta)
-    /// so this stays cheap at high throughput.
     /// The retained diagnostics as a shared snapshot, rebuilt only when the log
     /// has actually changed (§88, §124).
     ///
@@ -1926,6 +1920,11 @@ impl ChannelPipeline {
         rebuilt
     }
 
+    /// Build an owned, point-in-time snapshot of the *small* observable state (§137,
+    /// ADR-006): the Display's pause state, diagnostics, recent match firings, recording
+    /// state, liveness, and the stream's end offset. The scrollback bytes are **not**
+    /// included — they are fetched incrementally via [`stream_delta`](Self::stream_delta)
+    /// so this stays cheap at high throughput.
     pub fn snapshot(&mut self) -> ChannelSnapshot {
         let now = Instant::now();
         let diagnostics = self.diagnostics_snapshot();
@@ -2423,7 +2422,7 @@ mod tests {
 
     #[test]
     fn datagram_boundaries_do_not_segment_the_stream() {
-        // v2 invariant (§15, §18): UDP datagram boundaries are a reception/recording
+        // §15, §18: UDP datagram boundaries are a reception/recording
         // detail only. The stream concatenates datagram payloads verbatim — nothing
         // is inserted between them and nothing is reframed.
         let cid = ChannelId::new();
@@ -2669,7 +2668,7 @@ mod tests {
     #[tokio::test]
     async fn disp_is_the_exact_rendered_stream_across_read_boundaries() {
         // ADR-018: the .disp concatenation carries no read-boundary artifacts —
-        // no injected newlines (the old line-per-chunk behavior), and a UTF-8
+        // no injected newlines between reads, and a UTF-8
         // character split across two reads decodes as itself.
         use crate::record::{start_display_recording, DisplayFileRecorder};
         let cid = ChannelId::new();
@@ -4261,8 +4260,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_rules_with_interleaved_offsets_both_splice_into_disp() {
-        // Regression (renderer walker): apply_fired_rules collects annotations
-        // rule-major, so two timestamped Mark rules firing in one chunk can
+        // apply_fired_rules collects annotations rule-major, so two timestamped Mark rules firing in one chunk can
         // interleave offsets (rule ZZ at 5 collected before rule AA at 2). Both
         // timestamps must land in the .disp — the renderer sorts internally.
         use crate::config::{MarkPosition, MarkTimestamp};

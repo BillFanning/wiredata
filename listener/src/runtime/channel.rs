@@ -98,8 +98,7 @@ const STATUS_REPLY_WAIT: Duration = Duration::from_millis(300);
 ///
 /// Advisory stall notices are bounded and use `try_send` (§99): blocking the live
 /// reader to announce a reader stall would cause the very stall being reported.
-/// The capacity is large enough for a short burst; a dropped-advisory counter can
-/// be added if the rate ever matters. Every data-transport monitor also retains a
+/// The capacity is large enough for a short burst. Every data-transport monitor also retains a
 /// sender for its one terminal fault cause; that post-reception path awaits capacity
 /// through [`report_transport_fault`] instead of dropping (ADR-020).
 pub(crate) const TRANSPORT_NOTICES: usize = 16;
@@ -709,8 +708,7 @@ mod tests {
         // The same fault flips the shared state flag (ADR-006), so an orchestrator
         // reading it reconciles to Faulted without waiting for a command.
         assert!(running.is_faulted());
-        // The fault's CAUSE reaches the diagnostics (review round 2: the
-        // outcome string used to die unread in the monitor).
+        // The fault's CAUSE reaches the diagnostics, not only the event.
         let mut pipeline = running.stop().await.expect("pipeline returns");
         let snap = pipeline.snapshot();
         assert!(
