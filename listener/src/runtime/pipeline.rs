@@ -270,20 +270,10 @@ pub struct ChannelPipeline {
     /// restarted. The active handle owns the live counter; this preserves its
     /// run-level evidence after that handle is gone.
     raw_recording_queue_history: Option<QueueDepth>,
-    /// A begin with no destination leaves no recorder, so the recording state
-    /// would otherwise read back as "off". This sticky flag makes it read
-    /// `Faulted` instead (so the GUI shows ⚠, not ■). Cleared on a begin or a
-    /// stop.
-    begin_faulted: bool,
-    /// Display-recording sibling of `begin_faulted` (§54, ADR-012).
-    display_begin_faulted: bool,
-    /// Display-recording sibling of `recording_settings`: the settings a live
-    /// Display begin uses (§54). `None` = no destination set, so a begin faults.
-    display_recording_settings: Option<DisplayRecordingSettings>,
-    /// Each running recording's destination as the disk check last saw it
-    /// (§56.2): free space, the recording's size, and the lasting low-disk fault.
-    raw_disk: DiskWatch,
-    display_disk: DiskWatch,
+    /// The Raw tap's settings and the state around them (§53).
+    raw: Tap<RawRecordingSettings>,
+    /// The Display tap's, for a live Display begin (§54, ADR-012).
+    display: Tap<DisplayRecordingSettings>,
     /// Per-Channel liveness facts (§91.1): rolling throughput + last-data time.
     activity: ActivityMeter,
     /// Post-read capture to pipeline-start delay, accumulated without retaining
@@ -318,17 +308,6 @@ pub struct ChannelPipeline {
     /// drain first, so a new file never opens while its predecessor is still
     /// closing and a channel stop still reports every outcome (§56.1).
     retiring: JoinSet<RetiredRecording>,
-    /// The Raw recording settings used to build the recording on demand (§50.2,
-    /// lazy-create: nothing on disk until a `Begin` fires). `None` = no destination
-    /// set, so a `Begin` can't record.
-    recording_settings: Option<RawRecordingSettings>,
-    /// "Record on start" (§53): when set, `run_channel` calls `begin_recording` once at
-    /// startup. Begin goes through the same path as the live Record toggle, so a start
-    /// failure (e.g. Refuse over an existing file) records a diagnostic and emits
-    /// `RecordingFaulted` — it doesn't fail silently.
-    auto_begin_recording: bool,
-    /// "Record on start" for the Display recording (§54), begun the same way.
-    auto_begin_display_recording: bool,
     /// Anchor for the `Idle` condition before any data has arrived (§50.2): idle is
     /// measured from the last data, or from this instant when none has arrived yet.
     created_at: Instant,
@@ -349,6 +328,38 @@ pub struct ChannelPipeline {
     ingest_depth: usize,
     ingest_peak: usize,
     ingest_capacity: usize,
+}
+
+/// One recording tap's settings and the state kept around them.
+struct Tap<S> {
+    /// The settings used to build the recording on demand (§50.2, lazy-create:
+    /// nothing on disk until a `Begin` fires). `None` = no destination set, so
+    /// a begin faults.
+    settings: Option<S>,
+    /// A begin with no destination leaves no recorder, so the recording state
+    /// would otherwise read back as "off". This sticky flag makes it read
+    /// `Faulted` instead (so the GUI shows ⚠, not ■). Cleared on a begin or a
+    /// stop.
+    begin_faulted: bool,
+    /// "Record on start" (§53, §54): when set, `run_channel` begins once at
+    /// startup, through the same path as the live Record toggle, so a start
+    /// failure (e.g. Refuse over an existing file) records a diagnostic and
+    /// emits `RecordingFaulted` — it doesn't fail silently.
+    auto_begin: bool,
+    /// The running recording's destination as the disk check last saw it
+    /// (§56.2): free space, the recording's size, and the lasting low-disk fault.
+    disk: DiskWatch,
+}
+
+impl<S> Default for Tap<S> {
+    fn default() -> Self {
+        Self {
+            settings: None,
+            begin_faulted: false,
+            auto_begin: false,
+            disk: DiskWatch::default(),
+        }
+    }
 }
 
 /// A `Record` action queued for asynchronous application (§50.2).
@@ -451,11 +462,8 @@ impl ChannelPipeline {
             diagnostics_cache: None,
             raw_recorder: None,
             raw_recording_queue_history: None,
-            begin_faulted: false,
-            display_begin_faulted: false,
-            display_recording_settings: None,
-            raw_disk: DiskWatch::default(),
-            display_disk: DiskWatch::default(),
+            raw: Tap::default(),
+            display: Tap::default(),
             activity: ActivityMeter::new(),
             ingest_delay: DurationHistogram::default(),
             recent_ingest_delay: RecentDurationHistogram::default(),
@@ -471,9 +479,6 @@ impl ChannelPipeline {
             recent_matches: DropOldestQueue::with_capacity(RECENT_MATCHES_CAP),
             pending_record_controls: Vec::new(),
             retiring: JoinSet::new(),
-            recording_settings: None,
-            auto_begin_recording: false,
-            auto_begin_display_recording: false,
             created_at: Instant::now(),
             stream_buf: VecDeque::new(),
             stream_cap: caps.stream_display,
@@ -521,7 +526,7 @@ impl ChannelPipeline {
     /// Provide the Raw recording settings (§50.2): the recorder is created only when a
     /// `Record { Begin }` action fires, so nothing is written before then.
     pub fn with_recording_settings(mut self, settings: RawRecordingSettings) -> Self {
-        self.recording_settings = Some(settings);
+        self.raw.settings = Some(settings);
         self
     }
 
@@ -529,26 +534,26 @@ impl ChannelPipeline {
     /// match-triggered `Record { target: Display | Both, Begin }` lazily creates
     /// the `.disp` from these; nothing is written before a firing.
     pub fn with_display_recording_settings(mut self, settings: DisplayRecordingSettings) -> Self {
-        self.display_recording_settings = Some(settings);
+        self.display.settings = Some(settings);
         self
     }
 
     /// Mark "Record on start" (§53): `run_channel` begins recording once at startup,
     /// via the same path as the live toggle. Pair with `with_recording_settings`.
     pub fn with_auto_begin_recording(mut self) -> Self {
-        self.auto_begin_recording = true;
+        self.raw.auto_begin = true;
         self
     }
 
     /// Whether "Record on start" was set (consumed by `run_channel` at startup).
     pub fn should_auto_begin_recording(&self) -> bool {
-        self.auto_begin_recording
+        self.raw.auto_begin
     }
 
     /// Mark "Record on start" for the Display recording (§54). Pair with
     /// `with_display_recording_settings`.
     pub fn with_auto_begin_display_recording(mut self) -> Self {
-        self.auto_begin_display_recording = true;
+        self.display.auto_begin = true;
         self
     }
 
@@ -838,11 +843,13 @@ impl ChannelPipeline {
             RecorderReport::CouldNotBegin { detail } => {
                 let target = match tap {
                     RecordingTap::Raw => self
-                        .recording_settings
+                        .raw
+                        .settings
                         .as_ref()
                         .map(|s| (s.destination.display().to_string(), s.overwrite)),
                     RecordingTap::Display => self
-                        .display_recording_settings
+                        .display
+                        .settings
                         .as_ref()
                         .map(|s| (s.destination.display().to_string(), s.overwrite)),
                 };
@@ -1110,7 +1117,7 @@ impl ChannelPipeline {
                 .as_ref()
                 .is_none_or(|recorder| recorder.state() == RecordingState::Faulted)
             {
-                self.recording_settings = Some(settings);
+                self.raw.settings = Some(settings);
             }
         }
         if enabled {
@@ -1142,10 +1149,10 @@ impl ChannelPipeline {
             }
             None => {}
         }
-        let Some(settings) = self.recording_settings.clone() else {
+        let Some(settings) = self.raw.settings.clone() else {
             // No destination set — a Begin can't record. Surface it instead of a
             // silent no-op (the live toggle would otherwise appear to do nothing).
-            self.begin_faulted = true;
+            self.raw.begin_faulted = true;
             self.diagnostics.record(Diagnostic::error(
                 "can't begin Raw recording: no destination is set — set one in the Raw \
                  recording setup, then press Record again",
@@ -1169,7 +1176,7 @@ impl ChannelPipeline {
             recording.set_low_disk(true);
         }
         self.raw_recorder = Some(recording);
-        self.begin_faulted = false;
+        self.raw.begin_faulted = false;
     }
 
     /// Stop the Raw recording on a `Record { Stop }` (§50.2, §56): the recorder
@@ -1180,7 +1187,7 @@ impl ChannelPipeline {
     /// none is active. Also clears a prior begin-fault so the state reads
     /// "off" again, not ⚠.
     async fn stop_recording(&mut self) {
-        self.begin_faulted = false;
+        self.raw.begin_faulted = false;
         if let Some(recorder) = self.take_raw_recorder() {
             self.retiring.spawn(async move {
                 let finalized = recorder.finalize().await;
@@ -1290,7 +1297,7 @@ impl ChannelPipeline {
                 .as_ref()
                 .is_none_or(|recorder| recorder.recording.state() == RecordingState::Faulted)
             {
-                self.display_recording_settings = Some(settings);
+                self.display.settings = Some(settings);
             }
         }
         if enabled {
@@ -1319,8 +1326,8 @@ impl ChannelPipeline {
             }
             None => {}
         }
-        let Some(settings) = self.display_recording_settings.clone() else {
-            self.display_begin_faulted = true;
+        let Some(settings) = self.display.settings.clone() else {
+            self.display.begin_faulted = true;
             self.diagnostics.record(Diagnostic::error(
                 "can't begin Display recording: no destination is set — set one in the \
                  Record Display setup, then press Record again",
@@ -1342,7 +1349,7 @@ impl ChannelPipeline {
             recording.set_low_disk(true);
         }
         self.set_display_recorder(settings.renderer.clone(), recording);
-        self.display_begin_faulted = false;
+        self.display.begin_faulted = false;
     }
 
     /// Stop the Display recording (§54): retires **detached**, like the Raw
@@ -1350,7 +1357,7 @@ impl ChannelPipeline {
     /// loop never waits on the drain. A no-op if none is active. Clears a
     /// prior begin-fault so the state reads "off" again, not ⚠.
     async fn stop_display_recording(&mut self) {
-        self.display_begin_faulted = false;
+        self.display.begin_faulted = false;
         if let Some(rec) = self.take_display_recorder() {
             let channel_id = self.channel_id;
             let end = self.stream_pos_now();
@@ -1480,20 +1487,20 @@ impl ChannelPipeline {
     /// [`reap_disk_checks`](Self::reap_disk_checks) applies what it finds. A
     /// check that never returns is not joined by another.
     pub fn check_recording_disks(&mut self) {
-        if let Some(settings) = self
-            .raw_recorder
-            .as_ref()
-            .and(self.recording_settings.as_ref())
+        if let (Some(recorder), Some(settings)) =
+            (self.raw_recorder.as_ref(), self.raw.settings.as_ref())
         {
-            self.raw_disk.start_check(settings.plan());
+            self.raw
+                .disk
+                .start_check(settings.plan(), recorder.current_file());
         }
-        let display_running = self.display_recorder.is_some();
-        if let Some(settings) = self
-            .display_recording_settings
-            .as_ref()
-            .filter(|_| display_running)
-        {
-            self.display_disk.start_check(settings.plan());
+        if let (Some(rec), Some(settings)) = (
+            self.display_recorder.as_ref(),
+            self.display.settings.as_ref(),
+        ) {
+            self.display
+                .disk
+                .start_check(settings.plan(), rec.recording.current_file());
         }
     }
 
@@ -1551,6 +1558,7 @@ impl ChannelPipeline {
         let check_recovered = std::mem::replace(&mut watch.check_failing, false);
         watch.free_space = Some(found.free);
         watch.total_size = Some(found.files);
+        watch.others = found.others;
         let was_low = watch.low;
         if check_recovered {
             self.diagnostics.record(Diagnostic::event(format!(
@@ -1606,16 +1614,16 @@ impl ChannelPipeline {
 
     fn disk_watch_mut(&mut self, tap: RecordingTap) -> &mut DiskWatch {
         match tap {
-            RecordingTap::Raw => &mut self.raw_disk,
-            RecordingTap::Display => &mut self.display_disk,
+            RecordingTap::Raw => &mut self.raw.disk,
+            RecordingTap::Display => &mut self.display.disk,
         }
     }
 
     /// The disk guard of `tap`'s recording, from its settings (§56.2).
     fn tap_guard(&self, tap: RecordingTap) -> Option<DiskGuard> {
         match tap {
-            RecordingTap::Raw => self.recording_settings.as_ref()?.disk_guard,
-            RecordingTap::Display => self.display_recording_settings.as_ref()?.disk_guard,
+            RecordingTap::Raw => self.raw.settings.as_ref()?.disk_guard,
+            RecordingTap::Display => self.display.settings.as_ref()?.disk_guard,
         }
     }
 
@@ -1623,8 +1631,8 @@ impl ChannelPipeline {
     /// recording begun during it starts in that gap too.
     fn low_disk_holds_recording(&self, tap: RecordingTap) -> bool {
         let low = match tap {
-            RecordingTap::Raw => self.raw_disk.low,
-            RecordingTap::Display => self.display_disk.low,
+            RecordingTap::Raw => self.raw.disk.low,
+            RecordingTap::Display => self.display.disk.low,
         };
         low && self
             .tap_guard(tap)
@@ -1654,26 +1662,26 @@ impl ChannelPipeline {
         let (current_file, bytes_written, unstable, rotation, guard, watch) = match tap {
             RecordingTap::Raw => {
                 let recorder = self.raw_recorder.as_ref()?;
-                let settings = self.recording_settings.as_ref();
+                let settings = self.raw.settings.as_ref();
                 (
                     recorder.current_file(),
                     recorder.bytes_written(),
                     recorder.is_unstable(),
                     settings.map(|s| s.file_rotation),
                     settings.and_then(|s| s.disk_guard),
-                    &self.raw_disk,
+                    &self.raw.disk,
                 )
             }
             RecordingTap::Display => {
                 let recording = &self.display_recorder.as_ref()?.recording;
-                let settings = self.display_recording_settings.as_ref();
+                let settings = self.display.settings.as_ref();
                 (
                     recording.current_file(),
                     recording.bytes_written(),
                     recording.is_unstable(),
                     settings.map(|s| s.file_rotation),
                     settings.and_then(|s| s.disk_guard),
-                    &self.display_disk,
+                    &self.display.disk,
                 )
             }
         };
@@ -1708,7 +1716,7 @@ impl ChannelPipeline {
             self.note_recording_stop(RecordingTap::Raw, finalized, true);
         }
         let end = self.stream_pos_now();
-        self.display_disk = DiskWatch::default();
+        self.display.disk = DiskWatch::default();
         if let Some(rec) = self.display_recorder.take() {
             let finalized = finalize_view_recorder(self.channel_id, rec, end).await;
             self.note_recording_stop(RecordingTap::Display, finalized, false);
@@ -1751,7 +1759,7 @@ impl ChannelPipeline {
     pub fn raw_recording_state(&self) -> Option<RecordingState> {
         match self.raw_recorder.as_ref() {
             Some(r) => Some(r.state()),
-            None if self.begin_faulted => Some(RecordingState::Faulted),
+            None if self.raw.begin_faulted => Some(RecordingState::Faulted),
             None => None,
         }
     }
@@ -1762,7 +1770,7 @@ impl ChannelPipeline {
     pub fn display_recording_state(&self) -> Option<RecordingState> {
         match self.display_recorder.as_ref() {
             Some(rec) => Some(rec.recording.state()),
-            None if self.display_begin_faulted => Some(RecordingState::Faulted),
+            None if self.display.begin_faulted => Some(RecordingState::Faulted),
             None => None,
         }
     }
@@ -1819,13 +1827,13 @@ impl ChannelPipeline {
             retained.capacity = retained.capacity.max(capacity);
             retained.current = 0;
         }
-        self.raw_disk = DiskWatch::default();
+        self.raw.disk = DiskWatch::default();
         self.raw_recorder.take()
     }
 
     /// Take the Display recorder, forgetting its disk watch.
     fn take_display_recorder(&mut self) -> Option<ViewRecorder> {
-        self.display_disk = DiskWatch::default();
+        self.display.disk = DiskWatch::default();
         self.display_recorder.take()
     }
 
@@ -1997,13 +2005,25 @@ async fn finalize_view_recorder(
 const DISK_CHECK_LIMIT: Duration = Duration::from_secs(2);
 
 /// What one disk check found (§56.2).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct DiskFound {
     /// Free and total bytes on the destination's filesystem.
     free: u64,
     total: u64,
     /// The total size of the recording's files.
     files: u64,
+    /// What the size was built from, to carry into the next check.
+    others: Option<OtherFiles>,
+}
+
+/// The size of a recording's files other than the segment being written,
+/// scanned once when that segment became current (§56.2). Closed segments no
+/// longer grow, so a later check adds only the current segment's own size —
+/// its cost does not grow with the number of files in the folder.
+#[derive(Clone, Debug)]
+struct OtherFiles {
+    current: PathBuf,
+    size: u64,
 }
 
 /// A disk check running on the blocking pool.
@@ -2025,20 +2045,49 @@ struct DiskWatch {
     /// A failed check has been reported; the next success notes the recovery.
     check_failing: bool,
     check: Option<DiskCheck>,
+    /// The last scan of the other files, reused while the same segment is
+    /// current. Dropped with the watch when the recording stops.
+    others: Option<OtherFiles>,
 }
 
 impl DiskWatch {
     /// Start a check of `plan`'s destination, unless one is still in flight.
-    fn start_check(&mut self, plan: SegmentPlan) {
+    /// `current` is the segment being written: the folder is scanned when it
+    /// changes (and at the first check), not on every check.
+    fn start_check(&mut self, plan: SegmentPlan, current: Option<PathBuf>) {
         if self.check.is_some() {
             return;
         }
+        let known = self
+            .others
+            .clone()
+            .filter(|others| Some(&others.current) == current.as_ref());
         let handle = tokio::task::spawn_blocking(move || {
             let folder = plan.folder();
+            let free = fs4::available_space(&folder)?;
+            let total = fs4::total_space(&folder)?;
+            let Some(current) = current else {
+                // No segment is open, so there is nothing to keep a scan for.
+                return Ok(DiskFound {
+                    free,
+                    total,
+                    files: plan.files_size()?,
+                    others: None,
+                });
+            };
+            let others = match known {
+                Some(known) => known,
+                None => OtherFiles {
+                    size: plan.files_size_except(&current)?,
+                    current,
+                },
+            };
+            let own = plan.segment_size(&others.current);
             Ok(DiskFound {
-                free: fs4::available_space(&folder)?,
-                total: fs4::total_space(&folder)?,
-                files: plan.files_size()?,
+                free,
+                total,
+                files: others.size.saturating_add(own),
+                others: Some(others),
             })
         });
         self.check = Some(DiskCheck {
@@ -2132,7 +2181,7 @@ pub async fn run_channel(
     if pipeline.should_auto_begin_recording() {
         pipeline.begin_recording().await;
     }
-    if pipeline.auto_begin_display_recording {
+    if pipeline.display.auto_begin {
         pipeline.begin_display_recording().await;
     }
     loop {
@@ -3119,7 +3168,7 @@ mod tests {
 
         // Another check in the same episode reports nothing new.
         p.check_recording_disks();
-        settle_disks(&mut p, "the second check", |p| p.raw_disk.check.is_none()).await;
+        settle_disks(&mut p, "the second check", |p| p.raw.disk.check.is_none()).await;
         assert_eq!(count(&mut event_rx), (0, 0));
         p.finish().await;
         let _ = tokio::fs::remove_file(&path).await;
@@ -3172,6 +3221,7 @@ mod tests {
                 free,
                 total: 1_000_000,
                 files: 0,
+                others: None,
             })
         };
 
@@ -3298,6 +3348,7 @@ mod tests {
                 free: 5,
                 total: 10,
                 files: 3,
+                others: None,
             }),
         );
         assert!(p
@@ -3308,6 +3359,42 @@ mod tests {
         assert_eq!((status.free_space, status.total_size), (Some(5), Some(3)));
         p.finish().await;
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn the_size_follows_the_current_segment_without_rescanning_the_folder() {
+        // §56.2: the folder is scanned when a segment becomes current; later
+        // checks add the current segment's own size. A file that appears
+        // between checks is not seen until the next segment opens.
+        let cid = ChannelId::new();
+        let path = temp_path("size-scan");
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.set_recording(true, Some(raw_settings(&path, None))).await;
+        p.ingest(bytes_chunk(cid, b"abc"));
+        settle(&mut p, "the first write", |p| {
+            raw_status(p).is_some_and(|s| s.bytes_written == 3)
+        })
+        .await;
+        settle_disks(&mut p, "the first size", |p| {
+            raw_status(p).is_some_and(|s| s.total_size == Some(3))
+        })
+        .await;
+
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let stranger = path.with_file_name(format!("{stem}_2.tmp"));
+        std::fs::write(&stranger, [b'x'; 100]).unwrap();
+        p.ingest(bytes_chunk(cid, b"de"));
+        settle(&mut p, "the second write", |p| {
+            raw_status(p).is_some_and(|s| s.bytes_written == 5)
+        })
+        .await;
+        settle_disks(&mut p, "the grown size", |p| {
+            raw_status(p).is_some_and(|s| s.total_size == Some(5))
+        })
+        .await;
+        p.finish().await;
+        let _ = std::fs::remove_file(&stranger);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

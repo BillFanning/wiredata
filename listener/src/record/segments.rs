@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use super::controller::{OpenError, OpenKind, OpenRequest, SegmentSource};
-use super::file::{lock_file, DisplayFileRecorder, RawFileRecorder};
+use super::file::{lock_file, sidecar_path, DisplayFileRecorder, RawFileRecorder};
 use super::file_rotation::{ensure_rotation_dir, period_key, rotation_filename};
 use super::{FileRotationPolicy, OverwritePolicy, RecorderWriter};
 use crate::core::{GapReason, RecordError};
@@ -90,9 +90,37 @@ impl SegmentPlan {
     /// indexes — for status (§56.2). Other channels' and other taps' files in the
     /// same folder are not counted. Blocking — run it off the async runtime.
     pub fn files_size(&self) -> std::io::Result<u64> {
+        self.scan_size(None)
+    }
+
+    /// [`files_size`](Self::files_size) without the segment at `current` and
+    /// its index — the files that have stopped growing once `current` is the
+    /// segment being written. Add [`segment_size`](Self::segment_size) for the
+    /// rest.
+    pub fn files_size_except(&self, current: &Path) -> std::io::Result<u64> {
+        self.scan_size(Some(current))
+    }
+
+    /// The size of the segment at `path` and its index, by two stats — not a
+    /// scan of the folder. A missing file counts as nothing.
+    pub fn segment_size(&self, path: &Path) -> u64 {
+        let len = |p: &Path| std::fs::metadata(p).map_or(0, |meta| meta.len());
+        len(path) + len(&sidecar_path(path))
+    }
+
+    fn scan_size(&self, except: Option<&Path>) -> std::io::Result<u64> {
+        let except = except.and_then(|path| path.file_name().map(|n| n.to_owned()));
         let mut total = 0;
         for entry in std::fs::read_dir(self.folder())?.flatten() {
-            if self.is_recording_file(&entry.file_name().to_string_lossy()) {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(except) = &except {
+                let base = name_str.strip_suffix(".idx").unwrap_or(&name_str);
+                if base == except.to_string_lossy() {
+                    continue;
+                }
+            }
+            if self.is_recording_file(&name_str) {
                 // A file removed mid-scan is simply not counted.
                 total += entry.metadata().map_or(0, |meta| meta.len());
             }
@@ -553,6 +581,44 @@ mod tests {
                 .unwrap(),
             6
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_size_without_a_segment_plus_that_segment_is_the_whole_size() {
+        let dir = temp_dir("size-split");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, len) in [
+            ("GPS_2026-06-03_08.raw", 5),
+            ("GPS_2026-06-03_08.raw.idx", 3),
+            ("GPS_2026-06-03_08_2.raw", 4),
+            ("GPS_2026-06-03_08_2.raw.idx", 2),
+            ("GPS_2026-06-03_08.disp", 50),
+        ] {
+            std::fs::write(dir.join(name), vec![b'x'; len]).unwrap();
+        }
+        let plan = plan(&dir, FileRotationPolicy::Hourly);
+        let current = dir.join("GPS_2026-06-03_08_2.raw");
+        assert_eq!(plan.files_size_except(&current).unwrap(), 8);
+        assert_eq!(plan.segment_size(&current), 6);
+        assert_eq!(plan.files_size().unwrap(), 14);
+        assert_eq!(plan.segment_size(&dir.join("missing.raw")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "benchmark: prints the cost of one size scan over 20,000 files"]
+    fn files_size_over_twenty_thousand_files() {
+        let dir = temp_dir("size-bench");
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 2..20_002 {
+            std::fs::File::create(dir.join(format!("GPS_2026-06-03_08_{n}.raw"))).unwrap();
+        }
+        let plan = plan(&dir, FileRotationPolicy::Hourly);
+        let started = std::time::Instant::now();
+        let size = plan.files_size().unwrap();
+        println!("files_size over 20000 files: {:?}", started.elapsed());
+        assert_eq!(size, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

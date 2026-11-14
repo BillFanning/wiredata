@@ -2363,6 +2363,26 @@ profile was removed at the same time, at the user's request.
 A GUI profile load with both upgrade warnings and skipped Channels reports
 only the skipped Channels, since both use the one status line.
 
+## ADR-061 — The disk check scans a recording's folder once per segment
+
+**Status:** Accepted 2026-11-14.
+
+**Context:** The disk-space guard (§56.2) checks every 5 s and shows how much
+the recording's files take. It found that by scanning the destination folder
+on every check. Measured on 2026-11-14 (debug build, `%TEMP%`), a scan over
+20,000 matching files took 59 to 80 ms: past the 50 ms set as the point to
+act, and a cost that grows for ever on a weeks-long hourly recording.
+
+**Decision:** The folder is scanned when the current segment changes, or
+when no segment is open. Each 5 s check then reads free space as before and
+adds two file sizes, the current segment and its `.idx`, to the stored scan
+of everything else.
+
+**Boundary:** The figures shown are the same. A file that appears in the
+folder between segment opens is counted from the next open, not at once.
+
+**Consequences:** A check's cost no longer grows with the number of files.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_
