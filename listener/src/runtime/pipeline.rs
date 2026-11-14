@@ -368,17 +368,24 @@ struct PendingRecord {
     control: RecordControl,
 }
 
-/// The Raw recording settings needed to build the recording when a `Record { Begin }`
-/// fires (§50.2, §165) — the destination/overwrite/timestamps/rotation, packaged so
-/// they can be sent to the pipeline task (which runs on its own async task and can't
-/// read the config directly). Built from the channel's recording config, either at
-/// channel start or — for a live toggle — read from the editor at click time (ADR-012).
+/// What a tap adds to the shared recording settings: its file extension and
+/// the fields only it has.
+pub trait TapExtra {
+    /// The recording's file extension, with the dot.
+    const EXT: &'static str;
+}
+
+/// The settings needed to build a recording when a `Record { Begin }` fires
+/// (§50.2, §165) — destination, overwrite, rotation, queue budget, size cap and
+/// disk guard, packaged so they can be sent to the pipeline task (which runs on
+/// its own async task and can't read the config directly). Built from the
+/// channel's recording config, either at channel start or — for a live toggle —
+/// read from the editor at click time (ADR-012). `X` is the tap's own part.
 #[derive(Clone, Debug)]
-pub struct RawRecordingSettings {
+pub struct RecordingSettings<X> {
     pub destination: PathBuf,
     pub channel_name: String,
     pub overwrite: OverwritePolicy,
-    pub timestamps: bool,
     pub file_rotation: FileRotationPolicy,
     /// The recording queue's budget, in bytes (ADR-043).
     pub queue_budget: usize,
@@ -386,14 +393,16 @@ pub struct RawRecordingSettings {
     pub size_cap: u64,
     /// The disk guard on this recording's destination (§56.2).
     pub disk_guard: Option<DiskGuard>,
+    /// What only this tap has.
+    pub extra: X,
 }
 
-impl RawRecordingSettings {
+impl<X: TapExtra> RecordingSettings<X> {
     fn plan(&self) -> SegmentPlan {
         SegmentPlan {
             destination: self.destination.clone(),
             channel: self.channel_name.clone(),
-            ext: ".raw".to_owned(),
+            ext: X::EXT.to_owned(),
             rotation: self.file_rotation,
             overwrite: self.overwrite,
             size_cap: Some(self.size_cap),
@@ -401,39 +410,34 @@ impl RawRecordingSettings {
     }
 }
 
-/// The Display recording settings for a live begin (§54, ADR-012/-013): the Raw
-/// fields' sibling, plus the renderer — the `.disp` records a *view's* rendered
-/// output, so the begin must know how that view renders. Packaged like
-/// [`RawRecordingSettings`] so the pipeline task never reads config directly.
+/// The Raw tap's own settings (§53).
 #[derive(Clone, Debug)]
-pub struct DisplayRecordingSettings {
-    pub destination: PathBuf,
-    pub channel_name: String,
-    pub overwrite: OverwritePolicy,
-    pub file_rotation: FileRotationPolicy,
-    /// The recording queue's budget, in bytes (ADR-043).
-    pub queue_budget: usize,
-    /// The soft size cap per file, in bytes (§59).
-    pub size_cap: u64,
-    /// The disk guard on this recording's destination (§56.2).
-    pub disk_guard: Option<DiskGuard>,
+pub struct RawExtra {
+    pub timestamps: bool,
+}
+
+impl TapExtra for RawExtra {
+    const EXT: &'static str = ".raw";
+}
+
+/// The Display tap's own settings (§54, ADR-012/-013): the renderer — the
+/// `.disp` records a *view's* rendered output, so the begin must know how that
+/// view renders — and whether to mark gaps.
+#[derive(Clone, Debug)]
+pub struct DisplayExtra {
     pub renderer: DisplayView,
     /// Write a `‹GAP …›` line where the recording resumes after lost bytes.
     pub mark_gaps: bool,
 }
 
-impl DisplayRecordingSettings {
-    fn plan(&self) -> SegmentPlan {
-        SegmentPlan {
-            destination: self.destination.clone(),
-            channel: self.channel_name.clone(),
-            ext: ".disp".to_owned(),
-            rotation: self.file_rotation,
-            overwrite: self.overwrite,
-            size_cap: Some(self.size_cap),
-        }
-    }
+impl TapExtra for DisplayExtra {
+    const EXT: &'static str = ".disp";
 }
+
+/// The Raw recording's settings.
+pub type RawRecordingSettings = RecordingSettings<RawExtra>;
+/// The Display recording's settings.
+pub type DisplayRecordingSettings = RecordingSettings<DisplayExtra>;
 
 /// How long a begin waits for detached predecessor stops (see
 /// `land_retiring_before_begin`).
@@ -1168,7 +1172,7 @@ impl ChannelPipeline {
         // "started" — or why it could not — arrives as a report once the first
         // file's open resolves (`note_recorder_report`).
         let recording = start_recording(
-            RawSegments::new(settings.plan(), settings.timestamps),
+            RawSegments::new(settings.plan(), settings.extra.timestamps),
             settings.queue_budget,
             Timings::default(),
         );
@@ -1341,14 +1345,14 @@ impl ChannelPipeline {
             return;
         };
         let recording = start_recording(
-            DisplaySegments::new(settings.plan()).with_gap_marks(settings.mark_gaps),
+            DisplaySegments::new(settings.plan()).with_gap_marks(settings.extra.mark_gaps),
             settings.queue_budget,
             Timings::default(),
         );
         if self.low_disk_holds_recording(RecordingTap::Display) {
             recording.set_low_disk(true);
         }
-        self.set_display_recorder(settings.renderer.clone(), recording);
+        self.set_display_recorder(settings.extra.renderer.clone(), recording);
         self.display.begin_faulted = false;
     }
 
@@ -3047,7 +3051,7 @@ mod tests {
             destination: path.to_path_buf(),
             channel_name: "guarded".to_string(),
             overwrite: OverwritePolicy::Overwrite,
-            timestamps: false,
+            extra: RawExtra { timestamps: false },
             file_rotation: FileRotationPolicy::None,
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
@@ -3188,8 +3192,10 @@ mod tests {
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
             disk_guard: impossible_guard(),
-            renderer: DisplayView::default(),
-            mark_gaps: false,
+            extra: DisplayExtra {
+                renderer: DisplayView::default(),
+                mark_gaps: false,
+            },
         };
         p.set_display_recording(true, Some(settings)).await;
         settle_disks(&mut p, "the Display low-disk gap", |p| {
@@ -3815,7 +3821,7 @@ mod tests {
                 destination: path.clone(),
                 channel_name: "armed".to_string(),
                 overwrite: OverwritePolicy::Refuse,
-                timestamps: false,
+                extra: RawExtra { timestamps: false },
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
@@ -3879,8 +3885,10 @@ mod tests {
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
-                renderer: DisplayView::default(),
-                mark_gaps: false,
+                extra: DisplayExtra {
+                    renderer: DisplayView::default(),
+                    mark_gaps: false,
+                },
                 disk_guard: None,
             });
 
@@ -3939,7 +3947,7 @@ mod tests {
                 destination: raw_path.clone(),
                 channel_name: "both".to_string(),
                 overwrite: OverwritePolicy::Refuse,
-                timestamps: false,
+                extra: RawExtra { timestamps: false },
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
@@ -3952,8 +3960,10 @@ mod tests {
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
-                renderer: DisplayView::default(),
-                mark_gaps: false,
+                extra: DisplayExtra {
+                    renderer: DisplayView::default(),
+                    mark_gaps: false,
+                },
                 disk_guard: None,
             });
 
@@ -3992,7 +4002,7 @@ mod tests {
             destination: first_path.clone(),
             channel_name: "refault".to_string(),
             overwrite: OverwritePolicy::Refuse,
-            timestamps: false,
+            extra: RawExtra { timestamps: false },
             file_rotation: FileRotationPolicy::None,
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
@@ -4048,7 +4058,7 @@ mod tests {
                 destination: path.clone(),
                 channel_name: "live".to_string(),
                 overwrite: OverwritePolicy::Refuse,
-                timestamps: false,
+                extra: RawExtra { timestamps: false },
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
@@ -4095,7 +4105,7 @@ mod tests {
                 destination: path.clone(),
                 channel_name: "detached".to_string(),
                 overwrite: OverwritePolicy::Refuse,
-                timestamps: false,
+                extra: RawExtra { timestamps: false },
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
@@ -4299,8 +4309,10 @@ mod tests {
             file_rotation: FileRotationPolicy::None,
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
-            renderer: DisplayView::default(),
-            mark_gaps: false,
+            extra: DisplayExtra {
+                renderer: DisplayView::default(),
+                mark_gaps: false,
+            },
             disk_guard: None,
         };
         p.set_display_recording(true, Some(settings)).await;
@@ -4361,8 +4373,10 @@ mod tests {
             file_rotation: FileRotationPolicy::None,
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
-            renderer: DisplayView::default(),
-            mark_gaps: false,
+            extra: DisplayExtra {
+                renderer: DisplayView::default(),
+                mark_gaps: false,
+            },
             disk_guard: None,
         };
         let mut p = pipeline(cid, PipelineCapacities::default());

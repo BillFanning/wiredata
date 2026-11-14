@@ -35,7 +35,8 @@ use super::activity::ChannelActivity;
 use super::build::{build_display_view, build_serial, build_udp, BuildError};
 use super::channel::{spawn_monitored_channel, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES};
 use super::pipeline::{
-    DisplayPause, DisplayRecordingSettings, PipelineCapacities, RawRecordingSettings,
+    DisplayExtra, DisplayPause, DisplayRecordingSettings, PipelineCapacities, RawExtra,
+    RawRecordingSettings,
 };
 use super::run_summary::{ListenerRunSummary, RunEndReason, RunId};
 use super::snapshot::{
@@ -864,8 +865,10 @@ impl Listener {
                 queue_budget: self.caps.recording_queue_budget,
                 size_cap: display.size_cap(),
                 disk_guard: display.disk_guard,
-                mark_gaps: display.mark_gaps,
-                renderer,
+                extra: DisplayExtra {
+                    renderer,
+                    mark_gaps: display.mark_gaps,
+                },
             })
     }
 
@@ -1791,11 +1794,13 @@ impl Listener {
                     raw.overwrite_policy,
                     raw.file_rotation,
                 ),
-                timestamps: raw.timestamp_enabled,
                 file_rotation: raw.file_rotation,
                 queue_budget: self.caps.recording_queue_budget,
                 size_cap: raw.size_cap(),
                 disk_guard: raw.disk_guard,
+                extra: RawExtra {
+                    timestamps: raw.timestamp_enabled,
+                },
             })
     }
 }
@@ -1968,13 +1973,19 @@ mod tests {
             disk_guard: None,
             size_cap: None,
         };
-        assert!(!listener.settings_from(&off, "GPS").unwrap().timestamps);
+        assert!(
+            !listener
+                .settings_from(&off, "GPS")
+                .unwrap()
+                .extra
+                .timestamps
+        );
 
         let on = RawRecordingConfig {
             timestamp_enabled: true,
             ..off
         };
-        assert!(listener.settings_from(&on, "GPS").unwrap().timestamps);
+        assert!(listener.settings_from(&on, "GPS").unwrap().extra.timestamps);
     }
 
     #[test]
