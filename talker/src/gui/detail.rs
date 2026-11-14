@@ -1535,10 +1535,7 @@ fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
     });
     ui.end_row();
 
-    let sentence_type: nmea0183::SentenceType = entry
-        .nmea_sentence_type
-        .parse()
-        .expect("SentenceType parse is infallible");
+    let sentence_type = nmea0183::SentenceType::from(entry.nmea_sentence_type.as_str());
     let time_fields = sentence_type.time_fields();
     let supports_live_time = !time_fields.is_empty();
     ui.label("Time fields");

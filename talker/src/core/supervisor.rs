@@ -516,23 +516,43 @@ impl TalkerSupervisor {
             "channel {} starting ({message_count}-message schedule)",
             who.label
         );
-        let thread = std::thread::spawn(move || {
-            for pred in predecessors {
-                let _ = pred.join();
+        let channel = who.id.as_u64();
+        // An interior NUL would make `Builder::spawn` panic on the name.
+        let thread_name = format!("talker-{}", who.label.replace(' ', ""));
+        let label = who.label.clone();
+        let spawned = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                for pred in predecessors {
+                    let _ = pred.join();
+                }
+                let observer =
+                    runner::RunnerObserver::new(status_tx, policy).with_control(control_tx);
+                let observer = match notify {
+                    Some(notify) => observer.with_notify(notify),
+                    None => observer,
+                };
+                runner::open_and_run(who, cfg, schedule, cmd_rx, observer);
+            });
+        match spawned {
+            Ok(thread) => {
+                self.slots[i].handle = Some(TalkerHandle {
+                    cmd_tx,
+                    control_rx,
+                    status_rx,
+                    thread,
+                });
             }
-            let observer = runner::RunnerObserver::new(status_tx, policy).with_control(control_tx);
-            let observer = match notify {
-                Some(notify) => observer.with_notify(notify),
-                None => observer,
-            };
-            runner::open_and_run(who, cfg, schedule, cmd_rx, observer);
-        });
-        self.slots[i].handle = Some(TalkerHandle {
-            cmd_tx,
-            control_rx,
-            status_rx,
-            thread,
-        });
+            Err(e) => {
+                // The slot stays as a stopped channel: no handle, so nothing
+                // reports it running and `stop`, `poll` and `shutdown` skip it.
+                tracing::error!(
+                    channel,
+                    "channel {label} could not start: the system refused a new thread: {e}"
+                );
+                self.slots[i].pending_start = None;
+            }
+        }
     }
 
     /// Shared start prologue: stop any current runner and zero the telemetry

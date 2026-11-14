@@ -27,3 +27,10 @@ Remove an item when it is done: the commit says what changed.
   Either write the spec (sentence set, checksum, talker IDs, armoring rules) or
   amend AGENTS §1 to say nmea0183's behaviour is defined by rustdoc and tests by
   design.
+
+## Open questions
+
+- [ ] `$PRDID` carries no checksum by convention, but a received `$PRDID` with a
+  `*CS` suffix is not specified: decide whether the parser accepts and verifies
+  it, ignores it, or refuses it, then write it into the spec. (`ProprietarySentence::parse`
+  today makes no promise either way.)

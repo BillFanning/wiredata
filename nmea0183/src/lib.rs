@@ -19,6 +19,7 @@ pub use time::format_utc_time;
 /// The result of parsing any NMEA sentence.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum AnyNmeaSentence {
     Standard(NmeaSentence),
     Proprietary(ProprietarySentence),

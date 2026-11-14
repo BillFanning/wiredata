@@ -624,6 +624,17 @@ impl FromStr for SentenceType {
     }
 }
 
+/// Infallible conversion: any text is a valid `SentenceType` (unknown codes become
+/// `Custom`). Same mapping as [`FromStr`], without the `Result`.
+impl From<&str> for SentenceType {
+    fn from(s: &str) -> Self {
+        match s.parse() {
+            Ok(value) => value,
+            Err(never) => match never {},
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +816,17 @@ mod tests {
                 "{code} time-field positions are not strictly increasing: {fields:?}"
             );
         }
+    }
+
+    #[test]
+    fn from_str_slice_matches_parse() {
+        for text in ["", "XY", "GP", "GGA", "FOO", "ZZZZ"] {
+            let parsed: SentenceType = text.parse().unwrap();
+            assert_eq!(SentenceType::from(text), parsed);
+        }
+        assert_eq!(
+            SentenceType::from("XQZ"),
+            SentenceType::Custom("XQZ".to_string())
+        );
     }
 }

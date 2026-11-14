@@ -177,7 +177,7 @@ fn zda_sentence_at(
         zone_hours,
         zone_minutes,
     ];
-    let talker: TalkerId = talker.parse().expect("TalkerId parse is infallible");
+    let talker: TalkerId = TalkerId::from(talker);
     let wire = NmeaSentence::new(talker, SentenceType::ZDA, fields).to_wire();
     Ok(wire
         .strip_suffix("\r\n")

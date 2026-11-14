@@ -15,9 +15,6 @@ pub enum NmeaError {
     #[error("talker ID is too short or malformed: {0:?}")]
     InvalidTalkerId(String),
 
-    #[error("sentence type is empty or malformed: {0:?}")]
-    InvalidSentenceType(String),
-
     #[error("field {index} is invalid: {message}")]
     InvalidField { index: usize, message: String },
 

@@ -281,6 +281,16 @@ fn parse_f64(s: Option<&str>, index: usize, name: &str) -> Result<f64, NmeaError
         index,
         message: format!("'{name}' is not a valid f64: {e}"),
     })
+    .and_then(|v| {
+        if v.is_finite() {
+            Ok(v)
+        } else {
+            Err(NmeaError::InvalidField {
+                index,
+                message: format!("'{name}' is not a finite number"),
+            })
+        }
+    })
 }
 
 fn parse_u8(s: Option<&str>, index: usize, name: &str) -> Result<u8, NmeaError> {
@@ -345,6 +355,22 @@ mod tests {
     fn prdid_missing_field() {
         let err = ProprietarySentence::parse("$PRDID,1.50,0.30\r\n").unwrap_err();
         assert!(matches!(err, NmeaError::InvalidField { index: 2, .. }));
+    }
+
+    #[test]
+    fn prdid_refuses_non_finite_values() {
+        for (wire, index) in [
+            ("$PRDID,nan,0,0\r\n", 0),
+            ("$PRDID,inf,0,0\r\n", 0),
+            ("$PRDID,0,-inf,0\r\n", 1),
+            ("$PRDID,0,0,NaN\r\n", 2),
+        ] {
+            let err = ProprietarySentence::parse(wire).unwrap_err();
+            assert!(
+                matches!(err, NmeaError::InvalidField { index: i, .. } if i == index),
+                "{wire:?} gave {err:?}"
+            );
+        }
     }
 
     // --- PASHR ---

@@ -116,8 +116,8 @@ impl NmeaSentence {
             return Err(NmeaError::InvalidTalkerId(header.to_string()));
         }
         let (talker_str, type_str) = header.split_at(header.len() - 3);
-        let talker_id: TalkerId = talker_str.parse().unwrap();
-        let sentence_type: SentenceType = type_str.parse().unwrap();
+        let talker_id: TalkerId = TalkerId::from(talker_str);
+        let sentence_type: SentenceType = SentenceType::from(type_str);
 
         Ok(Self {
             talker_id,

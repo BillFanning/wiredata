@@ -155,25 +155,24 @@ impl Schedule {
         self.next_clock_check = self
             .wall_anchor
             .and_then(|_| start.checked_add(CLOCK_CHECK_INTERVAL));
-        for message in &mut self.messages {
-            if self.alignment == CadenceAlignment::Immediate {
-                message.next_fire = message.is_active().then_some(start);
-            }
-        }
         self.missed_sends = 0;
         self.clock_realignments = 0;
         self.armed = true;
     }
 
     fn align_deadlines(&mut self, now: Instant, wall_clock: SystemTime) {
-        for message in &mut self.messages {
+        for (index, message) in self.messages.iter_mut().enumerate() {
             message.next_fire = if !message.is_active() {
                 None
             } else if self.alignment == CadenceAlignment::Immediate {
                 Some(now)
             } else {
-                next_phase_delay(wall_clock, message.interval)
-                    .and_then(|delay| now.checked_add(delay))
+                let next = next_phase_delay(wall_clock, message.interval)
+                    .and_then(|delay| now.checked_add(delay));
+                if next.is_none() {
+                    warn_deadline_unrepresentable(index, message.interval);
+                }
+                next
             };
         }
     }
@@ -300,9 +299,9 @@ impl Schedule {
                 // messages.)
                 let late = now.duration_since(following).as_nanos();
                 let interval_nanos = interval.as_nanos();
-                // Grid points in (old next_fire, now] that will never fire:
-                // the one at `next_fire` plus one per full interval of
-                // additional lateness.
+                // Grid points in (old next_fire, now] that will never fire
+                // (the one at `next_fire` fires now): `following` itself
+                // plus one per full interval of additional lateness.
                 missed = (late / interval_nanos + 1) as u64;
                 let rem = late % interval_nanos;
                 following = (now - Duration::from_nanos(rem as u64))

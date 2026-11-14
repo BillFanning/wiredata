@@ -651,12 +651,9 @@ fn parse_nmea_identity(
             anyhow::bail!("NMEA {what} {s:?} contains {c:?}, which would corrupt sentence framing");
         }
     }
-    // Both `FromStr` impls have `Err = Infallible` (unknown strings become
-    // `Custom`), so these expects cannot fire.
-    let talker_id: TalkerId = talker.parse().expect("TalkerId parse is infallible");
-    let st: SentenceType = sentence_type
-        .parse()
-        .expect("SentenceType parse is infallible");
+    // Unknown strings become `Custom`, so neither conversion can fail.
+    let talker_id = TalkerId::from(talker);
+    let st = SentenceType::from(sentence_type);
     Ok((talker_id, st))
 }
 

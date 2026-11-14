@@ -5,8 +5,8 @@
 //! scheduler tick — **15.625 ms** by default on Windows. That is finer than
 //! any sensible sleep for a 10 Hz schedule, but *coarser than the interval*
 //! of a 100 Hz one: every wake arrives more than one interval late, the
-//! stall policy skips the backlog (spec §8.1), and ~40% of the grid never
-//! fires. Requesting 1 ms resolution (`timeBeginPeriod(1)`) while a
+//! stall policy skips the backlog (spec §8.1), and ~36% of sends are
+//! missed. Requesting 1 ms resolution (`timeBeginPeriod(1)`) while a
 //! sub-[`HIGH_RATE_THRESHOLD`] schedule is running fixes the miss rate.
 //!
 //! A schedule at or above that threshold instead stages a coarse wait, requests

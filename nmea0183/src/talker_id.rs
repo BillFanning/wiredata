@@ -395,6 +395,17 @@ impl FromStr for TalkerId {
     }
 }
 
+/// Infallible conversion: any text is a valid `TalkerId` (unknown codes become
+/// `Custom`). Same mapping as [`FromStr`], without the `Result`.
+impl From<&str> for TalkerId {
+    fn from(s: &str) -> Self {
+        match s.parse() {
+            Ok(value) => value,
+            Err(never) => match never {},
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +516,14 @@ mod tests {
         let id: TalkerId = "XY".parse().unwrap();
         assert_eq!(id, TalkerId::Custom("XY".to_string()));
         assert_eq!(id.to_string(), "XY");
+    }
+
+    #[test]
+    fn from_str_slice_matches_parse() {
+        for text in ["", "XY", "GP", "GGA", "FOO", "ZZZZ"] {
+            let parsed: TalkerId = text.parse().unwrap();
+            assert_eq!(TalkerId::from(text), parsed);
+        }
+        assert_eq!(TalkerId::from("XQZ"), TalkerId::Custom("XQZ".to_string()));
     }
 }
