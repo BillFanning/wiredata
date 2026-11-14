@@ -26,9 +26,8 @@ const NO_SEND_IN_PROGRESS: &str = "No message was being sent when these sends ca
 /// The missed-send callout: what was found, and a hover that says how far this
 /// particular finding can be trusted.
 ///
-/// The hover follows the branch rather than covering every branch at once. One
-/// shared text explained phrases the reader could not see on the line above
-/// it, which is how it came to read as a list of riddles.
+/// The hover follows the branch, so it only explains phrases the reader can see
+/// on the line above it.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::gui) struct MissedSendRouting {
     pub(in crate::gui) text: String,
@@ -358,8 +357,7 @@ mod tests {
         );
 
         // One active message cannot block another, so the blocking branch is
-        // structurally unreachable. Reporting its absence as a finding is the
-        // non-sequitur this branch exists to avoid.
+        // structurally unreachable and its absence is not reported as a finding.
         let active = MessageTiming {
             interval: Duration::from_millis(50),
             ..MessageTiming::default()
@@ -575,10 +573,9 @@ mod tests {
         );
     }
 
-    /// Every attributed message has to survive into the sentence. Naming only
-    /// the largest culprit and the shortfall silently dropped the rest: with five
-    /// misses on #2, four on #3 and three unmatched, the line accounted for
-    /// eight of twelve and read as though it had covered all of them.
+    /// The line accounts for every attributed miss, not only the largest
+    /// culprit's: with five misses on #2, four on #3 and three unmatched, it
+    /// states the nine attributed and the three unknown.
     #[test]
     fn the_routing_line_accounts_for_every_attributed_miss() {
         let hold = Duration::from_millis(120);

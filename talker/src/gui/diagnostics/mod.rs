@@ -74,10 +74,8 @@ pub(in crate::gui) fn compact_factor(factor: f64) -> String {
 }
 
 pub(in crate::gui) fn recent_snapshot_label(state: RecentSnapshotState) -> String {
-    // "Snapshot" said how the figure travels, not what it covers, and it reads
-    // as an instant — which is the one thing this is not. Every one of these
-    // summarizes up to a whole window, so each state names that window and then
-    // says what is wrong with it, if anything.
+    // Every state summarizes up to a whole window, so each names that window and
+    // then says what is wrong with it, if anything (ADR-042).
     let window = RECENT_WINDOW.as_secs();
     match state {
         RecentSnapshotState::Pending => "awaiting timing data".to_owned(),
@@ -89,9 +87,8 @@ pub(in crate::gui) fn recent_snapshot_label(state: RecentSnapshotState) -> Strin
         RecentSnapshotState::Current(age) => {
             format!("last ~{window} s · updated {} ago", compact_duration(age))
         }
-        // Past the window there is no "last ~10 s" left to describe: the figures
-        // are older than the span they claim, so the state leads with that
-        // rather than qualifying a window it can no longer stand behind.
+        // Past the window the figures are older than the span they would claim,
+        // so the state leads with their age.
         RecentSnapshotState::Expired(age) => {
             format!(
                 "recent timing unavailable · last update {} ago",
@@ -102,21 +99,14 @@ pub(in crate::gui) fn recent_snapshot_label(state: RecentSnapshotState) -> Strin
     }
 }
 
-/// Summarize a histogram without a sample-count gate.
+/// Summarize a histogram with no sample-count gate (ADR-046).
 ///
-/// There was one — below twenty samples the readout showed the maximum and
-/// called it a warm-up. It never guarded a bad computation: `rank` is
-/// `ceil(samples × 99 / 100)`, which equals `samples` for any count up to 99,
-/// so below a hundred samples the p99 bucket *is* the maximum's bucket. The
-/// gate only relabelled the same number, and it did so at 20 while the two
-/// statistics actually separate at 100.
-///
-/// So state the maximum, which is exact and true at one sample, and add the
-/// percentile only where it is genuinely a different figure. `p99 < max` is
-/// exactly that test: within one bucket the bound is `>=` the maximum, so the
-/// comparison is false; it becomes true only when the p99 bucket sits strictly
-/// below the maximum's. The sample count carries the weight the label used to
-/// imply, so nothing needs a warm-up disclaimer at any count.
+/// The maximum is exact and true at one sample, so it is always stated. The
+/// percentile is added only where it is a different figure: `rank` is
+/// `ceil(samples × 99 / 100)`, which equals `samples` up to 99, so below a
+/// hundred samples the p99 bucket is the maximum's bucket. `p99 < max` is that
+/// test: within one bucket the bound is `>=` the maximum, so the comparison is
+/// false until the p99 bucket sits strictly below the maximum's.
 pub(in crate::gui) fn timing_figures(histogram: DurationHistogram) -> Option<String> {
     let max = histogram.max()?;
     let p99 = histogram.percentile_upper_bound(99)?;
@@ -156,15 +146,11 @@ pub(in crate::gui) fn timing_metric(
 
 /// A work boundary named by its longest observation.
 ///
-/// "Worst" is the right superlative for lateness, where the reader wants the
-/// biggest miss. A render or a send call is not *bad* for taking a long time,
-/// it is just long, so these read "longest render" and "longest send call" —
-/// which also puts the name of the figure before the figure rather than after
-/// the boundary it belongs to.
+/// Reads "longest render" or "longest send call": a long render or send is not
+/// bad, only long, so "worst" is kept for lateness (ADR-046).
 ///
 /// The percentile trails in parentheses when it differs, so the leading figure
-/// keeps its position as the two converge and the line does not re-lay itself
-/// out around a clause that appears and disappears.
+/// keeps its position as the two converge.
 pub(in crate::gui) fn longest_metric(
     label: &str,
     histogram: DurationHistogram,
@@ -223,8 +209,7 @@ mod tests {
         ])
     }
 
-    /// The rule that replaced the warm-up gate, stated directly: the percentile
-    /// earns its place only when it differs from the maximum.
+    /// The percentile appears only when it differs from the maximum.
     #[test]
     fn timing_figures_add_a_percentile_only_when_it_differs_from_the_maximum() {
         assert_eq!(timing_figures(DurationHistogram::default()), None);
@@ -286,9 +271,8 @@ mod tests {
         );
     }
 
-    /// Each state names the window it covers, because none of these is an
-    /// instant — every one summarizes up to a whole window of samples, which is
-    /// what "snapshot" hid.
+    /// Each state names the window it covers, because every one summarizes up to
+    /// a whole window of samples rather than an instant.
     #[test]
     fn a_recent_window_label_states_its_span_and_what_is_wrong_with_it() {
         assert_eq!(
@@ -312,8 +296,7 @@ mod tests {
             "awaiting timing data"
         );
 
-        // Every consumer must use that vocabulary; the work line previously
-        // bypassed the helper and kept the retired "snapshot pending" phrase.
+        // Every consumer must use that vocabulary, the work line included.
         let mut cumulative = SendTimingTelemetry::default();
         cumulative
             .deadline_lateness
@@ -331,8 +314,7 @@ mod tests {
             "technician-facing timing help names the period, not its transport shape"
         );
 
-        // The span comes from the window constant, so a change to the engine's
-        // retention cannot leave five labels quoting a number it stopped using.
+        // The span comes from the window constant.
         assert!(
             recent_snapshot_label(RecentSnapshotState::Current(Duration::ZERO))
                 .contains(&RECENT_WINDOW.as_secs().to_string()),
@@ -373,8 +355,7 @@ mod tests {
     }
 
     /// The work boundaries name their figure before stating it, and the
-    /// percentile trails rather than leads — so gaining or losing one leaves
-    /// every word before it where the reader last saw it.
+    /// percentile trails rather than leads.
     #[test]
     fn a_work_boundary_reads_as_its_longest_observation() {
         let mut single = DurationHistogram::default();

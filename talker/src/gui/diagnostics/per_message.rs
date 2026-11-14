@@ -34,14 +34,10 @@ pub(in crate::gui) struct MessageRow {
     pub costs_others: bool,
 }
 
-/// Per-message cells use the same model as every other timing readout
-/// (ADR-046) — but the row already carries a Sends column, so repeating an
-/// identical count in every cell just crowds out the figures.
-///
-/// The count appears only when this boundary's population differs from that
-/// column, which is exactly when it is worth reading: lateness is sampled for
-/// sends withheld by retry backoff, and the send call is timed for writes that
-/// failed, so a gap here is evidence rather than noise.
+/// Per-message cells follow the shared timing readout model (ADR-046), but the
+/// row already has a Sends column, so a cell states its count only when its
+/// population differs from that column: lateness is sampled for sends withheld
+/// by retry backoff, and the send call is timed for writes that failed.
 fn cell_summary(histogram: DurationHistogram, sends: u64) -> String {
     let Some(figures) = timing_figures(histogram) else {
         return NO_MEASUREMENT.to_owned();
@@ -70,21 +66,19 @@ pub(in crate::gui) fn per_message_rows(
                 interval: if message.interval.is_zero() {
                     "dormant".to_owned()
                 } else if message.interval_changed {
-                    // The histograms beside this are cumulative, so they span the
-                    // cadence this message used to run at as well as this one.
+                    // The histograms beside this are cumulative, so they also span
+                    // any earlier interval this message ran at.
                     format!("{} (changed)", format_interval(message.interval))
                 } else {
                     format_interval(message.interval)
                 },
                 sends: thousands(sends),
                 late: cell_summary(message.deadline_lateness, sends),
-                // No render column: payload construction is a clock read, an
-                // allocation and a memcpy — typically 1-3 us, below the 50 us
-                // first bucket of the histogram that would report it. It stays
-                // in the clipboard report and in the channel-wide work line,
-                // where it costs nothing and still catches a pathological
-                // payload, rather than taking a column that reads the same
-                // forever.
+                // No render column: payload construction typically takes 1-3 us,
+                // below the 50 us first bucket of the histogram that would
+                // report it. Render stays in the clipboard report and the
+                // channel-wide work line, which still catch a pathological
+                // payload.
                 send_call: cell_summary(message.send_duration, sends),
                 longest_block: if message.longest_block.is_zero() {
                     NO_MEASUREMENT.to_owned()
@@ -96,9 +90,7 @@ pub(in crate::gui) fn per_message_rows(
                     )
                 },
                 // Two units in one cell, each with its noun attached, because
-                // they answer one question — what did this message cost the
-                // others — and a reader comparing rows should not have to
-                // track which of two columns moved.
+                // they answer one question: what this message cost the others.
                 cost_to_others: match (message.blocked_others.is_zero(), message.missed_others == 0)
                 {
                     (true, true) => NO_MEASUREMENT.to_owned(),
@@ -193,9 +185,8 @@ mod tests {
         assert!(rows[1].costs_others);
     }
 
-    /// The Sends column already carries the count, so repeating it in all three
-    /// timing cells said the same number four times per row. It survives only
-    /// where it differs — which is the case that carries information.
+    /// The Sends column already carries the count, so a timing cell repeats it
+    /// only where its own population differs.
     #[test]
     fn per_message_cells_repeat_the_send_count_only_when_it_differs() {
         let mut matching = MessageTiming::default();

@@ -1,8 +1,8 @@
 //! The send-outcomes line: what the run counted, stated as arithmetic.
 //!
 //! Leads with the schedule's own cadence points and subtracts each way a send
-//! can fail to go out, so the line defines its own final term. Every name for
-//! the successful remainder failed scrutiny — see [`send_outcomes`].
+//! can fail to go out, so the line defines its own final term and the successful
+//! remainder needs no name of its own — see [`send_outcomes`].
 
 use super::*;
 
@@ -53,12 +53,9 @@ pub(in crate::gui) fn peer_sent_words(bytes: u64) -> String {
 
 /// The run's counted send outcomes as one always-visible line.
 ///
-/// Written as visible arithmetic — the schedule's own cadence points, less each
-/// way a send can fail to go out — because every alternative required naming the
-/// successful remainder in isolation, and no such name survived scrutiny:
-/// *accepted* never says accepted by what, *sent* alone reads as delivery, and
-/// *unaccepted* is false for the two categories the interface never saw. Stating
-/// the subtraction removes the need: the line defines its own final term.
+/// Written as visible arithmetic: the schedule's own cadence points, less each
+/// way a send can fail to go out. The line defines its own final term, so the
+/// successful remainder is never named in isolation.
 pub(in crate::gui) fn send_outcomes(
     sent: u64,
     failed: u64,
@@ -170,9 +167,9 @@ mod tests {
 
     use wiredata_ui::diagnostics::SignalTone;
 
-    /// Every count on this line and in its tooltip is grouped. A long run's
-    /// scheduled total is the widest number in the pane, and it is the one a
-    /// reader has to compare against the sent total by eye.
+    /// Every count on this line and in its tooltip is digit-grouped, so the
+    /// widest number (a long run's scheduled total) compares by eye with the
+    /// sent total.
     #[test]
     fn send_outcomes_group_every_count_in_the_line_and_its_tooltip() {
         let long_run = send_outcomes(1_234_567, 0, 0, 0, 2_400);
@@ -199,8 +196,6 @@ mod tests {
         );
         assert_eq!(clean.tone, SignalTone::Healthy);
 
-        // Stated as arithmetic: the schedule's own cadence points, less each
-        // way a send fails to go out. Nothing has to name the remainder.
         let shortfall = send_outcomes(98, 0, 0, 1, 1);
         assert_eq!(
             shortfall.text,

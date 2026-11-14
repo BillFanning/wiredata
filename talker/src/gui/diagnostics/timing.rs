@@ -77,13 +77,11 @@ pub(in crate::gui) fn timing_detail_text(
             "Work per send: {} · run max late {run_max}",
             recent_snapshot_label(snapshot_state)
         ),
-        // Deadline lateness is deliberately absent: the Cadence row renders the
-        // same recent histogram with the schedule context that makes it
-        // readable, so repeating it here was one fact in two places. What is
-        // left is what nothing else shows — how long the two stages of the work
-        // itself took, channel-wide and recently, since the per-message table is
-        // cumulative — plus the run-wide lateness ceiling the Cadence row omits
-        // while a current window is available.
+        // Deadline lateness is absent: the Cadence row renders that recent
+        // histogram with its schedule context. This line shows what nothing else
+        // does: the two work stages channel-wide and recently (the per-message
+        // table is cumulative), plus the run-wide lateness ceiling the Cadence
+        // row omits while a current window is available.
         RecentSnapshotState::Current(_) | RecentSnapshotState::Final => {
             // Both boundaries share one population, so the count belongs to the
             // line rather than to each figure on it.

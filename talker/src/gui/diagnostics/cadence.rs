@@ -9,9 +9,8 @@ use super::*;
 /// Scale a delay against the channel's tightest cadence, for schedule context.
 ///
 /// The interval is named but not restated: the schedule phrase leads the same
-/// line and its groups are sorted shortest-first, so repeating the duration here
-/// printed it twice. There is no `≤` either — since the warm-up gate went
-/// (ADR-046) this only ever qualifies an exact maximum, never a bucket bound.
+/// line, shortest group first. There is no `≤`, because this only ever
+/// qualifies an exact maximum, never a bucket bound (ADR-046).
 pub(in crate::gui) fn relative_to_shortest(
     duration: std::time::Duration,
     shortest: std::time::Duration,
@@ -24,8 +23,8 @@ pub(in crate::gui) fn relative_to_shortest(
 /// The bare phrase, for a caller assembling its own bracket.
 ///
 /// `None` when there is no interval to scale against, which is not the same as
-/// an empty string: a caller joining qualifiers has to leave the separator out
-/// too, and a blank entry would have left a stray separator behind.
+/// an empty string: a caller joining qualifiers must leave the separator out
+/// too.
 fn share_of_shortest(
     duration: std::time::Duration,
     shortest: std::time::Duration,
@@ -44,9 +43,8 @@ const MAX_CADENCE_GROUPS: usize = 3;
 /// Dormant messages (a zero interval) are excluded — they have no cadence.
 ///
 /// Grouping rather than listing: real schedules cluster, and `2 at 50 ms, 1 at
-/// 15 s` says something a span (`50 ms–15 s`) actively obscures, since a span
-/// implies messages spread across the range. It also scales past the handful of
-/// messages a flat list stays readable at.
+/// 15 s` shows that where a span (`50 ms–15 s`) would imply messages spread
+/// across the range.
 pub(in crate::gui) fn cadence_groups(
     intervals: impl IntoIterator<Item = std::time::Duration>,
 ) -> Vec<(std::time::Duration, usize)> {
@@ -78,9 +76,8 @@ fn cadence_schedule_phrase(
     setup_incomplete: bool,
 ) -> String {
     if groups.is_empty() {
-        // An unfinished edit is not the same as a channel with nothing to send,
-        // and only one of them is actionable. Capacity already says this one
-        // line above; saying "No messages sending" here contradicted it.
+        // An unfinished edit is not a channel with nothing to send, and only one
+        // of them is actionable. Capacity says the same one line above.
         if setup_incomplete && cadence.is_none() {
             return "Finish message setup to calculate cadence".to_owned();
         }
@@ -201,20 +198,14 @@ pub(in crate::gui) fn cadence_decision(
             .deadline_lateness
             .percentile_upper_bound(99)
             .unwrap_or_default();
-        // "Sends" would be wrong here. Lateness is sampled when the channel
-        // reaches a scheduled deadline, before retry backoff decides whether to
-        // attempt anything. This population therefore includes work later
-        // withheld and excludes skipped points the channel never reached.
-        // One skeleton, whatever the figures do. The percentile used to lead
-        // the clause when it differed from the maximum and vanish when it did
-        // not, which moved every word after it — on a live readout that
-        // crosses back and forth as samples arrive, the line re-lays itself
-        // under the reader. The worst figure now always holds the same
-        // position. Two compact pieces of context follow in one bracket: the
-        // share normalizes the worst figure to the schedule, while the
-        // percentile contrasts the broader distribution with that outlier.
-        // A semicolon keeps those distinct statistics from reading as two
-        // names for the same number.
+        // The text says "behind schedule", not "sends": lateness is sampled when
+        // the channel reaches a scheduled deadline, before retry backoff decides
+        // whether to attempt anything. The population therefore includes work
+        // later withheld and excludes skipped points the channel never reached.
+        // One skeleton whatever the figures do (ADR-046): the worst figure holds
+        // its position, and the share of the shortest interval and the
+        // percentile follow in one bracket, separated by a semicolon because
+        // they are distinct statistics.
         let mut qualifiers = Vec::new();
         if let Some(share) = shortest.and_then(|interval| share_of_shortest(recent_max, interval)) {
             qualifiers.push(share);
@@ -227,12 +218,9 @@ pub(in crate::gui) fn cadence_decision(
         } else {
             format!(" ({})", qualifiers.join("; "))
         };
-        // The sample count is not on the line. A bare "201" invited the reader
-        // to weigh a denominator nothing on screen explained; the tooltip now
-        // states it with the window it was measured over, which is what makes
-        // it mean anything. What the line keeps is the window itself, because
-        // that is what says the figure describes current behaviour rather than
-        // the whole run.
+        // The sample count is not on the line; the tooltip states it with its
+        // window (ADR-046). The line keeps the window itself, which says the
+        // figure describes current behaviour rather than the whole run.
         format!(
             "{schedule} · worst {} behind schedule{qualifiers} · {snapshot_label}",
             compact_duration(recent_max)
@@ -267,9 +255,9 @@ pub(in crate::gui) fn cadence_tooltip(
         groups.iter().map(|(_, count)| count).sum()
     };
 
-    // The sample count lives here rather than on the line, and never alone. It
-    // follows the same source choice as the line: current/final timing when it
-    // has samples, otherwise the labelled run-wide fallback.
+    // The sample count is stated here, with its period. It follows the same
+    // source choice as the line: current/final timing when it has samples,
+    // otherwise the labelled run-wide fallback.
     let window = RECENT_WINDOW.as_secs();
     let using_run = matches!(snapshot_state, RecentSnapshotState::Expired(_))
         || (recent_samples == 0 && run_samples > 0);
@@ -353,8 +341,8 @@ mod tests {
         );
         assert_eq!(few.tone, SignalTone::Neutral);
 
-        // Crossing twenty changes nothing: the old gate fired here, but the two
-        // statistics are still identical.
+        // Crossing twenty samples changes nothing: the two statistics are still
+        // identical.
         for _ in 4..40 {
             recent.deadline_lateness.record(Duration::from_millis(1));
         }
@@ -401,9 +389,8 @@ mod tests {
             spread.text
         );
 
-        // The sample count is gone from the line: it is a denominator nothing
-        // on the row explained, and it now appears in the tooltip beside the
-        // window that gives it meaning.
+        // The sample count is not on the line; it is in the tooltip beside its
+        // window.
         for line in [&few.text, &more.text, &spread.text] {
             assert!(
                 !line.contains("reached"),
@@ -413,8 +400,6 @@ mod tests {
 
         // The point of the shape, not just its wording: a percentile appears
         // and disappears as the samples spread, and nothing before it may move.
-        // It used to lead the clause, so gaining one shifted every word after
-        // it and the live line re-laid itself under the reader.
         let leading = "3 messages: 2 at 50 ms, 1 at 1,000 ms · worst ";
         for line in [&more.text, &spread.text] {
             assert!(
@@ -544,9 +529,8 @@ mod tests {
             cadence_decision(empty, empty, None, &[], false, state).text,
             "No messages sending"
         );
-        // But an unfinished edit is a different, actionable state, and must not
-        // be reported as a channel that has nothing to send — Capacity says
-        // the same thing one line above.
+        // An unfinished edit is a different, actionable state, and must not be
+        // reported as a channel that has nothing to send.
         assert_eq!(
             cadence_decision(empty, empty, None, &[], true, state).text,
             "Finish message setup to calculate cadence"
