@@ -612,7 +612,7 @@ impl ChannelPipeline {
         self.transport_health
             .arrival_timestamps
             .record(data.received_at.wall_clock_source);
-        self.chunk_shape.sizes.record(data.payload.bytes().len());
+        self.chunk_shape.sizes.record(data.payload.len());
         if let Some(previous) = self
             .last_read_completed_at
             .replace(data.received_at.monotonic)
@@ -630,7 +630,7 @@ impl ChannelPipeline {
 
         // Liveness (§91.1): count received bytes at the chunk's arrival time.
         self.activity
-            .record_chunk(data.received_at.monotonic, data.payload.bytes().len());
+            .record_chunk(data.received_at.monotonic, data.payload.len());
         // Data arrived: re-arm any `Idle` rule so it can fire again on the next
         // quiet episode (§50.2). Cheap no-op when there are no idle rules.
         self.match_rules.note_activity();
@@ -653,7 +653,7 @@ impl ChannelPipeline {
         // received — the wire, regardless of read-chunk boundaries. A byte ring,
         // trimmed from the front. Honors the default view's pause (§50): a paused
         // view freezes its display while reception and recording keep going.
-        let bytes = data.payload.bytes();
+        let bytes = &data.payload[..];
         let view_paused = self
             .display_views
             .first()
@@ -2375,7 +2375,6 @@ mod tests {
     use crate::config::MatchCondition;
     use crate::core::ChunkTime;
     use crate::record::{start_raw_recording, RawFileRecorder};
-    use crate::transport::ReceivedPayload;
 
     fn pipeline(cid: ChannelId, caps: PipelineCapacities) -> ChannelPipeline {
         ChannelPipeline::new(cid, caps)
@@ -2384,7 +2383,7 @@ mod tests {
     fn bytes_chunk(cid: ChannelId, data: &[u8]) -> ReceivedData {
         ReceivedData {
             channel_id: cid,
-            payload: ReceivedPayload::Bytes(data.to_vec()),
+            payload: data.to_vec(),
             received_at: ChunkTime::now(),
         }
     }
@@ -2392,7 +2391,7 @@ mod tests {
     fn datagram(cid: ChannelId, data: &[u8]) -> ReceivedData {
         ReceivedData {
             channel_id: cid,
-            payload: ReceivedPayload::Datagram(data.to_vec()),
+            payload: data.to_vec(),
             received_at: ChunkTime::now(),
         }
     }
@@ -2407,7 +2406,7 @@ mod tests {
 
         p.ingest(ReceivedData {
             channel_id: cid,
-            payload: ReceivedPayload::Bytes(vec![0xAB]),
+            payload: vec![0xAB],
             received_at: ChunkTime {
                 monotonic: captured,
                 wall_clock: std::time::SystemTime::now(),
@@ -2447,7 +2446,7 @@ mod tests {
         for (offset_ms, payload) in [(0, vec![0; 8]), (7, vec![0; 1_500])] {
             p.ingest(ReceivedData {
                 channel_id: cid,
-                payload: ReceivedPayload::Bytes(payload),
+                payload,
                 received_at: ChunkTime {
                     monotonic: captured + Duration::from_millis(offset_ms),
                     wall_clock: std::time::SystemTime::now(),
@@ -4612,7 +4611,7 @@ mod tests {
         };
         pipeline.ingest(ReceivedData {
             channel_id: cid,
-            payload: ReceivedPayload::Bytes(b"xx$GPGGA,1".to_vec()),
+            payload: b"xx$GPGGA,1".to_vec(),
             received_at: arrival,
         });
         let snapshot = pipeline.snapshot();

@@ -10,6 +10,15 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-13) — hover text and the diagnostics card:
+
+- **§3.2 Hover text (ADR-056).** Every hover that explains something opens
+  with a bold sentence, then short paragraphs in plain, complete sentences. A
+  hover used to be one dense paragraph, and several stated things the code
+  does not do.
+- **§3.2 Receive diagnostics card (ADR-057).** The card has no title and no
+  status badge; its rows and callouts carry its warnings.
+
 Revision note (2026-11-12) — console output never holds up reception:
 
 - **§3.1 (ADR-055).** Every line printed while Channels run goes through a

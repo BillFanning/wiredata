@@ -342,7 +342,7 @@ impl RawFileRecorder {
 #[async_trait::async_trait]
 impl RawRecorder for RawFileRecorder {
     async fn write_chunk(&mut self, chunk: &ReceivedData) -> Result<(), RecordError> {
-        let bytes = chunk.payload.bytes();
+        let bytes = &chunk.payload[..];
         let offset = self.stream_offset;
         // Bytes before their index line (§57): an interrupted write then leaves
         // bytes the index does not describe, never an index entry pointing past
@@ -460,7 +460,6 @@ mod tests {
     use crate::record::{
         start_display_recording, start_raw_recording, StreamPos, DEFAULT_QUEUE_BUDGET,
     };
-    use crate::transport::ReceivedPayload;
     use std::sync::Arc;
 
     fn temp_path(tag: &str) -> PathBuf {
@@ -480,7 +479,7 @@ mod tests {
     fn chunk(bytes: &[u8]) -> Arc<ReceivedData> {
         Arc::new(ReceivedData {
             channel_id: ChannelId::new(),
-            payload: ReceivedPayload::Bytes(bytes.to_vec()),
+            payload: bytes.to_vec(),
             received_at: ChunkTime::now(),
         })
     }

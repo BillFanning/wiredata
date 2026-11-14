@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{ChannelId, ChunkTime};
 
 use super::{
-    ConnectionAcceptorRunner, DataTransportRunner, NewConnection, ReceivedData, ReceivedPayload,
+    ConnectionAcceptorRunner, DataTransportRunner, NewConnection, ReceivedData,
     TransportJoinHandle, TransportOutcome,
 };
 
@@ -152,7 +152,7 @@ impl DataTransportRunner for TcpConnectionTransport {
                             let received_at = ChunkTime::now();
                             let data = ReceivedData {
                                 channel_id,
-                                payload: ReceivedPayload::Bytes(buf[..n].to_vec()),
+                                payload: buf[..n].to_vec(),
                                 received_at,
                             };
                             // Awaiting `send` is the one place this transport may
@@ -215,8 +215,7 @@ mod tests {
 
         client.write_all(b"chunk-one").await.unwrap();
         let data = rx.recv().await.unwrap();
-        assert_eq!(data.payload.bytes(), b"chunk-one");
-        assert!(matches!(data.payload, ReceivedPayload::Bytes(_)));
+        assert_eq!(data.payload, b"chunk-one");
 
         // Closing the client ends the connection transport (EOF), so the join
         // handle completes on its own — reported as a normal `Completed` outcome.

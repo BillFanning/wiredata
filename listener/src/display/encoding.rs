@@ -7,6 +7,20 @@
 
 use super::DisplayEncoding;
 
+/// Split `bytes` at the end of its longest valid UTF-8 prefix: the prefix as text,
+/// and the rest. The rest is empty when all of `bytes` is valid; otherwise its
+/// first byte is the first one that is not part of a valid sequence, so a caller
+/// can handle that byte and continue with `&rest[1..]`.
+pub(crate) fn valid_utf8_prefix(bytes: &[u8]) -> (&str, &[u8]) {
+    let valid = match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    let (prefix, rest) = bytes.split_at(valid);
+    // The prefix is valid UTF-8 by construction; the fallback is unreachable.
+    (std::str::from_utf8(prefix).unwrap_or(""), rest)
+}
+
 /// Decode `bytes` into characters, pairing each character with the **byte offset**
 /// at which its source bytes begin (§50.2 inline annotations need to map a byte
 /// offset onto the decoded character stream). The offsets are non-decreasing and the
@@ -32,23 +46,14 @@ pub(crate) fn decode_with_offsets(bytes: &[u8], encoding: DisplayEncoding) -> Ve
             let mut out = Vec::new();
             let mut i = 0usize;
             while i < bytes.len() {
-                match std::str::from_utf8(&bytes[i..]) {
-                    Ok(s) => {
-                        for c in s.chars() {
-                            out.push((c, i));
-                            i += c.len_utf8();
-                        }
-                    }
-                    Err(e) => {
-                        let valid = e.valid_up_to();
-                        // Safe: bytes[i..i+valid] is valid UTF-8 by construction.
-                        for c in std::str::from_utf8(&bytes[i..i + valid]).unwrap().chars() {
-                            out.push((c, i));
-                            i += c.len_utf8();
-                        }
-                        out.push(('\u{FFFD}', i));
-                        i += 1;
-                    }
+                let (valid, rest) = valid_utf8_prefix(&bytes[i..]);
+                for c in valid.chars() {
+                    out.push((c, i));
+                    i += c.len_utf8();
+                }
+                if !rest.is_empty() {
+                    out.push(('\u{FFFD}', i));
+                    i += 1;
                 }
             }
             out

@@ -1,18 +1,14 @@
-# Listener Specification v2.4.5
+# Listener Specification v2.4.6
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-13) — hover text and the diagnostics card:
+Revision note (2026-11-13) — one shape for received bytes:
 
-- **§3.2 Hover text (ADR-056).** Every hover that explains something opens
-  with a bold sentence, then short paragraphs in plain, complete sentences. A
-  hover used to be one dense paragraph, and several stated things the code
-  does not do.
-- **§3.2 Receive diagnostics card (ADR-057).** The card has no title and no
-  status badge; its rows and callouts carry its warnings.
+- **§138.** `ReceivedData.payload` is one byte vector. It was an enum of a
+  stream chunk and a datagram, which every reader treated the same way.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -2885,13 +2881,10 @@ cancels the token, then awaits completion via `TransportJoinHandle`.
 ```rust
 pub struct ReceivedData {
     pub channel_id: ChannelId,
-    pub payload: ReceivedPayload,
+    // One read: a stream chunk (serial / TCP), or exactly one UDP datagram,
+    // whose boundary is preserved as a recording detail (§15).
+    pub payload: Vec<u8>,
     pub received_at: ChunkTime,
-}
-
-pub enum ReceivedPayload {
-    Bytes(Vec<u8>),    // a stream chunk (serial / TCP)
-    Datagram(Vec<u8>), // one UDP datagram; boundary preserved as a recording detail (§15)
 }
 
 // Post-read monotonic capture per chunk. Wall clock is post-read by default and may

@@ -262,16 +262,6 @@ pub fn validate_channel(
     }
 }
 
-/// Non-fatal configuration warnings (§71): the channel is still valid and will
-/// run, but something is likely a mistake. Surfaced to the user (e.g. printed at
-/// profile load) without skipping the channel.
-pub fn channel_warnings(_channel: &ChannelConfig) -> Vec<ChannelConfigWarning> {
-    // No warning conditions currently exist; the v1 decoded-field-without-decoder
-    // warning was removed with the decoder (ADR-010). The surface stays so future
-    // stream-era warnings (§71) have a home.
-    Vec::new()
-}
-
 /// Write `text` to a new temp file beside `path` and return its path.
 ///
 /// The process id and a per-process counter make the name unique, and
@@ -382,13 +372,6 @@ pub fn describe_channel_errors(errors: &[ChannelConfigError]) -> String {
         .collect::<Vec<_>>()
         .join("; ")
 }
-
-/// A non-fatal configuration warning (§71): the channel runs, but this is likely
-/// not what the user intended. Currently empty — the v1 decoded-field-without-
-/// decoder warning went with the decoder (ADR-010).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum ChannelConfigWarning {}
 
 #[cfg(test)]
 mod tests {

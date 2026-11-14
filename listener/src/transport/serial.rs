@@ -33,8 +33,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{lock_recover, ChannelId, ChunkTime, RuntimeEvent};
 
 use super::{
-    DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle, TransportNotice,
-    TransportOutcome,
+    DataTransportRunner, ReceivedData, TransportJoinHandle, TransportNotice, TransportOutcome,
 };
 
 /// Live serial control/status line state (§14.3, §161). Outputs (RTS, DTR) are
@@ -510,7 +509,7 @@ fn run_blocking_receive_loop(
                 let received_at = ChunkTime::now();
                 let data = ReceivedData {
                     channel_id,
-                    payload: ReceivedPayload::Bytes(buf[..n].to_vec()),
+                    payload: buf[..n].to_vec(),
                     received_at,
                 };
                 // Fast path: a non-full queue accepts at once and ends any stall
@@ -1085,8 +1084,8 @@ mod tests {
             let _ = done_tx.send(outcome);
         });
 
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"AB");
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"CDE");
+        assert_eq!(rx.recv().await.unwrap().payload, b"AB");
+        assert_eq!(rx.recv().await.unwrap().payload, b"CDE");
 
         // The reader is now idle; cancellation must end the loop within a timeout.
         cancel.cancel();
@@ -1147,9 +1146,9 @@ mod tests {
         // (§97.1 — the Transport→Pipeline edge stalls instead of losing data).
         // This is the §101 in-process boundary: zero loss inside our queues; any
         // loss would be a UART overrun upstream, outside what we can count.
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"3");
+        assert_eq!(rx.recv().await.unwrap().payload, b"1");
+        assert_eq!(rx.recv().await.unwrap().payload, b"2");
+        assert_eq!(rx.recv().await.unwrap().payload, b"3");
 
         cancel.cancel();
     }
@@ -1206,8 +1205,8 @@ mod tests {
         }
 
         let held_for = held_since.elapsed();
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
+        assert_eq!(rx.recv().await.unwrap().payload, b"1");
+        assert_eq!(rx.recv().await.unwrap().payload, b"2");
 
         // Exact completion comes from the shared state, independently of
         // notice delivery.
@@ -1369,8 +1368,8 @@ mod tests {
 
         wait_for_active_stall(&stall_state).await;
         tokio::time::sleep(Duration::from_millis(40)).await;
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
+        assert_eq!(rx.recv().await.unwrap().payload, b"1");
+        assert_eq!(rx.recv().await.unwrap().payload, b"2");
         let completed = wait_for_completed_stalls(&stall_state, 1).await;
         assert_eq!(completed.completed_episodes, 1);
         assert!(completed.completed_total >= Duration::from_millis(10));
@@ -1417,8 +1416,8 @@ mod tests {
         });
 
         wait_for_active_stall(&stall_state).await;
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
+        assert_eq!(rx.recv().await.unwrap().payload, b"1");
+        assert_eq!(rx.recv().await.unwrap().payload, b"2");
         assert!(matches!(
             done_rx.await.unwrap(),
             TransportOutcome::Faulted(_)
@@ -1461,7 +1460,7 @@ mod tests {
         // accidentally drain fast enough to avoid backpressure altogether.
         wait_for_active_stall(&stall_state).await;
         for expected in [b"1", b"2", b"3"] {
-            assert_eq!(rx.recv().await.unwrap().payload.bytes(), expected);
+            assert_eq!(rx.recv().await.unwrap().payload, expected);
         }
         let completed = wait_for_completed_stalls(&stall_state, 1).await;
         assert!(completed.completed_episodes >= 1);
@@ -1482,13 +1481,13 @@ mod tests {
         tx.try_send(ReceivedData {
             channel_id,
             received_at: ChunkTime::now(),
-            payload: ReceivedPayload::Bytes(b"first".to_vec()),
+            payload: b"first".to_vec(),
         })
         .unwrap();
         let pending = match tx.try_send(ReceivedData {
             channel_id,
             received_at: ChunkTime::now(),
-            payload: ReceivedPayload::Bytes(b"pending".to_vec()),
+            payload: b"pending".to_vec(),
         }) {
             Err(TrySendError::Full(pending)) => pending,
             other => panic!("capacity-one queue should initially be full: {other:?}"),
@@ -1496,7 +1495,7 @@ mod tests {
 
         // The consumer frees capacity before the first retry. With a zero
         // threshold, that successful retry is itself the threshold edge.
-        assert_eq!(rx.try_recv().unwrap().payload.bytes(), b"first");
+        assert_eq!(rx.try_recv().unwrap().payload, b"first");
         let (notice_tx, mut notice_rx) = mpsc::channel(2);
         let stall_state = SerialStallState::default();
         assert_eq!(
@@ -1520,7 +1519,7 @@ mod tests {
             notice_rx.try_recv(),
             Ok(TransportNotice::ReceptionResumed { .. })
         ));
-        assert_eq!(rx.try_recv().unwrap().payload.bytes(), b"pending");
+        assert_eq!(rx.try_recv().unwrap().payload, b"pending");
         let snapshot = stall_state.snapshot();
         assert_eq!(snapshot.completed_episodes, 1);
         assert!(snapshot.active_since.is_none());
@@ -1533,7 +1532,7 @@ mod tests {
         let block = |tag: &[u8]| ReceivedData {
             channel_id,
             received_at: ChunkTime::now(),
-            payload: ReceivedPayload::Bytes(tag.to_vec()),
+            payload: tag.to_vec(),
         };
         tx.try_send(block(b"first")).unwrap();
         let pending = match tx.try_send(block(b"pending")) {

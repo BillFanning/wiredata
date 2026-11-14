@@ -43,28 +43,10 @@ pub use udp::{BoundUdpTransport, UdpMode, UdpTransport};
 #[derive(Clone, Debug)]
 pub struct ReceivedData {
     pub channel_id: ChannelId,
-    pub payload: ReceivedPayload,
+    /// The received bytes, appended to the stream verbatim whether the OS delivered
+    /// them as a stream chunk (Serial, TCP) or one whole datagram (UDP, §15).
+    pub payload: Vec<u8>,
     pub received_at: ChunkTime,
-}
-
-/// The two payload shapes a transport can deliver (§138). Both are appended to the
-/// stream verbatim; the distinction only reflects how the OS delivered the bytes.
-#[derive(Clone, Debug)]
-pub enum ReceivedPayload {
-    /// A stream chunk whose boundaries track OS buffering, not content (Serial, TCP).
-    Bytes(Vec<u8>),
-    /// One datagram delivered whole by the OS (UDP, §15); appended to the stream
-    /// like any other bytes — the boundary is not preserved as structure.
-    Datagram(Vec<u8>),
-}
-
-impl ReceivedPayload {
-    /// The raw bytes of this payload, regardless of shape.
-    pub fn bytes(&self) -> &[u8] {
-        match self {
-            ReceivedPayload::Bytes(b) | ReceivedPayload::Datagram(b) => b,
-        }
-    }
 }
 
 /// Emitted by a TCP listener when it accepts a client (§16, §138). The runtime

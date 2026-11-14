@@ -2,7 +2,7 @@
 //!
 //! A UDP transport runs as a Tokio task (ADR-001 — async-native socket I/O, no
 //! dedicated thread). Each received datagram is delivered whole by the OS (§15):
-//! the transport emits `ReceivedPayload::Datagram`, which the pipeline appends to
+//! the transport emits it as one `ReceivedData`, which the pipeline appends to
 //! the verbatim stream like any other bytes (ADR-010 — no extraction, the datagram
 //! boundary is a reception detail, not stream structure).
 //!
@@ -24,8 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{ArrivalTimestampStatus, ChannelId, ChunkTime};
 
 use super::{
-    DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle, TransportNotice,
-    TransportOutcome,
+    DataTransportRunner, ReceivedData, TransportJoinHandle, TransportNotice, TransportOutcome,
 };
 
 /// Maximum size of a single UDP datagram payload (IPv4 theoretical max). The
@@ -402,7 +401,7 @@ impl DataTransportRunner for BoundUdpTransport {
                             }
                             let data = ReceivedData {
                                 channel_id,
-                                payload: ReceivedPayload::Datagram(buf[..n].to_vec()),
+                                payload: buf[..n].to_vec(),
                                 received_at,
                             };
                             // Awaiting `send` is the one place this transport may
@@ -683,9 +682,8 @@ mod tests {
         // `recv().await` blocks until the transport emits — deterministic, no sleep.
         let first = rx.recv().await.unwrap();
         let second = rx.recv().await.unwrap();
-        assert_eq!(first.payload.bytes(), b"$GPGGA,first");
-        assert_eq!(second.payload.bytes(), b"second");
-        assert!(matches!(first.payload, ReceivedPayload::Datagram(_)));
+        assert_eq!(first.payload, b"$GPGGA,first");
+        assert_eq!(second.payload, b"second");
         assert_eq!(
             first.received_at.wall_clock_source,
             crate::core::ArrivalTimestampSource::PostRead

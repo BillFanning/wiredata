@@ -555,7 +555,7 @@ mod tests {
     use super::*;
     use crate::core::{ChunkTime, RuntimeEvent};
     use crate::transport::udp::{UdpMode, UdpTransport};
-    use crate::transport::{ReceivedData, ReceivedPayload, TransportOutcome};
+    use crate::transport::{ReceivedData, TransportOutcome};
     use std::time::Duration;
     use tokio::net::UdpSocket;
 
@@ -573,7 +573,7 @@ mod tests {
                 for chunk in chunks {
                     let data = ReceivedData {
                         channel_id,
-                        payload: ReceivedPayload::Datagram(chunk),
+                        payload: chunk,
                         received_at: ChunkTime::now(),
                     };
                     // Stops early if the pipeline is gone (forced shutdown).

@@ -15,6 +15,7 @@
 mod encoding;
 mod render;
 
+pub(crate) use encoding::valid_utf8_prefix;
 pub use render::{AnnotationPlacement, DisplayView, RenderAnnotation, StreamRenderer};
 
 use crate::core::{ChannelId, ChunkTime};

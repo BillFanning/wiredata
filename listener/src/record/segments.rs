@@ -413,7 +413,6 @@ mod tests {
     use crate::core::{ChannelId, ChunkTime, RecordingState};
     use crate::record::controller::{start_recording, StreamPos, Timings};
     use crate::record::RecordingStopReason;
-    use crate::transport::ReceivedPayload;
     use chrono::{Local, TimeZone};
     use std::time::{Duration, Instant};
 
@@ -428,7 +427,7 @@ mod tests {
     fn chunk_at(bytes: &[u8], at: SystemTime) -> (Arc<ReceivedData>, StreamPos) {
         let item = Arc::new(ReceivedData {
             channel_id: ChannelId::new(),
-            payload: ReceivedPayload::Bytes(bytes.to_vec()),
+            payload: bytes.to_vec(),
             received_at: ChunkTime {
                 monotonic: Instant::now(),
                 wall_clock: at,

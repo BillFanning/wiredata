@@ -14,6 +14,7 @@ use crate::config::{
     MatchRule,
 };
 use crate::core::{validate_zda_talker_id, TimestampConfig, MAX_ZDA_TALKER_ID_BYTES};
+use crate::display::valid_utf8_prefix;
 use wiredata_ui::hover::{Hover, ShowHover};
 
 const MARKS_HOVER: Hover = Hover::new(
@@ -198,21 +199,15 @@ fn format_escaped_bytes(bytes: &[u8]) -> String {
         }
     }
     let mut out = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        match std::str::from_utf8(&bytes[i..]) {
-            Ok(s) => {
-                push_chars(&mut out, s);
-                break;
-            }
-            Err(e) => {
-                let valid = e.valid_up_to();
-                push_chars(&mut out, std::str::from_utf8(&bytes[i..i + valid]).unwrap());
-                i += valid;
-                out.push_str(&format!("<{:02X}>", bytes[i]));
-                i += 1;
-            }
-        }
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (valid, invalid) = valid_utf8_prefix(rest);
+        push_chars(&mut out, valid);
+        let Some((&bad, after)) = invalid.split_first() else {
+            break;
+        };
+        out.push_str(&format!("<{bad:02X}>"));
+        rest = after;
     }
     out
 }

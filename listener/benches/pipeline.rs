@@ -21,7 +21,7 @@ use listener::config::{MatchAction, MatchCondition, MatchRule};
 use listener::core::{ChannelId, ChunkTime};
 use listener::diagnostics::{Diagnostic, DiagnosticSeverity};
 use listener::runtime::{ChannelPipeline, PipelineCapacities};
-use listener::transport::{ReceivedData, ReceivedPayload, TransportNotice};
+use listener::transport::{ReceivedData, TransportNotice};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ fn payload_64b() -> Vec<u8> {
 fn chunk(cid: ChannelId, bytes: &[u8]) -> ReceivedData {
     ReceivedData {
         channel_id: cid,
-        payload: ReceivedPayload::Bytes(bytes.to_vec()),
+        payload: bytes.to_vec(),
         received_at: ChunkTime::now(),
     }
 }

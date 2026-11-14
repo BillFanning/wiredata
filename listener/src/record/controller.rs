@@ -55,7 +55,7 @@ pub trait RecordItem: Send + Sync + 'static {
 
 impl RecordItem for Arc<ReceivedData> {
     fn byte_len(&self) -> usize {
-        self.payload.bytes().len()
+        self.payload.len()
     }
 }
 
@@ -830,7 +830,6 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
 mod tests {
     use super::*;
     use crate::core::{ChannelId, ChunkTime};
-    use crate::transport::ReceivedPayload;
     use std::sync::atomic::AtomicU32;
 
     type Item = Arc<ReceivedData>;
@@ -838,7 +837,7 @@ mod tests {
     fn chunk(bytes: &[u8]) -> Item {
         Arc::new(ReceivedData {
             channel_id: ChannelId::new(),
-            payload: ReceivedPayload::Bytes(bytes.to_vec()),
+            payload: bytes.to_vec(),
             received_at: ChunkTime::now(),
         })
     }
@@ -884,7 +883,7 @@ mod tests {
             if self.fail_write_at == Some(self.writes) {
                 return Err(RecordError::Io(std::io::Error::other("device removed")));
             }
-            let bytes = item.payload.bytes().to_vec();
+            let bytes = item.payload.clone();
             self.len += bytes.len() as u64;
             lock(&self.log.written).push(bytes);
             Ok(())

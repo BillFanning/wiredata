@@ -252,14 +252,13 @@ pub fn start_display_recording<R: DisplayRecorder + 'static>(
 mod tests {
     use super::*;
     use crate::core::{ChannelId, ChunkTime, RecordingState};
-    use crate::transport::ReceivedPayload;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
 
     fn chunk(bytes: &[u8]) -> Arc<ReceivedData> {
         Arc::new(ReceivedData {
             channel_id: ChannelId::new(),
-            payload: ReceivedPayload::Bytes(bytes.to_vec()),
+            payload: bytes.to_vec(),
             received_at: ChunkTime::now(),
         })
     }

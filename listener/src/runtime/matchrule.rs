@@ -40,7 +40,7 @@ use crate::config::{MatchAction, MatchCondition, MatchRule};
 use crate::core::MatchRuleId;
 
 /// One configured rule in runtime form: its minted id, condition, actions, the
-/// enabled flag (a live toggle is deferred — see [`MatchRuleSet::set_enabled`]),
+/// enabled flag (fixed at compile time; rules change through Apply & Restart),
 /// and the small bit of state the `Idle` condition needs to fire exactly once
 /// per quiet episode.
 struct CompiledRule {
@@ -163,25 +163,10 @@ impl MatchRuleSet {
             .min()
     }
 
-    /// The ids of every rule, in config order. The name lives in config; the id
-    /// is the runtime key. **Not yet wired** to a runtime command — this is the
-    /// seam the deferred live rule-toggle will route through (ADR-012: a new
-    /// `Listener` method + pipeline command, like `set_recording`).
-    pub fn ids(&self) -> Vec<MatchRuleId> {
+    /// The ids of every rule, in config order, so a test can name the rules.
+    #[cfg(test)]
+    fn ids(&self) -> Vec<MatchRuleId> {
         self.rules.iter().map(|r| r.id).collect()
-    }
-
-    /// Enable or disable a rule by id. Returns whether a rule with that id
-    /// existed. **Not yet wired** — the deferred live rule-toggle's seam
-    /// (ADR-012); today rules change via the config Apply & Restart path.
-    pub fn set_enabled(&mut self, id: MatchRuleId, enabled: bool) -> bool {
-        if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
-            rule.enabled = enabled;
-            self.recompute_max_pattern_len();
-            true
-        } else {
-            false
-        }
     }
 
     /// Total boundary-split saves across all rules — `BytePattern` matches found
@@ -396,11 +381,6 @@ mod tests {
         config.enabled = false;
         let mut set = MatchRuleSet::compile(&[config]);
         assert!(set.evaluate_stream(b"X", 0).is_empty());
-
-        // Re-enable via the command path and it fires.
-        let id = set.ids()[0];
-        assert!(set.set_enabled(id, true));
-        assert_eq!(set.evaluate_stream(b"X", 1).len(), 1);
     }
 
     #[test]
