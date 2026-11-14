@@ -43,9 +43,66 @@ use super::snapshot::{
 };
 use super::telemetry::{ChunkShape, DurationHistogram, TransportHealth};
 
+/// The telemetry a stopped Channel keeps from its last run, built once in
+/// `land_stopped` from the run's final snapshot with the rolling rate zeroed. At rest
+/// the throughput is 0 by definition, but the byte total is the number the user
+/// cross-checks against the sender; the *next start* is what resets the readout
+/// (talker semantics).
+#[derive(Clone, Copy, Debug)]
+struct RetainedTelemetry {
+    activity: ChannelActivity,
+    boundary_saves: u64,
+    ingest_delay: DurationHistogram,
+    recent_ingest_delay: DurationHistogram,
+    ingest_processing: DurationHistogram,
+    recent_ingest_processing: DurationHistogram,
+    chunk_shape: ChunkShape,
+    transport_health: TransportHealth,
+}
+
+impl RetainedTelemetry {
+    /// The retained form of a run's final snapshot.
+    fn from_final(snap: &ChannelSnapshot) -> Self {
+        Self {
+            activity: ChannelActivity {
+                bytes_per_sec: 0.0,
+                ..snap.activity
+            },
+            boundary_saves: snap.match_boundary_saves,
+            ingest_delay: snap.ingest_delay,
+            recent_ingest_delay: snap.recent_ingest_delay,
+            ingest_processing: snap.ingest_processing,
+            recent_ingest_processing: snap.recent_ingest_processing,
+            chunk_shape: snap.chunk_shape,
+            transport_health: snap.transport_health,
+        }
+    }
+}
+
+impl Default for RetainedTelemetry {
+    /// A Channel that has not yet run: no data, no total.
+    fn default() -> Self {
+        Self {
+            activity: ChannelActivity {
+                last_data_at: None,
+                bytes_per_sec: 0.0,
+                total_bytes: 0,
+            },
+            boundary_saves: 0,
+            ingest_delay: DurationHistogram::default(),
+            recent_ingest_delay: DurationHistogram::default(),
+            ingest_processing: DurationHistogram::default(),
+            recent_ingest_processing: DurationHistogram::default(),
+            chunk_shape: ChunkShape::default(),
+            transport_health: TransportHealth::default(),
+        }
+    }
+}
+
 /// A minimal [`ChannelSnapshot`] for a stopped/faulted Channel (no live pipeline):
 /// retained diagnostics plus the completed run's activity and timing summaries.
 fn retained_snapshot(id: ChannelId, channel: &ManagedChannel) -> ChannelSnapshot {
+    let kept = &channel.retained;
     ChannelSnapshot {
         channel_id: id,
         // Placeholders — the caller stamps the effective lifecycle state, exactly
@@ -62,15 +119,15 @@ fn retained_snapshot(id: ChannelId, channel: &ManagedChannel) -> ChannelSnapshot
         // the rate). Without this a stopped channel's byte total read 0 on
         // the next poll — precisely when the user cross-checks it against
         // the sender's total.
-        activity: channel.retained_activity,
+        activity: kept.activity,
         matches: Vec::new(),
-        match_boundary_saves: channel.retained_boundary_saves,
-        ingest_delay: channel.retained_ingest_delay,
-        recent_ingest_delay: channel.retained_recent_ingest_delay,
-        ingest_processing: channel.retained_ingest_processing,
-        recent_ingest_processing: channel.retained_recent_ingest_processing,
-        chunk_shape: channel.retained_chunk_shape,
-        transport_health: channel.retained_transport_health,
+        match_boundary_saves: kept.boundary_saves,
+        ingest_delay: kept.ingest_delay,
+        recent_ingest_delay: kept.recent_ingest_delay,
+        ingest_processing: kept.ingest_processing,
+        recent_ingest_processing: kept.recent_ingest_processing,
+        chunk_shape: kept.chunk_shape,
+        transport_health: kept.transport_health,
         stream_end_offset: 0,
         ingest_queue: crate::runtime::QueueDepth::default(),
         raw_recording_queue: None,
@@ -92,24 +149,25 @@ fn retained_stats(channel: &ManagedChannel) -> ChannelStats {
             crate::diagnostics::DiagnosticSeverity::Error => errors += 1,
         }
     }
+    let kept = &channel.retained;
     ChannelStats {
         // Placeholders — the caller stamps the effective lifecycle state.
         state: ChannelState::Stopped,
         reconnect_pending: false,
         reconnect: None,
-        activity: channel.retained_activity,
+        activity: kept.activity,
         event_count: events,
         warning_count: warnings,
         error_count: errors,
         raw_recording: None,
         display_recording: None,
-        match_boundary_saves: channel.retained_boundary_saves,
-        ingest_delay: channel.retained_ingest_delay,
-        recent_ingest_delay: channel.retained_recent_ingest_delay,
-        ingest_processing: channel.retained_ingest_processing,
-        recent_ingest_processing: channel.retained_recent_ingest_processing,
-        chunk_shape: channel.retained_chunk_shape,
-        transport_health: channel.retained_transport_health,
+        match_boundary_saves: kept.boundary_saves,
+        ingest_delay: kept.ingest_delay,
+        recent_ingest_delay: kept.recent_ingest_delay,
+        ingest_processing: kept.ingest_processing,
+        recent_ingest_processing: kept.recent_ingest_processing,
+        chunk_shape: kept.chunk_shape,
+        transport_health: kept.transport_health,
         ingest_queue: crate::runtime::QueueDepth::default(),
         raw_recording_queue: None,
         raw_recording_status: None,
@@ -380,21 +438,10 @@ struct ManagedChannel {
     /// is still the newest retained entry. Cleared when a run's log replaces
     /// the retained list.
     repeated_start_fault: Option<RepeatedStartFault>,
-    /// The last run's liveness facts, retained across Stop like the
-    /// diagnostics — a stopped channel keeps reading its exact byte total at
-    /// rest (the natural moment to cross-check against the sender). Replaced
-    /// by each run's final snapshot with the rate zeroed; the *next start*
-    /// is what resets the readout (talker semantics).
-    retained_activity: ChannelActivity,
-    /// The last run's boundary-save total, retained like the activity.
-    retained_boundary_saves: u64,
-    /// The last run's post-read-to-pipeline timing summary, retained at rest.
-    retained_ingest_delay: DurationHistogram,
-    retained_recent_ingest_delay: DurationHistogram,
-    retained_ingest_processing: DurationHistogram,
-    retained_recent_ingest_processing: DurationHistogram,
-    retained_chunk_shape: ChunkShape,
-    retained_transport_health: TransportHealth,
+    /// The last run's telemetry, retained across Stop like the diagnostics — a
+    /// stopped channel keeps reading its exact byte total at rest. Replaced by
+    /// each run's final snapshot; the *next start* is what resets the readout.
+    retained: RetainedTelemetry,
     /// Start anchors for the currently running Channel, if one opened successfully.
     active_run: Option<ActiveRun>,
     /// Newest completed run, retained across ordinary restarts.
@@ -581,18 +628,7 @@ impl Listener {
                 retained_diagnostics: Vec::new(),
                 retained_diagnostics_snapshot: Arc::new(DiagnosticsSnapshot::default()),
                 repeated_start_fault: None,
-                retained_activity: ChannelActivity {
-                    last_data_at: None,
-                    bytes_per_sec: 0.0,
-                    total_bytes: 0,
-                },
-                retained_boundary_saves: 0,
-                retained_ingest_delay: DurationHistogram::default(),
-                retained_recent_ingest_delay: DurationHistogram::default(),
-                retained_ingest_processing: DurationHistogram::default(),
-                retained_recent_ingest_processing: DurationHistogram::default(),
-                retained_chunk_shape: ChunkShape::default(),
-                retained_transport_health: TransportHealth::default(),
+                retained: RetainedTelemetry::default(),
                 active_run: None,
                 last_run_summary: None,
             },
@@ -1144,17 +1180,7 @@ impl Listener {
             // zeroed — at rest the throughput is 0 by definition, but the byte total is
             // the number the user cross-checks against the sender.
             if let Some(snap) = final_snapshot {
-                channel.retained_activity = ChannelActivity {
-                    bytes_per_sec: 0.0,
-                    ..snap.activity
-                };
-                channel.retained_boundary_saves = snap.match_boundary_saves;
-                channel.retained_ingest_delay = snap.ingest_delay;
-                channel.retained_recent_ingest_delay = snap.recent_ingest_delay;
-                channel.retained_ingest_processing = snap.ingest_processing;
-                channel.retained_recent_ingest_processing = snap.recent_ingest_processing;
-                channel.retained_chunk_shape = snap.chunk_shape;
-                channel.retained_transport_health = snap.transport_health;
+                channel.retained = RetainedTelemetry::from_final(&snap);
                 channel.retained_diagnostics = snap.diagnostics.to_sorted_vec();
                 channel.repeated_start_fault = None;
                 // The stopped channel is polled at the same cadence as a live one,
