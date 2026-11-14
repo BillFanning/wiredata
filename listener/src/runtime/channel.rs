@@ -22,6 +22,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
@@ -84,6 +85,14 @@ impl MatchSetup {
 /// Bounded request channel for on-demand snapshots (§137, ADR-006). Tiny: a
 /// requester sends a oneshot reply and awaits; the pipeline answers between reads.
 const SNAPSHOT_REQUESTS: usize = 8;
+
+/// How long a status request waits for the pipeline's reply. A healthy
+/// pipeline answers within one loop pass (milliseconds); the longest honest
+/// delay is a Begin landing detached stops (`RETIRE_WAIT`), which a status
+/// poll should not wait out. 300 ms keeps a poll that visits every Channel
+/// in turn responsive even when a few of them are stuck, yet is long enough
+/// that a briefly busy pipeline is not mistaken for a stuck one.
+const STATUS_REPLY_WAIT: Duration = Duration::from_millis(300);
 
 /// Bounded capacity for the transport-notice channel (§95, §101, ADR-007).
 ///
@@ -256,38 +265,41 @@ impl MonitoredChannel {
     /// Returns `None` if the pipeline task has already ended (e.g. after a fault
     /// or stop) — the event stream remains the authoritative liveness signal.
     pub(crate) async fn snapshot(&self) -> Option<ChannelSnapshot> {
+        self.ask(PipelineRequest::Snapshot).await
+    }
+
+    /// Send one status request and await its reply, for at most
+    /// [`STATUS_REPLY_WAIT`] (send included: a stuck pipeline's request queue
+    /// fills). `None` when the pipeline has ended *or* did not answer in time —
+    /// a pipeline stuck inside `finish` (a recording close on a removed drive)
+    /// never reads its requests, and callers already serve the retained state
+    /// for `None`, so a poll cannot freeze behind one Channel.
+    async fn ask<T>(
+        &self,
+        request: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> PipelineRequest,
+    ) -> Option<T> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.requests
-            .send(PipelineRequest::Snapshot(reply_tx))
-            .await
-            .ok()?;
-        reply_rx.await.ok()
+        tokio::time::timeout(STATUS_REPLY_WAIT, async {
+            self.requests.send(request(reply_tx)).await.ok()?;
+            reply_rx.await.ok()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Cheap O(1) liveness stats for a multi-channel overview (§91.1, ADR-006) —
     /// no stream-buffer copy. `None` if the pipeline task has already ended.
     pub(crate) async fn stats(&self) -> Option<ChannelStats> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.requests
-            .send(PipelineRequest::Stats(reply_tx))
-            .await
-            .ok()?;
-        reply_rx.await.ok()
+        self.ask(PipelineRequest::Stats).await
     }
 
     /// Incremental stream bytes since `since` (§87, ADR-009): only what is new, so
     /// a live viewer never re-ships the whole scrollback. `None` if the pipeline
     /// task has already ended.
     pub(crate) async fn stream_delta(&self, since: u64) -> Option<StreamDelta> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.requests
-            .send(PipelineRequest::StreamDelta {
-                since,
-                reply: reply_tx,
-            })
+        self.ask(|reply| PipelineRequest::StreamDelta { since, reply })
             .await
-            .ok()?;
-        reply_rx.await.ok()
     }
 
     /// Begin/stop Raw recording live, without a restart (§50.2, ADR-012). Fire-and-

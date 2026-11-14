@@ -1138,9 +1138,18 @@ impl ChannelPipeline {
     /// cannot work (e.g. an existing file under a Refuse policy) arrives as a
     /// report, without faulting the Channel (§55).
     async fn begin_recording(&mut self) {
+        // Already on — writing, opening or in a gap — so `Begin` is idempotent.
+        // Checked before landing retirements: a no-op Begin (a `Record Begin`
+        // rule can fire on every match) must not wait on a stuck stop.
+        if self
+            .raw_recorder
+            .as_ref()
+            .is_some_and(|r| r.state() != RecordingState::Faulted)
+        {
+            return;
+        }
         self.land_retiring_before_begin().await;
         match self.raw_recorder.as_ref().map(|r| r.state()) {
-            // Already on — writing, opening or in a gap — so `Begin` is idempotent.
             Some(state) if state != RecordingState::Faulted => return,
             // A recording that could not begin still occupies the slot, and
             // Begin is the user's retry (the button reads "Record" — it must
@@ -1315,9 +1324,17 @@ impl ChannelPipeline {
     /// is already on; no destination reports a fault rather than a silent
     /// no-op; the first file opens in the recorder's task, as for Raw.
     async fn begin_display_recording(&mut self) {
+        // Already on — begin is idempotent, and must not wait on a stuck stop
+        // (see `begin_recording`).
+        if self
+            .display_recorder
+            .as_ref()
+            .is_some_and(|r| r.recording.state() != RecordingState::Faulted)
+        {
+            return;
+        }
         self.land_retiring_before_begin().await;
         match self.display_recorder.as_ref().map(|r| r.recording.state()) {
-            // Already on — begin is idempotent.
             Some(state) if state != RecordingState::Faulted => return,
             // Could not begin: Begin is the retry — drop it first (the Raw
             // sibling's rule).
@@ -1711,7 +1728,26 @@ impl ChannelPipeline {
     /// close (§56). In-flight bytes already accepted by a recorder are written. The
     /// stop-time INFO notes recorded here reach the GUI because the orchestrator takes
     /// one final snapshot of the returned pipeline after this runs (see `drain_handle`).
+    ///
+    /// The retirements and finalizes together are bounded by
+    /// [`Listener::STOP_GRACE`](crate::runtime::Listener::STOP_GRACE), the limit a user
+    /// Stop already gets. A faulted Channel keeps its handle until the user stops it,
+    /// so without this bound a close stuck on a removed drive would keep the task
+    /// (and every status request queued behind it) alive for ever. When the limit
+    /// passes, the same "finalization incomplete" error a user Stop logs is recorded.
     pub async fn finish(&mut self) {
+        let grace = crate::runtime::Listener::STOP_GRACE;
+        if tokio::time::timeout(grace, self.finalize_recordings())
+            .await
+            .is_err()
+        {
+            self.diagnostics
+                .record(finalization_incomplete(&self.channel_name, grace));
+        }
+        self.record_event("Channel stopped");
+    }
+
+    async fn finalize_recordings(&mut self) {
         // Land any detached stops first: a channel stop reports every
         // recording outcome before the final snapshot is taken (§56.1).
         self.drain_retiring().await;
@@ -1725,7 +1761,6 @@ impl ChannelPipeline {
             let finalized = finalize_view_recorder(self.channel_id, rec, end).await;
             self.note_recording_stop(RecordingTap::Display, finalized, false);
         }
-        self.record_event("Channel stopped");
     }
 
     // --- Inspection (used by the runtime and tests) ---
@@ -2143,6 +2178,17 @@ fn disk_has_recovered(free: u64, total: u64, threshold: DiskThreshold) -> bool {
             total > 0 && (free as u128) * 1000 >= (total as u128) * (percent as u128) * 11
         }
     }
+}
+
+/// The error logged when a Channel's stop did not finish within `grace`, so the
+/// end of its recordings may be missing (§113, §118). Shared by the Listener's
+/// abandoned user Stop and the pipeline's own bounded [`ChannelPipeline::finish`].
+pub(crate) fn finalization_incomplete(channel_name: &str, grace: Duration) -> Diagnostic {
+    Diagnostic::error(format!(
+        "finalization incomplete on channel {channel_name}: its stop did not finish within {} s, \
+         so the end of its recordings may be missing",
+        grace.as_secs()
+    ))
 }
 
 /// The async ingest loop for one Channel (§102, §110, §111).
@@ -3131,6 +3177,68 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn a_redundant_begin_does_not_wait_on_a_stuck_retirement() {
+        // A `Record Begin` rule can fire on every match. With the recorder
+        // already on, each Begin is a no-op and must not cost RETIRE_WAIT
+        // on the task that also reads ingest.
+        let cid = ChannelId::new();
+        let path = temp_path("redundant-begin");
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.set_recording(true, Some(raw_settings(&path, None))).await;
+        assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
+        // A detached stop that never lands.
+        p.retiring.spawn(std::future::pending());
+
+        let started = Instant::now();
+        for _ in 0..3 {
+            p.set_recording(true, None).await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "three redundant begins took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
+        p.retiring.abort_all();
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn a_redundant_display_begin_does_not_wait_on_a_stuck_retirement() {
+        let cid = ChannelId::new();
+        let path = temp_path("redundant-display-begin");
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        let settings = DisplayRecordingSettings {
+            destination: path.clone(),
+            channel_name: "redundant".to_string(),
+            overwrite: OverwritePolicy::Overwrite,
+            extra: DisplayExtra {
+                renderer: DisplayView::default(),
+                mark_gaps: false,
+            },
+            file_rotation: FileRotationPolicy::None,
+            queue_budget: DEFAULT_QUEUE_BUDGET,
+            size_cap: DEFAULT_SIZE_CAP,
+            disk_guard: None,
+        };
+        p.set_display_recording(true, Some(settings)).await;
+        assert_eq!(p.display_recording_state(), Some(RecordingState::Enabled));
+        p.retiring.spawn(std::future::pending());
+
+        let started = Instant::now();
+        for _ in 0..3 {
+            p.set_display_recording(true, None).await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "three redundant begins took {:?}",
+            started.elapsed()
+        );
+        p.retiring.abort_all();
         let _ = tokio::fs::remove_file(&path).await;
     }
 

@@ -397,6 +397,13 @@ fn transport_name(interface: &InterfaceConfig) -> &'static str {
     }
 }
 
+/// The most recent successful pipeline replies for the current run.
+#[derive(Default)]
+struct LastGood {
+    snapshot: Option<ChannelSnapshot>,
+    stats: Option<ChannelStats>,
+}
+
 /// Registry entry: the configuration, any accepted-but-unapplied change (§13),
 /// the lifecycle state, and the live handle — usually present while Running, though a
 /// spontaneous fault can leave a handle attached (effective state Faulted) until a
@@ -414,6 +421,11 @@ struct ManagedChannel {
     /// from that task, so it reads the flag to keep `state()` and command
     /// validation honest. A fresh flag is installed at each `start`.
     faulted: Arc<AtomicBool>,
+    /// The last status the running pipeline answered, served (restamped) when a
+    /// later request times out, so a briefly slow pipeline does not make the
+    /// counters jump back to the retained figures. Cleared when a new run
+    /// starts, so a run never shows an earlier run's figures.
+    last_good: Mutex<LastGood>,
     /// Live serial control-line handle (§161); `Some` only while a serial Channel
     /// is running.
     serial_control: Option<SerialControl>,
@@ -623,6 +635,7 @@ impl Listener {
                 handle: None,
                 display_pause: None,
                 faulted: Arc::new(AtomicBool::new(false)),
+                last_good: Mutex::new(LastGood::default()),
                 serial_control: None,
                 reconnect_state: None,
                 reconnect_carry: None,
@@ -740,7 +753,15 @@ impl Listener {
     pub async fn snapshot(&self, id: ChannelId) -> Option<ChannelSnapshot> {
         let channel = self.channels.get(&id)?;
         let live = match channel.handle.as_ref() {
-            Some(tasks) => tasks.snapshot().await,
+            Some(tasks) => match tasks.snapshot().await {
+                Some(fresh) => {
+                    lock_recover(&channel.last_good).snapshot = Some(fresh.clone());
+                    Some(fresh)
+                }
+                // No reply in time: this run's last answer, not the retained
+                // figures of an earlier run.
+                None => lock_recover(&channel.last_good).snapshot.clone(),
+            },
             None => None,
         };
         let mut snap = live.unwrap_or_else(|| retained_snapshot(id, channel));
@@ -761,7 +782,13 @@ impl Listener {
     pub async fn channel_stats(&self, id: ChannelId) -> Option<ChannelStats> {
         let channel = self.channels.get(&id)?;
         let live = match channel.handle.as_ref() {
-            Some(tasks) => tasks.stats().await,
+            Some(tasks) => match tasks.stats().await {
+                Some(fresh) => {
+                    lock_recover(&channel.last_good).stats = Some(fresh.clone());
+                    Some(fresh)
+                }
+                None => lock_recover(&channel.last_good).stats.clone(),
+            },
             None => None,
         };
         let mut stats = live.unwrap_or_else(|| retained_stats(channel));
@@ -773,7 +800,10 @@ impl Listener {
 
     /// Incremental stream bytes since the consumer's cursor (§87, ADR-009): only
     /// what is new, so a live viewer never re-ships the whole retained scrollback
-    /// (up to the 256 KB cap) each poll. `None` when unknown or not running.
+    /// (up to the 256 KB cap) each poll. `None` when unknown or not running, and
+    /// when the pipeline does not answer in time: unlike a snapshot there is no
+    /// last good value to serve, since repeating an old delta would break the
+    /// cursor contract.
     pub async fn stream_delta(&self, id: ChannelId, since: u64) -> Option<StreamDelta> {
         self.channels
             .get(&id)?
@@ -1033,6 +1063,7 @@ impl Listener {
                 let display_pause = Some(handle.display_pause().clone());
                 if let Some(channel) = self.channels.get_mut(&id) {
                     channel.handle = Some(handle);
+                    *lock_recover(&channel.last_good) = LastGood::default();
                     channel.display_pause = display_pause;
                     channel.serial_control = serial_control;
                     channel.state = ChannelState::Running;
@@ -1403,11 +1434,7 @@ impl Listener {
         };
         let name = channel.config.name.as_str().to_owned();
         let limit = self.error_retention(&channel.config);
-        let diagnostic = crate::diagnostics::Diagnostic::error(format!(
-            "finalization incomplete on channel {name}: its stop did not finish within {} s, \
-             so the end of its recordings may be missing",
-            Self::STOP_GRACE.as_secs()
-        ));
+        let diagnostic = super::pipeline::finalization_incomplete(&name, Self::STOP_GRACE);
         crate::diagnostics::emit_to_event_log(&name, id, &diagnostic);
         if let Some(channel) = self.channels.get_mut(&id) {
             channel.retain_diagnostic(diagnostic, limit);
@@ -1882,6 +1909,219 @@ mod tests {
     fn udp_channel() -> ChannelConfig {
         // Template binds 0.0.0.0:0 (ephemeral) — binds cleanly in tests.
         templates::udp_template()
+    }
+
+    #[tokio::test]
+    async fn status_does_not_wait_on_a_faulted_channel_whose_close_is_stuck() {
+        // A faulted Channel keeps its handle until the user stops it. Its
+        // pipeline then sits in `finish`, closing a recording on a drive that
+        // stopped answering; status must still serve (retained) and the
+        // pipeline task must still end within the stop grace.
+        use crate::core::ChunkTime;
+        use crate::record::{start_raw_recording, RawRecorder, DEFAULT_QUEUE_BUDGET};
+        use crate::transport::{ReceivedData, TransportJoinHandle, TransportOutcome};
+
+        struct StuckRecorder;
+        #[async_trait::async_trait]
+        impl RawRecorder for StuckRecorder {
+            async fn write_chunk(
+                &mut self,
+                _chunk: &ReceivedData,
+            ) -> Result<(), crate::core::RecordError> {
+                std::future::pending().await
+            }
+            async fn flush(&mut self) -> Result<(), crate::core::RecordError> {
+                Ok(())
+            }
+            async fn finalize(&mut self) -> Result<(), crate::core::RecordError> {
+                std::future::pending().await
+            }
+        }
+
+        // Sends one chunk (which the recorder never finishes writing), then faults.
+        struct FaultAfterOne(ChannelId);
+        impl DataTransportRunner for FaultAfterOne {
+            fn run(
+                self,
+                out: mpsc::Sender<ReceivedData>,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) -> TransportJoinHandle {
+                TransportJoinHandle::Task(tokio::spawn(async move {
+                    let _ = out
+                        .send(ReceivedData {
+                            channel_id: self.0,
+                            payload: b"x".to_vec(),
+                            received_at: ChunkTime::now(),
+                        })
+                        .await;
+                    TransportOutcome::Faulted("drive unplugged".to_string())
+                }))
+            }
+        }
+
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        let faulted = listener.channels[&id].faulted.clone();
+        let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
+        let handle = spawn_monitored_channel(
+            id,
+            FaultAfterOne(id),
+            Some(start_raw_recording(StuckRecorder, DEFAULT_QUEUE_BUDGET)),
+            None,
+            MatchSetup::none(),
+            PipelineCapacities::default(),
+            listener.events_tx.clone(),
+            faulted.clone(),
+            None,
+            (notice_tx, notice_rx),
+        );
+        listener.channels.get_mut(&id).unwrap().handle = Some(handle);
+        while !faulted.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
+        // Let the pipeline leave its loop and enter `finish`.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for _ in 0..2 {
+            let snap = tokio::time::timeout(Duration::from_secs(2), listener.snapshot(id))
+                .await
+                .expect("snapshot waited on the stuck pipeline")
+                .expect("a known channel always has a snapshot");
+            assert_eq!(snap.state, ChannelState::Faulted);
+        }
+        tokio::time::timeout(Duration::from_secs(2), listener.channel_stats(id))
+            .await
+            .expect("stats waited on the stuck pipeline");
+        tokio::time::timeout(Duration::from_secs(2), listener.stream_delta(id, 0))
+            .await
+            .expect("stream_delta waited on the stuck pipeline");
+
+        // `finish` gives up at the stop grace and says so, as a user Stop does.
+        let handle = listener
+            .channels
+            .get_mut(&id)
+            .unwrap()
+            .handle
+            .take()
+            .unwrap();
+        let mut pipeline =
+            tokio::time::timeout(Listener::STOP_GRACE + Duration::from_secs(2), handle.stop())
+                .await
+                .expect("the stuck close kept the pipeline task alive")
+                .expect("pipeline returns");
+        assert!(
+            pipeline
+                .snapshot()
+                .diagnostics
+                .errors
+                .iter()
+                .any(|d| d.message.contains("finalization incomplete")),
+            "the abandoned close is reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_pipeline_serves_its_last_good_status_not_the_retained_one() {
+        // A Running Channel answers once, then its pipeline stalls past the
+        // reply wait. The next status is that run's last answer (its byte
+        // total), not the retained figures of an earlier run (zero here).
+        use crate::core::ChunkTime;
+        use crate::record::{start_raw_recording, RawRecorder, DEFAULT_QUEUE_BUDGET};
+        use crate::transport::{ReceivedData, TransportJoinHandle, TransportOutcome};
+
+        struct StuckRecorder;
+        #[async_trait::async_trait]
+        impl RawRecorder for StuckRecorder {
+            async fn write_chunk(
+                &mut self,
+                _chunk: &ReceivedData,
+            ) -> Result<(), crate::core::RecordError> {
+                std::future::pending().await
+            }
+            async fn flush(&mut self) -> Result<(), crate::core::RecordError> {
+                Ok(())
+            }
+            async fn finalize(&mut self) -> Result<(), crate::core::RecordError> {
+                std::future::pending().await
+            }
+        }
+
+        // Sends one chunk, then faults when told to (which sends the pipeline
+        // into its stuck `finish`).
+        struct FaultOnCue(ChannelId, tokio::sync::oneshot::Receiver<()>);
+        impl DataTransportRunner for FaultOnCue {
+            fn run(
+                self,
+                out: mpsc::Sender<ReceivedData>,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) -> TransportJoinHandle {
+                TransportJoinHandle::Task(tokio::spawn(async move {
+                    let _ = out
+                        .send(ReceivedData {
+                            channel_id: self.0,
+                            payload: b"abc".to_vec(),
+                            received_at: ChunkTime::now(),
+                        })
+                        .await;
+                    let _ = self.1.await;
+                    TransportOutcome::Faulted("drive unplugged".to_string())
+                }))
+            }
+        }
+
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        let faulted = listener.channels[&id].faulted.clone();
+        let (cue, cue_rx) = tokio::sync::oneshot::channel();
+        let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
+        let handle = spawn_monitored_channel(
+            id,
+            FaultOnCue(id, cue_rx),
+            Some(start_raw_recording(StuckRecorder, DEFAULT_QUEUE_BUDGET)),
+            None,
+            MatchSetup::none(),
+            PipelineCapacities::default(),
+            listener.events_tx.clone(),
+            faulted.clone(),
+            None,
+            (notice_tx, notice_rx),
+        );
+        {
+            let channel = listener.channels.get_mut(&id).unwrap();
+            channel.handle = Some(handle);
+            channel.state = ChannelState::Running;
+        }
+
+        let answered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snap = listener.snapshot(id).await.unwrap();
+                if snap.activity.total_bytes == 3 {
+                    return snap;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the chunk never arrived");
+        assert_eq!(answered.state, ChannelState::Running);
+        let stats = listener.channel_stats(id).await.unwrap();
+        assert_eq!(stats.activity.total_bytes, 3);
+
+        let _ = cue.send(());
+        while !faulted.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await; // now inside `finish`
+
+        let stalled = listener.snapshot(id).await.unwrap();
+        assert_eq!(stalled.state, ChannelState::Faulted, "state is restamped");
+        assert_eq!(stalled.activity.total_bytes, 3, "last good, not retained");
+        let stalled = listener.channel_stats(id).await.unwrap();
+        assert_eq!(stalled.state, ChannelState::Faulted);
+        assert_eq!(stalled.activity.total_bytes, 3);
+        assert!(listener.stream_delta(id, 0).await.is_none());
     }
 
     #[tokio::test]
