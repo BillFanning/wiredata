@@ -124,8 +124,6 @@ pub fn start_tcp_listener(
                             // per connection need §59 filename templates).
                             None,
                             None,
-                            // One default Display View per connection.
-                            1,
                             // Per-connection Match Rules are deferred (§50.2): rules
                             // are per-listener config; wiring them per accepted
                             // connection follows the per-connection recording work.
@@ -141,7 +139,7 @@ pub fn start_tcp_listener(
                             pipeline_task,
                             channel_id: _,
                             pipeline_cancel: _,
-                            display_handles: _,
+                            display_pause: _,
                             // Per-connection snapshots are deferred (no per-conn
                             // handle is retained); drop the request sender.
                             requests: _,

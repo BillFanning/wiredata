@@ -25,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::activity::ActivityMeter;
 use super::snapshot::{
-    ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
-    QueueDepth, RecordingStatus, StreamDelta,
+    ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, PipelineRequest, QueueDepth,
+    RecordingStatus, StreamDelta,
 };
 use super::telemetry::{
     ChunkShape, CounterAvailability, DurationHistogram, RecentDurationHistogram,
@@ -41,8 +41,7 @@ use crate::config::{
 };
 
 use crate::core::{
-    zda_sentence, ChannelId, ChunkTime, DisplayViewId, MatchRuleId, RecordingState, RecordingTap,
-    RuntimeEvent,
+    zda_sentence, ChannelId, ChunkTime, MatchRuleId, RecordingState, RecordingTap, RuntimeEvent,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticLog};
 use crate::display::{
@@ -201,25 +200,23 @@ impl PipelineCapacities {
     }
 }
 
-/// A handle to one Display View's runtime pause state (§11). Cloneable and
-/// shareable across the pipeline-task boundary: a UI/orchestrator holds a clone
-/// and flips pause/resume without a command channel into the pipeline.
+/// A handle to a Channel's Display pause state (§11). Cloneable and shareable
+/// across the pipeline-task boundary: a UI/orchestrator holds a clone and flips
+/// pause/resume without a command channel into the pipeline.
 #[derive(Clone, Debug)]
-pub struct DisplayViewHandle {
-    pub id: DisplayViewId,
+pub struct DisplayPause {
     paused: Arc<AtomicBool>,
 }
 
-impl DisplayViewHandle {
+impl DisplayPause {
     fn new_active() -> Self {
         Self {
-            id: DisplayViewId::new(),
             paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Pause this view: it stops accumulating new stream bytes. Reception,
-    /// recording, and *other* views are unaffected (§50).
+    /// Pause the Display: it stops accumulating new stream bytes. Reception and
+    /// recording are unaffected (§50).
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
     }
@@ -233,29 +230,12 @@ impl DisplayViewHandle {
     }
 }
 
-/// A Display View's optional recorder: its **streaming** renderer (per-recording
+/// The Display Recording's state: its **streaming** renderer (per-recording
 /// state so the `.disp` is the exact rendered stream, ADR-018) plus the
 /// display-recording handle (§54). Recording runs regardless of pause (§58).
 struct ViewRecorder {
     renderer: StreamRenderer,
     recording: Recording<RenderedOutput>,
-}
-
-/// One Display View's runtime state: pause handle and an optional Display
-/// Recording (§54). The displayed content itself is the shared stream
-/// scrollback (§87) rendered per view; views hold no per-view history.
-struct PipelineDisplayView {
-    handle: DisplayViewHandle,
-    recorder: Option<ViewRecorder>,
-}
-
-impl PipelineDisplayView {
-    fn new() -> Self {
-        Self {
-            handle: DisplayViewHandle::new_active(),
-            recorder: None,
-        }
-    }
 }
 
 /// A detached recorder stop's outcome: the arguments
@@ -273,11 +253,11 @@ pub struct ChannelPipeline {
     /// every fresh pipeline, so the GUI needs an identity alongside the offset to
     /// reject stale deltas without confusing them with a restart.
     stream_generation: u64,
-    /// Display Views (§48): v2.1 is one logical view per Channel (ADR-023) —
-    /// the first entry, created by `new`, is *the* view. The `Vec` shape is
-    /// retained latitude for the deferred multi-view feature (Appendix A);
-    /// entries beyond the first are ignored by pause gating and the GUI.
-    display_views: Vec<PipelineDisplayView>,
+    /// The Channel's one Display View (§48): its pause state. The displayed
+    /// content is the shared stream scrollback (§87), which holds the history.
+    display_pause: DisplayPause,
+    /// The Display Recording (§54), `None` when it is off.
+    display_recorder: Option<ViewRecorder>,
     /// Retained diagnostics, count-limited per type (§88).
     diagnostics: DiagnosticLog,
     /// Last shared diagnostics snapshot and the log revision it was built from,
@@ -460,7 +440,8 @@ impl ChannelPipeline {
             // by its UUID; `with_channel_name` replaces it.
             channel_name: channel_id.to_string(),
             stream_generation: NEXT_STREAM_GENERATION.fetch_add(1, Ordering::Relaxed),
-            display_views: vec![PipelineDisplayView::new()],
+            display_pause: DisplayPause::new_active(),
+            display_recorder: None,
             diagnostics: DiagnosticLog::new(
                 Some(caps.event_retention),
                 Some(caps.warning_retention),
@@ -646,13 +627,10 @@ impl ChannelPipeline {
 
         // 2. Stream scrollback (§87): keep the most recent bytes exactly as
         // received — the wire, regardless of read-chunk boundaries. A byte ring,
-        // trimmed from the front. Honors the default view's pause (§50): a paused
+        // trimmed from the front. Honors the view's pause (§50): a paused
         // view freezes its display while reception and recording keep going.
         let bytes = &data.payload[..];
-        let view_paused = self
-            .display_views
-            .first()
-            .is_some_and(|v| v.handle.is_paused());
+        let view_paused = self.display_pause.is_paused();
         if !view_paused {
             if bytes.len() >= self.stream_cap {
                 // A single chunk already exceeds the cap: keep only its tail. Every
@@ -705,25 +683,23 @@ impl ChannelPipeline {
         let channel_id = self.channel_id;
         let chunk_marks =
             render_annotations_for_chunk(&mark_annotations, chunk_offset, bytes.len());
-        for view in &mut self.display_views {
-            if let Some(rec) = view.recorder.as_mut() {
-                // Streaming render (ADR-018): the concatenated .disp is the exact
-                // rendered stream — read boundaries leave no trace. Possibly
-                // empty (a chunk held back as an incomplete multi-byte tail).
-                // The chunk's arrival time rides in `pos`, so a rotating
-                // recording picks its period file from arrival, not write time
-                // (§59) — the two differ under a backlog.
-                let text = rec.renderer.render_chunk(bytes, &chunk_marks);
-                if !text.is_empty() {
-                    rec.recording.try_record(
-                        RenderedOutput {
-                            channel_id,
-                            text,
-                            timestamp: Some(data.received_at),
-                        },
-                        pos,
-                    );
-                }
+        if let Some(rec) = self.display_recorder.as_mut() {
+            // Streaming render (ADR-018): the concatenated .disp is the exact
+            // rendered stream — read boundaries leave no trace. Possibly
+            // empty (a chunk held back as an incomplete multi-byte tail).
+            // The chunk's arrival time rides in `pos`, so a rotating
+            // recording picks its period file from arrival, not write time
+            // (§59) — the two differ under a backlog.
+            let text = rec.renderer.render_chunk(bytes, &chunk_marks);
+            if !text.is_empty() {
+                rec.recording.try_record(
+                    RenderedOutput {
+                        channel_id,
+                        text,
+                        timestamp: Some(data.received_at),
+                    },
+                    pos,
+                );
             }
         }
 
@@ -752,11 +728,10 @@ impl ChannelPipeline {
             self.note_recorder_report(RecordingTap::Raw, report);
         }
         let display: Vec<RecorderReport> = self
-            .display_views
-            .iter()
-            .filter_map(|v| v.recorder.as_ref())
-            .flat_map(|r| r.recording.take_reports())
-            .collect();
+            .display_recorder
+            .as_ref()
+            .map(|r| r.recording.take_reports())
+            .unwrap_or_default();
         for report in display {
             self.note_recorder_report(RecordingTap::Display, report);
         }
@@ -1013,7 +988,7 @@ impl ChannelPipeline {
                         }
                     }
                     MatchAction::Mark { timestamp: None } => self.write_mark(rule.id, byte_offset),
-                    MatchAction::PauseDisplay { view } => self.pause_views(*view),
+                    MatchAction::PauseDisplay {} => self.display_pause.pause(),
                     MatchAction::Record { target, control } => {
                         self.pending_record_controls.push(PendingRecord {
                             target: *target,
@@ -1032,7 +1007,7 @@ impl ChannelPipeline {
         annotations
     }
 
-    /// `Mark` action (§50.2): drop a correlation marker into every Display View's
+    /// `Mark` action (§50.2): drop a correlation marker into the
     /// Display Recording (`.disp`) — **never** the raw `.raw` stream, which stays
     /// byte-exact (§5.6/§49). The `MatchTriggered` event and `recent_matches` log
     /// (written by the caller) are the marker's display/event surfaces.
@@ -1045,34 +1020,15 @@ impl ChannelPipeline {
         let text = format!("\n\u{2039}MARK rule={rule_id}{suffix}\u{203a}\n");
         let channel_id = self.channel_id;
         let pos = self.stream_pos_now();
-        for view in &mut self.display_views {
-            if let Some(rec) = view.recorder.as_mut() {
-                rec.recording.try_record(
-                    RenderedOutput {
-                        channel_id,
-                        text: text.clone(),
-                        timestamp: None,
-                    },
-                    pos,
-                );
-            }
-        }
-    }
-
-    /// `PauseDisplay` action (§50.2, §50): freeze one Display View by index, or all
-    /// views when `None`. Reception and recording continue (§58).
-    fn pause_views(&mut self, view: Option<usize>) {
-        match view {
-            Some(idx) => {
-                if let Some(v) = self.display_views.get(idx) {
-                    v.handle.pause();
-                }
-            }
-            None => {
-                for v in &self.display_views {
-                    v.handle.pause();
-                }
-            }
+        if let Some(rec) = self.display_recorder.as_mut() {
+            rec.recording.try_record(
+                RenderedOutput {
+                    channel_id,
+                    text,
+                    timestamp: None,
+                },
+                pos,
+            );
         }
     }
 
@@ -1330,9 +1286,8 @@ impl ChannelPipeline {
     ) {
         if let Some(settings) = settings {
             if self
-                .display_views
-                .first()
-                .and_then(|view| view.recorder.as_ref())
+                .display_recorder
+                .as_ref()
                 .is_none_or(|recorder| recorder.recording.state() == RecordingState::Faulted)
             {
                 self.display_recording_settings = Some(settings);
@@ -1350,12 +1305,7 @@ impl ChannelPipeline {
     /// no-op; the first file opens in the recorder's task, as for Raw.
     async fn begin_display_recording(&mut self) {
         self.land_retiring_before_begin().await;
-        match self
-            .display_views
-            .first()
-            .and_then(|v| v.recorder.as_ref())
-            .map(|r| r.recording.state())
-        {
+        match self.display_recorder.as_ref().map(|r| r.recording.state()) {
             // Already on — begin is idempotent.
             Some(state) if state != RecordingState::Faulted => return,
             // Could not begin: Begin is the retry — drop it first (the Raw
@@ -1537,10 +1487,7 @@ impl ChannelPipeline {
         {
             self.raw_disk.start_check(settings.plan());
         }
-        let display_running = self
-            .display_views
-            .first()
-            .is_some_and(|v| v.recorder.is_some());
+        let display_running = self.display_recorder.is_some();
         if let Some(settings) = self
             .display_recording_settings
             .as_ref()
@@ -1695,10 +1642,8 @@ impl ChannelPipeline {
                 }
             }
             RecordingTap::Display => {
-                for view in &self.display_views {
-                    if let Some(rec) = &view.recorder {
-                        rec.recording.set_low_disk(low);
-                    }
+                if let Some(rec) = &self.display_recorder {
+                    rec.recording.set_low_disk(low);
                 }
             }
         }
@@ -1720,7 +1665,7 @@ impl ChannelPipeline {
                 )
             }
             RecordingTap::Display => {
-                let recording = &self.display_views.first()?.recorder.as_ref()?.recording;
+                let recording = &self.display_recorder.as_ref()?.recording;
                 let settings = self.display_recording_settings.as_ref();
                 (
                     recording.current_file(),
@@ -1763,14 +1708,9 @@ impl ChannelPipeline {
             self.note_recording_stop(RecordingTap::Raw, finalized, true);
         }
         let end = self.stream_pos_now();
-        let mut display_stops = Vec::new();
         self.display_disk = DiskWatch::default();
-        for view in &mut self.display_views {
-            if let Some(rec) = view.recorder.take() {
-                display_stops.push(finalize_view_recorder(self.channel_id, rec, end).await);
-            }
-        }
-        for finalized in display_stops {
+        if let Some(rec) = self.display_recorder.take() {
+            let finalized = finalize_view_recorder(self.channel_id, rec, end).await;
             self.note_recording_stop(RecordingTap::Display, finalized, false);
         }
         self.record_event("Channel stopped");
@@ -1782,37 +1722,23 @@ impl ChannelPipeline {
         self.channel_id
     }
 
-    /// Add a Display View and return its pause handle (§48). The caller keeps
-    /// the handle to pause/resume the view across the pipeline-task boundary.
-    pub fn add_display_view(&mut self) -> DisplayViewHandle {
-        let view = PipelineDisplayView::new();
-        let handle = view.handle.clone();
-        self.display_views.push(view);
-        handle
-    }
-
-    /// Attach a Display Recording to the primary (first) Display View (§54),
-    /// rendering each chunk with `renderer`. v1 records the primary view;
-    /// per-view display-recording config is deferred (Appendix A).
+    /// Attach a Display Recording to the Channel's Display View (§54),
+    /// rendering each chunk with `renderer`.
     pub fn set_display_recorder(
         &mut self,
         renderer: DisplayView,
         recording: Recording<RenderedOutput>,
     ) {
-        if let Some(view) = self.display_views.first_mut() {
-            view.recorder = Some(ViewRecorder {
-                renderer: StreamRenderer::new(renderer),
-                recording,
-            });
-        }
+        self.display_recorder = Some(ViewRecorder {
+            renderer: StreamRenderer::new(renderer),
+            recording,
+        });
     }
 
-    /// Pause/resume handles for every Display View, default first (§48).
-    pub fn display_view_handles(&self) -> Vec<DisplayViewHandle> {
-        self.display_views
-            .iter()
-            .map(|v| v.handle.clone())
-            .collect()
+    /// The Display's pause handle (§11, §48). The caller keeps a clone to
+    /// pause/resume the Display across the pipeline-task boundary.
+    pub fn display_pause(&self) -> DisplayPause {
+        self.display_pause.clone()
     }
 
     pub fn diagnostics(&self) -> &DiagnosticLog {
@@ -1834,7 +1760,7 @@ impl ChannelPipeline {
     /// [`raw_recording_state`](Self::raw_recording_state): the primary view's
     /// recorder state, `Some(Faulted)` after a failed begin, `None` when off.
     pub fn display_recording_state(&self) -> Option<RecordingState> {
-        match self.display_views.first().and_then(|v| v.recorder.as_ref()) {
+        match self.display_recorder.as_ref() {
             Some(rec) => Some(rec.recording.state()),
             None if self.display_begin_faulted => Some(RecordingState::Faulted),
             None => None,
@@ -1897,12 +1823,10 @@ impl ChannelPipeline {
         self.raw_recorder.take()
     }
 
-    /// Take the primary view's Display recorder, forgetting its disk watch.
+    /// Take the Display recorder, forgetting its disk watch.
     fn take_display_recorder(&mut self) -> Option<ViewRecorder> {
         self.display_disk = DiskWatch::default();
-        self.display_views
-            .first_mut()
-            .and_then(|v| v.recorder.take())
+        self.display_recorder.take()
     }
 
     /// Raw-recording queue occupancy, retaining the run peak after a recorder is
@@ -1928,7 +1852,7 @@ impl ChannelPipeline {
     }
 
     /// Build an owned, point-in-time snapshot of the *small* observable state (§137,
-    /// ADR-006): per-view pause state, diagnostics, recent match firings, recording
+    /// ADR-006): the Display's pause state, diagnostics, recent match firings, recording
     /// state, liveness, and the stream's end offset. The scrollback bytes are **not**
     /// included — they are fetched incrementally via [`stream_delta`](Self::stream_delta)
     /// so this stays cheap at high throughput.
@@ -1966,14 +1890,7 @@ impl ChannelPipeline {
             reconnect_pending: false,
             reconnect: None,
             last_run_summary: None,
-            display_views: self
-                .display_views
-                .iter()
-                .map(|v| DisplayViewSnapshot {
-                    id: v.handle.id,
-                    paused: v.handle.is_paused(),
-                })
-                .collect(),
+            display_paused: Some(self.display_pause.is_paused()),
             diagnostics,
             raw_recording: self.raw_recording_state(),
             display_recording: self.display_recording_state(),
@@ -2502,7 +2419,7 @@ mod tests {
     fn paused_view_freezes_the_stream_tail() {
         let cid = ChannelId::new();
         let mut p = pipeline(cid, PipelineCapacities::default());
-        let view = p.display_view_handles()[0].clone();
+        let view = p.display_pause();
         p.ingest(bytes_chunk(cid, b"AB"));
         assert_eq!(&p.stream_tail()[..], &b"AB"[..]);
         // Pause: the displayed stream freezes (§50), but reception still counts
@@ -2698,7 +2615,7 @@ mod tests {
         let recording = start_display_recording(recorder, DEFAULT_QUEUE_BUDGET);
         let mut p = pipeline(cid, PipelineCapacities::default());
         p.set_display_recorder(DisplayView::default(), recording);
-        let view = p.display_view_handles()[0].clone();
+        let view = p.display_pause();
 
         view.pause();
         p.ingest(bytes_chunk(cid, b"while-paused"));
@@ -3599,7 +3516,7 @@ mod tests {
                 severity: crate::diagnostics::DiagnosticSeverity::Event,
             }],
         )]);
-        let view = p.display_view_handles()[0].clone();
+        let view = p.display_pause();
 
         // Before any pause the two spaces are identical.
         p.ingest(bytes_chunk(cid, b"aM")); // match at stream offset 1
@@ -3724,16 +3641,16 @@ mod tests {
     }
 
     #[test]
-    fn pause_display_rule_freezes_the_targeted_view() {
+    fn pause_display_rule_freezes_the_view() {
         let cid = ChannelId::new();
         let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[byte_rule(
             "freeze",
             b"STOP",
-            vec![MatchAction::PauseDisplay { view: Some(0) }],
+            vec![MatchAction::PauseDisplay {}],
         )]);
-        assert!(!p.snapshot().display_views[0].paused);
+        assert_eq!(p.snapshot().display_paused, Some(false));
         p.ingest(bytes_chunk(cid, b"...STOP..."));
-        assert!(p.snapshot().display_views[0].paused);
+        assert_eq!(p.snapshot().display_paused, Some(true));
     }
 
     #[test]

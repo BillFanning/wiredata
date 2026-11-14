@@ -5,7 +5,7 @@
 //! `ViewPrefs`, like it already owns its own scrollback and pause state — which is
 //! also the seam future per-channel features (highlights, marks) will hang off.
 //!
-//! They persist via the channel's first [`DisplayViewConfig`]: [`from_config`] seeds
+//! They persist via the channel's [`DisplayViewConfig`]: [`from_config`] seeds
 //! a `ViewPrefs` when a channel is added or a profile loads, and [`apply_to_config`]
 //! folds edits back so a profile save captures them. The font face and color scheme
 //! are presets, so they round-trip as stable tokens (see `MonoFont::name` /
@@ -112,23 +112,17 @@ impl ViewPrefs {
             && self.scroll_buffer_bytes == other.scroll_buffer_bytes
     }
 
-    /// Seed prefs from a channel's first display view (or defaults if it has none).
+    /// Seed prefs from a channel's display view.
     /// Mode and ctrl-chars map directly; the font face and color scheme are parsed
     /// from their persisted preset tokens; an absent font size falls back to default.
     pub(crate) fn from_config(config: &crate::config::ChannelConfig) -> Self {
-        // Scroll buffer comes from retention (a channel-level field), independent of
-        // whether the channel has a display view.
+        // Scroll buffer comes from retention, a channel-level field.
         let scroll_buffer_bytes = config
             .retention
             .byte_limit
             .unwrap_or(DEFAULT_SCROLL_BUFFER_BYTES)
             .clamp(MIN_SCROLL_BUFFER_BYTES, MAX_SCROLL_BUFFER_BYTES);
-        let Some(view) = config.display.views.first() else {
-            return Self {
-                scroll_buffer_bytes,
-                ..Self::default()
-            };
-        };
+        let view = &config.display.view;
         let font_size = view.font_size.unwrap_or(DEFAULT_FONT_SIZE);
         Self {
             mode: view.mode,
@@ -143,12 +137,10 @@ impl ViewPrefs {
     }
 
     /// Fold these prefs into a channel's config so a profile save captures them: the
-    /// presentation fields onto the first display view, and the scroll buffer onto
-    /// `retention.byte_limit`. The display no-ops if the channel has no view.
+    /// presentation fields onto the display view, and the scroll buffer onto
+    /// `retention.byte_limit`.
     pub(crate) fn apply_to_config(&self, config: &mut crate::config::ChannelConfig) {
-        if let Some(view) = config.display.views.first_mut() {
-            apply_to_view(self, view);
-        }
+        apply_to_view(self, &mut config.display.view);
         config.retention.byte_limit = Some(self.scroll_buffer_bytes);
     }
 }
@@ -194,7 +186,7 @@ mod tests {
                                               // the field existed and round-tripped through TOML long before anything
                                               // read it, so the gap this closes is the write side of the GUI.
         assert_eq!(
-            config.display.views[0].hex_grouping,
+            config.display.view.hex_grouping,
             HexGrouping {
                 bytes_per_group: 4,
                 groups_per_line: 4

@@ -21,7 +21,7 @@ use crate::config::{
     FlowControl, InterfaceConfig, Parity, Profile, RawRecordingConfig, ReconnectPolicy,
     RetentionConfig, StopBits,
 };
-use crate::core::{ChannelId, ChannelName, ChannelState, DisplayViewId, RuntimeEvent};
+use crate::core::{ChannelId, ChannelName, ChannelState, RuntimeEvent};
 use crate::runtime::{
     ChannelSnapshot, ChannelStats, DrainedStop, Listener, OpenedStart, PipelineCapacities,
     ReconnectAttempt, StreamDelta,
@@ -87,8 +87,8 @@ pub enum UiCommand {
     RemoveChannel(ChannelId),
     /// Rename a channel in place — instant, no restart (the name is a label only).
     Rename(ChannelId, ChannelName),
-    PauseDisplay(ChannelId, DisplayViewId),
-    ResumeDisplay(ChannelId, DisplayViewId),
+    PauseDisplay(ChannelId),
+    ResumeDisplay(ChannelId),
     SetRts(ChannelId, bool),
     SetDtr(ChannelId, bool),
     /// Begin (`true`) or stop (`false`) Raw recording on a running channel live,
@@ -209,12 +209,12 @@ pub enum UiUpdate {
 /// channel records to when it starts must carry its destination marker
 /// (ADR-043) — without it the folder may be on a different disk, such as an
 /// empty mount point whose drive is not plugged in. Only reads files.
-pub(crate) fn resume_check(path: &std::path::Path) -> Result<Profile, String> {
+pub(crate) fn resume_check(path: &std::path::Path) -> Result<(Profile, Vec<String>), String> {
     if !path.is_file() {
         return Err(format!("{} is no longer there", path.display()));
     }
-    let profile =
-        Profile::load(path).map_err(|err| format!("{} does not load: {err}", path.display()))?;
+    let (profile, warnings) = Profile::load_with_warnings(path)
+        .map_err(|err| format!("{} does not load: {err}", path.display()))?;
     let invalid: Vec<String> = profile
         .validate()
         .into_iter()
@@ -259,7 +259,7 @@ pub(crate) fn resume_check(path: &std::path::Path) -> Result<Profile, String> {
             }
         }
     }
-    Ok(profile)
+    Ok((profile, warnings))
 }
 
 /// A one-line, human-readable description of a channel's interface and endpoint,
@@ -375,7 +375,12 @@ enum WorkspaceStep {
     /// Forget the selection and the stream cursors.
     Clear,
     /// Register a profile's Channels, and start them for a resume.
-    Load { profile: Box<Profile>, start: bool },
+    Load {
+        profile: Box<Profile>,
+        /// What loading the file had to give up (see `Profile::load_with_warnings`).
+        warnings: Vec<String>,
+        start: bool,
+    },
     /// Announce a resume, after the runtime events of its starts.
     Resumed(String),
 }
@@ -662,8 +667,12 @@ impl Driver {
                 self.selected = None;
                 self.stream_cursors.clear();
             }
-            WorkspaceStep::Load { profile, start } => {
-                let added = self.register_profile(*profile);
+            WorkspaceStep::Load {
+                profile,
+                warnings,
+                start,
+            } => {
+                let added = self.register_profile(*profile, &warnings);
                 if start {
                     for id in added {
                         self.queue(id, [Step::Start { report: true }]);
@@ -755,11 +764,11 @@ impl Driver {
                     self.push(UiUpdate::ChannelRenamed(id, name.as_str().to_string()));
                 }
             }
-            UiCommand::PauseDisplay(id, view) => {
-                let _ = self.listener.pause_display(id, view);
+            UiCommand::PauseDisplay(id) => {
+                let _ = self.listener.pause_display(id);
             }
-            UiCommand::ResumeDisplay(id, view) => {
-                let _ = self.listener.resume_display(id, view);
+            UiCommand::ResumeDisplay(id) => {
+                let _ = self.listener.resume_display(id);
             }
             UiCommand::SetRts(id, on) => {
                 let _ = self.listener.set_rts(id, on).await;
@@ -819,7 +828,7 @@ impl Driver {
             UiCommand::SaveProfile(path) => self.save_profile(path),
             UiCommand::LoadProfile(path) => self.load_profile(path),
             UiCommand::CheckResume(path) => {
-                let checked = resume_check(&path).map(|profile| profile.name);
+                let checked = resume_check(&path).map(|(profile, _)| profile.name);
                 self.push(UiUpdate::ResumeChecked(path, checked));
             }
             UiCommand::Resume(path) => self.resume(path),
@@ -864,8 +873,8 @@ impl Driver {
     /// gave a drive time to go — then load it and start every channel. A
     /// channel that cannot start is reported and left to its reconnect policy.
     fn resume(&mut self, path: std::path::PathBuf) {
-        let profile = match resume_check(&path) {
-            Ok(profile) => profile,
+        let (profile, warnings) = match resume_check(&path) {
+            Ok(checked) => checked,
             Err(why) => {
                 self.push(UiUpdate::ResumeChecked(path, Err(why)));
                 return;
@@ -876,6 +885,7 @@ impl Driver {
         self.workspace.push_back(WorkspaceStep::Clear);
         self.workspace.push_back(WorkspaceStep::Load {
             profile: Box::new(profile),
+            warnings,
             start: true,
         });
         self.workspace.push_back(WorkspaceStep::Resumed(name));
@@ -885,8 +895,8 @@ impl Driver {
     /// is stopped and removed first, and the profile's Channels are registered
     /// Stopped (load never starts a channel).
     fn load_profile(&mut self, path: std::path::PathBuf) {
-        let profile = match Profile::load(&path) {
-            Ok(p) => p,
+        let (profile, warnings) = match Profile::load_with_warnings(&path) {
+            Ok(loaded) => loaded,
             Err(err) => {
                 self.push(UiUpdate::ProfileError(format!("load failed: {err}")));
                 return;
@@ -896,6 +906,7 @@ impl Driver {
         self.workspace.push_back(WorkspaceStep::Clear);
         self.workspace.push_back(WorkspaceStep::Load {
             profile: Box::new(profile),
+            warnings,
             start: false,
         });
     }
@@ -903,7 +914,7 @@ impl Driver {
     /// Register a profile's Channels Stopped, and return their ids. Each
     /// addition emits the usual update, so the App folds the swap with no
     /// special-casing.
-    fn register_profile(&mut self, profile: Profile) -> Vec<ChannelId> {
+    fn register_profile(&mut self, profile: Profile, warnings: &[String]) -> Vec<ChannelId> {
         // Validate before registering (§71, ADR-014): a hand-edited profile can carry an
         // invalid channel (e.g. a duplicate name) — skip those and load the rest, like
         // the CLI. Validation is workspace-level (`Profile::validate`), so duplicate
@@ -927,6 +938,13 @@ impl Driver {
         // The skip notice goes after ProfileLoaded: both set the one status
         // line, so the other way round "Loaded" replaced the reasons at once.
         self.push(UiUpdate::ProfileLoaded(profile.name.clone()));
+        if !warnings.is_empty() {
+            self.push(UiUpdate::ProfileError(format!(
+                "Loaded “{}” with changes to its old settings:\n{}",
+                profile.name,
+                warnings.join("\n")
+            )));
+        }
         if !skipped.is_empty() {
             self.push(UiUpdate::ProfileError(format!(
                 "Loaded “{}” with {} channel(s) skipped (invalid):\n{}",
@@ -1613,7 +1631,7 @@ mod tests {
 
         std::fs::create_dir_all(&recordings).unwrap();
         std::fs::write(recordings.join(crate::record::DESTINATION_MARKER), "").unwrap();
-        assert_eq!(resume_check(&path).unwrap().name, "Logging");
+        assert_eq!(resume_check(&path).unwrap().0.name, "Logging");
 
         let _ = std::fs::remove_file(&path);
         assert!(resume_check(&path)

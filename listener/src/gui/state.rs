@@ -899,7 +899,7 @@ mod tests {
             reconnect_pending: false,
             reconnect: None,
             last_run_summary: None,
-            display_views: vec![],
+            display_paused: None,
             diagnostics: std::sync::Arc::new(DiagnosticsSnapshot {
                 warnings: vec![crate::diagnostics::Diagnostic::warning("w"); warnings],
                 ..DiagnosticsSnapshot::default()

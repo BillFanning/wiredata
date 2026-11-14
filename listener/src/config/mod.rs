@@ -6,6 +6,7 @@
 //! validated config to live transports is the runtime's job (§128),
 //! not config's.
 
+mod legacy;
 pub mod limits;
 pub mod schema;
 pub mod templates;
@@ -60,8 +61,21 @@ impl Profile {
     /// Parse a profile from TOML text, enforcing schema-version compatibility
     /// (§72.1). The version is checked first, so a profile from another schema
     /// is refused for that rather than for keys this one does not have.
+    ///
+    /// Drops the warnings [`from_toml_with_warnings`](Self::from_toml_with_warnings)
+    /// returns: use that where there is somewhere to say them.
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
-        let doc: toml::Table = toml::from_str(text)?;
+        Self::from_toml_with_warnings(text).map(|(profile, _)| profile)
+    }
+
+    /// [`from_toml`](Self::from_toml), and what loading had to give up.
+    ///
+    /// A Channel has one Display View, saved as `display.view`. A profile
+    /// saved when it could have several, as a `views` list, still loads: the
+    /// first view is kept, and each warning names a view or a `PauseDisplay`
+    /// target that had to be dropped. Saving writes the current form.
+    pub fn from_toml_with_warnings(text: &str) -> Result<(Self, Vec<String>), ConfigError> {
+        let mut doc: toml::Table = toml::from_str(text)?;
         match doc.get("schema_version") {
             None => return Err(ConfigError::MissingSchemaVersion),
             Some(toml::Value::Integer(found)) => {
@@ -73,9 +87,21 @@ impl Profile {
             // A wrong type is left to the typed parse, which names it.
             Some(_) => {}
         }
-        let profile: Profile = toml::from_str(text)?;
+        let (profile, warnings) = match toml::from_str::<Profile>(text) {
+            Ok(profile) => (profile, Vec::new()),
+            Err(error) => {
+                // Only the old shape is rewritten. Any other failure is the
+                // file's own, reported with the line it is on.
+                let upgraded = legacy::upgrade(&mut doc);
+                if !upgraded.changed {
+                    return Err(error.into());
+                }
+                let profile: Profile = toml::Value::Table(doc).try_into()?;
+                (profile, upgraded.warnings)
+            }
+        };
         check_version(profile.schema_version)?;
-        Ok(profile)
+        Ok((profile, warnings))
     }
 
     /// Serialize this profile to TOML text.
@@ -86,7 +112,13 @@ impl Profile {
     /// Load a profile from a file (§70). Does not start channels or touch
     /// interfaces — it only reads and validates the schema version.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        Self::from_toml(&std::fs::read_to_string(path)?)
+        Self::load_with_warnings(path).map(|(profile, _)| profile)
+    }
+
+    /// [`load`](Self::load), and the warnings of
+    /// [`from_toml_with_warnings`](Self::from_toml_with_warnings).
+    pub fn load_with_warnings(path: &Path) -> Result<(Self, Vec<String>), ConfigError> {
+        Self::from_toml_with_warnings(&std::fs::read_to_string(path)?)
     }
 
     /// Save this profile to a file.
@@ -478,7 +510,7 @@ mod tests {
                         target: RecordTarget::Both,
                         control: RecordControl::Begin,
                     },
-                    MatchAction::PauseDisplay { view: Some(0) },
+                    MatchAction::PauseDisplay {},
                 ],
                 enabled: false,
             },
@@ -684,6 +716,172 @@ mod tests {
         ));
     }
 
+    /// A profile as an older build saved it: one UDP Channel with `display`
+    /// lines and `rules` appended.
+    fn old_profile(display: &str, rules: &str) -> String {
+        format!(
+            r#"schema_version = 3
+name = "old"
+
+[[channels]]
+name = "GPS"
+kind = "Udp"
+
+[channels.interface]
+type = "Udp"
+bind_address = "0.0.0.0"
+port = 10110
+mode = "Unicast"
+
+{display}
+
+[channels.retention]
+byte_limit = 65536
+
+{rules}
+"#
+        )
+    }
+
+    const HEX_VIEW: &str = r#"
+[[channels.display.views]]
+mode = "Hex"
+encoding = "Ascii"
+character_rendering = "Token"
+wrapping = "Wrap"
+font_size = 15.0
+"#;
+
+    fn hex_view() -> DisplayViewConfig {
+        DisplayViewConfig {
+            mode: crate::display::DisplayMode::Hex,
+            encoding: crate::display::DisplayEncoding::Ascii,
+            character_rendering: crate::display::CharacterRendering::Token,
+            wrapping: crate::display::WrappingMode::Wrap,
+            font_size: Some(15.0),
+            ..DisplayViewConfig::default()
+        }
+    }
+
+    #[test]
+    fn an_old_profile_with_one_view_loads_with_the_same_view_and_no_warning() {
+        let rules = r#"
+[[channels.match_rules]]
+name = "freeze"
+condition = { kind = "Idle", timeout_ms = 1000 }
+actions = [{ kind = "PauseDisplay", view = 0 }, { kind = "Notify", severity = "Event" }]
+"#;
+        let (profile, warnings) =
+            Profile::from_toml_with_warnings(&old_profile(HEX_VIEW, rules)).unwrap();
+        assert_eq!(warnings, Vec::<String>::new());
+        let channel = &profile.channels[0];
+        assert_eq!(channel.display.view, hex_view());
+        assert_eq!(
+            channel.match_rules[0].actions[0],
+            MatchAction::PauseDisplay {}
+        );
+        assert_eq!(channel.match_rules[0].actions.len(), 2);
+    }
+
+    #[test]
+    fn an_old_profile_with_several_views_keeps_the_first_and_warns() {
+        let views = format!(
+            "{HEX_VIEW}\n[[channels.display.views]]\nmode = \"Raw\"\nencoding = \"Utf8\"\n\
+             character_rendering = \"Native\"\nwrapping = \"NoWrap\"\n\n\
+             [[channels.display.views]]\nmode = \"Rendered\"\nencoding = \"Utf8\"\n\
+             character_rendering = \"Glyph\"\nwrapping = \"NoWrap\"\n"
+        );
+        let (profile, warnings) =
+            Profile::from_toml_with_warnings(&old_profile(&views, "")).unwrap();
+        assert_eq!(profile.channels[0].display.view, hex_view());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("channel \"GPS\""), "{warnings:?}");
+        assert!(warnings[0].contains("had 3 display views"), "{warnings:?}");
+        assert!(warnings[0].contains("other 2 dropped"), "{warnings:?}");
+    }
+
+    #[test]
+    fn an_old_profile_with_an_empty_view_list_takes_the_default_view() {
+        let (profile, warnings) =
+            Profile::from_toml_with_warnings(&old_profile("[channels.display]\nviews = []", ""))
+                .unwrap();
+        assert_eq!(warnings, Vec::<String>::new());
+        assert_eq!(profile.channels[0].display, DisplayConfig::default());
+        assert_eq!(
+            profile.channels[0].display.view,
+            DisplayViewConfig::default()
+        );
+    }
+
+    #[test]
+    fn an_old_pause_action_naming_a_later_view_is_removed_with_a_warning() {
+        let rules = r#"
+[[channels.match_rules]]
+name = "freeze"
+condition = { kind = "Idle", timeout_ms = 1000 }
+actions = [{ kind = "PauseDisplay", view = 1 }, { kind = "Notify", severity = "Event" }]
+"#;
+        let (profile, warnings) =
+            Profile::from_toml_with_warnings(&old_profile(HEX_VIEW, rules)).unwrap();
+        assert_eq!(profile.channels[0].match_rules[0].actions.len(), 1);
+        assert!(matches!(
+            profile.channels[0].match_rules[0].actions[0],
+            MatchAction::Notify { .. }
+        ));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("rule \"freeze\""), "{warnings:?}");
+        assert!(warnings[0].contains("display view 1"), "{warnings:?}");
+    }
+
+    #[test]
+    fn an_old_profile_saves_in_the_new_form_and_that_loads_to_the_same_profile() {
+        let (old, _) = Profile::from_toml_with_warnings(&old_profile(HEX_VIEW, "")).unwrap();
+        let saved = old.to_toml().unwrap();
+        assert!(saved.contains("[channels.display.view]"), "{saved}");
+        assert!(!saved.contains("views"), "{saved}");
+        let (reloaded, warnings) = Profile::from_toml_with_warnings(&saved).unwrap();
+        assert_eq!(warnings, Vec::<String>::new());
+        assert_eq!(reloaded, old);
+    }
+
+    #[test]
+    fn the_new_form_round_trips() {
+        let mut channel = templates::udp_template();
+        channel.display.view = hex_view();
+        channel.display.view.hex_grouping = HexGrouping {
+            bytes_per_group: 4,
+            groups_per_line: 2,
+        };
+        let mut profile = Profile::new("new");
+        profile.channels = vec![channel];
+        let (loaded, warnings) =
+            Profile::from_toml_with_warnings(&profile.to_toml().unwrap()).unwrap();
+        assert_eq!(warnings, Vec::<String>::new());
+        assert_eq!(loaded, profile);
+    }
+
+    #[test]
+    fn an_old_profile_default_display_is_upgraded_too() {
+        let text =
+            "schema_version = 3\nname = \"d\"\n\n[[defaults.display.views]]\nmode = \"Hex\"\n\
+             encoding = \"Ascii\"\ncharacter_rendering = \"Token\"\nwrapping = \"Wrap\"\n\
+             font_size = 15.0\n\n[[defaults.display.views]]\nmode = \"Raw\"\n\
+             encoding = \"Utf8\"\ncharacter_rendering = \"Native\"\nwrapping = \"NoWrap\"\n";
+        let (profile, warnings) = Profile::from_toml_with_warnings(text).unwrap();
+        assert_eq!(profile.defaults.display.unwrap().view, hex_view());
+        assert!(
+            warnings[0].contains("the profile's defaults"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn an_old_profile_with_a_misspelled_key_is_still_refused() {
+        let text = old_profile(HEX_VIEW, "").replace("byte_limit", "byte_limt");
+        let err = Profile::from_toml(&text).unwrap_err().to_string();
+        assert!(err.contains("byte_limt"), "{err}");
+    }
+
     #[test]
     fn missing_additive_fields_default_in() {
         // Only the required fields are present; everything else defaults (§72.1).
@@ -692,40 +890,6 @@ mod tests {
         assert_eq!(profile.schema_version, CURRENT_VERSION);
         assert!(profile.channels.is_empty());
         assert_eq!(profile.defaults, DefaultConfig::default());
-    }
-
-    /// The example profile the spec points readers to (§72) must load, every
-    /// Channel in it must be valid, and nothing it says may be dropped on the
-    /// way into the profile types.
-    #[test]
-    fn the_example_profile_loads_and_says_only_what_the_schema_has() {
-        let path = Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/profiles/profile.example.toml"
-        ));
-        let profile = Profile::load(path).expect("profile.example.toml loads");
-        assert!(!profile.channels.is_empty());
-        for (name, result) in profile.validate() {
-            assert_eq!(result, Ok(()), "{name}");
-        }
-
-        fn contained(written: &toml::Value, read_back: &toml::Value) -> bool {
-            match (written, read_back) {
-                (toml::Value::Table(w), toml::Value::Table(r)) => w
-                    .iter()
-                    .all(|(key, value)| r.get(key).is_some_and(|back| contained(value, back))),
-                (toml::Value::Array(w), toml::Value::Array(r)) => {
-                    w.len() == r.len() && w.iter().zip(r).all(|(a, b)| contained(a, b))
-                }
-                _ => written == read_back,
-            }
-        }
-        let written: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        let read_back: toml::Value = toml::from_str(&profile.to_toml().unwrap()).unwrap();
-        assert!(
-            contained(&written, &read_back),
-            "profile.example.toml holds a value the profile types drop"
-        );
     }
 
     /// ADR-048: a profile without `schema_version` is not taken to be current.
@@ -777,7 +941,7 @@ mod tests {
                     MatchAction::Notify {
                         severity: DiagnosticSeverity::Warning,
                     },
-                    MatchAction::PauseDisplay { view: Some(0) },
+                    MatchAction::PauseDisplay {},
                     MatchAction::Mark {
                         timestamp: Some(MarkTimestamp::default()),
                     },
@@ -823,8 +987,8 @@ mod tests {
             ("channels.2.interface", "TcpListenerConfig"),
             ("channels.0.reconnect", "ReconnectPolicy"),
             ("channels.0.display", "DisplayConfig"),
-            ("channels.0.display.views.0", "DisplayViewConfig"),
-            ("channels.0.display.views.0.hex_grouping", "HexGrouping"),
+            ("channels.0.display.view", "DisplayViewConfig"),
+            ("channels.0.display.view.hex_grouping", "HexGrouping"),
             ("channels.0.raw_recording", "RawRecordingConfig"),
             ("channels.0.raw_recording.disk_guard", "DiskGuard"),
             (

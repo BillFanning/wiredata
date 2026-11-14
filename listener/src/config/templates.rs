@@ -5,30 +5,9 @@
 //! port) are placeholders the user fills in before Start (§71).
 
 use crate::core::{ChannelKind, ChannelName};
-use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, WrappingMode};
 use crate::transport::udp::UdpMode;
 
 use super::schema::*;
-
-fn view(mode: DisplayMode) -> DisplayViewConfig {
-    DisplayViewConfig {
-        mode,
-        encoding: DisplayEncoding::Utf8,
-        character_rendering: CharacterRendering::Native,
-        font: None,
-        font_size: None,
-        foreground_color: None,
-        background_color: None,
-        wrapping: WrappingMode::NoWrap,
-        hex_grouping: HexGrouping::default(),
-    }
-}
-
-fn raw_and_hex() -> DisplayConfig {
-    DisplayConfig {
-        views: vec![view(DisplayMode::Raw), view(DisplayMode::Hex)],
-    }
-}
 
 /// A bounded default retention so templates validate (§80). 64 KB — matches the GUI's
 /// default scroll buffer (`gui::view_prefs::DEFAULT_SCROLL_BUFFER_BYTES`) and sits
@@ -37,7 +16,7 @@ fn default_retention() -> RetentionConfig {
     RetentionConfig::with_byte_limit(64 * 1024)
 }
 
-/// Generic serial channel (§82): 9600 8N1, Raw + Hex.
+/// Generic serial channel (§82): 9600 8N1, Raw display.
 pub fn serial_template() -> ChannelConfig {
     ChannelConfig {
         id: None,
@@ -53,7 +32,7 @@ pub fn serial_template() -> ChannelConfig {
             rts: None,
             dtr: None,
         }),
-        display: raw_and_hex(),
+        display: DisplayConfig::default(),
         raw_recording: RawRecordingConfig::default(),
         display_recording: DisplayRecordingConfig::default(),
         retention: default_retention(),
@@ -63,7 +42,7 @@ pub fn serial_template() -> ChannelConfig {
 }
 
 /// UDP channel (§84): bind 0.0.0.0, unicast; datagrams append to the verbatim stream
-/// (boundaries are a reception detail only, §18). Raw + Hex display views.
+/// (boundaries are a reception detail only, §18). Raw display.
 pub fn udp_template() -> ChannelConfig {
     ChannelConfig {
         id: None,
@@ -79,7 +58,7 @@ pub fn udp_template() -> ChannelConfig {
             kernel_timestamps: false,
             shared_port: false,
         }),
-        display: raw_and_hex(),
+        display: DisplayConfig::default(),
         raw_recording: RawRecordingConfig::default(),
         display_recording: DisplayRecordingConfig::default(),
         retention: default_retention(),
@@ -101,7 +80,7 @@ pub fn tcp_listener_template() -> ChannelConfig {
             max_connections: None,
             recv_buffer_bytes: None,
         }),
-        display: raw_and_hex(),
+        display: DisplayConfig::default(),
         raw_recording: RawRecordingConfig::default(),
         display_recording: DisplayRecordingConfig::default(),
         retention: default_retention(),

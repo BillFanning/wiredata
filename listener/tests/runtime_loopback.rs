@@ -795,11 +795,11 @@ async fn snapshot_surfaces_channel_liveness() {
 }
 
 #[tokio::test]
-async fn pausing_a_display_view_freezes_only_the_stream_display() {
-    // §50/§58: pausing the (default) Display View freezes the stream scrollback;
+async fn pausing_the_display_freezes_only_the_stream_display() {
+    // §50/§58: pausing the Display View freezes the stream scrollback;
     // reception, the byte counter, and recording continue.
     let port = free_udp_port();
-    let mut config = listener::config::templates::udp_template(); // Raw + Hex → two views
+    let mut config = listener::config::templates::udp_template();
     if let InterfaceConfig::Udp(udp) = &mut config.interface {
         udp.bind_address = "127.0.0.1".to_string();
         udp.port = port;
@@ -809,11 +809,8 @@ async fn pausing_a_display_view_freezes_only_the_stream_display() {
     let id = listener.add_channel(config);
     listener.start(id).await.unwrap();
 
-    let views = listener.display_views(id);
-    assert_eq!(views.len(), 2);
-    // Pausing the default (first) view freezes the shared scrollback (§50.1 removed;
-    // the scrollback honors the default view's pause).
-    listener.pause_display(id, views[0]).unwrap();
+    // Pausing the view freezes the shared scrollback (§50).
+    listener.pause_display(id).unwrap();
 
     let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     client.send_to(b"alpha", ("127.0.0.1", port)).await.unwrap();
@@ -821,13 +818,13 @@ async fn pausing_a_display_view_freezes_only_the_stream_display() {
 
     // The byte counter advances even though the scrollback stays frozen/empty.
     let snap = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 10).await;
-    assert!(snap.display_views[0].paused);
+    assert!(snap.display_paused == Some(true));
     assert_eq!(snap.stream_end_offset, 0); // scrollback frozen while paused
     assert!(stream_bytes(&listener, id).await.is_empty());
     assert_eq!(snap.activity.total_bytes, 10);
 
     // Resuming accumulates only new data — no backfill of what was missed.
-    listener.resume_display(id, views[0]).unwrap();
+    listener.resume_display(id).unwrap();
     client
         .send_to(b"charlie", ("127.0.0.1", port))
         .await

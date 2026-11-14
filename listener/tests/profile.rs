@@ -64,17 +64,11 @@ fn hex_grouping_round_trips_through_a_profile() {
     // §45/§1431: a per-view Hex grouping survives a save/load cycle, so a profile
     // can express it (the gap this closes — the field was documented but absent).
     let mut channel = templates::udp_template();
-    if let Some(view) = channel
-        .display
-        .views
-        .iter_mut()
-        .find(|v| matches!(v.mode, listener::display::DisplayMode::Hex))
-    {
-        view.hex_grouping = HexGrouping {
-            bytes_per_group: 4,
-            groups_per_line: 4,
-        };
-    }
+    channel.display.view.mode = listener::display::DisplayMode::Hex;
+    channel.display.view.hex_grouping = HexGrouping {
+        bytes_per_group: 4,
+        groups_per_line: 4,
+    };
     let mut profile = Profile::new("workspace");
     profile.channels = vec![channel];
 
@@ -105,9 +99,60 @@ fn a_profile_without_hex_grouping_loads_with_the_default() {
         .join("\n");
 
     let loaded = Profile::from_toml(&toml).expect("loads without the field");
-    for view in &loaded.channels[0].display.views {
-        assert_eq!(view.hex_grouping, HexGrouping::default());
-    }
+    assert_eq!(
+        loaded.channels[0].display.view.hex_grouping,
+        HexGrouping::default()
+    );
+}
+
+#[test]
+fn an_old_profile_with_a_view_list_loads_warns_and_resaves_in_the_new_form() {
+    // Profiles saved when a Channel could carry several views wrote a `views`
+    // list. Load keeps the first and says what it dropped; saving writes `view`.
+    let old = r#"schema_version = 3
+name = "old"
+
+[[channels]]
+name = "GPS"
+kind = "Udp"
+
+[channels.interface]
+type = "Udp"
+bind_address = "127.0.0.1"
+port = 10110
+mode = "Unicast"
+
+[[channels.display.views]]
+mode = "Hex"
+encoding = "Ascii"
+character_rendering = "Token"
+wrapping = "NoWrap"
+
+[[channels.display.views]]
+mode = "Raw"
+encoding = "Utf8"
+character_rendering = "Native"
+wrapping = "NoWrap"
+
+[channels.retention]
+byte_limit = 65536
+"#;
+    let path = temp_profile_path();
+    std::fs::write(&path, old).unwrap();
+    let (loaded, warnings) = Profile::load_with_warnings(&path).unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(
+        loaded.channels[0].display.view.mode,
+        listener::display::DisplayMode::Hex
+    );
+
+    loaded.save(&path).unwrap();
+    let (reloaded, warnings) = Profile::load_with_warnings(&path).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(reloaded, loaded);
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("views"));
+
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]

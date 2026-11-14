@@ -1,7 +1,7 @@
-//! Channel, display-view, and configuration identifiers (spec §129, §80.1).
+//! Channel and configuration identifiers (spec §129, §80.1).
 //!
-//! `ChannelId` and `DisplayViewId` are runtime objects minted while Listener
-//! runs (§97.1: the runtime mints `ChannelId`s, including one per accepted TCP
+//! `ChannelId` is a runtime object minted while Listener runs (§97.1: the
+//! runtime mints `ChannelId`s, including one per accepted TCP
 //! connection). `StableConfigId` is the persisted identity stored in a profile
 //! (§72, `ChannelConfig::id`).
 
@@ -54,23 +54,6 @@ impl ChannelName {
 impl fmt::Display for ChannelName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
-    }
-}
-
-/// Runtime identity of a single Display View (§11). A Channel may own several;
-/// pausing one does not pause the others. Runtime-only — never persisted (§69).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DisplayViewId(Uuid);
-
-impl DisplayViewId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for DisplayViewId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

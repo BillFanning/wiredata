@@ -1,21 +1,17 @@
-# Listener Specification v2.4.7
+# Listener Specification v2.4.8
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-13) — idle rules, reconnects and gap lines:
+Revision note (2026-11-13) — one display view:
 
-- **§50.2, §91, §126, §157 (ADR-030, amended).** Idle rules use an ordinary deadline
-  wait; the Windows 1 ms precision window, its lateness histograms and timer
-  counts are gone. A rule can fire up to about 16 ms late on Windows.
-- **§9.1 (ADR-058).** A fault within 60 s of a successful reconnect continues
-  the attempt count and backoff, so a flapping device reaches `max_attempts`.
-- **§54, §56, §56.1, §79, §142 (ADR-059).** A Display Recording marks a gap
-  that lost bytes with a `‹GAP …›` line where it resumes, under a new **Mark
-  gaps** option, on by default; Raw never. `RecordingStopReason` and the
-  `finalize` reason are gone: since ADR-043 a fault opens a gap instead.
+- **§11, §48, §50.2, §51, §54, §58, §78 (ADR-060).** A Channel has exactly one
+  display view, saved as `display.view`; the `views` list, `DisplayViewId` and
+  the `PauseDisplay` target are gone. Profiles saved with a `views` list still
+  load, keeping the first view and warning if there were more.
+- **§72.** The example profile is removed.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -464,9 +460,8 @@ Stop shall:
 ## 11. Display Pause and Resume
 
 Pause and Resume are display-level commands, not Channel-level commands, and they
-apply per Display View (a Channel may have several — §48), identified at runtime
-by a `DisplayViewId`. Pausing one view shall not pause the others. Pause state is
-runtime-only and is never persisted in a Profile (§69).
+apply to the Channel's one Display View (§48). Pause state is runtime-only and is
+never persisted in a Profile (§69).
 
 Display states:
 
@@ -991,10 +986,10 @@ view's switchable **modes** (§42), not separate simultaneous views; the per-vie
 settings of §46–§47 and the pause of §50 apply to this single view, so "the view
 is paused" and "the Channel's display is paused" mean the same thing.
 
-The profile schema's `views` list (§78) is retained for forward compatibility;
-The runtime reads exactly one entry and ignores the rest. Multiple simultaneous views
-(e.g. Raw + Hex side by side, each independently paused) are deferred —
-Appendix A.
+A profile saves the view as the `display.view` table (§78; ADR-060). A profile
+saved with the earlier `views` list still loads: its first view is kept, with a
+warning when it had more than one. Multiple simultaneous views (e.g. Raw + Hex
+side by side, each independently paused) are deferred — Appendix A.
 
 ## 49. Metadata Display
 
@@ -1034,7 +1029,7 @@ enum MatchAction {
     Record { target: RecordTarget, control: RecordControl }, // begin/stop, from the match forward
     Mark { timestamp: Option<MarkTimestamp> },               // marker + optional inline arrival annotation
     Notify { severity: DiagnosticSeverity },                 // raise an event/warning (§92–94)
-    PauseDisplay { view: Option<DisplayViewId> },            // freeze a view, or all
+    PauseDisplay {},                                         // freeze the display view
 }
 
 enum RecordTarget { Raw, Display, Both }
@@ -1056,7 +1051,7 @@ struct TimestampConfig { include_date: bool, include_millis: bool, include_timez
 - **Record** begins or stops recording **from the match forward**; there is **no pre-match backfill** (§158). Pre-trigger capture is deferred.
 - **Mark** correlates the match into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53). A bare `Mark` (`timestamp = None`) writes a `‹MARK …›` marker line into the view's `.disp`. When `timestamp` is `Some`, `Plain` splices the matched chunk's local arrival time, formatted per `TimestampConfig` (time-of-day always shown; date, milliseconds, and local UTC offset independently toggleable). `NmeaZda` instead splices `$<talker>ZDA,<hhmmss[.sss]>,<dd>,<mm>,<yyyy>,<zone-hours>,<zone-minutes>*XX`: time/date are UTC and zone fields carry the local offset. An offset outside minute precision or the supported ±13:59 range leaves both zone fields empty. Standard two-character talker IDs and custom 1–32-character printable ASCII IDs are accepted; whitespace/control characters and NMEA framing characters `$ ! , *` are invalid. IDs longer than two produce explicitly custom ZDA-shaped output.
 - `Before` attaches immediately before the match's first byte; `After` attaches immediately after its final byte. `separator` is appended after either style and may contain CR/LF. Rendering honors those controls and resets Raw wrap state, Rendered tab columns, and Hex continuation before subsequent data. The style-generated ZDA has no trailing CR/LF of its own. All styles are text insertions in every view mode, not on-screen byte-range styling (contrast removed `Highlight`, ADR-015).
-- **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes a view (or all views, §50); reception and recording continue.
+- **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes the display view (§50); reception and recording continue.
 
 **Configuration** (persists in profiles):
 
@@ -1087,7 +1082,7 @@ There are two independent recording systems, with different inputs, pipeline
 positions, and guarantees:
 
 - **Raw Recording** — byte-oriented; taps the received-chunk stream directly.
-- **Display Recording** — rendered-output-oriented; consumes a display view's
+- **Display Recording** — rendered-output-oriented; consumes the display view's
   output *after* rendering.
 
 Each is configured, queued, and faulted independently per Channel. Neither is an
@@ -1126,7 +1121,7 @@ A raw recording is written with the **`.raw`** extension (§59), and every segme
 
 ## 54. Display Recording
 
-Display Recording writes the rendered output of a specific display view
+Display Recording writes the rendered output of the Channel's display view
 (`RenderedOutput`, §141), after rendering. It is a fan-out consumer (§102),
 post-render.
 
@@ -1137,9 +1132,6 @@ inline arrival annotations a `Mark` produces (§50.2) are already spliced into r
 text — the recorder writes what the display shows, verbatim, with no timestamp logic
 of its own. (There is no separate per-chunk Display-Recording timestamp; the only
 timestamping is the per-match Mark, §50.2.)
-
-A Display Recording is bound to one display view's configuration. Recording a
-different view requires a separate Display Recording.
 
 **Gap lines** (ADR-059). When recording resumes after a gap that lost bytes
 (§56.1), the new `.disp` segment starts with one line,
@@ -1274,7 +1266,7 @@ No other metadata shall be recorded by default.
 
 ## 58. Recording During Display Pause
 
-Display Pause (§11, per display view) shall not affect either recording system.
+Display Pause (§11) shall not affect either recording system.
 Raw Recording is entirely upstream of display. Display Recording consumes
 rendered output independently of whether a view is presented on screen; pausing a
 view's presentation does not pause its recording.
@@ -1516,8 +1508,6 @@ duplicates at add-channel and rename time.
 
 ## 72. Recommended Rust Profile Structures
 
-**Example profile:** [`listener/profiles/profile.example.toml`](../profiles/profile.example.toml)
-
 ```rust
 struct Profile {
     schema_version: u32,
@@ -1646,7 +1636,9 @@ _Removed. There is no decoder (§29); `DecoderConfig` is gone._
 
 ```rust
 struct DisplayConfig {
-    views: Vec<DisplayViewConfig>,
+    view: DisplayViewConfig,           // one per Channel (§48); a missing table
+                                       //   is the default Raw / Utf8 / Native /
+                                       //   NoWrap view
 }
 
 struct DisplayViewConfig {
@@ -1761,9 +1753,6 @@ pub enum DataBits { Five, Six, Seven, Eight }
 pub enum Parity { None, Even, Odd, Mark, Space }
 pub enum StopBits { One, OnePointFive, Two }
 pub enum FlowControl { None, RtsCts }
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DisplayViewId(uuid::Uuid);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StableConfigId(uuid::Uuid);

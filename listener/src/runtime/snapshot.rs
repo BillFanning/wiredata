@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::oneshot;
 
 use crate::config::DiskGuard;
-use crate::core::{ChannelId, ChannelState, DisplayViewId, MatchRuleId, RecordingState};
+use crate::core::{ChannelId, ChannelState, MatchRuleId, RecordingState};
 use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 
 use super::activity::ChannelActivity;
@@ -235,8 +235,9 @@ pub struct ChannelSnapshot {
     pub reconnect: Option<ReconnectProgress>,
     /// Newest completed run for this stable Channel, retained across restarts.
     pub last_run_summary: Option<ListenerRunSummary>,
-    /// One entry per Display View (§48), in creation order (default view first).
-    pub display_views: Vec<DisplayViewSnapshot>,
+    /// Whether the Channel's Display View is paused (§50); `None` when no
+    /// pipeline is running, so there is nothing to pause.
+    pub display_paused: Option<bool>,
     /// Retained diagnostics, separated by severity (§88).
     ///
     /// Shared rather than owned: the producer rebuilds it only when the log
@@ -327,15 +328,6 @@ pub struct MarkRender {
     /// This is the match's first byte for `Before` and final byte for `After`.
     /// `None` when the matched bytes did not enter the paused view.
     pub view_offset: Option<u64>,
-}
-
-/// One Display View's snapshot: its identity and pause state (§50). The viewed
-/// content is the shared stream scrollback (fetched via [`StreamDelta`]), rendered
-/// per view.
-#[derive(Clone, Debug)]
-pub struct DisplayViewSnapshot {
-    pub id: DisplayViewId,
-    pub paused: bool,
 }
 
 /// Retained diagnostics by severity (§92–§95), oldest → newest within each.

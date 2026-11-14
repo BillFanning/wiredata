@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 
 use crate::config::schema::InterfaceConfig;
 use crate::config::ChannelConfig;
-use crate::core::{lock_recover, ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
+use crate::core::{lock_recover, ChannelId, ChannelState, RuntimeEvent};
 use crate::display::DisplayView;
 use crate::transport::serial::{OpenSerialTransport, SerialTransport};
 use crate::transport::tcp::{BoundTcpListenerTransport, TcpListenerTransport};
@@ -39,7 +39,7 @@ use super::activity::ChannelActivity;
 use super::build::{build_display_view, build_serial, build_tcp_listener, build_udp, BuildError};
 use super::channel::{spawn_monitored_channel, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES};
 use super::pipeline::{
-    DisplayRecordingSettings, DisplayViewHandle, PipelineCapacities, RawRecordingSettings,
+    DisplayPause, DisplayRecordingSettings, PipelineCapacities, RawRecordingSettings,
 };
 use super::run_summary::{ListenerRunSummary, RunEndReason, RunId};
 use super::snapshot::{
@@ -47,12 +47,6 @@ use super::snapshot::{
 };
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 use super::telemetry::{ChunkShape, DurationHistogram, TransportHealth};
-
-/// How many Display Views a Channel runs (§48): one per configured view, at
-/// least one (the pipeline's default view).
-fn view_count(config: &ChannelConfig) -> usize {
-    config.display.views.len().max(1)
-}
 
 /// A minimal [`ChannelSnapshot`] for a stopped/faulted Channel (no live pipeline):
 /// retained diagnostics plus the completed run's activity and timing summaries.
@@ -65,7 +59,7 @@ fn retained_snapshot(id: ChannelId, channel: &ManagedChannel) -> ChannelSnapshot
         reconnect_pending: false,
         reconnect: None,
         last_run_summary: None,
-        display_views: Vec::new(),
+        display_paused: None,
         diagnostics: Arc::clone(&channel.retained_diagnostics_snapshot),
         raw_recording: None,
         display_recording: None,
@@ -372,9 +366,9 @@ struct ManagedChannel {
     pending: Option<ChannelConfig>,
     state: ChannelState,
     handle: Option<ChannelHandle>,
-    /// Pause handles for the running Channel's Display Views (§11, §48); empty
+    /// Pause handle for the running Channel's Display View (§11, §48); `None`
     /// while Stopped.
-    display_handles: Vec<DisplayViewHandle>,
+    display_pause: Option<DisplayPause>,
     /// Shared fault flag (ADR-006). The detached fault monitor flips it when the
     /// transport ends on a spontaneous fault; the orchestrator can't be mutated
     /// from that task, so it reads the flag to keep `state()` and command
@@ -525,8 +519,8 @@ pub enum OrchestratorError {
     // right channel (by name) — see `Driver::push_channel_error`.
     #[error("unknown channel")]
     UnknownChannel(ChannelId),
-    #[error("unknown display view on the channel")]
-    UnknownDisplayView(DisplayViewId),
+    #[error("the channel has no running display to pause or resume")]
+    NoRunningDisplay(ChannelId),
     #[error("illegal channel state transition from {from:?} to {to:?}")]
     IllegalTransition {
         from: ChannelState,
@@ -598,7 +592,7 @@ impl Listener {
                 pending: None,
                 state: ChannelState::Stopped,
                 handle: None,
-                display_handles: Vec::new(),
+                display_pause: None,
                 faulted: Arc::new(AtomicBool::new(false)),
                 serial_control: None,
                 reconnect_state: None,
@@ -809,7 +803,7 @@ impl Listener {
     /// a restart (§54, ADR-012) — the Raw toggle's sibling, same return and fault
     /// contract as [`set_recording`](Self::set_recording). Settings come from the
     /// caller's click-time config; the renderer comes from the channel's stored
-    /// primary display view (kept current by `set_view_config`), so the `.disp`
+    /// display view (kept current by `set_view_config`), so the `.disp`
     /// records what the view shows.
     pub async fn set_display_recording(
         &self,
@@ -912,49 +906,26 @@ impl Listener {
         self.channels.get(&id).and_then(|c| c.pending.as_ref())
     }
 
-    /// The Display View ids of a running Channel (§48); empty while Stopped.
-    pub fn display_views(&self, channel: ChannelId) -> Vec<DisplayViewId> {
-        self.channels
-            .get(&channel)
-            .map(|c| c.display_handles.iter().map(|h| h.id).collect())
-            .unwrap_or_default()
-    }
-
-    /// Pause one Display View (§11, §50): reception, recording, numbering, and
-    /// other views are unaffected.
-    pub fn pause_display(
-        &self,
-        channel: ChannelId,
-        view: DisplayViewId,
-    ) -> Result<(), OrchestratorError> {
-        self.display_handle(channel, view)?.pause();
+    /// Pause a Channel's Display View (§11, §50): reception, recording and
+    /// numbering are unaffected. Errors while the Channel is not running.
+    pub fn pause_display(&self, channel: ChannelId) -> Result<(), OrchestratorError> {
+        self.display_pause(channel)?.pause();
         Ok(())
     }
 
     /// Resume a paused Display View (§11).
-    pub fn resume_display(
-        &self,
-        channel: ChannelId,
-        view: DisplayViewId,
-    ) -> Result<(), OrchestratorError> {
-        self.display_handle(channel, view)?.resume();
+    pub fn resume_display(&self, channel: ChannelId) -> Result<(), OrchestratorError> {
+        self.display_pause(channel)?.resume();
         Ok(())
     }
 
-    fn display_handle(
-        &self,
-        channel: ChannelId,
-        view: DisplayViewId,
-    ) -> Result<&DisplayViewHandle, OrchestratorError> {
-        let managed = self
-            .channels
+    fn display_pause(&self, channel: ChannelId) -> Result<&DisplayPause, OrchestratorError> {
+        self.channels
             .get(&channel)
-            .ok_or(OrchestratorError::UnknownChannel(channel))?;
-        managed
-            .display_handles
-            .iter()
-            .find(|h| h.id == view)
-            .ok_or(OrchestratorError::UnknownDisplayView(view))
+            .ok_or(OrchestratorError::UnknownChannel(channel))?
+            .display_pause
+            .as_ref()
+            .ok_or(OrchestratorError::NoRunningDisplay(channel))
     }
 
     fn set_state(&mut self, id: ChannelId, state: ChannelState) {
@@ -1043,14 +1014,14 @@ impl Listener {
         match opened {
             Ok((caps, interface)) => {
                 let (handle, serial_control) = self.wire(id, &config, interface, caps, faulted);
-                let display_handles = match &handle {
-                    ChannelHandle::Data(tasks) => tasks.display_handles().to_vec(),
+                let display_pause = match &handle {
+                    ChannelHandle::Data(tasks) => Some(tasks.display_pause().clone()),
                     // A TCP listener has no display itself; its connections do.
-                    ChannelHandle::TcpListener(_) => Vec::new(),
+                    ChannelHandle::TcpListener(_) => None,
                 };
                 if let Some(channel) = self.channels.get_mut(&id) {
                     channel.handle = Some(handle);
-                    channel.display_handles = display_handles;
+                    channel.display_pause = display_pause;
                     channel.serial_control = serial_control;
                     channel.state = ChannelState::Running;
                     channel.active_run = Some(run);
@@ -1182,7 +1153,7 @@ impl Listener {
                     final_snapshot.as_ref(),
                 ));
             }
-            channel.display_handles.clear();
+            channel.display_pause = None;
             channel.serial_control = None;
             channel.reconnect_state = None;
             channel.reconnect_carry = None;
@@ -1767,9 +1738,7 @@ impl Listener {
             // (§55) rather than a start fault.
             None,
             None,
-            // One runtime Display View per configured view (§48); at least one.
             // Each recording's disk guard travels in its settings (§56.2).
-            view_count(config),
             // Match Rules (§50.2, §165) plus the Raw recording settings a match-
             // triggered `Record` needs (lazy-create from the destination — nothing
             // until a match fires).
@@ -1900,15 +1869,10 @@ where
     drained
 }
 
-/// The renderer a Channel's `.disp` records with (§54): its stored primary
-/// display view (kept current by `set_view_config`), or the default view.
+/// The renderer a Channel's `.disp` records with (§54): its stored display
+/// view (kept current by `set_view_config`).
 fn display_renderer(config: &ChannelConfig) -> DisplayView {
-    config
-        .display
-        .views
-        .first()
-        .map(build_display_view)
-        .unwrap_or_default()
+    build_display_view(&config.display.view)
 }
 
 /// Phase 2 of [`Listener::stop`]: drain a Channel's handle to a stop and return
@@ -2470,27 +2434,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn display_views_can_be_paused_by_id() {
+    async fn the_display_can_be_paused_only_while_running() {
         let mut listener = Listener::with_default_capacities();
         let _ = listener.take_events();
-        // The UDP template configures a Raw + Hex display → two views (§84).
         let id = listener.add_channel(udp_channel());
-        assert!(listener.display_views(id).is_empty()); // none while Stopped
+        // Stopped: there is no display to pause.
+        assert!(matches!(
+            listener.pause_display(id),
+            Err(OrchestratorError::NoRunningDisplay(_))
+        ));
 
         listener.start(id).await.unwrap();
-        let views = listener.display_views(id);
-        assert_eq!(views.len(), 2);
-
-        // Pause/resume a known view; an unknown view id errors.
-        assert!(listener.pause_display(id, views[0]).is_ok());
-        assert!(listener.resume_display(id, views[0]).is_ok());
+        assert!(listener.pause_display(id).is_ok());
+        assert_eq!(
+            listener.snapshot(id).await.unwrap().display_paused,
+            Some(true)
+        );
+        assert!(listener.resume_display(id).is_ok());
+        assert_eq!(
+            listener.snapshot(id).await.unwrap().display_paused,
+            Some(false)
+        );
         assert!(matches!(
-            listener.pause_display(id, DisplayViewId::new()),
-            Err(OrchestratorError::UnknownDisplayView(_))
+            listener.pause_display(ChannelId::new()),
+            Err(OrchestratorError::UnknownChannel(_))
         ));
 
         listener.stop(id).await.unwrap();
-        assert!(listener.display_views(id).is_empty()); // cleared on stop
+        // The pause handle is cleared on stop.
+        assert!(matches!(
+            listener.pause_display(id),
+            Err(OrchestratorError::NoRunningDisplay(_))
+        ));
     }
 
     #[tokio::test]

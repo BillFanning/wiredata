@@ -10,6 +10,18 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-13) — idle rules, reconnects and gap lines:
+
+- **§50.2, §91, §126, §157 (ADR-030, amended).** Idle rules use an ordinary deadline
+  wait; the Windows 1 ms precision window, its lateness histograms and timer
+  counts are gone. A rule can fire up to about 16 ms late on Windows.
+- **§9.1 (ADR-058).** A fault within 60 s of a successful reconnect continues
+  the attempt count and backoff, so a flapping device reaches `max_attempts`.
+- **§54, §56, §56.1, §79, §142 (ADR-059).** A Display Recording marks a gap
+  that lost bytes with a `‹GAP …›` line where it resumes, under a new **Mark
+  gaps** option, on by default; Raw never. `RecordingStopReason` and the
+  `finalize` reason are gone: since ADR-043 a fault opens a gap instead.
+
 Revision note (2026-11-13) — one shape for received bytes:
 
 - **§138.** `ReceivedData.payload` is one byte vector. It was an enum of a

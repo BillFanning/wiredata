@@ -38,7 +38,7 @@ use crate::transport::{
 };
 
 use super::pipeline::{
-    run_channel, ChannelPipeline, DisplayRecordingSettings, DisplayViewHandle, PipelineCapacities,
+    run_channel, ChannelPipeline, DisplayPause, DisplayRecordingSettings, PipelineCapacities,
     RawRecordingSettings,
 };
 use super::snapshot::{ChannelSnapshot, ChannelStats, PipelineRequest, StreamDelta};
@@ -139,7 +139,7 @@ pub(crate) struct ChannelTasks {
     pub(crate) pipeline_cancel: CancellationToken,
     pub(crate) transport: TransportJoinHandle,
     pub(crate) pipeline_task: JoinHandle<ChannelPipeline>,
-    pub(crate) display_handles: Vec<DisplayViewHandle>,
+    pub(crate) display_pause: DisplayPause,
     /// Sender for snapshot/stats requests served by the pipeline task while it runs.
     pub(crate) requests: Sender<PipelineRequest>,
 }
@@ -155,7 +155,6 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     // `None` and begin recording lazily via the recording settings (§55).
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
-    view_count: usize,
     match_setup: MatchSetup,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
@@ -198,14 +197,10 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     if let Some(r) = raw_recorder {
         pipeline = pipeline.with_raw_recorder(r);
     }
-    // `new` created the default Display View; add the rest to reach the count (§48).
-    for _ in 1..view_count.max(1) {
-        pipeline.add_display_view();
-    }
     if let Some((renderer, recording)) = display_recorder {
         pipeline.set_display_recorder(renderer, recording);
     }
-    let display_handles = pipeline.display_view_handles();
+    let display_pause = pipeline.display_pause();
 
     let transport_cancel = CancellationToken::new();
     let pipeline_cancel = CancellationToken::new();
@@ -226,7 +221,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
         pipeline_cancel,
         transport,
         pipeline_task,
-        display_handles,
+        display_pause,
         requests,
     }
 }
@@ -247,14 +242,14 @@ pub(crate) struct MonitoredChannel {
     pipeline_cancel: CancellationToken,
     pipeline_task: JoinHandle<ChannelPipeline>,
     monitor: JoinHandle<()>,
-    display_handles: Vec<DisplayViewHandle>,
+    display_pause: DisplayPause,
     requests: Sender<PipelineRequest>,
 }
 
 impl MonitoredChannel {
-    /// Pause/resume handles for this Channel's Display Views (§11, §48).
-    pub(crate) fn display_handles(&self) -> &[DisplayViewHandle] {
-        &self.display_handles
+    /// The pause handle for this Channel's Display View (§11, §48).
+    pub(crate) fn display_pause(&self) -> &DisplayPause {
+        &self.display_pause
     }
 
     /// Request an on-demand snapshot of the running pipeline (§137, ADR-006).
@@ -373,7 +368,6 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     runner: R,
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
-    view_count: usize,
     match_setup: MatchSetup,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
@@ -396,14 +390,13 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         pipeline_cancel,
         transport,
         pipeline_task,
-        display_handles,
+        display_pause,
         requests,
     } = spawn_channel_tasks(
         channel_id,
         runner,
         raw_recorder,
         display_recorder,
-        view_count,
         match_setup,
         caps,
         events,
@@ -442,7 +435,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         pipeline_cancel,
         pipeline_task,
         monitor,
-        display_handles,
+        display_pause,
         requests,
     }
 }
@@ -535,7 +528,6 @@ pub fn start_data_channel<R: DataTransportRunner>(
         runner,
         raw_recorder,
         None,               // no display recording on a standalone channel
-        1,                  // a single default Display View
         MatchSetup::none(), // no Match Rules on a standalone channel
         caps,
         event_tx,

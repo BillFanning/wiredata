@@ -898,9 +898,7 @@ mod tests {
 
         let mut view = base.clone();
         view.retention.byte_limit = Some(256 * 1024);
-        if let Some(v) = view.display.views.first_mut() {
-            v.font_size = Some(20.0);
-        }
+        view.display.view.font_size = Some(20.0);
         assert!(!config_needs_restart(&view, &base));
 
         // A real restart-worthy edit (the interface) DOES register.

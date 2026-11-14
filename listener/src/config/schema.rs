@@ -212,15 +212,18 @@ pub struct TcpListenerConfig {
     pub recv_buffer_bytes: Option<usize>,
 }
 
-/// Display configuration: a set of views (§78).
+/// Display configuration: the Channel's one view (§48, §78).
+///
+/// Saved as a `view` table. Profiles written when a Channel could carry a list
+/// (`views`) still load: see [`Profile::from_toml`](super::Profile::from_toml).
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DisplayConfig {
     #[serde(default)]
-    pub views: Vec<DisplayViewConfig>,
+    pub view: DisplayViewConfig,
 }
 
-/// One display view's configuration (§78). Visual-only fields (font, colors) do
+/// The display view's configuration (§78). Visual-only fields (font, colors) do
 /// not affect produced text (see `display::DisplayView`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -243,6 +246,24 @@ pub struct DisplayViewConfig {
     /// modes. `#[serde(default)]` so profiles written before this field round-trip.
     #[serde(default)]
     pub hex_grouping: HexGrouping,
+}
+
+impl Default for DisplayViewConfig {
+    /// Raw bytes as UTF-8, characters shown as they are, no wrapping: the
+    /// renderer's own default (`display::DisplayView`).
+    fn default() -> Self {
+        Self {
+            mode: DisplayMode::Raw,
+            encoding: DisplayEncoding::Utf8,
+            character_rendering: CharacterRendering::Native,
+            font: None,
+            font_size: None,
+            foreground_color: None,
+            background_color: None,
+            wrapping: WrappingMode::NoWrap,
+            hex_grouping: HexGrouping::default(),
+        }
+    }
 }
 
 /// Hex-view byte grouping (§45): how many bytes share a group (separated by
@@ -496,13 +517,12 @@ pub enum MatchAction {
     },
     /// Raise a diagnostic event/warning of the given severity (§92–§94).
     Notify { severity: DiagnosticSeverity },
-    /// Freeze a Display View by index (into `display.views`), or all views when
-    /// `None` (§50). Reception and recording continue. (The spec models the target
-    /// as a runtime `DisplayViewId`; config uses a stable view index.)
-    PauseDisplay {
-        #[serde(default)]
-        view: Option<usize>,
-    },
+    /// Freeze the Channel's Display View (§50). Reception and recording
+    /// continue.
+    ///
+    /// An empty struct variant, not a unit one, for the reason `Plain {}`
+    /// gives (ADR-048): a key beside the tag is refused.
+    PauseDisplay {},
 }
 
 /// The inline arrival-time annotation a `Mark` action splices next to a matched

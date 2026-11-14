@@ -478,8 +478,11 @@ async fn latest_error(listener: &Listener, id: ChannelId, name: &str) -> String 
 /// invalid channels in a profile are reported and skipped, not fatal.
 fn build_channel_configs(cli: &Cli, console: &Console) -> Result<Vec<ChannelConfig>> {
     if let Some(path) = &cli.profile {
-        let profile =
-            Profile::load(path).with_context(|| format!("loading profile {}", path.display()))?;
+        let (profile, warnings) = Profile::load_with_warnings(path)
+            .with_context(|| format!("loading profile {}", path.display()))?;
+        for warning in warnings {
+            console.err(format_args!("warning: {warning}"));
+        }
         let mut valid = Vec::new();
         for (config, (name, result)) in profile.channels.iter().zip(profile.validate()) {
             match result {

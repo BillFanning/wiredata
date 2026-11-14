@@ -81,12 +81,11 @@ impl ListenerApp {
         // document order, so opening it pushed the button down onto the first control
         // row; CollapsingState lets us render the title row (title + button) ourselves
         // and the body separately, so the button stays put.
-        let view0 = self
+        let display_paused = self
             .state
             .channel(id)
             .and_then(|v| v.snapshot.as_ref())
-            .and_then(|s| s.display_views.first())
-            .map(|v0| (v0.id, v0.paused));
+            .and_then(|s| s.display_paused);
         let header_id = ui.make_persistent_id(("view_config", id));
         egui::collapsing_header::CollapsingState::load_with_default_open(
             ui.ctx(),
@@ -97,17 +96,17 @@ impl ListenerApp {
             // The collapse arrow is drawn by show_header; add the title + the
             // Pause/Resume button on the same row.
             ui.label("Configure display");
-            if let Some((view_id, is_paused)) = view0 {
+            if let Some(is_paused) = display_paused {
                 if is_paused {
                     if ui.button("Resume").clicked() {
-                        self.send(UiCommand::ResumeDisplay(id, view_id));
+                        self.send(UiCommand::ResumeDisplay(id));
                         // Jump the view back onto the newest bytes: pausing is
                         // for scrolling back, which disengaged stick_to_bottom.
                         self.resume_scroll_bottom = Some(id);
                     }
                     ui.label("view paused — reception continues");
                 } else if ui.button("Pause").on_hover(&PAUSE_HOVER).clicked() {
-                    self.send(UiCommand::PauseDisplay(id, view_id));
+                    self.send(UiCommand::PauseDisplay(id));
                 }
             }
         })

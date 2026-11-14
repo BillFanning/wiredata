@@ -43,8 +43,8 @@ pub use pipeline::{run_channel, CapacityRequest, ChannelPipeline, PipelineCapaci
 pub use queue::DropOldestQueue;
 pub use run_summary::{ListenerRunSummary, RunEndReason, RunId};
 pub use snapshot::{
-    ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
-    QueueDepth, ReconnectProgress, RecordingStatus, StreamDelta, TriggeredMatch,
+    ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, PipelineRequest, QueueDepth,
+    ReconnectProgress, RecordingStatus, StreamDelta, TriggeredMatch,
 };
 pub use tcp::{start_tcp_listener, TcpListenerHandle};
 pub use telemetry::{

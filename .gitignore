@@ -6,4 +6,3 @@
 /talker/profiles/*.toml
 !/talker/profiles/profile.example.toml
 /listener/profiles/*.toml
-!/listener/profiles/profile.example.toml

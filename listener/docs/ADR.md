@@ -768,7 +768,9 @@ deferred until something needs it. Pinned by
 
 ## ADR-023 — One Display View per Channel
 
-**Status:** Accepted 2026-07-16 (spec v2.1). **Context:** spec §48 promised multiple
+**Status:** Accepted 2026-07-16 (spec v2.1). **Corrected 2026-11-13 by ADR-060:**
+the `views` list this entry kept for forward compatibility is gone; a Channel's
+one view is saved as `display.view`. **Context:** spec §48 promised multiple
 simultaneous Display Views per Channel, but the runtime and GUI have only ever used
 the first view: scrollback pause gating keyed on `display_views.first()`, and the
 detail pane surfaced one view. A non-primary view could be *marked* paused but had no
@@ -2316,6 +2318,41 @@ through a hook Raw recorders leave empty.
 
 **Consequences:** A `.disp` file says where its gaps are without the event
 log beside it.
+
+## ADR-060 — One display view, in the profile as well as the runtime
+
+**Status:** Accepted 2026-11-13. Corrects ADR-023.
+
+**Context:** ADR-023 made a Channel show one display view but kept the
+profile's `views` list, a `DisplayViewId`, per-view pause handles and a
+`Vec` of views in the pipeline, all for a multi-view feature that is deferred
+(spec Appendix A). Everything that ran used the first entry; the rest were
+read and ignored, which let a profile say things that had no effect.
+
+**Decision:**
+
+- A Channel has exactly one view: `DisplayConfig.view`, saved as the
+  `display.view` table. `DisplayViewId`, the view list, the per-view pause
+  handles and `PauseDisplay`'s target are removed; pause applies to the
+  Channel's display.
+- **Old profiles still load.** The strict parse runs first. Only if it fails
+  is the parsed TOML rewritten from the old form (`config/legacy.rs`) and
+  parsed strictly again; when nothing was rewritten, the original error and
+  its line number stand. A `views` list keeps its first view; more than one,
+  or a `PauseDisplay` aimed at a later view, gives a warning that names the
+  Channel. The CLI prints it; the GUI shows it on the profile status line.
+  A saved profile always uses the new form.
+- An empty or missing view is the default Raw / Utf8 / Native / NoWrap view,
+  in the display and the Display Recording alike; the GUI used a different
+  default before.
+
+**Boundary:** Multiple simultaneous views remain deferred (Appendix A); they
+would bring back a list, deliberately, with what it needs. The example
+profile was removed at the same time, at the user's request.
+
+**Consequences:** A profile can no longer describe views that never show.
+A GUI profile load with both upgrade warnings and skipped Channels reports
+only the skipped Channels, since both use the one status line.
 
 ## Open questions
 
