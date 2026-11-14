@@ -54,6 +54,7 @@ socket2 = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender   = { workspace = true }
+anstyle-query      = { workspace = true }
 
 # Error handling (application-level)
 anyhow = { workspace = true }

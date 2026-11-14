@@ -19,6 +19,51 @@ use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuar
 /// lines are dropped and counted.
 pub const CONSOLE_QUEUE_LINES: usize = 4_096;
 
+/// Whether log lines on standard output may carry colour codes.
+///
+/// Only when something will turn the codes into colour. A classic Windows
+/// console window prints them as text (`←[2m…`) until a program turns on its
+/// virtual-terminal processing, and a file or a pipe keeps them as clutter. The
+/// level is always written out as a word, so no line loses meaning without
+/// colour.
+pub fn stdout_takes_colour() -> bool {
+    use std::io::IsTerminal as _;
+    colour_decision(
+        anstyle_query::no_color(),
+        anstyle_query::clicolor_force(),
+        std::io::stdout().is_terminal(),
+        terminal_interprets_colour,
+    )
+}
+
+/// `NO_COLOR` always wins, then `CLICOLOR_FORCE`; otherwise colour only on a
+/// terminal that interprets it. `interprets` is asked last because on Windows
+/// it changes the console's mode.
+fn colour_decision(
+    no_color: bool,
+    force: bool,
+    is_terminal: bool,
+    interprets: impl FnOnce() -> bool,
+) -> bool {
+    if no_color {
+        false
+    } else if force {
+        true
+    } else {
+        is_terminal && interprets()
+    }
+}
+
+/// On Windows, turn on the console's virtual-terminal processing and report
+/// whether that worked; elsewhere, ask the terminal type.
+fn terminal_interprets_colour() -> bool {
+    if cfg!(windows) {
+        anstyle_query::windows::enable_ansi_colors().unwrap_or(false)
+    } else {
+        anstyle_query::term_supports_ansi_color()
+    }
+}
+
 /// Standard output and standard error, each behind its own bounded queue.
 /// Cheap to clone; every clone feeds the same two queues, so lines on one
 /// stream come out in the order they were written.
@@ -142,6 +187,22 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Colour codes reach stdout only where they become colour; the user's
+    /// own `NO_COLOR` and `CLICOLOR_FORCE` come first, in that order.
+    #[test]
+    fn colour_is_used_only_where_it_will_show_as_colour() {
+        let never = || -> bool { panic!("a decided case must not touch the console") };
+
+        // A file or a pipe: plain text, and the console is not touched.
+        assert!(!colour_decision(false, false, false, never));
+        // A terminal that interprets the codes, and one that does not.
+        assert!(colour_decision(false, false, true, || true));
+        assert!(!colour_decision(false, false, true, || false));
+        // NO_COLOR beats everything, CLICOLOR_FORCE beats the terminal check.
+        assert!(!colour_decision(true, true, true, never));
+        assert!(colour_decision(false, true, false, never));
     }
 
     #[test]

@@ -64,6 +64,9 @@ crossbeam-channel = "0.5"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender   = "0.2"
+# Whether stdout takes colour codes, and turning them on in a Windows console.
+# Already in the tree through clap, so it adds no crate.
+anstyle-query      = "1.1"
 
 # ── Error handling ────────────────────────────────────────────────────────────
 # thiserror: library-style typed errors (used in nmea0183 crate)

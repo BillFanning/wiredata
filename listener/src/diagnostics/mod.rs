@@ -443,6 +443,7 @@ pub fn init_logging() -> (EventLog, ConsoleGuard) {
     let console = ConsoleGuard::open();
     let stdout = tracing_subscriber::fmt::layer()
         .with_timer(LocalTime)
+        .with_ansi(console::stdout_takes_colour())
         .with_writer(console.console().log_writer())
         .with_filter(filter);
     let folder = event_log_folder();
