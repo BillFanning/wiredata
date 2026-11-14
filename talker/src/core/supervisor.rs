@@ -28,7 +28,7 @@ use crossbeam_channel::{Receiver, TrySendError};
 use crate::core::channel::{ChannelId, InterfaceConfig};
 use crate::core::internal_fault::InternalFaultTally;
 use crate::core::message::MessageConfig;
-use crate::core::run_summary::{RunId, RunSummary};
+use crate::core::run_summary::{RunId, RunSummary, RunTotals};
 use crate::core::runner::{
     self, CommandExecution, CommandId, CommandTarget, ObserverPolicy, RunnerControlStatus,
     RunnerIdentity, TalkerCommand, TalkerHandle, TalkerStatus,
@@ -986,10 +986,7 @@ fn drain_control_statuses(
                                 "interface update failed; the previous interface settings remain in use: {message}"
                             ),
                             CommandTarget::MessageInterval(index) => {
-                                format!(
-                                    "message {} interval update failed: {message}",
-                                    index + 1
-                                )
+                                format!("message {} interval update failed: {message}", index + 1)
                             }
                             CommandTarget::Stop => format!("stop command failed: {message}"),
                         };
@@ -1104,24 +1101,27 @@ fn drain_statuses(
     for status in status_rx.try_iter() {
         match status {
             TalkerStatus::Counters {
-                total_count,
-                total_bytes,
-                per_message_counts,
-                per_message_timing,
-                dropped_statuses,
-                missed_sends,
-                failed_sends,
-                possibly_partial_sends,
-                peer_bytes,
+                totals,
                 send_failure_episodes,
-                withheld_sends,
                 active_send_error,
-                timing,
                 captured_at,
                 final_snapshot,
-                timer,
                 ..
             } => {
+                let RunTotals {
+                    total_count,
+                    total_bytes,
+                    per_message_counts,
+                    per_message_timing,
+                    dropped_statuses,
+                    missed_sends,
+                    failed_sends,
+                    possibly_partial_sends,
+                    peer_bytes,
+                    withheld_sends,
+                    timing,
+                    timer,
+                } = *totals;
                 telemetry.total_count = total_count;
                 telemetry.total_bytes = total_bytes;
                 telemetry.per_message_counts = per_message_counts.into();
@@ -1266,22 +1266,15 @@ mod tests {
     fn failure_counter_at(active_send_error: Option<&str>, episodes: u64) -> TalkerStatus {
         TalkerStatus::Counters {
             channel: ChannelId::mint(),
-            total_count: 0,
-            total_bytes: 0,
-            per_message_counts: Vec::new(),
-            per_message_timing: Vec::new(),
-            dropped_statuses: 1,
-            missed_sends: 0,
-            failed_sends: episodes,
+            totals: Box::new(RunTotals {
+                dropped_statuses: 1,
+                failed_sends: episodes,
+                ..RunTotals::default()
+            }),
             send_failure_episodes: episodes,
-            withheld_sends: 0,
             active_send_error: active_send_error.map(str::to_owned),
-            timing: Box::default(),
             captured_at: Instant::now(),
             final_snapshot: false,
-            timer: TimerStatus::default(),
-            possibly_partial_sends: 0,
-            peer_bytes: None,
         }
     }
 
@@ -1432,10 +1425,10 @@ mod tests {
             "the reaped exact-at-rest snapshot retains final provenance"
         );
         let summary = sup.last_run_summary(0).expect("completed run retained");
-        assert_eq!(summary.total_count, wire, "summary is exact at rest");
-        assert_eq!(summary.total_bytes, telemetry.total_bytes);
+        assert_eq!(summary.totals.total_count, wire, "summary is exact at rest");
+        assert_eq!(summary.totals.total_bytes, telemetry.total_bytes);
         assert_eq!(
-            summary.per_message_counts.as_slice(),
+            summary.totals.per_message_counts.as_slice(),
             &*telemetry.per_message_counts
         );
         assert_eq!(
@@ -1497,18 +1490,7 @@ mod tests {
             finished_at: SystemTime::UNIX_EPOCH,
             elapsed: Duration::ZERO,
             end_reason: crate::core::run_summary::RunEndReason::StopCommand,
-            total_count: 0,
-            total_bytes: 0,
-            per_message_counts: Vec::new(),
-            per_message_timing: Vec::new(),
-            dropped_statuses: 0,
-            missed_sends: 0,
-            failed_sends: 0,
-            withheld_sends: 0,
-            timing: Default::default(),
-            timer: Default::default(),
-            possibly_partial_sends: 0,
-            peer_bytes: None,
+            totals: RunTotals::default(),
         }
     }
 
@@ -1526,18 +1508,13 @@ mod tests {
                 finished_at: SystemTime::UNIX_EPOCH,
                 elapsed: Duration::ZERO,
                 end_reason: crate::core::run_summary::RunEndReason::StopCommand,
-                total_count,
-                total_bytes: total_count,
-                per_message_counts: vec![total_count],
-                per_message_timing: vec![MessageTiming::default()],
-                dropped_statuses: 0,
-                missed_sends: 0,
-                failed_sends: 0,
-                withheld_sends: 0,
-                timing: Default::default(),
-                timer: Default::default(),
-                possibly_partial_sends: 0,
-                peer_bytes: None,
+                totals: RunTotals {
+                    total_count,
+                    total_bytes: total_count,
+                    per_message_counts: vec![total_count],
+                    per_message_timing: vec![MessageTiming::default()],
+                    ..RunTotals::default()
+                },
             })
         };
         let mut retained = None;
@@ -1582,7 +1559,7 @@ mod tests {
         let retained = retained.expect("newest summary retained");
         assert_eq!(retained.run_id, newer_id);
         assert_eq!(
-            retained.total_count, 20,
+            retained.totals.total_count, 20,
             "the misrouted summary must not displace the slot's own"
         );
     }
@@ -2045,9 +2022,9 @@ mod tests {
         let predecessor = sup
             .last_run_summary(0)
             .expect("restart retained the completed predecessor");
-        assert!(predecessor.total_count >= 2);
+        assert!(predecessor.totals.total_count >= 2);
         assert_eq!(
-            predecessor.total_count,
+            predecessor.totals.total_count,
             sent.lock().unwrap().len() as u64,
             "predecessor summary remains exact without replacing new telemetry"
         );

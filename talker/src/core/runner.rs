@@ -18,9 +18,9 @@ use wiredata_ui::format::{compact_duration, interval as whole_ms, thousands};
 use crate::core::{
     channel::{ChannelId, Interface, InterfaceConfig, MissingRetryConfiguration, PartialWrite},
     internal_fault::InternalFaultTally,
-    run_summary::{RunEndReason, RunId, RunSummary},
+    run_summary::{RunEndReason, RunId, RunSummary, RunTotals},
     scheduler::{ClockStep, Schedule, Tick},
-    telemetry::{MessageTiming, MessageTimingRecorder, SendTimingRecorder, SendTimingReport},
+    telemetry::{MessageTimingRecorder, SendTimingRecorder},
     timing,
 };
 
@@ -121,42 +121,12 @@ pub enum TalkerStatus {
     /// full queue.
     Counters {
         channel: ChannelId,
-        /// Running send count across all messages in this channel: complete
-        /// messages only.
-        total_count: u64,
-        /// Cumulative wire bytes the interface accepted across all messages in
-        /// this channel, counted apart from complete messages: it includes the
-        /// accepted part of each possibly-partial send (§4.4).
-        total_bytes: u64,
-        /// Per-message running send counts, indexed by the message's
-        /// position in the compiled schedule.
-        per_message_counts: Vec<u64>,
-        /// Per-message cumulative timing on the same index basis, including
-        /// the delay each message's sends imposed on the others (ADR-045).
-        per_message_timing: Vec<MessageTiming>,
-        /// Cumulative count of status updates this channel discarded because
-        /// the receiver was full.
-        dropped_statuses: u64,
-        /// Cumulative count of sends missed under the scheduler's stall
-        /// policy (`Schedule::missed_sends`) — the channel couldn't keep to
-        /// its configured cadence.
-        missed_sends: u64,
-        /// Cumulative send calls that reached the interface and failed before
-        /// it accepted any byte.
-        failed_sends: u64,
-        /// Cumulative send calls that failed after the interface accepted part
-        /// of the message (§4.4, ADR-059): the receiver may hold a fragment.
-        /// Never resent, and not in `failed_sends`.
-        possibly_partial_sends: u64,
-        /// Bytes the TCP peer sent during this run, read and discarded before
-        /// each write (ADR-059, §4.5): "peer sent N bytes". `None` for a
-        /// transport that does not read its peer.
-        peer_bytes: Option<u64>,
+        /// The run's cumulative outcomes. Boxed to keep this variant small;
+        /// the final snapshot's value is the one the run summary carries.
+        totals: Box<RunTotals>,
         /// Cumulative send-failure episodes. Repeated attempts inside one
         /// bounded-backoff episode do not increase this count.
         send_failure_episodes: u64,
-        /// Cumulative due fires withheld by the bounded-backoff gate.
-        withheld_sends: u64,
         /// The current write or reopen error from the open failure episode.
         ///
         /// This repeats the immediate [`SendFailed`](Self::SendFailed)
@@ -165,19 +135,13 @@ pub enum TalkerStatus {
         /// opening another counted episode. `None` likewise repairs a dropped
         /// [`SendRecovered`](Self::SendRecovered) edge.
         active_send_error: Option<String>,
-        /// Cumulative bounded measurements of deadline handling, payload
-        /// rendering, and the application-level interface send call.
-        timing: Box<SendTimingReport>,
-        /// Exact monotonic instant at which `timing` was collapsed. This is
+        /// Exact monotonic instant at which `totals.timing` was collapsed. This is
         /// snapshot provenance, not necessarily the newest sample time.
         captured_at: Instant,
         /// Whether this is the mandatory exact-at-rest snapshot emitted after
         /// the send loop ends. Finality travels with the measurement rather
         /// than being inferred from observer thread lifecycle.
         final_snapshot: bool,
-        /// Current platform deadline-wait policy and the shortest active
-        /// interval that selected it.
-        timer: timing::TimerStatus,
     },
     /// Low-frequency edge update when a schedule change selects a different
     /// timer policy. Counters repeat the same state while sends are active;
@@ -1409,22 +1373,24 @@ fn run_loop(
                     per_message_timing.set_schedule(schedule.message_demand());
                     timer.emit(TalkerStatus::Counters {
                         channel: who.id,
-                        total_count,
-                        total_bytes,
-                        per_message_counts: per_message_counts.clone(),
-                        per_message_timing: per_message_timing.snapshot(),
-                        dropped_statuses: drops_so_far,
-                        missed_sends: schedule.missed_sends(),
-                        failed_sends,
-                        possibly_partial_sends,
-                        peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
+                        totals: Box::new(RunTotals {
+                            total_count,
+                            total_bytes,
+                            per_message_counts: per_message_counts.clone(),
+                            per_message_timing: per_message_timing.snapshot(),
+                            dropped_statuses: drops_so_far,
+                            missed_sends: schedule.missed_sends(),
+                            failed_sends,
+                            possibly_partial_sends,
+                            peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
+                            withheld_sends,
+                            timing: send_timing.snapshot_at(now),
+                            timer: timer.status(),
+                        }),
                         send_failure_episodes,
-                        withheld_sends,
                         active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
-                        timing: Box::new(send_timing.snapshot_at(now)),
                         captured_at: now,
                         final_snapshot: false,
-                        timer: timer.status(),
                     });
                 }
             }
@@ -1497,27 +1463,28 @@ fn run_loop(
             stopped_behind_line(&who.label, missed_sends)
         );
     }
-    let final_timing = send_timing.snapshot_at(finished_mono);
     per_message_timing.set_schedule(schedule.message_demand());
-    let final_per_message = per_message_timing.snapshot();
-    let _ = status_tx.send(TalkerStatus::Counters {
-        channel: who.id,
+    let totals = RunTotals {
         total_count,
         total_bytes,
-        per_message_counts: per_message_counts.clone(),
-        per_message_timing: final_per_message.clone(),
+        per_message_counts,
+        per_message_timing: per_message_timing.snapshot(),
         dropped_statuses,
         missed_sends,
         failed_sends,
         possibly_partial_sends,
         peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
-        send_failure_episodes,
         withheld_sends,
+        timing: send_timing.snapshot_at(finished_mono),
+        timer: timer_status,
+    };
+    let _ = status_tx.send(TalkerStatus::Counters {
+        channel: who.id,
+        totals: Box::new(totals.clone()),
+        send_failure_episodes,
         active_send_error: episode.as_ref().map(|ep| ep.active_error.clone()),
-        timing: Box::new(final_timing),
         captured_at: finished_mono,
         final_snapshot: true,
-        timer: timer_status,
     });
     if let Some(n) = &notify {
         n();
@@ -1535,18 +1502,7 @@ fn run_loop(
                 finished_at,
                 elapsed: finished_mono.saturating_duration_since(started_mono),
                 end_reason,
-                total_count,
-                total_bytes,
-                per_message_counts,
-                per_message_timing: final_per_message,
-                dropped_statuses,
-                missed_sends,
-                failed_sends,
-                possibly_partial_sends,
-                peer_bytes: peer_sent(current_config.as_ref(), peer_bytes),
-                withheld_sends,
-                timing: final_timing,
-                timer: timer_status,
+                totals,
             }),
         },
     );
@@ -2102,12 +2058,12 @@ mod tests {
         while final_timing.is_none() {
             for status in handle.status_rx.try_iter() {
                 if let TalkerStatus::Counters {
-                    per_message_timing,
+                    totals,
                     final_snapshot: true,
                     ..
                 } = status
                 {
-                    final_timing = Some(per_message_timing);
+                    final_timing = Some(totals.per_message_timing);
                 }
             }
             assert!(Instant::now() < deadline, "no final counter snapshot");
@@ -2331,13 +2287,17 @@ mod tests {
                 }
                 TalkerStatus::Counters {
                     channel,
-                    total_count,
-                    total_bytes,
-                    per_message_counts,
-                    dropped_statuses,
+                    totals,
                     final_snapshot,
                     ..
                 } => {
+                    let RunTotals {
+                        total_count,
+                        total_bytes,
+                        per_message_counts,
+                        dropped_statuses,
+                        ..
+                    } = &**totals;
                     assert_eq!(*channel, id, "counters carry the stable id");
                     assert!(*total_count >= last_total, "counters must be monotonic");
                     last_total = *total_count;
@@ -2394,27 +2354,10 @@ mod tests {
             .try_iter()
             .filter_map(|status| match status {
                 TalkerStatus::Counters {
-                    total_count,
-                    total_bytes,
-                    per_message_counts,
-                    dropped_statuses,
-                    missed_sends,
-                    failed_sends,
-                    withheld_sends,
-                    timing,
-                    timer,
+                    totals,
+                    final_snapshot: true,
                     ..
-                } => Some((
-                    total_count,
-                    total_bytes,
-                    per_message_counts,
-                    dropped_statuses,
-                    missed_sends,
-                    failed_sends,
-                    withheld_sends,
-                    *timing,
-                    timer,
-                )),
+                } => Some(totals),
                 _ => None,
             })
             .last()
@@ -2432,16 +2375,12 @@ mod tests {
 
         assert_eq!(summary.channel, id);
         assert_eq!(summary.end_reason, RunEndReason::StopCommand);
-        assert_eq!(summary.total_count, final_counters.0);
-        assert_eq!(summary.total_bytes, final_counters.1);
-        assert_eq!(summary.per_message_counts, final_counters.2);
-        assert_eq!(summary.dropped_statuses, final_counters.3);
-        assert_eq!(summary.missed_sends, final_counters.4);
-        assert_eq!(summary.failed_sends, final_counters.5);
-        assert_eq!(summary.withheld_sends, final_counters.6);
-        assert_eq!(summary.timing, final_counters.7);
-        assert_eq!(summary.timer, final_counters.8);
-        assert_eq!(summary.total_count, sent.lock().unwrap().len() as u64);
+        // One value, built once: every total the two carry is the same.
+        assert_eq!(summary.totals, *final_counters);
+        assert_eq!(
+            summary.totals.total_count,
+            sent.lock().unwrap().len() as u64
+        );
     }
 
     #[test]
@@ -2538,7 +2477,7 @@ mod tests {
         for s in status_rx.try_iter() {
             match s {
                 TalkerStatus::SendSample { .. } => samples += 1,
-                TalkerStatus::Counters { total_count, .. } => last_total = total_count,
+                TalkerStatus::Counters { totals, .. } => last_total = totals.total_count,
                 TalkerStatus::TimerStatus { .. } => {}
                 _ => panic!("unexpected status variant"),
             }
@@ -2809,11 +2748,8 @@ mod tests {
             let saw_live_outcomes = statuses.iter().any(|status| {
                 matches!(
                     status,
-                    TalkerStatus::Counters {
-                        failed_sends,
-                        withheld_sends,
-                        ..
-                    } if *failed_sends >= 1 && *withheld_sends >= 1
+                    TalkerStatus::Counters { totals, .. }
+                        if totals.failed_sends >= 1 && totals.withheld_sends >= 1
                 )
             });
             if saw_live_outcomes {
@@ -2835,18 +2771,15 @@ mod tests {
         );
         let outcomes = statuses.iter().rev().find_map(|status| match status {
             TalkerStatus::Counters {
-                total_count,
-                failed_sends,
-                withheld_sends,
+                totals,
                 active_send_error,
-                timing,
                 ..
             } => Some((
-                *total_count,
-                *failed_sends,
-                *withheld_sends,
+                totals.total_count,
+                totals.failed_sends,
+                totals.withheld_sends,
                 active_send_error.clone(),
-                **timing,
+                totals.timing,
             )),
             _ => None,
         });
@@ -2994,11 +2927,9 @@ mod tests {
             );
             for s in handle.status_rx.try_iter() {
                 match s {
-                    TalkerStatus::Counters {
-                        failed_sends,
-                        withheld_sends,
-                        ..
-                    } if !healed && failed_sends >= 1 && withheld_sends >= 1 => {
+                    TalkerStatus::Counters { totals, .. }
+                        if !healed && totals.failed_sends >= 1 && totals.withheld_sends >= 1 =>
+                    {
                         fail.store(false, std::sync::atomic::Ordering::SeqCst);
                         healed = true;
                     }
@@ -3026,12 +2957,15 @@ mod tests {
         join_within(handle, Duration::from_secs(2));
         let final_outcomes = final_statuses.try_iter().find_map(|status| match status {
             TalkerStatus::Counters {
-                failed_sends,
-                withheld_sends,
+                totals,
                 active_send_error,
                 final_snapshot: true,
                 ..
-            } => Some((failed_sends, withheld_sends, active_send_error)),
+            } => Some((
+                totals.failed_sends,
+                totals.withheld_sends,
+                active_send_error,
+            )),
             _ => None,
         });
         let (failed_total, withheld_total, active_send_error) =
@@ -3099,17 +3033,14 @@ mod tests {
             .try_iter()
             .find_map(|status| match status {
                 TalkerStatus::Counters {
-                    total_count,
-                    total_bytes,
-                    failed_sends,
-                    possibly_partial_sends,
+                    totals,
                     final_snapshot: true,
                     ..
                 } => Some((
-                    total_count,
-                    total_bytes,
-                    failed_sends,
-                    possibly_partial_sends,
+                    totals.total_count,
+                    totals.total_bytes,
+                    totals.failed_sends,
+                    totals.possibly_partial_sends,
                 )),
                 _ => None,
             })
@@ -3151,8 +3082,8 @@ mod tests {
                 "the reply was never counted: {counted:?}"
             );
             for status in handle.status_rx.try_iter() {
-                if let TalkerStatus::Counters { peer_bytes, .. } = status {
-                    counted = Some(peer_bytes);
+                if let TalkerStatus::Counters { totals, .. } = status {
+                    counted = Some(totals.peer_bytes);
                 }
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -3357,23 +3288,21 @@ mod tests {
             .try_iter()
             .find_map(|status| match status {
                 TalkerStatus::Counters {
-                    total_count,
-                    failed_sends,
-                    withheld_sends,
-                    timing,
-                    per_message_timing,
+                    totals,
                     final_snapshot: true,
                     ..
                 } => Some((
-                    total_count,
-                    failed_sends,
-                    withheld_sends,
-                    timing.cumulative.render_duration.sample_count(),
-                    timing.cumulative.send_duration.sample_count(),
-                    per_message_timing
+                    totals.total_count,
+                    totals.failed_sends,
+                    totals.withheld_sends,
+                    totals.timing.cumulative.render_duration.sample_count(),
+                    totals.timing.cumulative.send_duration.sample_count(),
+                    totals
+                        .per_message_timing
                         .first()
                         .map_or(0, |message| message.render_duration.sample_count()),
-                    per_message_timing
+                    totals
+                        .per_message_timing
                         .first()
                         .map_or(0, |message| message.send_duration.sample_count()),
                 )),

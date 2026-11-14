@@ -41,24 +41,28 @@ pub enum RunEndReason {
     OwnerDisconnected,
 }
 
-/// Exact final outcomes plus bounded timing and environment facts for one run.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunSummary {
-    pub run_id: RunId,
-    pub channel: ChannelId,
-    pub label: String,
-    pub started_at: SystemTime,
-    pub finished_at: SystemTime,
-    pub elapsed: Duration,
-    pub end_reason: RunEndReason,
+/// The cumulative outcomes of one run: what the runner's final
+/// `TalkerStatus::Counters` and the completed run's [`RunSummary`] both state.
+/// The runner builds it once at the end of a run and hands the same value to
+/// both, so the two cannot disagree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunTotals {
+    /// Complete messages sent, across all messages in the channel.
     pub total_count: u64,
+    /// Wire bytes the interface accepted, including the accepted part of each
+    /// possibly-partial send (§4.4).
     pub total_bytes: u64,
+    /// Per-message send counts, indexed by position in the compiled schedule.
     pub per_message_counts: Vec<u64>,
     /// Per-message cumulative timing on the same index basis, including the
     /// delay each message's sends imposed on the others (ADR-045).
     pub per_message_timing: Vec<MessageTiming>,
+    /// Status updates discarded because the receiver was full.
     pub dropped_statuses: u64,
+    /// Sends missed under the scheduler's stall policy.
     pub missed_sends: u64,
+    /// Send calls that reached the interface and failed before it accepted any
+    /// byte.
     pub failed_sends: u64,
     /// Sends that failed after the interface accepted part of the message
     /// (§4.4); their accepted bytes are in `total_bytes`.
@@ -66,12 +70,16 @@ pub struct RunSummary {
     /// Bytes the TCP peer sent, read and discarded (§4.5); `None` for a
     /// transport that does not read its peer.
     pub peer_bytes: Option<u64>,
+    /// Due fires withheld by the bounded-backoff gate.
     pub withheld_sends: u64,
+    /// Bounded cumulative measurements of deadline handling, payload rendering
+    /// and the interface send call.
     pub timing: SendTimingReport,
+    /// Platform deadline-wait policy and the interval that selected it.
     pub timer: TimerStatus,
 }
 
-impl RunSummary {
+impl RunTotals {
     pub fn unsent_sends(&self) -> u64 {
         self.missed_sends
             .saturating_add(self.failed_sends)
@@ -82,7 +90,22 @@ impl RunSummary {
     pub fn scheduled_sends(&self) -> u64 {
         self.total_count.saturating_add(self.unsent_sends())
     }
+}
 
+/// Exact final outcomes plus bounded timing and environment facts for one run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunSummary {
+    pub run_id: RunId,
+    pub channel: ChannelId,
+    pub label: String,
+    pub started_at: SystemTime,
+    pub finished_at: SystemTime,
+    pub elapsed: Duration,
+    pub end_reason: RunEndReason,
+    pub totals: RunTotals,
+}
+
+impl RunSummary {
     pub fn started_utc(&self) -> String {
         format_utc(self.started_at)
     }
@@ -115,16 +138,16 @@ impl RunSummary {
         let _ = writeln!(out, "finished_utc={}", self.finished_utc());
         let _ = writeln!(out, "elapsed_us={}", self.elapsed.as_micros());
         let _ = writeln!(out, "end_reason={}", end_reason_name(self.end_reason));
-        let _ = writeln!(out, "sent_messages={}", self.total_count);
-        let _ = writeln!(out, "sent_bytes={}", self.total_bytes);
-        let _ = writeln!(out, "failed_sends={}", self.failed_sends);
+        let _ = writeln!(out, "sent_messages={}", self.totals.total_count);
+        let _ = writeln!(out, "sent_bytes={}", self.totals.total_bytes);
+        let _ = writeln!(out, "failed_sends={}", self.totals.failed_sends);
         let _ = writeln!(
             out,
             "possibly_partial_sends={}",
-            self.possibly_partial_sends
+            self.totals.possibly_partial_sends
         );
-        let _ = writeln!(out, "withheld_sends={}", self.withheld_sends);
-        match self.peer_bytes {
+        let _ = writeln!(out, "withheld_sends={}", self.totals.withheld_sends);
+        match self.totals.peer_bytes {
             Some(bytes) => {
                 let _ = writeln!(out, "peer_sent_bytes={bytes}");
             }
@@ -132,9 +155,10 @@ impl RunSummary {
                 let _ = writeln!(out, "peer_sent_bytes=not_applicable");
             }
         }
-        let _ = writeln!(out, "missed_sends={}", self.missed_sends);
-        let _ = writeln!(out, "scheduled_sends={}", self.scheduled_sends());
+        let _ = writeln!(out, "missed_sends={}", self.totals.missed_sends);
+        let _ = writeln!(out, "scheduled_sends={}", self.totals.scheduled_sends());
         let counts = self
+            .totals
             .per_message_counts
             .iter()
             .map(u64::to_string)
@@ -144,73 +168,122 @@ impl RunSummary {
         // Per-message lanes stay flat and comma-separated, positionally aligned
         // with `per_message_sent`, so a reader can diff one line per fact
         // instead of re-assembling a block per message.
-        write_per_message(&mut out, "interval_us", &self.per_message_timing, |m| {
-            m.interval.as_micros().to_string()
-        });
+        write_per_message(
+            &mut out,
+            "interval_us",
+            &self.totals.per_message_timing,
+            |m| m.interval.as_micros().to_string(),
+        );
         write_per_message(
             &mut out,
             "interval_changed",
-            &self.per_message_timing,
+            &self.totals.per_message_timing,
             |m| u8::from(m.interval_changed).to_string(),
         );
         // Each boundary carries its own sample count and maximum, so a lane can
         // be read without assuming the counts match `per_message_sent` — the
         // lateness population includes sends withheld by retry backoff.
-        write_per_message(&mut out, "late_samples", &self.per_message_timing, |m| {
-            m.deadline_lateness.sample_count().to_string()
-        });
-        write_per_message(&mut out, "late_p99_us", &self.per_message_timing, |m| {
-            optional_us(m.deadline_lateness.percentile_upper_bound(99))
-        });
-        write_per_message(&mut out, "late_max_us", &self.per_message_timing, |m| {
-            optional_us(m.deadline_lateness.max())
-        });
-        write_per_message(&mut out, "render_samples", &self.per_message_timing, |m| {
-            m.render_duration.sample_count().to_string()
-        });
-        write_per_message(&mut out, "render_p99_us", &self.per_message_timing, |m| {
-            optional_us(m.render_duration.percentile_upper_bound(99))
-        });
-        write_per_message(&mut out, "render_max_us", &self.per_message_timing, |m| {
-            optional_us(m.render_duration.max())
-        });
-        write_per_message(&mut out, "send_samples", &self.per_message_timing, |m| {
-            m.send_duration.sample_count().to_string()
-        });
-        write_per_message(&mut out, "send_p99_us", &self.per_message_timing, |m| {
-            optional_us(m.send_duration.percentile_upper_bound(99))
-        });
-        write_per_message(&mut out, "send_max_us", &self.per_message_timing, |m| {
-            optional_us(m.send_duration.max())
-        });
+        write_per_message(
+            &mut out,
+            "late_samples",
+            &self.totals.per_message_timing,
+            |m| m.deadline_lateness.sample_count().to_string(),
+        );
+        write_per_message(
+            &mut out,
+            "late_p99_us",
+            &self.totals.per_message_timing,
+            |m| optional_us(m.deadline_lateness.percentile_upper_bound(99)),
+        );
+        write_per_message(
+            &mut out,
+            "late_max_us",
+            &self.totals.per_message_timing,
+            |m| optional_us(m.deadline_lateness.max()),
+        );
+        write_per_message(
+            &mut out,
+            "render_samples",
+            &self.totals.per_message_timing,
+            |m| m.render_duration.sample_count().to_string(),
+        );
+        write_per_message(
+            &mut out,
+            "render_p99_us",
+            &self.totals.per_message_timing,
+            |m| optional_us(m.render_duration.percentile_upper_bound(99)),
+        );
+        write_per_message(
+            &mut out,
+            "render_max_us",
+            &self.totals.per_message_timing,
+            |m| optional_us(m.render_duration.max()),
+        );
+        write_per_message(
+            &mut out,
+            "send_samples",
+            &self.totals.per_message_timing,
+            |m| m.send_duration.sample_count().to_string(),
+        );
+        write_per_message(
+            &mut out,
+            "send_p99_us",
+            &self.totals.per_message_timing,
+            |m| optional_us(m.send_duration.percentile_upper_bound(99)),
+        );
+        write_per_message(
+            &mut out,
+            "send_max_us",
+            &self.totals.per_message_timing,
+            |m| optional_us(m.send_duration.max()),
+        );
         // The culprit lane: what each message's own sends cost the others.
         write_per_message(
             &mut out,
             "blocked_others_us",
-            &self.per_message_timing,
+            &self.totals.per_message_timing,
             |m| m.blocked_others.as_micros().to_string(),
         );
-        write_per_message(&mut out, "blocking_sends", &self.per_message_timing, |m| {
-            m.blocking_sends.to_string()
-        });
+        write_per_message(
+            &mut out,
+            "blocking_sends",
+            &self.totals.per_message_timing,
+            |m| m.blocking_sends.to_string(),
+        );
         // The elapsed hold, which `blocked_others_us` is not: that one sums
         // every delayed message's wait and can exceed the send causing it.
         write_per_message(
             &mut out,
             "longest_block_us",
-            &self.per_message_timing,
+            &self.totals.per_message_timing,
             |m| m.longest_block.as_micros().to_string(),
         );
         // Sends lost rather than delayed. This lane sums to at most
         // `missed_sends`; the shortfall is what could not be charged to a
         // retained send, which is weaker than saying the thread was idle.
-        write_per_message(&mut out, "missed_others", &self.per_message_timing, |m| {
-            m.missed_others.to_string()
-        });
-        let _ = writeln!(out, "observer_updates_dropped={}", self.dropped_statuses);
-        let _ = writeln!(out, "timer_policy={}", timer_mode_name(self.timer.mode));
-        let _ = writeln!(out, "timer_reason={}", timer_intent_name(self.timer.intent));
+        write_per_message(
+            &mut out,
+            "missed_others",
+            &self.totals.per_message_timing,
+            |m| m.missed_others.to_string(),
+        );
+        let _ = writeln!(
+            out,
+            "observer_updates_dropped={}",
+            self.totals.dropped_statuses
+        );
+        let _ = writeln!(
+            out,
+            "timer_policy={}",
+            timer_mode_name(self.totals.timer.mode)
+        );
+        let _ = writeln!(
+            out,
+            "timer_reason={}",
+            timer_intent_name(self.totals.timer.intent)
+        );
         let shortest_us = self
+            .totals
             .timer
             .shortest_active_interval()
             .map(|duration| duration.as_micros().to_string())
@@ -219,42 +292,42 @@ impl RunSummary {
         let _ = writeln!(
             out,
             "cadence_alignment={}",
-            cadence_alignment_name(self.timer.cadence_alignment)
+            cadence_alignment_name(self.totals.timer.cadence_alignment)
         );
         let _ = writeln!(
             out,
             "wall_clock_realignments={}",
-            self.timer.clock_realignments
+            self.totals.timer.clock_realignments
         );
         write_histogram(
             &mut out,
             "deadline_lateness",
-            self.timing.cumulative.deadline_lateness,
+            self.totals.timing.cumulative.deadline_lateness,
         );
         write_histogram(
             &mut out,
             "render_duration",
-            self.timing.cumulative.render_duration,
+            self.totals.timing.cumulative.render_duration,
         );
         write_histogram(
             &mut out,
             "send_call_duration",
-            self.timing.cumulative.send_duration,
+            self.totals.timing.cumulative.send_duration,
         );
         write_histogram(
             &mut out,
             "recent_deadline_lateness",
-            self.timing.recent.deadline_lateness,
+            self.totals.timing.recent.deadline_lateness,
         );
         write_histogram(
             &mut out,
             "recent_render_duration",
-            self.timing.recent.render_duration,
+            self.totals.timing.recent.render_duration,
         );
         write_histogram(
             &mut out,
             "recent_send_call_duration",
-            self.timing.recent.send_duration,
+            self.totals.timing.recent.send_duration,
         );
         out
     }
@@ -355,58 +428,60 @@ mod tests {
             finished_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_012),
             elapsed: Duration::from_millis(12_345),
             end_reason: RunEndReason::StopCommand,
-            total_count: 100,
-            total_bytes: 7_000,
-            per_message_counts: vec![60, 40],
-            per_message_timing: vec![
-                // #0: the victim — fast cadence, late, blames nobody.
-                MessageTiming {
-                    interval: Duration::from_millis(50),
-                    wire_bytes: 80,
-                    interval_changed: false,
-                    deadline_lateness: histogram(Duration::from_millis(9)),
-                    render_duration: histogram(Duration::from_micros(40)),
-                    send_duration: histogram(Duration::from_micros(300)),
-                    blocked_others: Duration::ZERO,
-                    blocking_sends: 0,
-                    longest_block: Duration::ZERO,
-                    missed_others: 0,
+            totals: RunTotals {
+                total_count: 100,
+                total_bytes: 7_000,
+                per_message_counts: vec![60, 40],
+                per_message_timing: vec![
+                    // #0: the victim — fast cadence, late, blames nobody.
+                    MessageTiming {
+                        interval: Duration::from_millis(50),
+                        wire_bytes: 80,
+                        interval_changed: false,
+                        deadline_lateness: histogram(Duration::from_millis(9)),
+                        render_duration: histogram(Duration::from_micros(40)),
+                        send_duration: histogram(Duration::from_micros(300)),
+                        blocked_others: Duration::ZERO,
+                        blocking_sends: 0,
+                        longest_block: Duration::ZERO,
+                        missed_others: 0,
+                    },
+                    // #1: the culprit — slow cadence, slow write, charged for it.
+                    MessageTiming {
+                        interval: Duration::from_secs(2),
+                        wire_bytes: 512,
+                        interval_changed: true,
+                        deadline_lateness: histogram(Duration::from_micros(80)),
+                        render_duration: histogram(Duration::from_micros(90)),
+                        send_duration: histogram(Duration::from_millis(120)),
+                        blocked_others: Duration::from_millis(430),
+                        blocking_sends: 4,
+                        longest_block: Duration::from_millis(120),
+                        // Two of the run's three misses are its doing; the third
+                        // passed with the thread free and belongs to no message.
+                        missed_others: 2,
+                    },
+                ],
+                dropped_statuses: 2,
+                missed_sends: 3,
+                failed_sends: 1,
+                possibly_partial_sends: 1,
+                peer_bytes: Some(42),
+                withheld_sends: 2,
+                timing: SendTimingReport {
+                    cumulative,
+                    recent: cumulative,
                 },
-                // #1: the culprit — slow cadence, slow write, charged for it.
-                MessageTiming {
-                    interval: Duration::from_secs(2),
-                    wire_bytes: 512,
-                    interval_changed: true,
-                    deadline_lateness: histogram(Duration::from_micros(80)),
-                    render_duration: histogram(Duration::from_micros(90)),
-                    send_duration: histogram(Duration::from_millis(120)),
-                    blocked_others: Duration::from_millis(430),
-                    blocking_sends: 4,
-                    longest_block: Duration::from_millis(120),
-                    // Two of the run's three misses are its doing; the third
-                    // passed with the thread free and belongs to no message.
-                    missed_others: 2,
+                timer: TimerStatus {
+                    mode: TimerMode::WindowsOneMillisecond,
+                    intent: TimerIntent::ContinuousHighRate,
+                    active_cadence: Some(ActiveCadence {
+                        messages: 1,
+                        shortest: Duration::from_millis(10),
+                    }),
+                    cadence_alignment: CadenceAlignment::UtcPhase,
+                    clock_realignments: 1,
                 },
-            ],
-            dropped_statuses: 2,
-            missed_sends: 3,
-            failed_sends: 1,
-            possibly_partial_sends: 1,
-            peer_bytes: Some(42),
-            withheld_sends: 2,
-            timing: SendTimingReport {
-                cumulative,
-                recent: cumulative,
-            },
-            timer: TimerStatus {
-                mode: TimerMode::WindowsOneMillisecond,
-                intent: TimerIntent::ContinuousHighRate,
-                active_cadence: Some(ActiveCadence {
-                    messages: 1,
-                    shortest: Duration::from_millis(10),
-                }),
-                cadence_alignment: CadenceAlignment::UtcPhase,
-                clock_realignments: 1,
             },
         }
     }
@@ -414,8 +489,8 @@ mod tests {
     #[test]
     fn outcome_totals_are_saturating_and_complete() {
         let summary = summary();
-        assert_eq!(summary.unsent_sends(), 7);
-        assert_eq!(summary.scheduled_sends(), 107);
+        assert_eq!(summary.totals.unsent_sends(), 7);
+        assert_eq!(summary.totals.scheduled_sends(), 107);
     }
 
     #[test]

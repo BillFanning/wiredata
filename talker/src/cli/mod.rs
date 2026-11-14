@@ -423,25 +423,16 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
                         say(health.down(channel, &message, &send_retry, now));
                     }
                     TalkerStatus::SendRecovered { channel, .. } => say(health.up(channel, now)),
-                    TalkerStatus::Counters {
-                        channel,
-                        total_count,
-                        total_bytes,
-                        failed_sends,
-                        possibly_partial_sends,
-                        peer_bytes,
-                        dropped_statuses,
-                        ..
-                    } => {
+                    TalkerStatus::Counters { channel, totals, .. } => {
                         finals.insert(
                             channel,
                             FinalCounts {
-                                sent: total_count,
-                                bytes: total_bytes,
-                                failed: failed_sends,
-                                possibly_partial: possibly_partial_sends,
-                                peer_bytes,
-                                dropped: dropped_statuses,
+                                sent: totals.total_count,
+                                bytes: totals.total_bytes,
+                                failed: totals.failed_sends,
+                                possibly_partial: totals.possibly_partial_sends,
+                                peer_bytes: totals.peer_bytes,
+                                dropped: totals.dropped_statuses,
                             },
                         );
                     }

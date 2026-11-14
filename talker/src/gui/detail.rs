@@ -94,11 +94,11 @@ fn show_per_message_table(ui: &mut egui::Ui, rows: &[MessageRow]) {
 }
 
 fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
-    let unsent = summary.unsent_sends();
+    let unsent = summary.totals.unsent_sends();
     let heading = format!(
         "Last completed run · {} · {} sent · {unsent} unsent",
         compact_duration(summary.elapsed),
-        summary.total_count,
+        summary.totals.total_count,
     );
     egui::CollapsingHeader::new(heading)
         .id_salt("last_completed_run")
@@ -129,19 +129,19 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
             ui.weak(format!(
                 "Sent: {} · {} messages · {} unsent ({} failed · {} possibly partial · {} \
                  withheld · {} missed)",
-                human_bytes(summary.total_bytes),
-                summary.total_count,
+                human_bytes(summary.totals.total_bytes),
+                summary.totals.total_count,
                 unsent,
-                summary.failed_sends,
-                summary.possibly_partial_sends,
-                summary.withheld_sends,
-                summary.missed_sends,
+                summary.totals.failed_sends,
+                summary.totals.possibly_partial_sends,
+                summary.totals.withheld_sends,
+                summary.totals.missed_sends,
             ))
             .on_hover(&SENT_MEANING_TOOLTIP);
-            if let Some(bytes) = summary.peer_bytes {
+            if let Some(bytes) = summary.totals.peer_bytes {
                 ui.weak(peer_sent_words(bytes)).on_hover(&PEER_SENT_TOOLTIP);
             }
-            let (timer_detail, timer_hot) = timer_status_detail(summary.timer);
+            let (timer_detail, timer_hot) = timer_status_detail(summary.totals.timer);
             let timer = egui::RichText::new(format!("Timer: {timer_detail}")).weak();
             ui.label(if timer_hot {
                 timer.color(theme_palette(ui).warning)
@@ -154,7 +154,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
             // value with its sample count, and a percentile only where it
             // differs. A completed run had its own p99-only form, which read as
             // a different measurement of the same thing.
-            let timing = summary.timing.cumulative;
+            let timing = summary.totals.timing.cumulative;
             let timing_text = if timing.deadline_lateness.sample_count() == 0 {
                 "Timing: no deadline samples".to_owned()
             } else {
