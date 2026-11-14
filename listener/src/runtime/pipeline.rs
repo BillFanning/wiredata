@@ -850,8 +850,8 @@ impl ChannelPipeline {
                 Some(Diagnostic::error(format!(
                     "{what} on channel {channel} is unstable: {faults} faults within {}; \
                      retrying every {} until recording is stopped",
-                    describe_wait(window),
-                    describe_wait(retry)
+                    wiredata_ui::format::wait(window),
+                    wiredata_ui::format::wait(retry)
                 ))),
                 None,
             ),
@@ -2212,19 +2212,6 @@ fn local_time(at: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Local>::from(at)
         .format("%Y-%m-%d %H:%M:%S%.3f")
         .to_string()
-}
-
-/// A wait in the largest whole unit that states it exactly.
-fn describe_wait(wait: Duration) -> String {
-    let secs = wait.as_secs();
-    if secs >= 60 && secs.is_multiple_of(60) {
-        let minutes = secs / 60;
-        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
-    } else if wait.subsec_millis() == 0 {
-        format!("{secs} s")
-    } else {
-        format!("{} ms", wait.as_millis())
-    }
 }
 
 /// The async ingest loop for one Channel (§102, §110, §111).

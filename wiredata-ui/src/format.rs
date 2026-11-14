@@ -61,6 +61,23 @@ pub fn interval(interval: Duration) -> String {
     format!("{} ms", thousands(interval.as_millis() as u64))
 }
 
+/// Format a configured wait exactly, in the largest unit that holds it whole:
+/// `5 min`, `30 s`, or `1500 ms`.
+///
+/// Waits are entered and shown as the value the operator chose, so unlike
+/// `wiredata_cli::describe` nothing is truncated: a wait that is not a whole
+/// number of seconds stays in milliseconds. The unit names match `describe`.
+pub fn wait(wait: Duration) -> String {
+    let millis = wait.as_millis();
+    if millis != 0 && millis.is_multiple_of(60_000) {
+        format!("{} min", millis / 60_000)
+    } else if millis.is_multiple_of(1_000) {
+        format!("{} s", millis / 1_000)
+    } else {
+        format!("{millis} ms")
+    }
+}
+
 /// Format a percentage as a whole number, rounded **down**.
 ///
 /// Flooring is the point: several of these sit next to a threshold (80% is low
@@ -109,7 +126,7 @@ pub fn compact_duration(duration: Duration) -> String {
         return format!("{nanos} ns");
     }
     if nanos < 1_000_000 {
-        return scaled_duration(nanos as f64 / 1_000.0, "us");
+        return scaled_duration(nanos as f64 / 1_000.0, "µs");
     }
     if nanos < 1_000_000_000 {
         // Past a couple of milliseconds the fraction is finer than the wake
@@ -157,6 +174,18 @@ mod tests {
     }
 
     #[test]
+    fn waits_keep_their_exact_value_in_the_largest_whole_unit() {
+        assert_eq!(wait(Duration::from_millis(250)), "250 ms");
+        assert_eq!(wait(Duration::from_millis(1_500)), "1500 ms");
+        assert_eq!(wait(Duration::from_secs(1)), "1 s");
+        assert_eq!(wait(Duration::from_secs(30)), "30 s");
+        assert_eq!(wait(Duration::from_secs(90)), "90 s");
+        assert_eq!(wait(Duration::from_secs(60)), "1 min");
+        assert_eq!(wait(Duration::from_secs(600)), "10 min");
+        assert_eq!(wait(Duration::ZERO), "0 s");
+    }
+
+    #[test]
     fn percentages_are_whole_numbers_that_never_round_up_into_a_threshold() {
         assert_eq!(percent(0.0), "0%");
         assert_eq!(percent(2.9), "2%");
@@ -174,7 +203,7 @@ mod tests {
 
     #[test]
     fn milliseconds_past_two_drop_a_precision_the_wake_path_lacks() {
-        assert_eq!(compact_duration(Duration::from_micros(900)), "900 us");
+        assert_eq!(compact_duration(Duration::from_micros(900)), "900 µs");
         assert_eq!(compact_duration(Duration::from_millis(1)), "1.00 ms");
         assert_eq!(compact_duration(Duration::from_micros(1_500)), "1.50 ms");
         assert_eq!(compact_duration(Duration::from_millis(2)), "2.00 ms");
@@ -211,9 +240,9 @@ mod tests {
     fn durations_choose_compact_units_and_precision() {
         assert_eq!(compact_duration(Duration::ZERO), "0 ns");
         assert_eq!(compact_duration(Duration::from_nanos(999)), "999 ns");
-        assert_eq!(compact_duration(Duration::from_micros(1)), "1.00 us");
-        assert_eq!(compact_duration(Duration::from_micros(12)), "12.0 us");
-        assert_eq!(compact_duration(Duration::from_micros(999)), "999 us");
+        assert_eq!(compact_duration(Duration::from_micros(1)), "1.00 µs");
+        assert_eq!(compact_duration(Duration::from_micros(12)), "12.0 µs");
+        assert_eq!(compact_duration(Duration::from_micros(999)), "999 µs");
         assert_eq!(compact_duration(Duration::from_micros(1_250)), "1.25 ms");
         assert_eq!(compact_duration(Duration::from_millis(15)), "15 ms");
         assert_eq!(compact_duration(Duration::from_millis(999)), "999 ms");

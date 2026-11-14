@@ -577,13 +577,7 @@ pub(super) fn reconnect_behaviour(policy: &crate::config::ReconnectPolicy) -> St
                 again."
             .to_owned();
     }
-    let wait = |ms: u64| {
-        if ms.is_multiple_of(1000) {
-            format!("{} s", ms / 1000)
-        } else {
-            format!("{ms} ms")
-        }
-    };
+    let wait = |ms: u64| wiredata_ui::format::wait(std::time::Duration::from_millis(ms));
     let until = match policy.max_attempts {
         None => "until it works".to_owned(),
         Some(1) => "once, then gives up".to_owned(),

@@ -358,12 +358,13 @@ pub enum ChannelConfigError {
     #[error("retention is unbounded: set a limit on the channel or in defaults")]
     UnboundedRetention,
     #[error(
-        "channel name is not filesystem-safe but recording file rotation uses it in filenames (§59)"
+        "channel name can't be used in a file name, and rotating recordings name their files \
+         after it"
     )]
     InvalidChannelName,
-    #[error("channel name duplicates another channel's — names must be unique (§6, §71)")]
+    #[error("another channel has this name; names must be unique")]
     DuplicateChannelName,
-    #[error("a match rule's byte pattern is empty (it would match at every byte offset, §50.2)")]
+    #[error("a match rule's byte pattern is empty; it would match at every byte")]
     EmptyMatchPattern,
     #[error("invalid NMEA ZDA Mark talker ID: {0}")]
     InvalidZdaTalkerId(crate::core::ZdaTalkerIdError),
@@ -948,7 +949,7 @@ mod tests {
         ];
         assert_eq!(
             describe_channel_errors(&errors),
-            "channel name duplicates another channel's — names must be unique (§6, §71); \
+            "another channel has this name; names must be unique; \
              reconnect multiplier 20 is outside 1.0–10"
         );
     }

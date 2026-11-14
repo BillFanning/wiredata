@@ -183,7 +183,7 @@ mod tests {
 
         // #2 is barely late itself, and is charged for what it cost.
         assert_eq!(rows[1].label, "#2");
-        assert_eq!(rows[1].late, "worst 80.0 us of 1");
+        assert_eq!(rows[1].late, "worst 80.0 µs of 1");
         assert_eq!(rows[1].send_call, "worst 120 ms of 1");
         // The hold is its own cell because it is the one elapsed time here:
         // the combined waiting sums across victims and the misses are a count,
@@ -206,7 +206,7 @@ mod tests {
         let rows = per_message_rows(&[3], &[matching]);
         assert_eq!(rows[0].sends, "3");
         assert_eq!(rows[0].late, "worst 1.00 ms", "count is already a column");
-        assert_eq!(rows[0].send_call, "worst 200 us");
+        assert_eq!(rows[0].send_call, "worst 200 µs");
 
         // Retry backoff samples lateness for sends it then withholds, so this
         // population outruns the successful-send count — and that gap is the
@@ -217,7 +217,7 @@ mod tests {
         }
         let rows = per_message_rows(&[3], &[withheld]);
         assert_eq!(rows[0].late, "worst 1.00 ms of 12");
-        assert_eq!(rows[0].send_call, "worst 200 us");
+        assert_eq!(rows[0].send_call, "worst 200 µs");
     }
 
     #[test]

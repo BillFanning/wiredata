@@ -360,11 +360,11 @@ mod tests {
         );
         assert_eq!(
             timing_metric("render", timing.render_duration, line_samples),
-            "render worst 100 us"
+            "render worst 100 µs"
         );
         assert_eq!(
             timing_metric("send call", timing.send_duration, line_samples),
-            "send call worst 200 us"
+            "send call worst 200 µs"
         );
         assert_eq!(
             timing_metric("render", DurationHistogram::default(), line_samples),
@@ -379,7 +379,7 @@ mod tests {
     fn a_work_boundary_reads_as_its_longest_observation() {
         let mut single = DurationHistogram::default();
         single.record(Duration::from_micros(100));
-        assert_eq!(longest_metric("render", single, 1), "longest render 100 us");
+        assert_eq!(longest_metric("render", single, 1), "longest render 100 µs");
 
         let mut spread = DurationHistogram::default();
         for _ in 0..200 {

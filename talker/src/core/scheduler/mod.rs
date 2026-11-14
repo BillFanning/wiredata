@@ -424,9 +424,10 @@ impl Schedule {
 /// never silent.
 fn warn_deadline_unrepresentable(index: usize, interval: Duration) {
     tracing::warn!(
-        "message {}: its next send, {interval:?} ahead, is past what the system clock \
+        "message {}: its next send, {} ahead, is past what the system clock \
          can represent; it will not be sent again",
-        index + 1
+        index + 1,
+        wiredata_ui::format::interval(interval)
     );
 }
 

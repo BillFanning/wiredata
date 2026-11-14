@@ -127,7 +127,10 @@ pub(crate) fn status_words(
         ) => {
             // Rounded up: "next try in 0 s" would read as stuck.
             let secs = next_try_in.as_secs() + u64::from(next_try_in.subsec_nanos() > 0);
-            format!("Reconnecting — attempt {attempt}, next try in {secs} s")
+            format!(
+                "Reconnecting — attempt {attempt}, next try in {}",
+                wiredata_ui::format::wait(std::time::Duration::from_secs(secs))
+            )
         }
         (ChannelStatus::Faulted, Some(ReconnectProgress::GaveUp { attempts })) => format!(
             "Faulted — gave up after {attempts} attempt{}",
