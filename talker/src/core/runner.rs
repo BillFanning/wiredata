@@ -191,8 +191,8 @@ pub enum TalkerStatus {
 /// transport may first prepare or replace its failed handle; an unavailable
 /// replacement withholds that fire too. Each unsuccessful retry doubles the wait up to
 /// [`RETRY_BACKOFF_MAX`], and the first successful send closes the episode.
-/// Without this, a 100 Hz schedule against a dead TCP/serial target retries
-/// (and used to log) 100 times a second, burying the original failure.
+/// Without it, a 100 Hz schedule against a dead TCP/serial target would retry
+/// 100 times a second.
 pub const RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 /// Retry delay cap: a persistently dead interface is probed at most once per
 /// this interval. Retrying stays automatic — there is no manual Retry state —
@@ -272,14 +272,9 @@ struct FailureEpisode {
 /// How long a channel must go without missing a scheduled send before its
 /// off-cadence episode is closed.
 ///
-/// Recovery cannot be "the first poll that missed nothing". A marginal channel
-/// misses intermittently, so closing on the first clean tick would log a start
-/// and an end for every pair of ticks — at a 10 ms cadence, a hundred pairs a
-/// second, which is the flood the edge-triggering exists to prevent. The window
-/// only has to outlast the miss's cause, and the coarsest ordinary one is an OS
-/// scheduling quantum, measured in tens of milliseconds. Seconds is therefore
-/// the right order of magnitude, and five is a settle time chosen within it
-/// rather than a threshold proven by anything.
+/// Recovery is not "the first poll that missed nothing": the window has to
+/// outlast an intermittent miss's cause, so it is measured in seconds. Five is
+/// a settle time chosen within that range, not a proven threshold (ADR-053).
 ///
 /// **It is a minimum, not a deadline.** The test runs only where the miss count
 /// arrives, on a reached cadence point, so a channel is not woken to announce
@@ -292,12 +287,9 @@ const MISS_RECOVERY_SETTLE: Duration = Duration::from_secs(5);
 /// send (reported) to [`MISS_RECOVERY_SETTLE`] without another (reported with
 /// these counts).
 ///
-/// Edge-triggered for the reason the failure path is, only more so. Misses are
-/// counted at every poll, and they concentrate on the shortest interval, so a
-/// line per missed send would emit thousands a second under exactly the
-/// overload it is describing — into a log pane that is itself a queue consumer.
-/// The first miss and the return to schedule are the two facts worth a line;
-/// the count in between belongs on the line that closes the episode.
+/// Edge-triggered (ADR-053): the first miss and the return to schedule each
+/// get a line, and the count in between goes on the line that closes the
+/// episode.
 struct MissEpisode {
     /// Scheduled sends missed since the episode opened, ≥ 1.
     missed: u64,
@@ -1127,9 +1119,7 @@ impl<'a> RunState<'a> {
         self.per_message_timing
             .record_misses(index, scheduled_for, interval, missed);
         // Report falling off cadence and returning to it, and nothing
-        // in between. The first miss is reported for the same reason
-        // the first failed send is: it is the moment the reader could
-        // have acted, and every later one says only "still".
+        // in between (ADR-053).
         match observe_misses(&mut self.miss_episode, missed, due_handled_at) {
             MissReport::FellBehind(now_missed) => tracing::warn!(
                 channel = self.who.id.as_u64(),
@@ -1142,10 +1132,8 @@ impl<'a> RunState<'a> {
                     now_missed
                 )
             ),
-            // Not "back to normal": this is a statement about cadence
-            // points only. Sends can still be failing or withheld by
-            // retry backoff while every point is reached, and that
-            // episode reports itself separately.
+            // A statement about cadence points only, not "back to normal":
+            // a failure episode reports itself separately (ADR-053).
             MissReport::BackOnSchedule { missed, length } => tracing::info!(
                 channel = self.who.id.as_u64(),
                 "{}",
@@ -1653,10 +1641,9 @@ fn emit_status(
         }
         Err(TrySendError::Full(_)) => {
             *dropped_statuses += 1;
-            // Stated as the consequence, not the mechanism. "Status receiver is
-            // falling behind" named an internal queue the reader cannot see and
-            // read as a fault on the send path, which is the one thing this can
-            // never be. What it costs is display freshness, and nothing else.
+            // The warning states the consequence, display freshness, not the
+            // internal queue, which the reader cannot see and which never
+            // affects the send path.
             if *dropped_statuses == 1 {
                 tracing::warn!(
                     channel = who.id.as_u64(),

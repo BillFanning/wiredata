@@ -8,8 +8,7 @@ use crate::core::timing::CadenceAlignment;
 /// One channel in a profile: a single interface and the messages sent on it.
 ///
 /// A channel has exactly one interface port. Each message is configured
-/// independently (payload, interval, and — from a later phase — timestamp and
-/// checksum).
+/// independently (payload, interval, timestamp and checksum).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,13 +16,11 @@ pub struct ChannelConfig {
     /// Display name shown in the GUI channel list. Cosmetic only — channels
     /// are identified by position, so the name carries no uniqueness
     /// requirement. Empty means "unnamed"; the GUI falls back to
-    /// "Channel N". Additive `#[serde(default)]` field: older profiles
-    /// load with an empty name.
+    /// "Channel N". Omitted from a profile when empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    /// Cadence-wait policy. Additive and omitted for the default Standard
-    /// behavior, so existing schema-v2 profiles load unchanged.
     /// Optional UTC phase alignment for the first and re-based send deadlines.
+    /// Omitted from a profile when it is the default, immediate start.
     #[serde(default, skip_serializing_if = "CadenceAlignment::is_immediate")]
     pub cadence_alignment: CadenceAlignment,
     pub interface: InterfaceConfig,

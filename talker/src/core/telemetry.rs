@@ -81,10 +81,8 @@ pub struct SendTimingReport {
 /// **What that pair does and does not establish.** Delay blame
 /// ([`blocked_others`](MessageTiming::blocked_others)) is measured against
 /// deadlines the channel *reached*, so it explains observed **lateness**
-/// directly (ADR-045). It could never explain a **miss**, because a missed
-/// cadence point is passed over before any of it runs — and it failed worst
-/// exactly under overload, where fewer deadlines are reached and the evidence
-/// thins out as the problem grows.
+/// directly (ADR-045). It cannot explain a **miss**, because a missed cadence
+/// point is passed over before any of it runs.
 ///
 /// [`missed_others`](MessageTiming::missed_others) closes that gap by counting
 /// at the miss instead of at the deadline (ADR-051). The two are separate
@@ -130,11 +128,9 @@ pub struct MessageTiming {
     /// message's sends held the channel thread, and so will never fire.
     ///
     /// The counterpart to `blocked_others` for the sends that never happened
-    /// rather than the ones that happened late — and the one that survives
-    /// overload. `blocked_others` can only grow when a deadline is *reached*,
-    /// so the worse the stall, the fewer deadlines there are to observe and
-    /// the thinner the evidence gets. A missed point is counted where it
-    /// occurred, so this grows with the problem instead (ADR-051).
+    /// rather than the ones that happened late. A missed point is counted where
+    /// it occurred, so this grows with the stall instead of thinning out
+    /// (ADR-051).
     ///
     /// Summing this across every message gives the share of the channel's
     /// `missed_sends` that some send is answerable for. The remainder has no
@@ -211,10 +207,8 @@ struct SendWindow {
 /// at instant T", and T is routinely older than the most recent write: the
 /// runner handles messages earliest-first, so by the time a delayed message is
 /// reached, several other sends may have started and finished since its
-/// deadline passed. Retaining one window answered that question with "nobody"
-/// for every case but the simplest, which understated blame and — once a
-/// readout began describing the shortfall — misreported a busy thread as an
-/// idle one.
+/// deadline passed. A single retained window would answer "nobody" for every
+/// case but the simplest, and understate blame.
 ///
 /// **How deep the ring has to be**, and why that is not a guess. Once a
 /// message's deadline is overdue, each *other* message can be serviced at most

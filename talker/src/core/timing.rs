@@ -95,25 +95,11 @@ pub enum TimerIntent {
 
 /// Select the deadline-wait policy from the schedule alone.
 ///
-/// There was a per-channel Standard/Precise choice here. It asked the user to
-/// decide something they had no way to evaluate, did nothing at all below
-/// [`HIGH_RATE_THRESHOLD`] (where this function never reached it) and nothing on
-/// any platform without a timer-resolution request — and the answer is not
-/// actually in doubt.
-///
-/// The window's cost is its duty cycle, `PRECISION_WINDOW / interval`, which
-/// falls as schedules slow down. Its benefit is roughly constant: about 14 ms of
-/// worst-case wake error removed, whatever the interval. Cost drops, benefit
-/// does not, so above the threshold the window is never the wrong call — at the
-/// threshold its duty is 100%, exactly matching the continuous request it
-/// replaces, and it only gets cheaper from there.
-///
-/// Below the threshold there is nothing to window: the coarse wait preceding the
-/// window wakes on the platform tick, so the window cannot be narrower than the
-/// two ticks that make it necessary in the first place — which is why
-/// [`PRECISION_WINDOW`] and [`HIGH_RATE_THRESHOLD`] are the same constant. An
-/// interval shorter than the window leaves no coarse phase to stage, so a
-/// continuous request is the only mechanism that works.
+/// Below [`HIGH_RATE_THRESHOLD`] the request is held continuously; at or above
+/// it, only in a [`PRECISION_WINDOW`] before each waited deadline. The window is
+/// never the wrong call above the threshold, because its cost falls with the
+/// interval while its benefit does not, and below it there is no coarse phase
+/// to stage, which is why the two constants are the same value (ADR-047).
 pub fn timer_intent(shortest_active_interval: Option<Duration>) -> TimerIntent {
     match shortest_active_interval {
         None => TimerIntent::None,
@@ -180,10 +166,8 @@ pub enum TimerMode {
 /// knows how many cadences fed that pool.
 ///
 /// Deliberately just a count and the timer-policy input. The interval
-/// *distribution* is carried per message on the counters lane and rendered from
-/// there; a longest-interval field here duplicated it to serve one sub-second
-/// transient — the window between a channel's first `TimerStatus` and its first
-/// `Counters` — which is not worth a second source of the same fact.
+/// *distribution* is carried per message on the counters lane, so it has one
+/// source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActiveCadence {
     /// Non-dormant messages in the running schedule.

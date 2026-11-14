@@ -55,7 +55,6 @@ const CRC16_MODBUS: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_MODBUS);
 const CRC32_ISO_HDLC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 
 impl ChecksumConfig {
-    /// Compute the checksum of `data`, returned as the raw bytes to append.
     /// Bytes [`Self::compute`] appends, which depends only on the algorithm.
     /// Lets a compiled message state its wire length without rendering.
     pub(crate) const fn wire_len(&self) -> usize {
@@ -66,6 +65,7 @@ impl ChecksumConfig {
         }
     }
 
+    /// Compute the checksum of `data`, returned as the raw bytes to append.
     pub fn compute(&self, data: &[u8]) -> Vec<u8> {
         let mut bytes = match self.algorithm {
             ChecksumAlgorithm::Xor => vec![data.iter().fold(0u8, |acc, &b| acc ^ b)],
