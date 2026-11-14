@@ -49,6 +49,10 @@ eframe = { version = "0.34", default-features = false, features = [
     # pulled in the unmaintained zbus/zvariant stack (RUSTSEC-2026-0370..0372).
     # Keyboard navigation does not depend on it.
     "glow",                 # OpenGL renderer (required for run_native)
+    # Linux window backends. accesskit used to enable winit's by the back door;
+    # without it, a Linux build has no windowing platform at all.
+    "x11",
+    "wayland",
 ] }
 egui = "0.34"
 
