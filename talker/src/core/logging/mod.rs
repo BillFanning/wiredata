@@ -256,9 +256,9 @@ impl LoggingHandle {
         self.level.clone()
     }
 
-    /// Runtime control for the GUI's optional file destination.
-    ///
-    /// `None` in CLI mode, whose file destination is fixed at launch.
+    /// Control and loss count for the file destination: runtime on/off for the
+    /// GUI, read-only in effect for the CLI, whose destination is fixed at
+    /// launch. `None` when nothing is logged to a file.
     pub fn file_log_toggle(&self) -> Option<FileLogToggle> {
         self.file_log.clone()
     }
@@ -280,6 +280,29 @@ impl LoggingHandle {
 }
 
 // ── init ──────────────────────────────────────────────────────────────────────
+
+/// Start the file-log worker when there is something to write to: a file named
+/// in the configuration, or a GUI that may name one later.
+///
+/// An unwritable destination fails here, before anything runs, as the CLI has
+/// always done: the worker opens its file on its own thread and would otherwise
+/// report the failure only as a state nobody is watching.
+fn start_file_sink(
+    file: Option<&FileLogConfig>,
+    toggleable: bool,
+) -> anyhow::Result<Option<wiredata_log::FileSink>> {
+    if file.is_none() && !toggleable {
+        return Ok(None);
+    }
+    if let Some(file) = file {
+        drop(wiredata_log::open_rolling_file(&file.clone().into())?);
+    }
+    let sink = wiredata_log::spawn("Talker")?;
+    if let Some(file) = file {
+        sink.toggle.enable(file.clone())?;
+    }
+    Ok(Some(sink))
+}
 
 /// Install the global tracing subscriber.
 ///
@@ -325,28 +348,12 @@ pub fn init(
         );
     }
 
-    if !gui_mode {
-        if let Some(fc) = &config.file {
-            let appender = wiredata_log::open_rolling_file(&fc.clone().into())?;
-            let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-            guards.push(guard);
-            layers.push(
-                tracing_subscriber::fmt::layer()
-                    .with_ansi(false)
-                    .with_writer(non_blocking)
-                    .boxed(),
-            );
-        }
-    }
-
-    // The GUI may turn its file destination on and off after the subscriber is
-    // installed. Its layer is permanent, while the worker owns the optional
-    // file handle; no open, write, flush, or close runs on the UI/talker thread.
-    if gui_mode {
-        let sink = wiredata_log::spawn("Talker")?;
-        if let Some(config) = config.file.clone() {
-            sink.toggle.enable(config)?;
-        }
+    // One file path for both front ends: a worker thread behind a bounded,
+    // non-blocking handoff, which counts what it drops and writes a gap line
+    // after a loss (ADR-061). The GUI may turn its destination on and off after
+    // the subscriber is installed; the CLI's is fixed at launch. Either way no
+    // open, write, flush or close runs on a thread that logs.
+    if let Some(sink) = start_file_sink(config.file.as_ref(), gui_mode)? {
         layers.push(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -585,5 +592,69 @@ mod tests {
             serde_json::to_string(&Rotation::Daily).unwrap(),
             "\"daily\""
         );
+    }
+
+    /// The CLI's file destination is the shared worker, not a plain appender:
+    /// it has a toggle that reports state and loss, and its guard flushes what
+    /// was accepted. Loss itself is wiredata-log's to prove; this proves the
+    /// CLI configuration reaches it.
+    #[test]
+    fn a_cli_file_log_runs_through_the_loss_counting_worker() {
+        let directory =
+            std::env::temp_dir().join(format!("talker-cli-file-log-{}", std::process::id()));
+        let mut file = FileLogConfig::new(&directory);
+        file.prefix = "cli.log".into();
+        file.rotation = Rotation::Never;
+
+        let sink = start_file_sink(Some(&file), false)
+            .unwrap()
+            .expect("a configured file starts the worker without a GUI");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(
+            sink.toggle.state(),
+            wiredata_log::FileLogState::Enabled { .. }
+        ) {
+            assert!(std::time::Instant::now() < deadline, "worker never opened");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            sink.toggle.dropped_events(),
+            0,
+            "loss is counted, from zero"
+        );
+
+        let wiredata_log::FileSink { writer, guard, .. } = sink;
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(writer)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || tracing::info!("through the worker"));
+        drop(guard);
+
+        let saved = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(saved.contains("through the worker"), "{saved}");
+    }
+
+    #[test]
+    fn no_file_and_no_gui_starts_no_worker() {
+        assert!(start_file_sink(None, false).unwrap().is_none());
+        assert!(start_file_sink(None, true).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_unwritable_cli_log_destination_fails_at_start() {
+        let blocker = std::env::temp_dir().join(format!(
+            "talker-cli-file-log-blocker-{}",
+            std::process::id()
+        ));
+        std::fs::write(&blocker, b"a file where a folder is wanted").unwrap();
+        let file = FileLogConfig::new(blocker.join("logs"));
+        let result = start_file_sink(Some(&file), false);
+        let _ = std::fs::remove_file(&blocker);
+        assert!(result.is_err());
     }
 }
