@@ -29,8 +29,8 @@ use super::snapshot::{
     QueueDepth, RecordingStatus, StreamDelta,
 };
 use super::telemetry::{
-    ChunkShape, CounterAvailability, DurationHistogram, IdleDeadlineTimerMode,
-    IdleDeadlineTimerSummary, RecentDurationHistogram, SerialStallSummary, TransportHealth,
+    ChunkShape, CounterAvailability, DurationHistogram, RecentDurationHistogram,
+    SerialStallSummary, TransportHealth,
 };
 use crate::config::limits::{
     capacity_error, MAX_INGEST_CHUNKS, MAX_RECORDING_QUEUE_BYTES, MAX_UI_EVENTS,
@@ -50,8 +50,8 @@ use crate::display::{
 };
 use crate::record::file_rotation::next_period_start;
 use crate::record::{
-    start_recording, DisplaySegments, FileRotationPolicy, Finalized, OpenKind, OverwritePolicy,
-    RawSegments, RecorderReport, Recording, RecordingStopReason, SegmentPlan, StreamPos, Timings,
+    local_time, start_recording, DisplaySegments, FileRotationPolicy, Finalized, OpenKind,
+    OverwritePolicy, RawSegments, RecorderReport, Recording, SegmentPlan, StreamPos, Timings,
     DEFAULT_QUEUE_BUDGET,
 };
 use crate::transport::udp::SharedPortStatus;
@@ -319,10 +319,6 @@ pub struct ChannelPipeline {
     transport_health: TransportHealth,
     /// Reader-owned Serial stall truth. `None` for non-Serial transports.
     serial_stall_state: Option<SerialStallState>,
-    /// Idle-rule firing lateness against each rule's monotonic deadline.
-    rule_timer_lateness: DurationHistogram,
-    recent_rule_timer_lateness: RecentDurationHistogram,
-    idle_deadline_timer: IdleDeadlineTimerSummary,
     events: Option<Sender<RuntimeEvent>>,
     /// Compiled find/trigger rules (§50.2, §165); empty when none are configured.
     match_rules: MatchRuleSet,
@@ -431,6 +427,8 @@ pub struct DisplayRecordingSettings {
     /// The disk guard on this recording's destination (§56.2).
     pub disk_guard: Option<DiskGuard>,
     pub renderer: DisplayView,
+    /// Write a `‹GAP …›` line where the recording resumes after lost bytes.
+    pub mark_gaps: bool,
 }
 
 impl DisplayRecordingSettings {
@@ -486,9 +484,6 @@ impl ChannelPipeline {
             last_read_completed_at: None,
             transport_health: TransportHealth::default(),
             serial_stall_state: None,
-            rule_timer_lateness: DurationHistogram::default(),
-            recent_rule_timer_lateness: RecentDurationHistogram::default(),
-            idle_deadline_timer: IdleDeadlineTimerSummary::default(),
             events: None,
             match_rules: MatchRuleSet::compile(&[]),
             boundary_split_noted: false,
@@ -1092,10 +1087,6 @@ impl ChannelPipeline {
         let idle_for = now.saturating_duration_since(last);
         let fired = self.match_rules.evaluate_idle(idle_for);
         if !fired.is_empty() {
-            for lateness in fired.iter().filter_map(|rule| rule.timer_lateness) {
-                self.rule_timer_lateness.record(lateness);
-                self.recent_rule_timer_lateness.record_at(now, lateness);
-            }
             // Idle firings carry no byte offset, so they produce no inline Mark
             // timestamp (and no view offset); the returned annotations are empty.
             let _ = self.apply_fired_rules(fired, ChunkTime::now(), None, 0);
@@ -1189,7 +1180,7 @@ impl ChannelPipeline {
             // work without a channel restart). Drop it, then recreate.
             Some(_) => {
                 if let Some(recorder) = self.take_raw_recorder() {
-                    let finalized = recorder.finalize(RecordingStopReason::Disabled).await;
+                    let finalized = recorder.finalize().await;
                     self.note_recording_stop(RecordingTap::Raw, finalized, false);
                 }
             }
@@ -1236,7 +1227,7 @@ impl ChannelPipeline {
         self.begin_faulted = false;
         if let Some(recorder) = self.take_raw_recorder() {
             self.retiring.spawn(async move {
-                let finalized = recorder.finalize(RecordingStopReason::Disabled).await;
+                let finalized = recorder.finalize().await;
                 (RecordingTap::Raw, finalized, true)
             });
         }
@@ -1372,13 +1363,7 @@ impl ChannelPipeline {
             Some(_) => {
                 if let Some(rec) = self.take_display_recorder() {
                     let end = self.stream_pos_now();
-                    let finalized = finalize_view_recorder(
-                        self.channel_id,
-                        rec,
-                        RecordingStopReason::Disabled,
-                        end,
-                    )
-                    .await;
+                    let finalized = finalize_view_recorder(self.channel_id, rec, end).await;
                     self.note_recording_stop(RecordingTap::Display, finalized, false);
                 }
             }
@@ -1399,7 +1384,7 @@ impl ChannelPipeline {
             return;
         };
         let recording = start_recording(
-            DisplaySegments::new(settings.plan()),
+            DisplaySegments::new(settings.plan()).with_gap_marks(settings.mark_gaps),
             settings.queue_budget,
             Timings::default(),
         );
@@ -1420,9 +1405,7 @@ impl ChannelPipeline {
             let channel_id = self.channel_id;
             let end = self.stream_pos_now();
             self.retiring.spawn(async move {
-                let finalized =
-                    finalize_view_recorder(channel_id, rec, RecordingStopReason::Disabled, end)
-                        .await;
+                let finalized = finalize_view_recorder(channel_id, rec, end).await;
                 (RecordingTap::Display, finalized, true)
             });
         }
@@ -1776,7 +1759,7 @@ impl ChannelPipeline {
         // recording outcome before the final snapshot is taken (§56.1).
         self.drain_retiring().await;
         if let Some(recorder) = self.take_raw_recorder() {
-            let finalized = recorder.finalize(RecordingStopReason::ChannelStopped).await;
+            let finalized = recorder.finalize().await;
             self.note_recording_stop(RecordingTap::Raw, finalized, true);
         }
         let end = self.stream_pos_now();
@@ -1784,15 +1767,7 @@ impl ChannelPipeline {
         self.display_disk = DiskWatch::default();
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
-                display_stops.push(
-                    finalize_view_recorder(
-                        self.channel_id,
-                        rec,
-                        RecordingStopReason::ChannelStopped,
-                        end,
-                    )
-                    .await,
-                );
+                display_stops.push(finalize_view_recorder(self.channel_id, rec, end).await);
             }
         }
         for finalized in display_stops {
@@ -1895,9 +1870,6 @@ impl ChannelPipeline {
             recent_ingest_processing: self.recent_ingest_processing.snapshot_at(now),
             chunk_shape: self.chunk_shape,
             transport_health: self.transport_health_at(now),
-            rule_timer_lateness: self.rule_timer_lateness,
-            recent_rule_timer_lateness: self.recent_rule_timer_lateness.snapshot_at(now),
-            idle_deadline_timer: self.idle_deadline_timer,
             ingest_queue: self.ingest_queue(),
             raw_recording_queue: self.raw_recording_queue(),
         }
@@ -2016,9 +1988,6 @@ impl ChannelPipeline {
             recent_ingest_processing: self.recent_ingest_processing.snapshot_at(now),
             chunk_shape: self.chunk_shape,
             transport_health: self.transport_health_at(now),
-            rule_timer_lateness: self.rule_timer_lateness,
-            recent_rule_timer_lateness: self.recent_rule_timer_lateness.snapshot_at(now),
-            idle_deadline_timer: self.idle_deadline_timer,
             // The scrollback bytes are fetched incrementally (StreamDelta), not
             // bundled here — only the cursor target travels in the snapshot.
             stream_end_offset: self.stream_end_offset(),
@@ -2091,7 +2060,6 @@ impl ChannelPipeline {
 async fn finalize_view_recorder(
     channel_id: ChannelId,
     mut rec: ViewRecorder,
-    reason: RecordingStopReason,
     end: StreamPos,
 ) -> Finalized {
     let tail = rec.renderer.finish();
@@ -2105,7 +2073,7 @@ async fn finalize_view_recorder(
             end,
         );
     }
-    rec.recording.finalize(reason).await
+    rec.recording.finalize().await
 }
 
 /// How long a disk check may run before it is reported as failing (§56.2).
@@ -2207,13 +2175,6 @@ fn disk_has_recovered(free: u64, total: u64, threshold: DiskThreshold) -> bool {
     }
 }
 
-/// A wall-clock instant in local time, for gap records (§56.1).
-fn local_time(at: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Local>::from(at)
-        .format("%Y-%m-%d %H:%M:%S%.3f")
-        .to_string()
-}
-
 /// The async ingest loop for one Channel (§102, §110, §111).
 ///
 /// Drains the bounded Transport→Pipeline channel until cancelled or the sender
@@ -2298,8 +2259,7 @@ pub async fn run_channel(
             },
             _ = disk_check.tick() => pipeline.check_recording_disks(),
             _ = recorder_check.tick() => pipeline.poll_recorders(),
-            timer_mode = wait_for_idle_deadline(idle_deadline) => {
-                pipeline.idle_deadline_timer.record(timer_mode);
+            () = wait_for_idle_deadline(idle_deadline) => {
                 pipeline.evaluate_idle_rules(Instant::now());
                 pipeline.apply_pending_records().await;
                 // Recorders report from their own tasks; on a quiet stream a
@@ -2337,32 +2297,12 @@ pub async fn run_channel(
     pipeline
 }
 
-const IDLE_PRECISION_WINDOW: Duration = Duration::from_millis(32);
-
-async fn wait_for_idle_deadline(deadline: Option<Instant>) -> IdleDeadlineTimerMode {
+/// Wait until `deadline`, or forever when there is none. The caller drops and
+/// recomputes this future on every loop pass, so new data restarts the wait.
+async fn wait_for_idle_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => {
-            #[cfg(windows)]
-            {
-                let now = Instant::now();
-                let window_start = deadline.checked_sub(IDLE_PRECISION_WINDOW).unwrap_or(now);
-                if now < window_start {
-                    tokio::time::sleep_until(tokio::time::Instant::from_std(window_start)).await;
-                }
-                let guard = wiredata_timing::high_resolution();
-                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-                if guard.is_effective() {
-                    IdleDeadlineTimerMode::WindowsOneMillisecond
-                } else {
-                    IdleDeadlineTimerMode::WindowsRequestFailed
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = IDLE_PRECISION_WINDOW;
-                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-                IdleDeadlineTimerMode::NativeDeadlineWait
-            }
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
         }
         None => std::future::pending().await,
     }
@@ -2804,10 +2744,7 @@ mod tests {
             async fn flush(&mut self) -> Result<(), crate::core::RecordError> {
                 Ok(())
             }
-            async fn finalize(
-                &mut self,
-                _reason: RecordingStopReason,
-            ) -> Result<(), crate::core::RecordError> {
+            async fn finalize(&mut self) -> Result<(), crate::core::RecordError> {
                 Ok(())
             }
         }
@@ -3205,10 +3142,7 @@ mod tests {
             async fn flush(&mut self) -> Result<(), crate::core::RecordError> {
                 Ok(())
             }
-            async fn finalize(
-                &mut self,
-                _reason: RecordingStopReason,
-            ) -> Result<(), crate::core::RecordError> {
+            async fn finalize(&mut self) -> Result<(), crate::core::RecordError> {
                 Ok(())
             }
         }
@@ -3289,6 +3223,7 @@ mod tests {
             size_cap: DEFAULT_SIZE_CAP,
             disk_guard: impossible_guard(),
             renderer: DisplayView::default(),
+            mark_gaps: false,
         };
         p.set_display_recording(true, Some(settings)).await;
         settle_disks(&mut p, "the Display low-disk gap", |p| {
@@ -3821,12 +3756,10 @@ mod tests {
         p.ingest(bytes_chunk(cid, b"x"));
         p.evaluate_idle_rules(Instant::now() + Duration::from_secs(1));
         assert_eq!(p.snapshot().matches.len(), 2);
-        assert_eq!(p.snapshot().rule_timer_lateness.sample_count(), 2);
-        assert_eq!(p.snapshot().recent_rule_timer_lateness.sample_count(), 2);
     }
 
     #[test]
-    fn idle_rule_deadline_and_lateness_use_the_same_monotonic_anchor() {
+    fn idle_rule_deadline_and_firing_use_the_same_monotonic_anchor() {
         let cid = ChannelId::new();
         let base = Instant::now();
         let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[MatchRule {
@@ -3842,26 +3775,11 @@ mod tests {
             Some(base + Duration::from_millis(500))
         );
         p.evaluate_idle_rules(base + Duration::from_millis(620));
-        let timing = p.stats().rule_timer_lateness;
-        assert_eq!(timing.sample_count(), 1);
-        assert_eq!(timing.max(), Some(Duration::from_millis(120)));
+        assert_eq!(p.snapshot().matches.len(), 1);
         assert_eq!(
             p.next_idle_deadline(base + Duration::from_millis(700)),
             None
         );
-    }
-
-    #[tokio::test]
-    async fn idle_deadline_wait_reports_the_platform_timer_policy() {
-        let mode = wait_for_idle_deadline(Some(Instant::now() + Duration::from_millis(2))).await;
-        #[cfg(windows)]
-        assert!(matches!(
-            mode,
-            IdleDeadlineTimerMode::WindowsOneMillisecond
-                | IdleDeadlineTimerMode::WindowsRequestFailed
-        ));
-        #[cfg(not(windows))]
-        assert_eq!(mode, IdleDeadlineTimerMode::NativeDeadlineWait);
     }
 
     #[tokio::test]
@@ -3958,6 +3876,7 @@ mod tests {
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
                 renderer: DisplayView::default(),
+                mark_gaps: false,
                 disk_guard: None,
             });
 
@@ -4030,6 +3949,7 @@ mod tests {
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
                 renderer: DisplayView::default(),
+                mark_gaps: false,
                 disk_guard: None,
             });
 
@@ -4376,6 +4296,7 @@ mod tests {
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
             renderer: DisplayView::default(),
+            mark_gaps: false,
             disk_guard: None,
         };
         p.set_display_recording(true, Some(settings)).await;
@@ -4437,6 +4358,7 @@ mod tests {
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
             renderer: DisplayView::default(),
+            mark_gaps: false,
             disk_guard: None,
         };
         let mut p = pipeline(cid, PipelineCapacities::default());

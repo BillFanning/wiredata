@@ -10,6 +10,11 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-13) — one shape for received bytes:
+
+- **§138.** `ReceivedData.payload` is one byte vector. It was an enum of a
+  stream chunk and a datagram, which every reader treated the same way.
+
 Revision note (2026-11-13) — hover text and the diagnostics card:
 
 - **§3.2 Hover text (ADR-056).** Every hover that explains something opens

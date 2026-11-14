@@ -29,7 +29,7 @@ use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 use super::activity::ChannelActivity;
 use super::pipeline::{DisplayRecordingSettings, RawRecordingSettings};
 use super::run_summary::ListenerRunSummary;
-use super::telemetry::{ChunkShape, DurationHistogram, IdleDeadlineTimerSummary, TransportHealth};
+use super::telemetry::{ChunkShape, DurationHistogram, TransportHealth};
 
 /// A query the pipeline task answers from its current state, replying on a
 /// oneshot. Dropping the reply sender simply yields nothing.
@@ -207,12 +207,6 @@ pub struct ChannelStats {
     pub chunk_shape: ChunkShape,
     /// Transport-specific stall/loss counters with explicit support state.
     pub transport_health: TransportHealth,
-    /// Cumulative Idle-rule firing lateness against monotonic deadlines.
-    pub rule_timer_lateness: DurationHistogram,
-    /// Approximate last-ten-seconds view of [`Self::rule_timer_lateness`].
-    pub recent_rule_timer_lateness: DurationHistogram,
-    /// Platform timer mechanism used for completed Idle deadline waits.
-    pub idle_deadline_timer: IdleDeadlineTimerSummary,
     /// Depth of the Transport→Pipeline ingest queue (§99) — the edge that backpressures
     /// the reader. A rising `peak` is the first sign reception is outrunning processing.
     pub ingest_queue: QueueDepth,
@@ -281,12 +275,6 @@ pub struct ChannelSnapshot {
     pub chunk_shape: ChunkShape,
     /// Transport-specific stall/loss counters; see [`ChannelStats::transport_health`].
     pub transport_health: TransportHealth,
-    /// Idle-rule deadline lateness; see [`ChannelStats::rule_timer_lateness`].
-    pub rule_timer_lateness: DurationHistogram,
-    /// Recent deadline lateness; see [`ChannelStats::recent_rule_timer_lateness`].
-    pub recent_rule_timer_lateness: DurationHistogram,
-    /// Platform timer mechanism used for completed Idle deadline waits.
-    pub idle_deadline_timer: IdleDeadlineTimerSummary,
     /// Absolute stream offset just past the last received byte (§87): the total
     /// bytes accepted into the scrollback since Start. The live viewer uses this as
     /// its cursor target and fetches the bytes themselves incrementally via

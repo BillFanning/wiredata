@@ -1,14 +1,21 @@
-# Listener Specification v2.4.6
+# Listener Specification v2.4.7
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-13) — one shape for received bytes:
+Revision note (2026-11-13) — idle rules, reconnects and gap lines:
 
-- **§138.** `ReceivedData.payload` is one byte vector. It was an enum of a
-  stream chunk and a datagram, which every reader treated the same way.
+- **§50.2, §91, §126, §157 (ADR-030, amended).** Idle rules use an ordinary deadline
+  wait; the Windows 1 ms precision window, its lateness histograms and timer
+  counts are gone. A rule can fire up to about 16 ms late on Windows.
+- **§9.1 (ADR-058).** A fault within 60 s of a successful reconnect continues
+  the attempt count and backoff, so a flapping device reaches `max_attempts`.
+- **§54, §56, §56.1, §79, §142 (ADR-059).** A Display Recording marks a gap
+  that lost bytes with a `‹GAP …›` line where it resumes, under a new **Mark
+  gaps** option, on by default; Raw never. `RecordingStopReason` and the
+  `finalize` reason are gone: since ADR-043 a fault opens a gap instead.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -415,6 +422,14 @@ does **not** apply to TCP Connection Channels: the listener accepts connections
 and does not dial out (TCP client mode is deferred, Appendix A), so a dropped
 client simply ends. Each attempt emits a reconnect event (§137); after
 `max_attempts` (if set) the Channel remains Faulted.
+
+A successful reconnect does not end the sequence until the Channel has stayed
+up for 60 s (ADR-058). A fault within 60 s of a successful reconnect continues
+it: the next attempt number and the next backoff step, counted towards
+`max_attempts`. Only 60 s of staying up, or a manual stop, starts the count and
+the backoff over. A device that connects and drops repeatedly is therefore
+retried at a growing interval and gives up at `max_attempts`, instead of being
+retried at the shortest delay for ever.
 
 **In the GUI, reconnect is a visible, confirmed choice** (ADR-045):
 
@@ -1010,7 +1025,7 @@ enum MatchCondition {
 }
 ```
 
-`BytePattern` scans the live stream and matches **across receive-chunk boundaries**, however many reads a pattern spans: the runtime retains the newest bytes of the stream (the longest enabled pattern minus one byte, which may span several short reads) and scans them joined to each new chunk, reporting matches once. A match that only completes because of that carry — its first byte lay in an earlier chunk — is a **boundary split**: it is recovered (not lost), its firing anchors on the match's true start offset, and it is **measured** so an operator can see read boundaries splitting their patterns. Every boundary split increments a monotonic `match_boundary_saves` counter exposed in the Channel's stats and snapshot (*how often*). The first split of a run also records an event Diagnostic naming *where* (the stream offset) and *why* (the chunk-boundary split); later splits in that run are counted but not noted, so a pattern that straddles reads constantly cannot flood the log. `Idle` uses the per-Channel activity monitor (§166): it waits on the earliest exact monotonic deadline, fires once when the stream has been quiet for `timeout`, and re-arms when data resumes. Firing lateness is measured against that deadline. On Windows only, the final 32 ms of a completed Idle wait requests 1 ms timer resolution; Linux and macOS retain a native deadline wait. New data or cancellation abandons the pending wait and its guard without recording a firing. (The former `DecodedField` and `MessageSize` conditions are removed with the decoder/message infrastructure.)
+`BytePattern` scans the live stream and matches **across receive-chunk boundaries**, however many reads a pattern spans: the runtime retains the newest bytes of the stream (the longest enabled pattern minus one byte, which may span several short reads) and scans them joined to each new chunk, reporting matches once. A match that only completes because of that carry — its first byte lay in an earlier chunk — is a **boundary split**: it is recovered (not lost), its firing anchors on the match's true start offset, and it is **measured** so an operator can see read boundaries splitting their patterns. Every boundary split increments a monotonic `match_boundary_saves` counter exposed in the Channel's stats and snapshot (*how often*). The first split of a run also records an event Diagnostic naming *where* (the stream offset) and *why* (the chunk-boundary split); later splits in that run are counted but not noted, so a pattern that straddles reads constantly cannot flood the log. `Idle` uses the per-Channel activity monitor (§166): it waits on the earliest exact monotonic deadline, fires once when the stream has been quiet for `timeout`, and re-arms when data resumes. The wait is an ordinary deadline wait on every platform, so on Windows a rule can fire up to about 16 ms late (ADR-030, amended). New data or cancellation abandons the pending wait without recording a firing. (The former `DecodedField` and `MessageSize` conditions are removed with the decoder/message infrastructure.)
 
 **Actions:**
 
@@ -1056,7 +1071,7 @@ struct MatchRule {
 
 Rules are part of `ChannelConfig` (§72) as `match_rules: Vec<MatchRule>`.
 
-**Evaluation and constraints.** `BytePattern` rules evaluate as bytes arrive (the scanner keeps a carry of the newest `pattern.len() − 1` stream bytes, however many chunks they came from); `Idle` uses one recomputed earliest-deadline wait, not a periodic rule poll. Evaluation is bounded and shall not stall reception (§100). Timer resolution can tighten a deadline wake but cannot improve data-arrival timestamps or make Listener hard real-time (§126). One condition per rule; no cross-channel rules; no pre-trigger capture — all deferred.
+**Evaluation and constraints.** `BytePattern` rules evaluate as bytes arrive (the scanner keeps a carry of the newest `pattern.len() − 1` stream bytes, however many chunks they came from); `Idle` uses one recomputed earliest-deadline wait, not a periodic rule poll. Evaluation is bounded and shall not stall reception (§100). Listener is not hard real-time (§126). One condition per rule; no cross-channel rules; no pre-trigger capture — all deferred.
 
 ---
 
@@ -1126,6 +1141,14 @@ timestamping is the per-match Mark, §50.2.)
 A Display Recording is bound to one display view's configuration. Recording a
 different view requires a separate Display Recording.
 
+**Gap lines** (ADR-059). When recording resumes after a gap that lost bytes
+(§56.1), the new `.disp` segment starts with one line,
+`‹GAP <reason> · <start> to <end> · not recorded›`, where `<start>` is the first lost
+byte's arrival time and `<end>` the first resumed byte's, both local time with
+milliseconds. It is written only when bytes were actually lost, only with the
+recording's **Mark gaps** option on (the default, `mark_gaps`, §79), and never into a
+Raw Recording, which stays byte-exact (§53).
+
 ## 55. Recording Start Behavior
 
 Recording captures only data received while recording is Enabled. On enable:
@@ -1151,14 +1174,6 @@ A recording ends in three ways: user disable, Channel stop, or a finalization
 abandoned at shutdown (§113). A fault does not end it (§56.1). When it ends, data
 received after the stopping instant is not written, and the current segment is
 finalized (flushed and closed) with whatever was written.
-
-```rust
-enum RecordingStopReason {
-    Disabled,        // user disabled recording
-    ChannelStopped,  // channel left the Running state
-    ShutdownTimeout, // finalization abandoned at shutdown (§113)
-}
-```
 
 ### 56.1 Faults, Gaps and Segments (acquisition-priority tiebreak)
 
@@ -1190,7 +1205,8 @@ any state → Stopping → Off
   ends, and the reason. A recording that ends records manual stop or shutdown
   timeout the same way. Gap records go to the event log (§118) and to
   diagnostics (§93); `RecordingFaulted(ChannelId, RecordingTap)` (§137) is emitted
-  when a gap starts.
+  when a gap starts. A Display Recording also marks a gap that lost bytes with a
+  line in the segment it resumes in (§54).
 
 This is the explicit resolution of §5.6 (raw recording authoritative) versus
 §100 (reception highest priority): under sustained overload Listener preserves
@@ -1676,6 +1692,8 @@ struct DisplayRecordingConfig {        // §54 — the rendered view output (.di
     file_rotation: FileRotationPolicy, // §59; default None
     size_cap: Option<u64>,             // §59, as for Raw
     disk_guard: Option<DiskGuard>,     // §56.2, on the Display destination
+    mark_gaps: bool,                   // §54; default true — a ‹GAP …› line
+                                       //   where recording resumes after lost bytes
 }                                      // no timestamp field — the only display
                                        //   timestamp is the per-match Mark (§50.2)
 ```
@@ -1973,8 +1991,6 @@ spent without turning every chunk into an observer event:
   histogram. Chunk boundaries describe transport reads, never protocol messages.
 - **Queues:** exact observed Transport→Pipeline and Raw-recorder high-water marks plus
   capacities. The Raw peak survives recorder retirement so Stop does not erase it.
-- **Rules:** cumulative and recent Idle firing lateness plus completed wait counts by
-  native, successful Windows 1 ms, or failed Windows-request policy.
 - **Transport health:** completed Serial backpressure episode count/total/maximum plus
   any active episode's elapsed time, platform-explicit UDP kernel drop
   availability/count, and configured/observed arrival timestamp sources.
@@ -1996,7 +2012,7 @@ warning threshold still contribute when they complete.
 
 When a successfully opened Channel run ends, Listener retains one self-contained
 summary with exact bytes/chunks, diagnostics counts, queue peaks, bounded timing,
-timer policy, transport health, wall-clock start/finish, monotonic elapsed duration,
+transport health, wall-clock start/finish, monotonic elapsed duration,
 end reason, and build/platform facts. A complete final snapshot after a normal Serial
 retry-loop exit contains finalized, inactive stall totals. If a pipeline-task panic or
 shutdown grace limit prevents the final snapshot, the summary is marked incomplete
@@ -2514,8 +2530,8 @@ Listener does not guarantee:
 - Deterministic network latency
 
 Listener is a monitoring and analysis tool, not a hard real-time control system.
-Exact monotonic Idle deadlines and a Windows 1 ms timer-period request reduce one
-known wake-quantization source but cannot remove executor load or OS scheduling.
+Idle rules wait on exact monotonic deadlines, but a wake still depends on the OS
+timer tick, executor load and scheduling.
 Software receive timestamps likewise do not establish hardware or per-byte wire time.
 
 ---
@@ -2936,22 +2952,24 @@ pub trait RawRecorder {
     /// Append one received chunk exactly as received.
     async fn write_chunk(&mut self, chunk: &ReceivedData) -> Result<(), RecordError>;
     async fn flush(&mut self) -> Result<(), RecordError>;
-    /// Flush, close, and write the truncation marker (for faults).
-    async fn finalize(&mut self, reason: RecordingStopReason) -> Result<(), RecordError>;
+    /// Flush and close.
+    async fn finalize(&mut self) -> Result<(), RecordError>;
 }
 
 #[async_trait::async_trait]
 pub trait DisplayRecorder {
     async fn write_rendered(&mut self, output: &RenderedOutput) -> Result<(), RecordError>;
     async fn flush(&mut self) -> Result<(), RecordError>;
-    async fn finalize(&mut self, reason: RecordingStopReason) -> Result<(), RecordError>;
+    async fn finalize(&mut self) -> Result<(), RecordError>;
+    /// Write the gap line (§54) at the start of the segment that resumes after a
+    /// gap that lost bytes. Does nothing unless the recording marks gaps.
+    async fn mark_gap(&mut self, gap: &GapMark) -> Result<(), RecordError>;
 }
 ```
 
 Both implementations run as their own task draining a bounded queue (file I/O via
-`spawn_blocking` or `tokio::fs`, buffered — ADR-001, §97.1). Queue-full →
-transition to `Faulted` and call `finalize(Faulted(..))`; never block the
-producer (§56.1).
+`spawn_blocking` or `tokio::fs`, buffered — ADR-001, §97.1). A full queue opens a
+gap and recording continues in a new segment (§56.1); the producer never blocks.
 
 ## 143. Retention Store Trait
 
@@ -3134,10 +3152,10 @@ Raw Display shall show actual data only and shall not insert structure of its ow
 
 - Total bytes received (§25)
 - Rolling throughput and last-data time (§166)
-- Cumulative and recent handoff, ingest-processing, and Idle-lateness summaries
+- Cumulative and recent handoff and ingest-processing summaries
 - Chunk size/inter-read-gap shape and ingest/Raw-recorder queue peaks
 - Applicable completed Serial stall episode count/total/maximum plus separate active
-  elapsed time, UDP drop-counter, arrival-source, and Idle timer-policy facts
+  elapsed time, UDP drop-counter, and arrival-source facts
 - One retained completed-run summary with an on-click clipboard report
 
 Recording timestamps (§57), when enabled, use the per-chunk arrival time (§26).

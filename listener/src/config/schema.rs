@@ -380,6 +380,11 @@ pub struct DisplayRecordingConfig {
     /// Disk-space guard on the Display destination (§56.2); `None` = off.
     #[serde(default)]
     pub disk_guard: Option<DiskGuard>,
+    /// Write a `‹GAP …›` line in the file a recording resumes in after bytes were
+    /// lost (§56.1). On by default, so a profile saved before this option existed
+    /// gets the lines.
+    #[serde(default = "default_true")]
+    pub mark_gaps: bool,
 }
 
 impl DisplayRecordingConfig {
@@ -401,6 +406,7 @@ impl Default for DisplayRecordingConfig {
             file_rotation: FileRotationPolicy::Hourly,
             size_cap: None,
             disk_guard: None,
+            mark_gaps: true,
         }
     }
 }

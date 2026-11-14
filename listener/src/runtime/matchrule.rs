@@ -77,8 +77,6 @@ pub struct FiredRule {
     /// missed it. Always `false` for `Idle`. Drives the where/why/how-often
     /// measurement in the pipeline.
     pub boundary_split: bool,
-    /// Timer evaluation lateness for an `Idle` firing. `None` for byte matches.
-    pub timer_lateness: Option<Duration>,
 }
 
 /// A Channel's compiled Match Rules (§50.2). Owned by the pipeline.
@@ -237,7 +235,6 @@ impl MatchRuleSet {
                             match_offset: Some(self.carry_offset + match_start as u64),
                             match_len: pattern.len(),
                             boundary_split: true,
-                            timer_lateness: None,
                         });
                     }
                     start = match_start + 1;
@@ -256,7 +253,6 @@ impl MatchRuleSet {
                     match_offset: Some(chunk_offset + match_start as u64),
                     match_len: pattern.len(),
                     boundary_split: false,
-                    timer_lateness: None,
                 });
                 start = match_start + 1;
             }
@@ -304,9 +300,6 @@ impl MatchRuleSet {
                     match_offset: None,
                     match_len: 0,
                     boundary_split: false,
-                    timer_lateness: Some(
-                        idle_for.saturating_sub(Duration::from_millis(timeout_ms)),
-                    ),
                 });
             }
         }
@@ -571,7 +564,6 @@ mod tests {
         // At/over the timeout: fires once.
         let fired = set.evaluate_idle(Duration::from_millis(600));
         assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].timer_lateness, Some(Duration::from_millis(100)));
         assert_eq!(set.next_idle_wait(Duration::from_millis(600)), None);
         // Still quiet, already fired: latched, no repeat.
         assert!(set.evaluate_idle(Duration::from_millis(900)).is_empty());

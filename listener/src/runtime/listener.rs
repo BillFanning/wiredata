@@ -46,7 +46,7 @@ use super::snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, ReconnectProgress, StreamDelta,
 };
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
-use super::telemetry::{ChunkShape, DurationHistogram, IdleDeadlineTimerSummary, TransportHealth};
+use super::telemetry::{ChunkShape, DurationHistogram, TransportHealth};
 
 /// How many Display Views a Channel runs (§48): one per configured view, at
 /// least one (the pipeline's default view).
@@ -82,9 +82,6 @@ fn retained_snapshot(id: ChannelId, channel: &ManagedChannel) -> ChannelSnapshot
         recent_ingest_processing: channel.retained_recent_ingest_processing,
         chunk_shape: channel.retained_chunk_shape,
         transport_health: channel.retained_transport_health,
-        rule_timer_lateness: channel.retained_rule_timer_lateness,
-        recent_rule_timer_lateness: channel.retained_recent_rule_timer_lateness,
-        idle_deadline_timer: channel.retained_idle_deadline_timer,
         stream_end_offset: 0,
         ingest_queue: crate::runtime::QueueDepth::default(),
         raw_recording_queue: None,
@@ -124,9 +121,6 @@ fn retained_stats(channel: &ManagedChannel) -> ChannelStats {
         recent_ingest_processing: channel.retained_recent_ingest_processing,
         chunk_shape: channel.retained_chunk_shape,
         transport_health: channel.retained_transport_health,
-        rule_timer_lateness: channel.retained_rule_timer_lateness,
-        recent_rule_timer_lateness: channel.retained_recent_rule_timer_lateness,
-        idle_deadline_timer: channel.retained_idle_deadline_timer,
         ingest_queue: crate::runtime::QueueDepth::default(),
         raw_recording_queue: None,
         raw_recording_status: None,
@@ -178,6 +172,25 @@ struct ReconnectState {
     next_attempt_at: Instant,
     /// Whether `max_attempts` was exhausted (stop retrying, stay Faulted).
     gave_up: bool,
+}
+
+/// How long a reconnected Channel must stay up before its attempt count and
+/// backoff start over (§9.1). A device that connects and drops again within this
+/// window is still misbehaving: restarting at attempt 1 and the shortest delay
+/// would retry it at the fastest rate for ever and `max_attempts` would never
+/// apply. Only this much uptime counts as recovery.
+const RECONNECT_STABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// Where a reconnect sequence stood when an attempt succeeded, kept for
+/// [`RECONNECT_STABLE_AFTER`] so a quick fault continues it.
+#[derive(Clone, Copy)]
+struct ReconnectCarry {
+    /// Attempts made, the successful one included.
+    attempts: u32,
+    /// The backoff the next attempt would wait.
+    backoff: Duration,
+    /// When the reconnect succeeded.
+    reconnected_at: Instant,
 }
 
 /// Start anchors for one successfully opened run. Wall time is reportable;
@@ -321,6 +334,9 @@ pub struct ReconnectAttempt {
     id: ChannelId,
     attempt: u32,
     previous: ReconnectState,
+    /// The clock reading the attempt was issued at, so a success is timed on
+    /// the caller's clock.
+    now: Instant,
 }
 
 impl ReconnectAttempt {
@@ -370,6 +386,9 @@ struct ManagedChannel {
     /// Auto-reconnect backoff state (§9.1, §162); `Some` while a reconnect is
     /// pending for a faulted Channel with reconnect enabled.
     reconnect_state: Option<ReconnectState>,
+    /// The last successful reconnect, until the Channel has stayed up
+    /// [`RECONNECT_STABLE_AFTER`]. Any stop clears it.
+    reconnect_carry: Option<ReconnectCarry>,
     /// Diagnostics retained across runs and faults for this Channel (§88, within
     /// session): the last run's pipeline diagnostics (folded in at stop) plus any
     /// start-time fault that never ran a pipeline (e.g. a bind conflict). Served by
@@ -401,9 +420,6 @@ struct ManagedChannel {
     retained_recent_ingest_processing: DurationHistogram,
     retained_chunk_shape: ChunkShape,
     retained_transport_health: TransportHealth,
-    retained_rule_timer_lateness: DurationHistogram,
-    retained_recent_rule_timer_lateness: DurationHistogram,
-    retained_idle_deadline_timer: IdleDeadlineTimerSummary,
     /// Start anchors for the currently running Channel, if one opened successfully.
     active_run: Option<ActiveRun>,
     /// Newest completed run, retained across ordinary restarts.
@@ -586,6 +602,7 @@ impl Listener {
                 faulted: Arc::new(AtomicBool::new(false)),
                 serial_control: None,
                 reconnect_state: None,
+                reconnect_carry: None,
                 retained_diagnostics: Vec::new(),
                 retained_diagnostics_snapshot: Arc::new(DiagnosticsSnapshot::default()),
                 repeated_start_fault: None,
@@ -601,9 +618,6 @@ impl Listener {
                 retained_recent_ingest_processing: DurationHistogram::default(),
                 retained_chunk_shape: ChunkShape::default(),
                 retained_transport_health: TransportHealth::default(),
-                retained_rule_timer_lateness: DurationHistogram::default(),
-                retained_recent_rule_timer_lateness: DurationHistogram::default(),
-                retained_idle_deadline_timer: IdleDeadlineTimerSummary::default(),
                 active_run: None,
                 last_run_summary: None,
             },
@@ -631,6 +645,7 @@ impl Listener {
         if let Some(channel) = self.channels.get_mut(&id) {
             if !policy.enabled {
                 channel.reconnect_state = None;
+                channel.reconnect_carry = None;
             }
             channel.config.reconnect = policy;
         }
@@ -842,6 +857,7 @@ impl Listener {
                 queue_budget: self.caps.recording_queue_budget,
                 size_cap: display.size_cap(),
                 disk_guard: display.disk_guard,
+                mark_gaps: display.mark_gaps,
                 renderer,
             })
     }
@@ -1169,6 +1185,7 @@ impl Listener {
             channel.display_handles.clear();
             channel.serial_control = None;
             channel.reconnect_state = None;
+            channel.reconnect_carry = None;
             channel.state = ChannelState::Stopped;
             channel.faulted.store(false, Ordering::Relaxed);
             // Retain the final pipeline's diagnostics (its full log, including the
@@ -1191,9 +1208,6 @@ impl Listener {
                 channel.retained_recent_ingest_processing = snap.recent_ingest_processing;
                 channel.retained_chunk_shape = snap.chunk_shape;
                 channel.retained_transport_health = snap.transport_health;
-                channel.retained_rule_timer_lateness = snap.rule_timer_lateness;
-                channel.retained_recent_rule_timer_lateness = snap.recent_rule_timer_lateness;
-                channel.retained_idle_deadline_timer = snap.idle_deadline_timer;
                 channel.retained_diagnostics = snap.diagnostics.to_sorted_vec();
                 channel.repeated_start_fault = None;
                 // The stopped channel is polled at the same cadence as a live one,
@@ -1476,14 +1490,32 @@ impl Listener {
             match state {
                 // First observation of the fault: arm the backoff timer.
                 None => {
-                    let backoff = Duration::from_millis(policy.initial_backoff_ms);
+                    // A fault soon after a successful reconnect continues that
+                    // sequence; one after `RECONNECT_STABLE_AFTER` up starts over.
+                    let carry = self
+                        .channels
+                        .get_mut(&id)
+                        .and_then(|c| c.reconnect_carry.take())
+                        .filter(|c| {
+                            now.saturating_duration_since(c.reconnected_at) < RECONNECT_STABLE_AFTER
+                        });
+                    let (attempts, backoff) = match carry {
+                        Some(c) => (c.attempts, c.backoff),
+                        None => (0, Duration::from_millis(policy.initial_backoff_ms)),
+                    };
+                    let gave_up = policy.max_attempts.is_some_and(|max| attempts >= max);
+                    if gave_up {
+                        let _ = self
+                            .events_tx
+                            .try_send(RuntimeEvent::ChannelReconnectGaveUp(id));
+                    }
                     self.set_reconnect_state(
                         id,
                         ReconnectState {
-                            attempts: 0,
+                            attempts,
                             backoff,
                             next_attempt_at: now + backoff,
-                            gave_up: false,
+                            gave_up,
                         },
                     );
                 }
@@ -1513,6 +1545,7 @@ impl Listener {
                         id,
                         attempt,
                         previous: s,
+                        now,
                     });
                 }
             }
@@ -1529,18 +1562,28 @@ impl Listener {
             id,
             attempt,
             previous,
+            now,
         } = attempt;
-        if started {
-            let _ = self
-                .events_tx
-                .try_send(RuntimeEvent::ChannelReconnected(id));
-            return;
-        }
         let Some(policy) = self.channels.get(&id).map(|c| c.config.reconnect) else {
             return;
         };
         let next_ms = (previous.backoff.as_millis() as f64 * policy.multiplier) as u64;
         let backoff = Duration::from_millis(next_ms.min(policy.max_backoff_ms).max(1));
+        if started {
+            let _ = self
+                .events_tx
+                .try_send(RuntimeEvent::ChannelReconnected(id));
+            // Not yet proven stable: a fault within `RECONNECT_STABLE_AFTER`
+            // carries on from the next attempt and the next backoff step.
+            if let Some(channel) = self.channels.get_mut(&id) {
+                channel.reconnect_carry = Some(ReconnectCarry {
+                    attempts: attempt,
+                    backoff,
+                    reconnected_at: now,
+                });
+            }
+            return;
+        }
         // Decided here, not when the next backoff ends: status must not count
         // down to an attempt that will not be made.
         let gave_up = policy.max_attempts.is_some_and(|max| attempt >= max);
@@ -2622,6 +2665,178 @@ mod tests {
             }
         }
         assert_eq!(gave_up, 1, "one give-up notice");
+    }
+
+    /// A Running UDP Channel with reconnect on, and a driver step that
+    /// reconnects it at `at`: fault it, arm, wait out the backoff, stop, start.
+    /// Returns the attempt number made. Time is supplied, so nothing waits.
+    async fn drop_and_reconnect(
+        listener: &mut Listener,
+        id: ChannelId,
+        fault_seen: Instant,
+        due_at: Instant,
+    ) -> u32 {
+        listener
+            .channels
+            .get(&id)
+            .unwrap()
+            .faulted
+            .store(true, Ordering::Relaxed);
+        assert!(
+            listener.reconnects_due(fault_seen, |_| false).is_empty(),
+            "the first look only arms the backoff"
+        );
+        let due = listener
+            .reconnects_due(due_at, |_| false)
+            .pop()
+            .expect("an attempt is due");
+        let attempt = due.attempt;
+        let _ = listener.stop(id).await;
+        let started = listener.start(id).await.is_ok();
+        listener.finish_reconnect(due, started);
+        assert!(started);
+        attempt
+    }
+
+    fn quick_policy(max_attempts: Option<u32>) -> crate::config::ReconnectPolicy {
+        crate::config::ReconnectPolicy {
+            enabled: true,
+            initial_backoff_ms: 1_000,
+            max_backoff_ms: 60_000,
+            multiplier: 2.0,
+            max_attempts,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fault_soon_after_a_reconnect_continues_the_count_and_backoff() {
+        // §9.1: a Channel that comes back and drops within 60 s is still
+        // misbehaving; the next attempt is number 2 after a wait of the
+        // next backoff step, not attempt 1 after the initial delay.
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let mut config = udp_channel();
+        config.reconnect = quick_policy(None);
+        let id = listener.add_channel(config);
+        listener.start(id).await.unwrap();
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+
+        assert_eq!(
+            drop_and_reconnect(&mut listener, id, at(0), at(10)).await,
+            1
+        );
+        // Back up at 10 s, down again at 40 s (30 s up): continue.
+        listener
+            .channels
+            .get(&id)
+            .unwrap()
+            .faulted
+            .store(true, Ordering::Relaxed);
+        assert!(listener.reconnects_due(at(40), |_| false).is_empty());
+        assert!(
+            listener.reconnects_due(at(41), |_| false).is_empty(),
+            "the initial 1 s delay must not apply: the next step is 2 s"
+        );
+        let due = listener.reconnects_due(at(42), |_| false).pop().unwrap();
+        assert_eq!(due.attempt, 2);
+        let _ = listener.stop(id).await;
+    }
+
+    #[tokio::test]
+    async fn a_fault_after_a_minute_up_starts_the_sequence_over() {
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let mut config = udp_channel();
+        config.reconnect = quick_policy(None);
+        let id = listener.add_channel(config);
+        listener.start(id).await.unwrap();
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+
+        assert_eq!(
+            drop_and_reconnect(&mut listener, id, at(0), at(10)).await,
+            1
+        );
+        // Reconnected at 10 s; a fault at 70 s is exactly 60 s later.
+        listener
+            .channels
+            .get(&id)
+            .unwrap()
+            .faulted
+            .store(true, Ordering::Relaxed);
+        assert!(listener.reconnects_due(at(70), |_| false).is_empty());
+        let due = listener.reconnects_due(at(71), |_| false).pop().unwrap();
+        assert_eq!(due.attempt, 1, "fresh: attempt 1 after the initial 1 s");
+        let _ = listener.stop(id).await;
+    }
+
+    #[tokio::test]
+    async fn a_device_that_keeps_dropping_quickly_reaches_max_attempts() {
+        let mut listener = Listener::with_default_capacities();
+        let mut events = listener.take_events().unwrap();
+        let mut config = udp_channel();
+        config.reconnect = quick_policy(Some(2));
+        let id = listener.add_channel(config);
+        listener.start(id).await.unwrap();
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+
+        assert_eq!(
+            drop_and_reconnect(&mut listener, id, at(0), at(10)).await,
+            1
+        );
+        assert_eq!(
+            drop_and_reconnect(&mut listener, id, at(20), at(30)).await,
+            2
+        );
+        // The third drop, 10 s after the second reconnect: no attempt 3.
+        listener
+            .channels
+            .get(&id)
+            .unwrap()
+            .faulted
+            .store(true, Ordering::Relaxed);
+        assert!(listener.reconnects_due(at(40), |_| false).is_empty());
+        assert!(listener.reconnect_exhausted(id));
+        assert_eq!(
+            listener.channel_stats(id).await.unwrap().reconnect,
+            Some(ReconnectProgress::GaveUp { attempts: 2 })
+        );
+        assert!(listener.reconnects_due(at(4_000), |_| false).is_empty());
+        let mut gave_up = 0;
+        while let Ok(event) = events.try_recv() {
+            if event == RuntimeEvent::ChannelReconnectGaveUp(id) {
+                gave_up += 1;
+            }
+        }
+        assert_eq!(gave_up, 1, "one give-up notice");
+        let _ = listener.stop(id).await;
+    }
+
+    #[tokio::test]
+    async fn a_manual_stop_forgets_the_reconnect_sequence() {
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let mut config = udp_channel();
+        config.reconnect = quick_policy(None);
+        let id = listener.add_channel(config);
+        listener.start(id).await.unwrap();
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+
+        assert_eq!(
+            drop_and_reconnect(&mut listener, id, at(0), at(10)).await,
+            1
+        );
+        listener.stop(id).await.unwrap();
+        listener.start(id).await.unwrap();
+        assert_eq!(
+            drop_and_reconnect(&mut listener, id, at(20), at(30)).await,
+            1,
+            "an operator's stop and start begins a new sequence"
+        );
+        listener.stop(id).await.unwrap();
     }
 
     #[tokio::test]

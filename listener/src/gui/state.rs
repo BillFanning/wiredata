@@ -116,9 +116,6 @@ pub struct ChannelView {
     pub recent_ingest_processing: crate::runtime::DurationHistogram,
     pub chunk_shape: crate::runtime::ChunkShape,
     pub transport_health: crate::runtime::TransportHealth,
-    pub rule_timer_lateness: crate::runtime::DurationHistogram,
-    pub recent_rule_timer_lateness: crate::runtime::DurationHistogram,
-    pub idle_deadline_timer: crate::runtime::IdleDeadlineTimerSummary,
     pub ingest_queue: crate::runtime::QueueDepth,
     pub raw_recording_queue: Option<crate::runtime::QueueDepth>,
     /// What status shows about each running recording (§56.2), including its
@@ -189,9 +186,6 @@ impl ChannelView {
             recent_ingest_processing: crate::runtime::DurationHistogram::default(),
             chunk_shape: crate::runtime::ChunkShape::default(),
             transport_health: crate::runtime::TransportHealth::default(),
-            rule_timer_lateness: crate::runtime::DurationHistogram::default(),
-            recent_rule_timer_lateness: crate::runtime::DurationHistogram::default(),
-            idle_deadline_timer: crate::runtime::IdleDeadlineTimerSummary::default(),
             ingest_queue: crate::runtime::QueueDepth::default(),
             raw_recording_queue: None,
             raw_recording_status: None,
@@ -536,9 +530,6 @@ impl AppState {
                     view.recent_ingest_processing = snapshot.recent_ingest_processing;
                     view.chunk_shape = snapshot.chunk_shape;
                     view.transport_health = snapshot.transport_health;
-                    view.rule_timer_lateness = snapshot.rule_timer_lateness;
-                    view.recent_rule_timer_lateness = snapshot.recent_rule_timer_lateness;
-                    view.idle_deadline_timer = snapshot.idle_deadline_timer;
                     view.ingest_queue = snapshot.ingest_queue;
                     view.raw_recording_queue = snapshot.raw_recording_queue;
                     view.raw_recording_status = snapshot.raw_recording_status.clone();
@@ -570,9 +561,6 @@ impl AppState {
                     view.recent_ingest_processing = stats.recent_ingest_processing;
                     view.chunk_shape = stats.chunk_shape;
                     view.transport_health = stats.transport_health;
-                    view.rule_timer_lateness = stats.rule_timer_lateness;
-                    view.recent_rule_timer_lateness = stats.recent_rule_timer_lateness;
-                    view.idle_deadline_timer = stats.idle_deadline_timer;
                     view.ingest_queue = stats.ingest_queue;
                     view.raw_recording_queue = stats.raw_recording_queue;
                     view.raw_recording_status = stats.raw_recording_status.clone();
@@ -694,9 +682,6 @@ impl AppState {
                     view.recent_ingest_processing = crate::runtime::DurationHistogram::default();
                     view.chunk_shape = crate::runtime::ChunkShape::default();
                     view.transport_health = crate::runtime::TransportHealth::default();
-                    view.rule_timer_lateness = crate::runtime::DurationHistogram::default();
-                    view.recent_rule_timer_lateness = crate::runtime::DurationHistogram::default();
-                    view.idle_deadline_timer = crate::runtime::IdleDeadlineTimerSummary::default();
                 }
             }
             RuntimeEvent::ChannelStopped(id) => {
@@ -729,9 +714,6 @@ impl AppState {
                     view.recent_ingest_processing = crate::runtime::DurationHistogram::default();
                     view.chunk_shape = crate::runtime::ChunkShape::default();
                     view.transport_health = crate::runtime::TransportHealth::default();
-                    view.rule_timer_lateness = crate::runtime::DurationHistogram::default();
-                    view.recent_rule_timer_lateness = crate::runtime::DurationHistogram::default();
-                    view.idle_deadline_timer = crate::runtime::IdleDeadlineTimerSummary::default();
                 }
             }
             RuntimeEvent::ChannelReconnectGaveUp(id) => self.set_status(id, ChannelStatus::Faulted),
@@ -937,9 +919,6 @@ mod tests {
             recent_ingest_processing: crate::runtime::DurationHistogram::default(),
             chunk_shape: crate::runtime::ChunkShape::default(),
             transport_health: crate::runtime::TransportHealth::default(),
-            rule_timer_lateness: crate::runtime::DurationHistogram::default(),
-            recent_rule_timer_lateness: crate::runtime::DurationHistogram::default(),
-            idle_deadline_timer: crate::runtime::IdleDeadlineTimerSummary::default(),
             stream_end_offset: total_bytes,
             ingest_queue: crate::runtime::QueueDepth::default(),
             raw_recording_queue: None,
@@ -1036,12 +1015,6 @@ mod tests {
             max: std::time::Duration::from_millis(8),
             active_for: None,
         });
-        snapshot
-            .rule_timer_lateness
-            .record(std::time::Duration::from_millis(3));
-        snapshot
-            .recent_rule_timer_lateness
-            .record(std::time::Duration::from_millis(3));
 
         state.apply(UiUpdate::Snapshot(id, Box::new(snapshot)));
         let view = state.channel(id).unwrap();
@@ -1050,8 +1023,6 @@ mod tests {
         assert_eq!(view.recent_ingest_processing.sample_count(), 1);
         assert_eq!(view.chunk_shape.chunk_count(), 1);
         assert_eq!(view.transport_health.serial_stalls.unwrap().episodes, 1);
-        assert_eq!(view.rule_timer_lateness.sample_count(), 1);
-        assert_eq!(view.recent_rule_timer_lateness.sample_count(), 1);
 
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelStopped(id)));
         let view = state.channel(id).unwrap();
@@ -1064,8 +1035,6 @@ mod tests {
         assert_eq!(view.recent_ingest_processing.sample_count(), 1);
         assert_eq!(view.chunk_shape.chunk_count(), 1);
         assert_eq!(view.transport_health.serial_stalls.unwrap().episodes, 1);
-        assert_eq!(view.rule_timer_lateness.sample_count(), 1);
-        assert_eq!(view.recent_rule_timer_lateness.sample_count(), 1);
 
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
         let view = state.channel(id).unwrap();
@@ -1077,8 +1046,6 @@ mod tests {
             view.transport_health,
             crate::runtime::TransportHealth::default()
         );
-        assert_eq!(view.rule_timer_lateness.sample_count(), 0);
-        assert_eq!(view.recent_rule_timer_lateness.sample_count(), 0);
     }
 
     #[test]
@@ -1135,9 +1102,6 @@ mod tests {
                 recent_ingest_processing: crate::runtime::DurationHistogram::default(),
                 chunk_shape: crate::runtime::ChunkShape::default(),
                 transport_health: crate::runtime::TransportHealth::default(),
-                rule_timer_lateness: crate::runtime::DurationHistogram::default(),
-                recent_rule_timer_lateness: crate::runtime::DurationHistogram::default(),
-                idle_deadline_timer: crate::runtime::IdleDeadlineTimerSummary::default(),
                 ingest_queue: crate::runtime::QueueDepth::default(),
                 raw_recording_queue: None,
                 raw_recording_status: None,

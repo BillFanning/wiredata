@@ -288,6 +288,7 @@ async fn talker_input_gets_zda_in_live_mark_and_disp_but_never_raw() {
         file_rotation: FileRotationPolicy::None,
         size_cap: None,
         disk_guard: None,
+        mark_gaps: true,
     };
 
     let mut listener = Listener::with_default_capacities();
@@ -642,6 +643,7 @@ async fn set_display_recording_toggles_display_recording_live_through_the_orches
         file_rotation: FileRotationPolicy::None,
         size_cap: None,
         disk_guard: None,
+        mark_gaps: true,
     };
 
     let mut listener = Listener::with_default_capacities();
@@ -740,6 +742,7 @@ async fn raw_and_display_recording_run_to_independent_destinations() {
         file_rotation: FileRotationPolicy::None,
         size_cap: None,
         disk_guard: None,
+        mark_gaps: true,
     };
 
     let mut listener = Listener::with_default_capacities();

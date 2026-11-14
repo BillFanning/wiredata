@@ -171,29 +171,6 @@ const UDP_AVAILABLE_TOOLTIP: Hover = Hover::new(
      Zero means that no nonzero update has reached this display. It does not mean that no \
      packets were lost here or elsewhere.",
 );
-const IDLE_RULE_TIMING_TOOLTIP: Hover = Hover::new(
-    "How late each Idle rule fired after its no-data deadline.\n\n\
-     The worst firing is shown with the number of firings behind it. Where it differs, a figure \
-     such as \"99% ≤ 2 ms\" means that at least 99 of every 100 measured firings were no more \
-     than about 2 ms late.\n\n\
-     Lateness can include the operating system's delay in waking Listener, competition for the \
-     processor, and time Listener spent on requests, on processing input, or on recording before \
-     it checked the rule.\n\n\
-     It does not measure the accuracy of wall-clock time or of when data was received.",
-);
-const IDLE_TIMER_TOOLTIP: Hover = Hover::new(
-    "How many times Listener woke at an Idle rule's no-data deadline, and how it waited.\n\n\
-     Only completed wakes are counted, not every wait that was started. A wait that was \
-     restarted by new input or by other channel work is not counted. One completed wake can fire \
-     several rules.\n\n\
-     On Windows, Listener asks for 1 ms timer resolution only during the final 32 ms before a \
-     deadline. 1 ms effective counts wakes where the request worked. 1 ms unavailable counts \
-     completed wakes where it did not, which is not necessarily the same as the number of failed \
-     requests to Windows.\n\n\
-     Linux and macOS use the system's own precise waits, shown as native deadline wakes.\n\n\
-     Compare unavailable wakes with the measured lateness. Unavailable wakes alone are not proof \
-     that a rule fired late.",
-);
 const INGEST_QUEUE_TOOLTIP: Hover = Hover::new(
     "How many received blocks were waiting in the Ingest queue.\n\n\
      Last sample is the number of blocks in the queue, counting the one just taken, at the \
@@ -755,41 +732,6 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
         }
     }
 
-    let has_idle_rule = view.config.match_rules.iter().any(|rule| {
-        rule.enabled && matches!(rule.condition, crate::config::MatchCondition::Idle { .. })
-    });
-    let cumulative_rule_timing = view.rule_timer_lateness;
-    let recent_rule_timing = view.recent_rule_timer_lateness;
-    if has_idle_rule || cumulative_rule_timing.sample_count() > 0 {
-        let text = detail_timing(
-            "Idle rule lateness",
-            "firing",
-            cumulative_rule_timing,
-            recent_rule_timing,
-            window,
-        );
-        ui.label(egui::RichText::new(text).weak())
-            .on_hover(&IDLE_RULE_TIMING_TOOLTIP);
-        let timer = view.idle_deadline_timer;
-        let timer_text = if cfg!(windows) {
-            format!(
-                "Idle timer: completed wakes {} · 1 ms effective {} · 1 ms unavailable {}",
-                timer
-                    .windows_one_millisecond_waits
-                    .saturating_add(timer.windows_request_failures),
-                timer.windows_one_millisecond_waits,
-                timer.windows_request_failures,
-            )
-        } else {
-            format!(
-                "Idle timer: completed native deadline wakes {}",
-                timer.native_waits
-            )
-        };
-        ui.label(egui::RichText::new(timer_text).weak())
-            .on_hover(&IDLE_TIMER_TOOLTIP);
-    }
-
     let ingest = view.ingest_queue;
     let ingest_text = if ingest.capacity == 0 {
         "Ingest pressure: awaiting first block".to_owned()
@@ -876,12 +818,11 @@ mod tests {
         compact_timing, counted, detail_timing, pressure_signal, queue_level_reaches_half,
         receive_buffer_words, shared_port_words, size_figures, timing_figures, timing_window,
         transport_signal, ChannelStatus, ReceiveBuffer, SharedPortStatus,
-        ARRIVAL_TIMESTAMP_TOOLTIP, CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP, IDLE_RULE_TIMING_TOOLTIP,
-        IDLE_TIMER_TOOLTIP, INGEST_QUEUE_TOOLTIP, PIPELINE_TOOLTIP, PRESSURE_TOOLTIP,
-        PROCESSING_TOOLTIP, RAW_QUEUE_ACTIVE_TOOLTIP, RAW_QUEUE_FAULTED_TOOLTIP,
-        RAW_QUEUE_GAP_TOOLTIP, RAW_QUEUE_RETAINED_TOOLTIP, RECEIVE_BUFFER_TOOLTIP,
-        RECEIVE_DETAILS_TOOLTIP, SERIAL_BACKPRESSURE_TOOLTIP, SHARED_PORT_TOOLTIP,
-        TRANSPORT_TOOLTIP, UDP_AVAILABLE_TOOLTIP, UDP_DROP_CALLOUT_TOOLTIP,
+        ARRIVAL_TIMESTAMP_TOOLTIP, CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP, INGEST_QUEUE_TOOLTIP,
+        PIPELINE_TOOLTIP, PRESSURE_TOOLTIP, PROCESSING_TOOLTIP, RAW_QUEUE_ACTIVE_TOOLTIP,
+        RAW_QUEUE_FAULTED_TOOLTIP, RAW_QUEUE_GAP_TOOLTIP, RAW_QUEUE_RETAINED_TOOLTIP,
+        RECEIVE_BUFFER_TOOLTIP, RECEIVE_DETAILS_TOOLTIP, SERIAL_BACKPRESSURE_TOOLTIP,
+        SHARED_PORT_TOOLTIP, TRANSPORT_TOOLTIP, UDP_AVAILABLE_TOOLTIP, UDP_DROP_CALLOUT_TOOLTIP,
         UDP_NOT_APPLICABLE_TOOLTIP, UDP_UNAVAILABLE_TOOLTIP,
     };
     use crate::core::RecordingState;
@@ -1067,18 +1008,6 @@ mod tests {
         assert!(SERIAL_BACKPRESSURE_TOOLTIP
             .text()
             .contains("advisory and can be lost"));
-        assert!(IDLE_RULE_TIMING_TOOLTIP
-            .text()
-            .contains("competition for the processor"));
-        assert!(IDLE_RULE_TIMING_TOOLTIP
-            .text()
-            .contains("or on recording before it checked the rule"));
-        assert!(IDLE_TIMER_TOOLTIP
-            .text()
-            .contains("Only completed wakes are counted"));
-        assert!(IDLE_TIMER_TOOLTIP
-            .text()
-            .contains("One completed wake can fire several rules"));
         assert!(CHUNK_SHAPE_TOOLTIP.text().contains("full channel run"));
         assert!(CHUNK_SHAPE_TOOLTIP
             .text()
@@ -1122,8 +1051,6 @@ mod tests {
             &UDP_NOT_APPLICABLE_TOOLTIP,
             &UDP_UNAVAILABLE_TOOLTIP,
             &UDP_AVAILABLE_TOOLTIP,
-            &IDLE_RULE_TIMING_TOOLTIP,
-            &IDLE_TIMER_TOOLTIP,
             &INGEST_QUEUE_TOOLTIP,
             &RAW_QUEUE_ACTIVE_TOOLTIP,
             &RAW_QUEUE_GAP_TOOLTIP,
@@ -1218,7 +1145,6 @@ mod tests {
     fn detail_timing_pairs_the_recent_window_with_the_whole_run() {
         let empty = DurationHistogram::default();
         let run = histogram(40, Duration::from_millis(5));
-        let recent = histogram(7, Duration::from_millis(5));
         let worst = compact_duration(Duration::from_millis(5));
 
         assert_eq!(
@@ -1230,14 +1156,6 @@ mod tests {
             format!(
                 "Handoff timing: no chunks in ~final 10 s · worst {worst} of 40 chunks this run"
             )
-        );
-        assert_eq!(
-            detail_timing("Idle rule lateness", "firing", run, recent, "~last 10 s"),
-            format!(
-                "Idle rule lateness (~last 10 s): worst {worst} of 7 firings · \
-                 worst {worst} of 40 firings this run"
-            ),
-            "the noun follows the measurement, not the transport"
         );
     }
 
@@ -1314,7 +1232,6 @@ mod tests {
         for hover in [
             PIPELINE_TOOLTIP,
             RECEIVE_DETAILS_TOOLTIP,
-            IDLE_RULE_TIMING_TOOLTIP,
             CHUNK_SHAPE_TOOLTIP,
             HANDOFF_TOOLTIP,
             PROCESSING_TOOLTIP,

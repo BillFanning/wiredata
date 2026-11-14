@@ -78,15 +78,33 @@ pub fn effective_overwrite(
     }
 }
 
-/// Why a segment is being finalized (§56).
-#[derive(Debug)]
-pub enum RecordingStopReason {
-    /// The user disabled recording.
-    Disabled,
-    /// The Channel left the Running state, or the segment reached a boundary.
-    ChannelStopped,
-    /// A fault occurred; the segment ends at its truncation point (§56.1).
-    Faulted(RecordError),
+/// A gap that lost bytes, as the first segment after it learns of it: why, and
+/// where the lost stream began and where recording resumed (§56.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GapMark {
+    pub reason: GapReason,
+    pub start: StreamPos,
+    pub end: StreamPos,
+}
+
+impl GapMark {
+    /// The line a Display recording carries where it resumed: one line, ended by
+    /// a newline, in the style of the `‹MARK …›` lines.
+    pub fn display_line(&self) -> String {
+        format!(
+            "\u{2039}GAP {} \u{b7} {} to {} \u{b7} not recorded\u{203a}\n",
+            self.reason.describe(),
+            local_time(self.start.at),
+            local_time(self.end.at)
+        )
+    }
+}
+
+/// A wall-clock instant in local time, to the millisecond, for gap records.
+pub fn local_time(at: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(at)
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
 }
 
 /// Writes received chunks verbatim, exactly as received (§53, §142).
@@ -95,8 +113,8 @@ pub trait RawRecorder: Send {
     /// Append one received chunk verbatim, exactly as received.
     async fn write_chunk(&mut self, chunk: &ReceivedData) -> Result<(), RecordError>;
     async fn flush(&mut self) -> Result<(), RecordError>;
-    /// Flush, close, and (for faults) note the truncation point (§56.1).
-    async fn finalize(&mut self, reason: RecordingStopReason) -> Result<(), RecordError>;
+    /// Flush and close.
+    async fn finalize(&mut self) -> Result<(), RecordError>;
     /// Bytes in the file now, for the size cap (§59). Zero when unknown.
     fn written_len(&self) -> u64 {
         0
@@ -116,7 +134,7 @@ pub trait RawRecorder: Send {
 pub trait DisplayRecorder: Send {
     async fn write_rendered(&mut self, output: &RenderedOutput) -> Result<(), RecordError>;
     async fn flush(&mut self) -> Result<(), RecordError>;
-    async fn finalize(&mut self, reason: RecordingStopReason) -> Result<(), RecordError>;
+    async fn finalize(&mut self) -> Result<(), RecordError>;
     /// Bytes in the file now, for the size cap (§59). Zero when unknown.
     fn written_len(&self) -> u64 {
         0
@@ -124,6 +142,11 @@ pub trait DisplayRecorder: Send {
     /// The file being written, for reports.
     fn file_path(&self) -> Option<&Path> {
         None
+    }
+    /// Note, in the file a recording resumed in, where it was not recorded
+    /// before (§56.1). Does nothing unless the recorder writes gap marks.
+    async fn mark_gap(&mut self, _gap: &GapMark) -> Result<(), RecordError> {
+        Ok(())
     }
 }
 
@@ -133,7 +156,13 @@ pub trait DisplayRecorder: Send {
 pub trait RecorderWriter<I: Send>: Send {
     async fn write(&mut self, item: &I) -> Result<(), RecordError>;
     async fn flush(&mut self) -> Result<(), RecordError>;
-    async fn finalize(&mut self, reason: RecordingStopReason) -> Result<(), RecordError>;
+    /// Called once, on the first segment after a gap that lost bytes, before
+    /// the item the recording resumed with. Raw writers leave it a no-op: a
+    /// `.raw` is exactly the bytes received (§53).
+    async fn mark_gap(&mut self, _gap: &GapMark) -> Result<(), RecordError> {
+        Ok(())
+    }
+    async fn finalize(&mut self) -> Result<(), RecordError>;
     /// Bytes in the file now, for the size cap (§59).
     fn bytes_written(&self) -> u64 {
         0
@@ -156,8 +185,8 @@ impl<R: RawRecorder> RecorderWriter<Arc<ReceivedData>> for R {
     async fn flush(&mut self) -> Result<(), RecordError> {
         RawRecorder::flush(self).await
     }
-    async fn finalize(&mut self, reason: RecordingStopReason) -> Result<(), RecordError> {
-        RawRecorder::finalize(self, reason).await
+    async fn finalize(&mut self) -> Result<(), RecordError> {
+        RawRecorder::finalize(self).await
     }
     fn bytes_written(&self) -> u64 {
         self.written_len()
@@ -178,8 +207,11 @@ impl<R: DisplayRecorder> RecorderWriter<RenderedOutput> for R {
     async fn flush(&mut self) -> Result<(), RecordError> {
         DisplayRecorder::flush(self).await
     }
-    async fn finalize(&mut self, reason: RecordingStopReason) -> Result<(), RecordError> {
-        DisplayRecorder::finalize(self, reason).await
+    async fn finalize(&mut self) -> Result<(), RecordError> {
+        DisplayRecorder::finalize(self).await
+    }
+    async fn mark_gap(&mut self, gap: &GapMark) -> Result<(), RecordError> {
+        DisplayRecorder::mark_gap(self, gap).await
     }
     fn bytes_written(&self) -> u64 {
         self.written_len()
@@ -281,7 +313,7 @@ mod tests {
         async fn flush(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
-        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+        async fn finalize(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
     }
@@ -334,7 +366,7 @@ mod tests {
         async fn flush(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
-        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+        async fn finalize(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
     }
@@ -347,7 +379,7 @@ mod tests {
         let mut recording = start_raw_recording(SecondWriteFails::default(), DEFAULT_QUEUE_BUDGET);
         recording.try_record(chunk(b"one"), pos(0));
         recording.try_record(chunk(b"two"), pos(3)); // this write fails
-        let finalized = recording.finalize(RecordingStopReason::Disabled).await;
+        let finalized = recording.finalize().await;
         assert!(
             finalized
                 .fault
@@ -372,7 +404,7 @@ mod tests {
         async fn flush(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
-        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+        async fn finalize(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
     }
@@ -381,7 +413,7 @@ mod tests {
     async fn a_clean_stop_reports_no_fault() {
         let mut recording = start_raw_recording(CountingRecorder::default(), DEFAULT_QUEUE_BUDGET);
         recording.try_record(chunk(b"data"), pos(0));
-        let finalized = recording.finalize(RecordingStopReason::Disabled).await;
+        let finalized = recording.finalize().await;
         assert!(finalized.fault.is_none());
     }
 
@@ -396,7 +428,7 @@ mod tests {
         async fn flush(&mut self) -> Result<(), RecordError> {
             Err(RecordError::Io(std::io::Error::other("flush: device gone")))
         }
-        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+        async fn finalize(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
     }
@@ -445,7 +477,7 @@ mod tests {
         async fn flush(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
-        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+        async fn finalize(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
     }
@@ -474,7 +506,7 @@ mod tests {
         assert!(current < peak, "the controller took an item off the queue");
 
         release.notify_one();
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
     }
 
     /// A recorder that counts flush calls.
@@ -492,7 +524,7 @@ mod tests {
             self.flushes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+        async fn finalize(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
     }
@@ -515,7 +547,7 @@ mod tests {
             flushes.load(Ordering::SeqCst) > before,
             "a running recorder flushes on the timer, not only at finalize"
         );
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
     }
 
     #[tokio::test]
@@ -527,7 +559,7 @@ mod tests {
             recording.try_record(chunk(b"x"), pos(offset));
         }
         assert_eq!(recording.state(), RecordingState::Enabled);
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
         assert_eq!(count.load(Ordering::SeqCst), 3);
     }
 }

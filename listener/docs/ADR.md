@@ -986,7 +986,13 @@ unchanged.
 
 ## ADR-030 — Idle rules wait on exact deadlines with bounded Windows precision
 
-**Status:** Accepted 2026-07-19 (spec v2.2.1).
+**Status:** Accepted 2026-07-19 (spec v2.2.1). **Amended 2026-11-13:** the
+exact-deadline wait stands; the Windows precision window, the 1 ms request,
+the lateness histograms and the wait counts are removed. The user judged
+about 16 ms of possible lateness on Windows acceptable for a rule that fires
+on a quiet stream, against a timer request, two histograms, a summary and a
+GUI readout kept only for it. Idle rules now use one ordinary deadline wait
+on every platform. The text below records the decision as first made.
 
 **Context:** Idle rules were evaluated by a shared 250 ms maintenance tick, adding up
 to one tick of avoidable lateness before executor or OS wake jitter. Receiving data is
@@ -2251,6 +2257,65 @@ with no title and no badge. `wiredata-ui` no longer has a badge at all.
 claims, and the callouts.
 
 **Consequences:** The card starts with the Transport row, a row higher.
+
+## ADR-058 — A reconnect sequence ends only after 60 s up
+
+**Status:** Accepted 2026-11-13.
+
+**Context:** A faulted Channel reconnects under its `ReconnectPolicy` (§9.1):
+attempts with a growing backoff, up to `max_attempts`. A successful attempt
+used to end the sequence at once, so a device that connected and dropped a
+moment later started again from attempt 1 and the shortest delay. It was
+retried at that rate for ever, `max_attempts` never applied, and each cycle
+wrote several event-log lines: the wrong shape for weeks-long logging, where
+a misbehaving device should be retried patiently and its noise kept down.
+
+**Decision:** A successful reconnect leaves the attempt count and backoff in
+place until the Channel has stayed up for 60 s (`RECONNECT_STABLE_AFTER` in
+`runtime/listener.rs`). A fault within that time continues the sequence: the
+next attempt number and the next backoff step, counted towards
+`max_attempts`. Staying up for 60 s, or a manual stop, starts it over.
+
+**Boundary:** The recorder's own rule for repeated faults (3 within 10 min,
+then a retry every 5 min) is separate and unchanged. Reconnect off still
+means no automatic reconnect.
+
+**Consequences:** A flapping device is retried at a growing interval and,
+with `max_attempts` set, gives up. A device that stays up a minute between
+faults is treated as recovered each time.
+
+## ADR-059 — Display recordings mark their gaps; fault-finalization is gone
+
+**Status:** Accepted 2026-11-13. Completes ADR-043.
+
+**Context:** §142 still said a recorder's `finalize` would "write the
+truncation marker (for faults)", driven by a `RecordingStopReason`. ADR-043
+had already turned recording faults into gaps that continue in a new segment:
+nothing ended a recording with a fault, every `finalize` ignored its reason,
+and no recorder wrote a marker. A gap was recorded only in the event log and
+diagnostics, so a `.disp` file read on its own showed no sign of one.
+
+**Decision:**
+
+- `RecordingStopReason` and the `finalize` parameter are removed; a stop
+  always writes the accepted backlog, then finalizes.
+- When a Display Recording resumes after a gap that lost bytes, the new
+  segment starts with one line, `‹GAP <reason> · <start> to <end> · not
+  recorded›` (§54), in the style of the `‹MARK›` lines but with no leading
+  newline, since a resumed segment is always a fresh file.
+- It is a per-recording choice, **Mark gaps** (`mark_gaps`), on by default:
+  after a long run, a gap is what a reader most needs to find. A profile
+  saved before the option existed loads with it on.
+- A Raw Recording never gets the line: `.raw` stays exactly the bytes
+  received (§53).
+
+**Boundary:** No line is written for a gap that lost no bytes, or for a gap
+still open when recording stops; the event log reports both, as before. The
+controller stays generic over its items: the recorder side writes the line,
+through a hook Raw recorders leave empty.
+
+**Consequences:** A `.disp` file says where its gaps are without the event
+log beside it.
 
 ## Open questions
 

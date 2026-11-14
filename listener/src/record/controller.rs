@@ -33,7 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::{RecorderWriter, RecordingStopReason};
+use super::{GapMark, RecorderWriter};
 use crate::core::{GapReason, RecordError, RecordingState};
 use crate::display::RenderedOutput;
 use crate::transport::ReceivedData;
@@ -274,7 +274,7 @@ impl Shared {
 pub struct Recording<I: RecordItem> {
     items: mpsc::UnboundedSender<Queued<I>>,
     commands: mpsc::UnboundedSender<Command>,
-    terminate: Option<oneshot::Sender<RecordingStopReason>>,
+    terminate: Option<oneshot::Sender<()>>,
     shared: Arc<Shared>,
     task: JoinHandle<Option<String>>,
     budget: usize,
@@ -355,9 +355,9 @@ impl<I: RecordItem> Recording<I> {
 
     /// Stop recording (user disable or Channel stop): the controller writes the
     /// accepted backlog and finalizes (§56, §110).
-    pub async fn finalize(mut self, reason: RecordingStopReason) -> Finalized {
+    pub async fn finalize(mut self) -> Finalized {
         if let Some(terminate) = self.terminate.take() {
-            let _ = terminate.send(reason);
+            let _ = terminate.send(());
         }
         drop(self.items);
         let fault = self
@@ -460,7 +460,7 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
         mut self,
         mut items: mpsc::UnboundedReceiver<Queued<I>>,
         mut commands: mpsc::UnboundedReceiver<Command>,
-        mut terminate: oneshot::Receiver<RecordingStopReason>,
+        mut terminate: oneshot::Receiver<()>,
     ) -> Option<String> {
         let mut flush_tick =
             tokio::time::interval_at(Instant::now() + self.timings.flush, self.timings.flush);
@@ -480,14 +480,13 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
                 .filter(|_| self.segment.is_none() && !self.low_disk);
             tokio::select! {
                 biased;
-                reason = &mut terminate => {
-                    let reason = reason.unwrap_or(RecordingStopReason::ChannelStopped);
-                    return self.stop(reason, &mut items).await;
+                _ = &mut terminate => {
+                    return self.stop(&mut items).await;
                 }
                 Some(command) = commands.recv() => self.on_command(command, &mut items).await,
                 maybe = items.recv() => match maybe {
                     Some(queued) => self.on_item(queued, &mut items).await,
-                    None => return self.stop(RecordingStopReason::ChannelStopped, &mut items).await,
+                    None => return self.stop(&mut items).await,
                 },
                 _ = flush_tick.tick(), if self.segment.is_some() => self.flush(&mut items).await,
                 _ = tokio::time::sleep_until(retry_at.unwrap_or_else(Instant::now)), if retry_at.is_some() => {}
@@ -619,7 +618,29 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
             self.shared.note_gap_start(queued.pos);
             return;
         };
-        match segment.write(&queued.item).await {
+        // The first item after a gap: a recorder that marks gaps writes its line
+        // now, so it comes just before the item the recording resumed with.
+        let gap_start = *lock(&self.shared.gap_start);
+        let marked = match (self.closing_gap, self.gap) {
+            (true, Some(reason)) => match gap_start {
+                Some(start) => {
+                    segment
+                        .mark_gap(&GapMark {
+                            reason,
+                            start,
+                            end: queued.pos,
+                        })
+                        .await
+                }
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        };
+        let written = match marked {
+            Ok(()) => segment.write(&queued.item).await,
+            Err(error) => Err(error),
+        };
+        match written {
             Ok(()) => {
                 self.shared
                     .file_len
@@ -715,7 +736,7 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
     /// already accounted for by the gap's start.
     async fn end_segment(&mut self) {
         if let Some(mut segment) = self.segment.take() {
-            let _ = segment.finalize(RecordingStopReason::ChannelStopped).await;
+            let _ = segment.finalize().await;
         }
         self.unflushed_since = None;
         *lock(&self.shared.file) = None;
@@ -788,28 +809,17 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
         self.shared.set_state(RecordingState::Gap(reason));
     }
 
-    /// Stop: write the accepted backlog on a graceful stop — under the same
+    /// Stop: write the accepted backlog — under the same
     /// rotation and size-cap rules as while running — then finalize. Returns
     /// the fault when the stop was not clean.
-    async fn stop(
-        mut self,
-        reason: RecordingStopReason,
-        items: &mut mpsc::UnboundedReceiver<Queued<I>>,
-    ) -> Option<String> {
+    async fn stop(mut self, items: &mut mpsc::UnboundedReceiver<Queued<I>>) -> Option<String> {
         self.last_fault = None;
-        let graceful = !matches!(reason, RecordingStopReason::Faulted(_));
         while let Ok(queued) = items.try_recv() {
-            if graceful {
-                self.write_item(queued, items).await;
-            } else {
-                self.shared
-                    .queued_bytes
-                    .fetch_sub(queued.cost, Ordering::AcqRel);
-            }
+            self.write_item(queued, items).await;
         }
         let mut fault = self.last_fault.take();
         if let Some(mut segment) = self.segment.take() {
-            if let Err(error) = segment.finalize(reason).await {
+            if let Err(error) = segment.finalize().await {
                 fault.get_or_insert(format!("finalize failed: {error}"));
             }
         }
@@ -891,7 +901,7 @@ mod tests {
         async fn flush(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
-        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+        async fn finalize(&mut self) -> Result<(), RecordError> {
             Ok(())
         }
         fn bytes_written(&self) -> u64 {
@@ -975,11 +985,7 @@ mod tests {
         let mut recording = start_recording(source, DEFAULT_QUEUE_BUDGET, fast());
         recording.try_record(chunk(b"AB"), pos(0));
         recording.try_record(chunk(b"CD"), pos(2));
-        assert!(recording
-            .finalize(RecordingStopReason::Disabled)
-            .await
-            .fault
-            .is_none());
+        assert!(recording.finalize().await.fault.is_none());
         assert_eq!(
             written(&segments),
             vec![vec![b"AB".to_vec(), b"CD".to_vec()]]
@@ -1009,11 +1015,7 @@ mod tests {
         })
         .await;
         recording.try_record(chunk(b"GH"), pos(6));
-        assert!(recording
-            .finalize(RecordingStopReason::Disabled)
-            .await
-            .fault
-            .is_none());
+        assert!(recording.finalize().await.fault.is_none());
 
         assert_eq!(
             written(&segments),
@@ -1037,7 +1039,7 @@ mod tests {
         .await;
         assert_eq!(recording.current_file(), None);
         assert_eq!(recording.bytes_written(), 0);
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
     }
 
     #[tokio::test]
@@ -1059,7 +1061,7 @@ mod tests {
                 .any(|r| matches!(r, RecorderReport::GapClosed { .. }))
         })
         .await;
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
 
         assert!(reports.iter().any(|r| matches!(
             r,
@@ -1103,7 +1105,7 @@ mod tests {
         })
         .await;
         recording.try_record(chunk(b"GH"), pos(6));
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
 
         assert_eq!(
             written(&segments),
@@ -1158,7 +1160,7 @@ mod tests {
         recording.try_record(chunk(b"GH"), pos(6)); // lost too: the gap has begun
         wait_for("recovery", || recording.state() == RecordingState::Enabled).await;
         recording.try_record(chunk(b"IJ"), pos(8));
-        let finalized = recording.finalize(RecordingStopReason::Disabled).await;
+        let finalized = recording.finalize().await;
         assert!(finalized.fault.is_none());
         assert_eq!(
             written(&segments),
@@ -1203,7 +1205,7 @@ mod tests {
             .take_reports()
             .iter()
             .any(|r| matches!(r, RecorderReport::Unstable { .. })));
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
     }
 
     #[tokio::test]
@@ -1250,7 +1252,7 @@ mod tests {
         })
         .await;
         recording.try_record(chunk(b"kept"), pos(4));
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
         assert_eq!(written(&segments), vec![vec![b"kept".to_vec()]]);
     }
 
@@ -1266,7 +1268,7 @@ mod tests {
         {
             recording.try_record(chunk(bytes), pos(i as u64 * 2));
         }
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
         assert_eq!(
             written(&segments),
             vec![
@@ -1300,7 +1302,7 @@ mod tests {
             !recording.is_unstable(),
             "low disk is a condition, not a fault"
         );
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
         assert_eq!(
             written(&segments),
             vec![vec![b"AB".to_vec()], vec![b"EF".to_vec()]]

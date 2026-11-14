@@ -49,5 +49,5 @@ pub use snapshot::{
 pub use tcp::{start_tcp_listener, TcpListenerHandle};
 pub use telemetry::{
     ArrivalTimestampSummary, ByteHistogram, ChunkShape, CounterAvailability, DurationHistogram,
-    IdleDeadlineTimerMode, IdleDeadlineTimerSummary, SerialStallSummary, TransportHealth,
+    SerialStallSummary, TransportHealth,
 };

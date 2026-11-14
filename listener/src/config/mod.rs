@@ -622,6 +622,26 @@ mod tests {
     }
 
     #[test]
+    fn a_display_recording_saved_without_mark_gaps_loads_with_it_on() {
+        // A profile from before the option existed gets the gap lines; one that
+        // turns them off keeps that choice through a save and a load.
+        let old: DisplayRecordingConfig = toml::from_str("enabled = true\n").unwrap();
+        assert!(old.mark_gaps);
+        assert!(DisplayRecordingConfig::default().mark_gaps);
+
+        let off = DisplayRecordingConfig {
+            mark_gaps: false,
+            ..DisplayRecordingConfig::default()
+        };
+        let text = toml::to_string(&off).unwrap();
+        assert!(
+            !toml::from_str::<DisplayRecordingConfig>(&text)
+                .unwrap()
+                .mark_gaps
+        );
+    }
+
+    #[test]
     fn templates_are_valid() {
         let mut profile = Profile::new("templates");
         profile.channels = vec![templates::serial_template(), templates::udp_template()];

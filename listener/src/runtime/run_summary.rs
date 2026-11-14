@@ -11,8 +11,7 @@ use crate::transport::udp::SharedPortStatus;
 
 use super::snapshot::{ChannelSnapshot, QueueDepth};
 use super::telemetry::{
-    ByteHistogram, ChunkShape, CounterAvailability, DurationHistogram, IdleDeadlineTimerSummary,
-    TransportHealth,
+    ByteHistogram, ChunkShape, CounterAvailability, DurationHistogram, TransportHealth,
 };
 
 /// Process-unique identity for one successfully started Channel run.
@@ -65,9 +64,6 @@ pub struct ListenerRunSummary {
     pub recent_ingest_delay: DurationHistogram,
     pub ingest_processing: DurationHistogram,
     pub recent_ingest_processing: DurationHistogram,
-    pub rule_timer_lateness: DurationHistogram,
-    pub recent_rule_timer_lateness: DurationHistogram,
-    pub idle_deadline_timer: IdleDeadlineTimerSummary,
     pub transport_health: TransportHealth,
     pub ingest_queue: QueueDepth,
     pub raw_recording_queue: Option<QueueDepth>,
@@ -110,14 +106,6 @@ impl ListenerRunSummary {
                 .map_or_else(DurationHistogram::default, |snap| snap.ingest_processing),
             recent_ingest_processing: snapshot.map_or_else(DurationHistogram::default, |snap| {
                 snap.recent_ingest_processing
-            }),
-            rule_timer_lateness: snapshot
-                .map_or_else(DurationHistogram::default, |snap| snap.rule_timer_lateness),
-            recent_rule_timer_lateness: snapshot.map_or_else(DurationHistogram::default, |snap| {
-                snap.recent_rule_timer_lateness
-            }),
-            idle_deadline_timer: snapshot.map_or_else(IdleDeadlineTimerSummary::default, |snap| {
-                snap.idle_deadline_timer
             }),
             transport_health: snapshot
                 .map_or_else(TransportHealth::default, |snap| snap.transport_health),
@@ -182,27 +170,6 @@ impl ListenerRunSummary {
             &mut out,
             "recent_ingest_processing",
             self.recent_ingest_processing,
-        );
-        write_duration_histogram(&mut out, "idle_rule_lateness", self.rule_timer_lateness);
-        write_duration_histogram(
-            &mut out,
-            "recent_idle_rule_lateness",
-            self.recent_rule_timer_lateness,
-        );
-        let _ = writeln!(
-            out,
-            "idle_timer_native_waits={}",
-            self.idle_deadline_timer.native_waits
-        );
-        let _ = writeln!(
-            out,
-            "idle_timer_windows_1ms_waits={}",
-            self.idle_deadline_timer.windows_one_millisecond_waits
-        );
-        let _ = writeln!(
-            out,
-            "idle_timer_windows_request_failures={}",
-            self.idle_deadline_timer.windows_request_failures
         );
         write_queue(&mut out, "ingest_queue", Some(self.ingest_queue));
         write_queue(
@@ -367,12 +334,6 @@ mod tests {
             recent_ingest_delay: ingest_delay,
             ingest_processing: DurationHistogram::default(),
             recent_ingest_processing: DurationHistogram::default(),
-            rule_timer_lateness: DurationHistogram::default(),
-            recent_rule_timer_lateness: DurationHistogram::default(),
-            idle_deadline_timer: IdleDeadlineTimerSummary {
-                native_waits: 1,
-                ..IdleDeadlineTimerSummary::default()
-            },
             transport_health: TransportHealth {
                 serial_stalls: Some(SerialStallSummary {
                     episodes: 1,

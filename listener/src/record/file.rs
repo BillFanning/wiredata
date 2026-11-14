@@ -16,7 +16,7 @@ use crate::core::RecordError;
 use crate::display::RenderedOutput;
 use crate::transport::ReceivedData;
 
-use super::{DisplayRecorder, OverwritePolicy, RawRecorder, RecordingStopReason};
+use super::{DisplayRecorder, GapMark, OverwritePolicy, RawRecorder};
 
 /// Open a recording destination, enforcing the overwrite policy (§55, §121).
 ///
@@ -369,7 +369,7 @@ impl RawRecorder for RawFileRecorder {
         Ok(())
     }
 
-    async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+    async fn finalize(&mut self) -> Result<(), RecordError> {
         // Flush buffered data to disk before close (truncation point is recorded
         // by the runtime via RecordingFaulted, §56.1). The OS closes the file
         // when the recorder is dropped after the task ends.
@@ -402,9 +402,19 @@ pub struct DisplayFileRecorder {
     /// Advisory lock on the destination (§121, ADR-014); see `RawFileRecorder._lock`.
     _lock: Option<std::fs::File>,
     path: PathBuf,
+    /// Whether to write a `‹GAP …›` line where recording resumed after a gap
+    /// that lost bytes (§56.1).
+    mark_gaps: bool,
 }
 
 impl DisplayFileRecorder {
+    /// Write a `‹GAP …›` line where this recording resumed after a gap that lost
+    /// bytes. Off unless asked: a bare recorder adds nothing to the rendered text.
+    pub fn with_gap_marks(mut self, on: bool) -> Self {
+        self.mark_gaps = on;
+        self
+    }
+
     pub async fn create(path: &Path, policy: OverwritePolicy) -> Result<Self, RecordError> {
         // Lock the destination first (§121, ADR-014) — same as Raw, so a `.disp` cannot
         // be shared by two recordings either.
@@ -423,12 +433,23 @@ impl DisplayFileRecorder {
             len,
             _lock: None,
             path: path.to_path_buf(),
+            mark_gaps: false,
         })
     }
 }
 
 #[async_trait::async_trait]
 impl DisplayRecorder for DisplayFileRecorder {
+    async fn mark_gap(&mut self, gap: &GapMark) -> Result<(), RecordError> {
+        if !self.mark_gaps {
+            return Ok(());
+        }
+        let line = gap.display_line();
+        self.file.write_all(line.as_bytes()).await?;
+        self.len += line.len() as u64;
+        Ok(())
+    }
+
     async fn write_rendered(&mut self, output: &RenderedOutput) -> Result<(), RecordError> {
         self.file.write_all(output.text.as_bytes()).await?;
         self.len += output.text.len() as u64;
@@ -440,7 +461,7 @@ impl DisplayRecorder for DisplayFileRecorder {
         Ok(())
     }
 
-    async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+    async fn finalize(&mut self) -> Result<(), RecordError> {
         self.flush().await
     }
 
@@ -530,7 +551,7 @@ mod tests {
                 .await
                 .unwrap();
             rec.write_chunk(&chunk(b"new")).await.unwrap();
-            rec.finalize(RecordingStopReason::Disabled).await.unwrap();
+            rec.finalize().await.unwrap();
         }
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new");
 
@@ -540,7 +561,7 @@ mod tests {
                 .await
                 .unwrap();
             rec.write_chunk(&chunk(b"-more")).await.unwrap();
-            rec.finalize(RecordingStopReason::Disabled).await.unwrap();
+            rec.finalize().await.unwrap();
         }
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new-more");
 
@@ -559,7 +580,7 @@ mod tests {
         recording.try_record(chunk(b"$GPGGA,"), pos());
         recording.try_record(chunk(b"123.4*7F\r\n"), pos());
         recording.try_record(chunk(b"\x00\x01\x02"), pos());
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
 
         let written = tokio::fs::read(&path).await.unwrap();
         assert_eq!(written, b"$GPGGA,123.4*7F\r\n\x00\x01\x02");
@@ -576,7 +597,7 @@ mod tests {
         let mut recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
         recording.try_record(chunk(b"AB"), pos());
         recording.try_record(chunk(b"CDE"), pos());
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
 
         // Byte stream holds only payload bytes — no timestamps interleaved (§53).
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"ABCDE");
@@ -611,7 +632,7 @@ mod tests {
                 .unwrap();
             let mut recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
             recording.try_record(chunk(b"ABCDE"), pos());
-            let _ = recording.finalize(RecordingStopReason::Disabled).await;
+            let _ = recording.finalize().await;
         }
         {
             let recorder = RawFileRecorder::create(&path, OverwritePolicy::AppendIfExists, true)
@@ -620,7 +641,7 @@ mod tests {
             let mut recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
             recording.try_record(chunk(b"FG"), pos());
             recording.try_record(chunk(b"HIJ"), pos());
-            let _ = recording.finalize(RecordingStopReason::Disabled).await;
+            let _ = recording.finalize().await;
         }
 
         let raw = tokio::fs::read(&path).await.unwrap();
@@ -658,7 +679,7 @@ mod tests {
                 .unwrap();
             let mut recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
             recording.try_record(chunk(b"early-bytes"), pos());
-            let _ = recording.finalize(RecordingStopReason::Disabled).await;
+            let _ = recording.finalize().await;
         }
         assert!(
             tokio::fs::metadata(&sidecar_path(&path)).await.is_err(),
@@ -670,7 +691,7 @@ mod tests {
                 .unwrap();
             let mut recording = start_raw_recording(recorder, DEFAULT_QUEUE_BUDGET);
             recording.try_record(chunk(b"late"), pos());
-            let _ = recording.finalize(RecordingStopReason::Disabled).await;
+            let _ = recording.finalize().await;
         }
 
         let sidecar = tokio::fs::read_to_string(&sidecar_path(&path))
@@ -714,7 +735,7 @@ mod tests {
             },
             pos(),
         );
-        let _ = recording.finalize(RecordingStopReason::Disabled).await;
+        let _ = recording.finalize().await;
 
         // The recorder appends verbatim — no injected separators (ADR-018): the
         // rendered stream's own text is the file, byte for byte.
@@ -796,10 +817,7 @@ mod tests {
         );
         assert_eq!(recorder.take_open_note(), None, "reported once");
         recorder.write_chunk(&chunk(b"FG")).await.unwrap();
-        recorder
-            .finalize(RecordingStopReason::Disabled)
-            .await
-            .unwrap();
+        recorder.finalize().await.unwrap();
         drop(recorder);
 
         let index = tokio::fs::read_to_string(sidecar_path(&path))

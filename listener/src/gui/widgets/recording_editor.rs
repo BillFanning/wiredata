@@ -160,6 +160,20 @@ const TIMESTAMP_SIDECAR_TOOLTIP: Hover = Hover::new(
      companion file counting from the start of that file.",
 );
 
+/// Help for the gap line in a Display recording (§56.1). It names the line, the
+/// file it goes in and the one it never goes in.
+const MARK_GAPS_HOVER: Hover = Hover::new(
+    "Writes one line into the Display recording where recording resumed after \
+     received bytes were lost.\n\n\
+     The line reads like ‹GAP the recording queue overflowed · 2026-11-13 14:02:11.250 \
+     to 2026-11-13 14:02:19.730 · not recorded›. It gives the reason and the local \
+     times of the first lost block and of the first block recorded again.\n\n\
+     It goes only in the .disp file, just before the text recording resumed with. \
+     The Raw recording never gets it, so a .raw file stays exactly the bytes \
+     received.\n\n\
+     Nothing is written if no bytes arrived during the gap.",
+);
+
 /// Edit the channel's **Raw** recording setup (§53): destination, overwrite, rotation,
 /// timestamp sidecar. The byte-exact verbatim stream (§53) — a separate pipeline tap
 /// from Display (ADR-013). The live Record toggle and the "Record on start" flag
@@ -206,4 +220,7 @@ pub(crate) fn edit_display_recording(ui: &mut egui::Ui, config: &mut ChannelConf
         &mut rec.overwrite_policy,
         &mut rec.file_rotation,
     );
+    // Display only: a `.raw` is exactly the bytes received, so it never gets one.
+    ui.checkbox(&mut rec.mark_gaps, "Mark gaps")
+        .on_hover(&MARK_GAPS_HOVER);
 }

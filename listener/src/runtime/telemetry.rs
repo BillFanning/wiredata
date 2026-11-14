@@ -112,39 +112,6 @@ pub struct ArrivalTimestampSummary {
     pub post_read_samples: u64,
 }
 
-/// Platform wait mechanism used for one completed Idle-rule deadline wake.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IdleDeadlineTimerMode {
-    NativeDeadlineWait,
-    WindowsOneMillisecond,
-    WindowsRequestFailed,
-}
-
-/// Cumulative completed Idle deadline waits by platform timer policy.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct IdleDeadlineTimerSummary {
-    pub native_waits: u64,
-    pub windows_one_millisecond_waits: u64,
-    pub windows_request_failures: u64,
-}
-
-impl IdleDeadlineTimerSummary {
-    pub fn record(&mut self, mode: IdleDeadlineTimerMode) {
-        let count = match mode {
-            IdleDeadlineTimerMode::NativeDeadlineWait => &mut self.native_waits,
-            IdleDeadlineTimerMode::WindowsOneMillisecond => &mut self.windows_one_millisecond_waits,
-            IdleDeadlineTimerMode::WindowsRequestFailed => &mut self.windows_request_failures,
-        };
-        *count = count.saturating_add(1);
-    }
-
-    pub fn total_waits(&self) -> u64 {
-        self.native_waits
-            .saturating_add(self.windows_one_millisecond_waits)
-            .saturating_add(self.windows_request_failures)
-    }
-}
-
 impl ArrivalTimestampSummary {
     pub fn record(&mut self, source: ArrivalTimestampSource) {
         match source {
@@ -234,16 +201,5 @@ mod tests {
         assert_eq!(summary.kernel_samples, 1);
         assert_eq!(summary.post_read_samples, 1);
         assert_eq!(summary.status, ArrivalTimestampStatus::KernelSoftware);
-    }
-
-    #[test]
-    fn idle_timer_summary_distinguishes_native_effective_and_failed_waits() {
-        let mut summary = IdleDeadlineTimerSummary::default();
-        summary.record(IdleDeadlineTimerMode::NativeDeadlineWait);
-        summary.record(IdleDeadlineTimerMode::WindowsOneMillisecond);
-        summary.record(IdleDeadlineTimerMode::WindowsRequestFailed);
-
-        assert_eq!(summary.total_waits(), 3);
-        assert_eq!(summary.windows_request_failures, 1);
     }
 }
