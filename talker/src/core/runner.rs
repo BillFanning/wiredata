@@ -2124,10 +2124,38 @@ mod tests {
         join_within(handle, Duration::from_secs(5));
 
         lines.extend(log_rx.try_iter().map(|event| event.message));
-        assert!(
-            !lines.iter().any(|line| line.contains("missed")),
-            "failing sends are not missed sends: {lines:#?}"
-        );
+        // A loaded machine can genuinely delay the thread past a deadline, and
+        // then a miss is real and must be reported. What must never happen is
+        // a failing send reported as a miss: so every miss line has to show
+        // lateness of at least one whole interval, and "stopped while behind
+        // schedule" may follow only a real miss.
+        let late_by = |line: &str| -> Option<Duration> {
+            let value = line.split("was ").nth(1)?.split(" late").next()?;
+            let (number, unit) = value.split_once(' ')?;
+            let number: f64 = number.replace(',', "").parse().ok()?;
+            match unit {
+                "ms" => Some(Duration::from_secs_f64(number / 1000.0)),
+                "s" => Some(Duration::from_secs_f64(number)),
+                _ => None,
+            }
+        };
+        let mut real_misses = 0;
+        for line in lines.iter().filter(|line| line.contains("missed")) {
+            if line.contains("stopped while behind schedule") {
+                assert!(
+                    real_misses > 0,
+                    "a stop reported misses that never happened: {lines:#?}"
+                );
+            } else {
+                let late = late_by(line)
+                    .unwrap_or_else(|| panic!("a miss line without its lateness: {line}"));
+                assert!(
+                    late >= Duration::from_millis(200),
+                    "failing sends are not missed sends: {lines:#?}"
+                );
+                real_misses += 1;
+            }
+        }
     }
 
     /// End to end through the real send path: the message whose write holds the

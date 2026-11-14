@@ -140,7 +140,7 @@ pub fn validate_zda_talker_id(talker: &str) -> Result<(), ZdaTalkerIdError> {
 
 /// Construct an inline `$--ZDA` annotation for `at`, without trailing CR/LF.
 /// The clock/date fields are UTC. The zone fields are NMEA's local zone (the
-/// time added to local time to get UTC; see [`zda_zone_fields`]) when it fits
+/// time added to local time to get UTC; see `zda_zone_fields`) when it fits
 /// ZDA's signed-hour/minute range.
 pub fn zda_sentence(
     talker: &str,
