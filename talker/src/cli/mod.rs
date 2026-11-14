@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use clap::{Args as ClapArgs, ValueEnum};
 use wiredata_cli::{doubling_retry, exit_status, HealthWatch, EXIT_CANNOT_START};
+use wiredata_ui::format::thousands;
 
 use crate::core::{
     channel::{ChannelId, CONNECT_TIMEOUT, WRITE_TIMEOUT},
@@ -470,34 +471,43 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
         }
     }
 
+    // The closing lines are collected here and printed only after the log
+    // queue is written out. Log lines reach the console from the queue's own
+    // thread (ADR-064), so lines printed directly while it still held some
+    // came out interleaved with them, splitting the summary mid-line.
+    let mut closing = Vec::new();
     if stop_incomplete {
         // The stuck threads end with the process.
-        eprintln!(
+        closing.push(format!(
             "WARNING: the stop did not finish within {} s: a channel's send is blocked \
              in the operating system",
             STOP_LIMIT.as_secs()
-        );
+        ));
     } else {
         for handle in handles {
             let _ = handle.join();
         }
         tracing::info!("stopped");
     }
-    eprintln!("summary:");
+    closing.push("summary:".to_owned());
     for (id, line) in health.summary(Instant::now()) {
-        eprintln!("  {line}{}", counters_note(finals.get(&id), echo));
+        closing.push(format!("  {line}{}", counters_note(finals.get(&id), echo)));
     }
     let not_shown = log.console_lines_not_shown();
     if not_shown > 0 {
-        eprintln!(
+        closing.push(format!(
             "WARNING: {not_shown} log line{} not shown: the console was not taking output",
             if not_shown == 1 { " was" } else { "s were" }
-        );
+        ));
     }
     let status = exit_status(stop_incomplete, health.degraded());
-    // A held Windows logoff or shutdown goes ahead only once the log has
-    // flushed: Windows may end the process straight away.
+    // Writes out what the log queue holds. A held Windows logoff or shutdown
+    // goes ahead only after this and the closing lines: Windows may end the
+    // process straight away.
     drop(log);
+    for line in closing {
+        eprintln!("{line}");
+    }
     windows_stop.finish();
     Ok(status)
 }
@@ -523,25 +533,34 @@ fn counters_note(counts: Option<&FinalCounts>, echo: bool) -> String {
     let Some(counts) = counts else {
         return String::new();
     };
+    // Grouped like every other count talker prints, so "92,706" here reads
+    // the same as the "34,194 sends missed" line beside it.
     let mut note = format!(
         "; sent {} message{} ({} bytes), {} failed send{}",
-        counts.sent,
+        thousands(counts.sent),
         if counts.sent == 1 { "" } else { "s" },
-        counts.bytes,
-        counts.failed,
+        thousands(counts.bytes),
+        thousands(counts.failed),
         if counts.failed == 1 { "" } else { "s" }
     );
     if counts.possibly_partial > 0 {
-        note.push_str(&format!(", {} possibly partial", counts.possibly_partial));
+        note.push_str(&format!(
+            ", {} possibly partial",
+            thousands(counts.possibly_partial)
+        ));
     }
     if let Some(bytes) = counts.peer_bytes.filter(|&bytes| bytes > 0) {
         note.push_str(&format!(
-            "; peer sent {bytes} byte{}",
+            "; peer sent {} byte{}",
+            thousands(bytes),
             if bytes == 1 { "" } else { "s" }
         ));
     }
     if echo && counts.dropped > 0 {
-        note.push_str(&format!("; {} echo lines dropped", counts.dropped));
+        note.push_str(&format!(
+            "; {} echo lines dropped",
+            thousands(counts.dropped)
+        ));
     }
     note
 }
@@ -743,24 +762,24 @@ mod tests {
         };
         assert_eq!(
             counters_note(Some(&counts), false),
-            "; sent 120 messages (4800 bytes), 1 failed send"
+            "; sent 120 messages (4,800 bytes), 1 failed send"
         );
         assert_eq!(
             counters_note(Some(&counts), true),
-            "; sent 120 messages (4800 bytes), 1 failed send; 3 echo lines dropped"
+            "; sent 120 messages (4,800 bytes), 1 failed send; 3 echo lines dropped"
         );
         assert_eq!(counters_note(None, true), "", "a channel that never sent");
         // §4.4: said only when it happened.
         counts.possibly_partial = 2;
         assert_eq!(
             counters_note(Some(&counts), false),
-            "; sent 120 messages (4800 bytes), 1 failed send, 2 possibly partial"
+            "; sent 120 messages (4,800 bytes), 1 failed send, 2 possibly partial"
         );
         // §4.5: a TCP peer that answered.
         counts.peer_bytes = Some(12);
         assert_eq!(
             counters_note(Some(&counts), false),
-            "; sent 120 messages (4800 bytes), 1 failed send, 2 possibly partial; \
+            "; sent 120 messages (4,800 bytes), 1 failed send, 2 possibly partial; \
              peer sent 12 bytes"
         );
     }
