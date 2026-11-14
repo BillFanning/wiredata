@@ -115,7 +115,7 @@ pub enum TransportNotice {
     /// The transport ended on a spontaneous fault (§94). Sent by the channel's
     /// fault monitor so the **cause** reaches the pipeline's diagnostics log —
     /// the paired `ChannelFaulted` lifecycle event (§137) carries only the id,
-    /// and this string previously died unread with the transport outcome. Terminal
+    /// and the transport outcome's own string is not read elsewhere. Terminal
     /// delivery waits for bounded queue capacity rather than dropping (ADR-020).
     TransportFaulted {
         channel_id: ChannelId,

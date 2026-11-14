@@ -120,7 +120,7 @@ mod tests {
     use chrono::TimeZone;
 
     /// A `SystemTime` at a fixed **local** instant, so period keys are deterministic
-    /// regardless of the test machine's timezone (period keys are local time now).
+    /// regardless of the test machine's timezone (period keys are local time).
     /// Avoids the DST-ambiguity edge by picking ordinary mid-day/mid-night times.
     fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> SystemTime {
         Local

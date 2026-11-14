@@ -653,7 +653,7 @@ fn retry_stalled_send(
 ///
 /// Commands are drained every call; the four input-line ioctls run only when
 /// `next_line_poll` is due ([`CONTROL_LINE_POLL_INTERVAL`]) or a command was just
-/// applied — they used to run before every read, which at high chunk rates was
+/// applied, because at high chunk rates polling before every read would be
 /// more driver traffic than the data itself.
 fn service_control_lines(
     reader: &mut impl BlockingReader,
