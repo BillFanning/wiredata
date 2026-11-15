@@ -308,6 +308,9 @@ pub struct ChannelPipeline {
     /// drain first, so a new file never opens while its predecessor is still
     /// closing and a channel stop still reports every outcome (§56.1).
     retiring: JoinSet<RetiredRecording>,
+    /// Set when [`finish`](Self::finish) gave up at the stop grace: the end of
+    /// a recording may be missing, though the task itself ended.
+    finalization_abandoned: bool,
     /// Anchor for the `Idle` condition before any data has arrived (§50.2): idle is
     /// measured from the last data, or from this instant when none has arrived yet.
     created_at: Instant,
@@ -483,6 +486,7 @@ impl ChannelPipeline {
             recent_matches: DropOldestQueue::with_capacity(RECENT_MATCHES_CAP),
             pending_record_controls: Vec::new(),
             retiring: JoinSet::new(),
+            finalization_abandoned: false,
             created_at: Instant::now(),
             stream_buf: VecDeque::new(),
             stream_cap: caps.stream_display,
@@ -1740,10 +1744,17 @@ impl ChannelPipeline {
             .await
             .is_err()
         {
+            self.finalization_abandoned = true;
             self.diagnostics
                 .record(finalization_incomplete(&self.channel_name, grace));
         }
         self.record_event("Channel stopped");
+    }
+
+    /// Whether [`finish`](Self::finish) gave up at the stop grace. Its
+    /// diagnostic is already recorded.
+    pub fn finalization_abandoned(&self) -> bool {
+        self.finalization_abandoned
     }
 
     async fn finalize_recordings(&mut self) {

@@ -331,7 +331,7 @@ pub struct StopTicket {
 /// [`Listener::finish_stop`].
 pub struct DrainedStop {
     id: ChannelId,
-    drained: Option<Option<ChannelSnapshot>>,
+    drained: Option<Drained>,
 }
 
 impl StopTicket {
@@ -1127,7 +1127,8 @@ impl Listener {
     }
 
     /// Land a drained stop in Stopped (ADR-052). Returns the Channel's name
-    /// when its drain was abandoned at the grace period.
+    /// when its finalization is incomplete: the drain was abandoned at the
+    /// grace period, or the pipeline's own close gave up.
     pub fn finish_stop(&mut self, drained: DrainedStop) -> Option<String> {
         self.finish_drained(drained.id, drained.drained)
     }
@@ -1135,15 +1136,23 @@ impl Listener {
     /// Land a drained Channel in Stopped (see [`drain_all`]); `None` marks a
     /// drain abandoned at the grace period, which is logged as "finalization
     /// incomplete". Returns the Channel's name when it was abandoned.
-    fn finish_drained(
-        &mut self,
-        id: ChannelId,
-        drained: Option<Option<ChannelSnapshot>>,
-    ) -> Option<String> {
-        // A timed-out drain has no final snapshot.
-        let finished = drained.is_some();
-        self.land_stopped(id, drained.flatten());
-        (!finished).then(|| self.note_finalization_incomplete(id))
+    fn finish_drained(&mut self, id: ChannelId, drained: Option<Drained>) -> Option<String> {
+        let Some(drained) = drained else {
+            // A timed-out drain has no final snapshot, and nothing has said so.
+            self.land_stopped(id, None);
+            return Some(self.note_finalization_incomplete(id));
+        };
+        self.land_stopped(id, drained.snapshot);
+        // The pipeline gave up closing on its own, at a fault or within this
+        // stop; its snapshot already carries the diagnostic.
+        drained.abandoned.then(|| self.channel_name(id))
+    }
+
+    /// A Channel's name for output, or its id when it is not known.
+    fn channel_name(&self, id: ChannelId) -> String {
+        self.channels
+            .get(&id)
+            .map_or_else(|| id.to_string(), |c| c.config.name.as_str().to_owned())
     }
 
     /// Phase 1 of [`stop`](Self::stop): validate the transition, mark a Running
@@ -1429,10 +1438,10 @@ impl Listener {
     /// Log that `id`'s stop did not finish within the grace period (§113,
     /// §118), and return its name.
     fn note_finalization_incomplete(&mut self, id: ChannelId) -> String {
+        let name = self.channel_name(id);
         let Some(channel) = self.channels.get(&id) else {
-            return id.to_string();
+            return name;
         };
-        let name = channel.config.name.as_str().to_owned();
         let limit = self.error_retention(&channel.config);
         let diagnostic = super::pipeline::finalization_incomplete(&name, Self::STOP_GRACE);
         crate::diagnostics::emit_to_event_log(&name, id, &diagnostic);
@@ -1853,6 +1862,17 @@ impl ShutdownOutcome {
 /// left to wait for it, which would keep the process alive.
 pub const RUNTIME_SHUTDOWN_LIMIT: Duration = Duration::from_secs(2);
 
+/// What a drain that finished hands back.
+#[derive(Debug, Default)]
+struct Drained {
+    /// The final snapshot; `None` when there was no pipeline to take one
+    /// from (a start-time fault, or a pipeline task that panicked).
+    snapshot: Option<ChannelSnapshot>,
+    /// The pipeline's own close gave up at the stop grace
+    /// ([`ChannelPipeline::finalization_abandoned`]).
+    abandoned: bool,
+}
+
 /// Drain every Channel at once, each bounded by `grace` (§113: each Channel
 /// shuts down independently). `None` marks a drain that did not finish in
 /// time; it is abandoned. A drain that panicked counts as finished, without a
@@ -1860,9 +1880,9 @@ pub const RUNTIME_SHUTDOWN_LIMIT: Duration = Duration::from_secs(2);
 async fn drain_all<F>(
     drains: Vec<(ChannelId, F)>,
     grace: Duration,
-) -> Vec<(ChannelId, Option<Option<ChannelSnapshot>>)>
+) -> Vec<(ChannelId, Option<Drained>)>
 where
-    F: std::future::Future<Output = Option<ChannelSnapshot>> + Send + 'static,
+    F: std::future::Future<Output = Drained> + Send + 'static,
 {
     let mut set = tokio::task::JoinSet::new();
     let mut ids = HashMap::new();
@@ -1874,7 +1894,7 @@ where
     while let Some(joined) = set.join_next_with_id().await {
         match joined {
             Ok((task, result)) => drained.push((ids[&task], result)),
-            Err(error) => drained.push((ids[&error.id()], Some(None))),
+            Err(error) => drained.push((ids[&error.id()], Some(Drained::default()))),
         }
     }
     drained
@@ -1891,12 +1911,19 @@ fn display_renderer(config: &ChannelConfig) -> DisplayView {
 /// (so its last diagnostics — "Channel stopped", "Raw recording stopped" — are
 /// included). Owns the handle (no `&mut Listener`), so a caller can wrap *this*
 /// in a timeout and, if it fires, still run `Listener::finish_stop` — the
-/// cleanup never depends on the drain completing. `None` for a start-time fault
-/// (no pipeline).
-async fn drain_handle(handle: Option<MonitoredChannel>) -> Option<ChannelSnapshot> {
-    // `None` if the pipeline task panicked — no final snapshot then, which
-    // callers already tolerate.
-    handle?.stop().await.map(|mut pipeline| pipeline.snapshot())
+/// cleanup never depends on the drain completing. No snapshot for a
+/// start-time fault (no pipeline), or when the pipeline task panicked.
+async fn drain_handle(handle: Option<MonitoredChannel>) -> Drained {
+    let Some(handle) = handle else {
+        return Drained::default();
+    };
+    match handle.stop().await {
+        Some(mut pipeline) => Drained {
+            snapshot: Some(pipeline.snapshot()),
+            abandoned: pipeline.finalization_abandoned(),
+        },
+        None => Drained::default(),
+    }
 }
 
 #[cfg(test)]
@@ -1911,12 +1938,10 @@ mod tests {
         templates::udp_template()
     }
 
-    #[tokio::test]
-    async fn status_does_not_wait_on_a_faulted_channel_whose_close_is_stuck() {
-        // A faulted Channel keeps its handle until the user stops it. Its
-        // pipeline then sits in `finish`, closing a recording on a drive that
-        // stopped answering; status must still serve (retained) and the
-        // pipeline task must still end within the stop grace.
+    /// Add a Channel that receives one chunk, which its Raw recorder never
+    /// finishes writing, then faults: its pipeline enters `finish` with a
+    /// close stuck as on a drive that stopped answering.
+    async fn fault_with_a_stuck_close(listener: &mut Listener) -> ChannelId {
         use crate::core::ChunkTime;
         use crate::record::{start_raw_recording, RawRecorder, DEFAULT_QUEUE_BUDGET};
         use crate::transport::{ReceivedData, TransportJoinHandle, TransportOutcome};
@@ -1959,8 +1984,6 @@ mod tests {
             }
         }
 
-        let mut listener = Listener::with_default_capacities();
-        let _ = listener.take_events();
         let id = listener.add_channel(udp_channel());
         let faulted = listener.channels[&id].faulted.clone();
         let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
@@ -1982,6 +2005,18 @@ mod tests {
         }
         // Let the pipeline leave its loop and enter `finish`.
         tokio::time::sleep(Duration::from_millis(100)).await;
+        id
+    }
+
+    #[tokio::test]
+    async fn status_does_not_wait_on_a_faulted_channel_whose_close_is_stuck() {
+        // A faulted Channel keeps its handle until the user stops it. Its
+        // pipeline then sits in `finish`, closing a recording on a drive that
+        // stopped answering; status must still serve (retained) and the
+        // pipeline task must still end within the stop grace.
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = fault_with_a_stuck_close(&mut listener).await;
 
         for _ in 0..2 {
             let snap = tokio::time::timeout(Duration::from_secs(2), listener.snapshot(id))
@@ -2018,6 +2053,33 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("finalization incomplete")),
             "the abandoned close is reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_faulted_channel_whose_own_close_gave_up_makes_shutdown_incomplete() {
+        // The pipeline gives up closing at the stop grace and its task ends,
+        // so the shutdown drain itself finishes at once. The recording's end
+        // is still missing, and the CLI's exit code 4 depends on this outcome.
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = fault_with_a_stuck_close(&mut listener).await;
+        let name = listener.channels[&id].config.name.as_str().to_owned();
+        tokio::time::sleep(Listener::STOP_GRACE + Duration::from_millis(500)).await;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), listener.shutdown())
+            .await
+            .expect("the pipeline task had already ended");
+        assert_eq!(outcome.incomplete, vec![name]);
+        assert_eq!(listener.channels[&id].state, ChannelState::Stopped);
+        let reported = listener.channels[&id]
+            .retained_diagnostics
+            .iter()
+            .filter(|d| d.message.contains("finalization incomplete"))
+            .count();
+        assert_eq!(
+            reported, 1,
+            "said once, by the pipeline, not again at shutdown"
         );
     }
 
@@ -2128,12 +2190,11 @@ mod tests {
     async fn shutdown_drains_every_channel_at_once_and_abandons_a_stuck_one() {
         // §113: each Channel shuts down independently, and a drain that cannot
         // finish is abandoned at the grace period instead of holding up exit.
-        type Drain =
-            std::pin::Pin<Box<dyn std::future::Future<Output = Option<ChannelSnapshot>> + Send>>;
+        type Drain = std::pin::Pin<Box<dyn std::future::Future<Output = Drained> + Send>>;
         let (stuck, quick) = (ChannelId::new(), ChannelId::new());
         let drains: Vec<(ChannelId, Drain)> = vec![
             (stuck, Box::pin(std::future::pending())),
-            (quick, Box::pin(async { None })),
+            (quick, Box::pin(async { Drained::default() })),
         ];
         let started = std::time::Instant::now();
         let mut finished: Vec<(ChannelId, bool)> = drain_all(drains, Duration::from_millis(200))

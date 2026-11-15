@@ -2149,9 +2149,13 @@ already on, so a frequent `Record Begin` rule could hold up reception.
   a user Stop is, and logs "finalization incomplete" on expiry (§113).
 - A Begin on a recorder that is already running returns at once.
 
-**Boundary:** A stuck Channel still costs up to 300 ms of each poll. A Channel
-that faulted with a stuck close and is then stopped does not set the CLI's
-exit code 4; the error reaches the diagnostics and the event log.
+**Boundary:** A stuck Channel still costs up to 300 ms of each poll.
+
+**Correction (2026-11-14):** As first built, a Channel that faulted with a
+stuck close and was then stopped did not set the CLI's exit code 4. Its
+pipeline task had already ended, so the stop's drain finished in time and
+counted as complete. The drain now also reports whether the pipeline's own
+close gave up, and that counts as finalization incomplete, named once.
 
 **Consequences:** Every other Channel's status keeps moving while one is
 stuck, and a running Channel slow to answer shows figures at most one poll old.
