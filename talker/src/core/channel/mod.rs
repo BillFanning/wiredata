@@ -218,6 +218,53 @@ impl std::fmt::Display for MissingRetryConfiguration {
 
 impl std::error::Error for MissingRetryConfiguration {}
 
+/// Change a live handle's settings in place, and never leave it holding a
+/// mixture of the old and the new.
+///
+/// `apply_next` is tried first. If it fails, `restore` puts the previous
+/// settings back. If that fails too the handle may hold some of each, so it
+/// is released and `reopen` opens a fresh one with the previous settings;
+/// should that fail as well, `handle` is left `None` for the interface's
+/// retry to reopen. Every failure is returned as an error that says which of
+/// these happened; `what` names the handle ("serial port", "UDP socket").
+pub(super) fn change_or_restore<H>(
+    handle: &mut Option<H>,
+    what: &str,
+    apply_next: impl FnOnce(&mut H) -> anyhow::Result<()>,
+    restore: impl FnOnce(&mut H) -> anyhow::Result<()>,
+    reopen: impl FnOnce() -> anyhow::Result<H>,
+) -> anyhow::Result<()> {
+    let Some(live) = handle.as_mut() else {
+        anyhow::bail!("the {what} is not open");
+    };
+    let Err(change_err) = apply_next(live) else {
+        return Ok(());
+    };
+    let Err(restore_err) = restore(live) else {
+        return Err(change_err.context(format!(
+            "applying the new {what} settings; the previous settings were restored"
+        )));
+    };
+    // Released before the reopen: a serial port is exclusive, and a socket
+    // holds its local port.
+    drop(handle.take());
+    match reopen() {
+        Ok(fresh) => {
+            *handle = Some(fresh);
+            Err(change_err.context(format!(
+                "applying the new {what} settings; the previous settings could not be \
+                 restored in place ({restore_err:#}), so the {what} was reopened with them"
+            )))
+        }
+        Err(reopen_err) => Err(change_err.context(format!(
+            "applying the new {what} settings; the previous settings could not be \
+             restored in place ({restore_err:#}), and reopening the {what} with them \
+             failed ({reopen_err:#}). The {what} is closed, and nothing is sent until a \
+             retry reopens it with the previous settings"
+        ))),
+    }
+}
+
 impl InterfaceConfig {
     /// Open the live interface described by this config.
     pub fn open(&self) -> anyhow::Result<Box<dyn Interface>> {
@@ -234,6 +281,96 @@ mod tests {
     use std::net::UdpSocket;
 
     use super::*;
+
+    /// A stand-in handle: the settings it holds, by name.
+    type Fake = &'static str;
+
+    fn fails(_: &mut Fake) -> anyhow::Result<()> {
+        anyhow::bail!("the driver refused")
+    }
+
+    #[test]
+    fn a_change_that_applies_keeps_the_handle() {
+        let mut handle = Some("old");
+        change_or_restore(
+            &mut handle,
+            "serial port",
+            |h| {
+                *h = "new";
+                Ok(())
+            },
+            |_| unreachable!("nothing to restore"),
+            || unreachable!("nothing to reopen"),
+        )
+        .unwrap();
+        assert_eq!(handle, Some("new"));
+    }
+
+    #[test]
+    fn a_refused_change_restores_the_previous_settings() {
+        let mut handle = Some("old");
+        let error = change_or_restore(
+            &mut handle,
+            "serial port",
+            |h| {
+                *h = "half new";
+                fails(h)
+            },
+            |h| {
+                *h = "old";
+                Ok(())
+            },
+            || unreachable!("the restore worked"),
+        )
+        .unwrap_err();
+        assert_eq!(handle, Some("old"));
+        assert!(
+            format!("{error:#}").contains("the previous settings were restored"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_failed_restore_reopens_with_the_previous_settings() {
+        let mut handle = Some("old");
+        let error = change_or_restore(
+            &mut handle,
+            "serial port",
+            |h| {
+                *h = "half new";
+                fails(h)
+            },
+            fails,
+            || Ok("old, reopened"),
+        )
+        .unwrap_err();
+        assert_eq!(handle, Some("old, reopened"), "never the mixture");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("so the serial port was reopened with them"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_restore_and_reopen_leave_no_handle_to_send_on() {
+        let mut handle = Some("old");
+        let error = change_or_restore(
+            &mut handle,
+            "UDP socket",
+            |h| {
+                *h = "half new";
+                fails(h)
+            },
+            fails,
+            || anyhow::bail!("address in use"),
+        )
+        .unwrap_err();
+        assert_eq!(handle, None, "a mixed handle must not be sent on");
+        let text = format!("{error:#}");
+        assert!(text.contains("The UDP socket is closed"), "{text}");
+        assert!(text.contains("address in use"), "{text}");
+    }
 
     #[test]
     fn open_udp_unicast_succeeds() {

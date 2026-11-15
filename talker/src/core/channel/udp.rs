@@ -3,15 +3,30 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use anyhow::Context;
 
 use super::config::{InterfaceConfig, UdpConfig, UdpMode};
-use super::Interface;
+use super::{change_or_restore, Interface, MissingRetryConfiguration};
 
 pub(super) struct UdpInterface {
+    /// `None` only after a settings change left the socket untrusted and it
+    /// could not be reopened at once; a retry reopens it.
+    bound: Option<Bound>,
+}
+
+/// A bound socket and where it sends.
+struct Bound {
     socket: UdpSocket,
     destination: SocketAddr,
 }
 
 impl UdpInterface {
     pub(super) fn open(config: &UdpConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            bound: Some(Bound::open(config)?),
+        })
+    }
+}
+
+impl Bound {
+    fn open(config: &UdpConfig) -> anyhow::Result<Self> {
         // Bound in the destination's address family: an IPv4 socket cannot
         // send to an IPv6 address, or the reverse.
         let any: IpAddr = if config.destination().is_ipv6() {
@@ -31,10 +46,23 @@ impl UdpInterface {
 
 impl Interface for UdpInterface {
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        self.socket
-            .send_to(data, self.destination)
+        let bound = self.bound.as_ref().context("UDP socket is not open")?;
+        bound
+            .socket
+            .send_to(data, bound.destination)
             .context("sending UDP datagram")?;
         Ok(())
+    }
+
+    fn prepare_retry(&mut self, current: Option<&InterfaceConfig>) -> anyhow::Result<bool> {
+        if self.bound.is_some() {
+            return Ok(false);
+        }
+        let Some(InterfaceConfig::Udp(config)) = current else {
+            return Err(MissingRetryConfiguration.into());
+        };
+        self.bound = Some(Bound::open(config)?);
+        Ok(true)
     }
 
     fn reconfigure(
@@ -52,27 +80,28 @@ impl Interface for UdpInterface {
             return Ok(false);
         }
 
-        let reset_for_next = is_multicast(&current.mode) && !is_multicast(&next.mode);
-        match apply_socket_config(&self.socket, next, reset_for_next) {
-            Ok(destination) => {
-                self.destination = destination;
-                Ok(true)
-            }
-            Err(change_err) => {
-                let reset_for_rollback = is_multicast(&next.mode) && !is_multicast(&current.mode);
-                match apply_socket_config(&self.socket, current, reset_for_rollback) {
-                    Ok(destination) => {
-                        self.destination = destination;
-                        Err(change_err
-                            .context("applying UDP settings; previous settings were restored"))
-                    }
-                    Err(rollback_err) => Err(change_err.context(format!(
-                        "applying UDP settings; restoring the previous settings also failed: \
-                     {rollback_err:#}"
-                    ))),
-                }
-            }
+        if self.bound.is_none() {
+            // Closed after an untrusted change: open a new socket with `next`.
+            return Ok(false);
         }
+
+        let reset_for_next = is_multicast(&current.mode) && !is_multicast(&next.mode);
+        let reset_for_rollback = is_multicast(&next.mode) && !is_multicast(&current.mode);
+        change_or_restore(
+            &mut self.bound,
+            "UDP socket",
+            |bound| {
+                bound.destination = apply_socket_config(&bound.socket, next, reset_for_next)?;
+                Ok(())
+            },
+            |bound| {
+                bound.destination =
+                    apply_socket_config(&bound.socket, current, reset_for_rollback)?;
+                Ok(())
+            },
+            || Bound::open(current),
+        )
+        .map(|()| true)
     }
 }
 
@@ -217,12 +246,16 @@ mod tests {
         let mut next = UdpConfig::unicast(receiver.local_addr().unwrap());
         next.local_port = Some(local_port);
         let mut interface = UdpInterface::open(&current).unwrap();
-        assert_eq!(interface.socket.multicast_ttl_v4().unwrap(), 7);
+        let ttl = |interface: &UdpInterface| {
+            let bound = interface.bound.as_ref().unwrap();
+            bound.socket.multicast_ttl_v4().unwrap()
+        };
+        assert_eq!(ttl(&interface), 7);
 
         assert!(interface
             .reconfigure(&InterfaceConfig::Udp(current), &InterfaceConfig::Udp(next))
             .unwrap());
-        assert_eq!(interface.socket.multicast_ttl_v4().unwrap(), 1);
+        assert_eq!(ttl(&interface), 1);
         interface.send(b"unicast").unwrap();
         receiver
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -256,7 +289,8 @@ mod tests {
             Some(4),
         );
         let conn = UdpInterface::open(&config).unwrap();
-        assert_eq!(conn.socket.multicast_ttl_v4().unwrap(), 4);
+        let bound = conn.bound.as_ref().unwrap();
+        assert_eq!(bound.socket.multicast_ttl_v4().unwrap(), 4);
     }
 
     #[test]

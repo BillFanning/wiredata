@@ -1,14 +1,15 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.29
+**Version:** 1.30
 **Date:** 2026-11-14
 **Status:** Accepted
 
-Revision note (2026-11-14) — the time policy:
+Revision note (2026-11-14) — fixes from the November code review:
 
-- **ADR-067** — one policy for every time of day in both apps: local unless
-  a format, a labelled option or the feature's name says UTC; a zone on
-  whatever is written to a file, a log or the wire.
+- **ADR-068** — a settings change on a live serial port or UDP socket never
+  leaves it half-changed.
+- **ADR-061** — stopping the log file at exit is bounded, and a log that may be
+  missing its last lines is reported.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -2448,6 +2449,14 @@ exactly the details that make it trustworthy.
 **Boundary:** Like `wiredata-timing` and `wiredata-telemetry`, the crate stays
 narrow. No logging policy moves into it.
 
+**Added decision (2026-11-14):** Stopping the log file at exit is bounded. Both
+CLIs ask the worker to write out and close, and wait at most 2 s. A worker
+stuck on a drive or share that stopped answering is left behind, since an
+operating-system write cannot be cancelled. The CLI then prints a closing
+WARNING saying the last lines of the log may be missing, or that the last write
+failed, with the error. A guard that is simply dropped waits at most 500 ms.
+The exit code is unchanged by any of it.
+
 **Alternatives considered:**
 
 - **Copy the worker into listener:** Rejected. Two implementations of loss
@@ -2679,6 +2688,29 @@ are. It adds no UTC option where none was asked for.
 **Consequences:** An unmarked time anywhere in wiredata is local. A reader on
 another computer, or in another season, can still place any time read from a
 file.
+
+---
+
+## ADR-068 — A settings change never leaves a port or socket half-changed
+
+**Status:** Accepted 2026-11-14.
+
+**Context:** A live serial port or UDP socket takes a settings change in place,
+one setting after another. A change that fails part way leaves the handle
+holding some new settings and some old ones, while the screen still shows the
+old ones as applied. The channel would then send with settings nobody chose.
+
+**Decision:** If applying the new settings fails, the previous settings are put
+back. If that also fails, the handle may hold a mixture, so it is closed and
+reopened with the previous confirmed settings. If the reopen fails too, the
+handle stays closed and nothing is sent until the ordinary retry reopens it
+with the previous settings. The error names which of the three happened.
+
+**Boundary:** TCP is not changed in place, so it is unaffected. The confirmed
+settings shown as applied never change on a failed update.
+
+**Consequences:** A channel never sends with settings other than the ones shown
+as applied.
 
 ---
 

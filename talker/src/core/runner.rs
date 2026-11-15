@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use wiredata_cli::doubling_retry;
 use wiredata_ui::format::{compact_duration, interval as whole_ms, thousands};
 
@@ -1322,7 +1322,11 @@ impl<'a> RunState<'a> {
             .last_sample
             .is_none_or(|t| now - t >= self.policy.sample_interval);
         if due {
-            let repeat = self.last_sampled_index == Some(index) && self.schedule.len() > 1;
+            // A zero interval asks for every successful send, so the
+            // repeat-suppression rotation does not apply.
+            let repeat = !self.policy.sample_interval.is_zero()
+                && self.last_sampled_index == Some(index)
+                && self.schedule.len() > 1;
             if !repeat || self.repeats_skipped_while_due >= self.schedule.len() as u64 {
                 self.last_sample = Some(now);
                 self.last_sampled_index = Some(index);
@@ -1554,9 +1558,15 @@ fn run_loop(
     let end_reason = 'run: loop {
         // Drain anything already queued so back-to-back sends can't starve
         // command handling.
-        for cmd in cmd_rx.try_iter() {
-            if let Flow::Stop = run.on_command(cmd) {
-                break 'run RunEndReason::StopCommand;
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(cmd) => {
+                    if let Flow::Stop = run.on_command(cmd) {
+                        break 'run RunEndReason::StopCommand;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break 'run RunEndReason::OwnerDisconnected,
             }
         }
 
@@ -2606,6 +2616,85 @@ mod tests {
         }
         assert_eq!(samples, 1, "one payload sample regardless of send count");
         assert_eq!(last_total as usize, sent.lock().unwrap().len());
+    }
+
+    #[test]
+    fn every_send_policy_samples_every_send_with_a_dormant_message_present() {
+        let (sent, handle, _id) = spawn_runner(&[msg("AA", 1), msg("BB", 0)], false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sent.lock().unwrap().len() < 10 {
+            assert!(Instant::now() < deadline, "expected 10 sends within 5 s");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        let status_rx = handle.status_rx.clone();
+        join_within(handle, Duration::from_secs(2));
+
+        let samples = status_rx
+            .try_iter()
+            .filter(|s| matches!(s, TalkerStatus::SendSample { .. }))
+            .count();
+        let writes = sent.lock().unwrap().len();
+        assert!(writes >= 10);
+        assert_eq!(samples, writes, "every successful send must be sampled");
+    }
+
+    /// An interface whose every write overruns the schedule's interval.
+    struct AlwaysSlowInterface {
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Interface for AlwaysSlowInterface {
+        fn send(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+            let n = self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            // A runner that never notices its owner is gone would write for
+            // ever; end the test thread rather than leak it.
+            assert!(n < 100, "runner kept sending after its owner disconnected");
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_permanently_overloaded_runner_still_notices_a_dropped_owner() {
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let interface = Box::new(AlwaysSlowInterface {
+            writes: Arc::clone(&writes),
+        });
+        let schedule = Schedule::compile(&[msg("AB", 1)], Instant::now()).unwrap();
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
+        let (control_tx, _control_rx) = crossbeam_channel::bounded(16);
+        let (status_tx, _status_rx) = crossbeam_channel::bounded(256);
+        let who = RunnerIdentity {
+            id: ChannelId::mint(),
+            label: "test".into(),
+            run_id: RunId::mint(),
+        };
+        drop(cmd_tx);
+        let thread = std::thread::spawn(move || {
+            run(
+                who,
+                interface,
+                None,
+                schedule,
+                cmd_rx,
+                RunnerObserver::new(status_tx, ObserverPolicy::every_send())
+                    .with_control(control_tx),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !thread.is_finished() {
+            assert!(Instant::now() < deadline, "runner did not stop in time");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        thread.join().unwrap();
+        assert!(
+            writes.load(std::sync::atomic::Ordering::SeqCst) <= 2,
+            "a disconnected owner must end the run within a pass or two"
+        );
     }
 
     #[test]

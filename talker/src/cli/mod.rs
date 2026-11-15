@@ -248,18 +248,11 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
         return Ok(EXIT_CANNOT_START);
     }
 
-    // Compile every schedule before opening any interface. Preparation is inert,
-    // so a bad message cannot briefly claim a serial port or socket.
+    // Check and compile every schedule before opening any interface.
+    // Preparation is inert, so a bad message cannot briefly claim a serial
+    // port or socket.
+    let schedules = prepare_schedules(&profile);
     let channels = profile.channels;
-    let schedules = channels
-        .iter()
-        .enumerate()
-        .map(|(i, channel)| {
-            Schedule::compile_unarmed(&channel.messages)
-                .map(|schedule| schedule.with_alignment(channel.cadence_alignment))
-                .with_context(|| format!("compiling channel {i} schedule"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>();
     let schedules = match schedules {
         Ok(schedules) => schedules,
         Err(err) => {
@@ -423,7 +416,14 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
                         say(health.down(channel, &message, &send_retry, now));
                     }
                     TalkerStatus::SendRecovered { channel, .. } => say(health.up(channel, now)),
-                    TalkerStatus::Counters { channel, totals, .. } => {
+                    TalkerStatus::Counters { channel, totals, active_send_error, .. } => {
+                        say(reconcile_send_health(
+                            &mut health,
+                            channel,
+                            active_send_error.as_deref(),
+                            &send_retry,
+                            now,
+                        ));
                         finals.insert(
                             channel,
                             FinalCounts {
@@ -495,12 +495,75 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
     // Writes out what the log queue holds. A held Windows logoff or shutdown
     // goes ahead only after this and the closing lines: Windows may end the
     // process straight away.
-    drop(log);
+    if let Some(warning) = log.shutdown(LOG_STOP_LIMIT).and_then(log_stop_warning) {
+        closing.push(warning);
+    }
     for line in closing {
         eprintln!("{line}");
     }
     windows_stop.finish();
     Ok(status)
+}
+
+/// How long the exit waits for the log file to be written out. A file on a
+/// drive that stopped answering is given up on, so it cannot hold the
+/// process open after the channels have stopped.
+const LOG_STOP_LIMIT: Duration = Duration::from_secs(2);
+
+/// The closing line for a log file that was not completely written; `None`
+/// when it was.
+fn log_stop_warning(outcome: wiredata_log::ShutdownOutcome) -> Option<String> {
+    use wiredata_log::ShutdownOutcome;
+    match outcome {
+        ShutdownOutcome::Clean => None,
+        ShutdownOutcome::FinalWriteFailed(error) => Some(format!(
+            "WARNING: the last lines of the log file could not be written: {error}"
+        )),
+        ShutdownOutcome::TimedOut => Some(format!(
+            "WARNING: the log file was not written out within {} s, so its last lines              may be missing: the drive it is on is not answering",
+            LOG_STOP_LIMIT.as_secs()
+        )),
+        ShutdownOutcome::WorkerPanicked => Some(
+            "WARNING: the log file's writer failed, so its last lines may be missing".to_owned(),
+        ),
+    }
+}
+
+/// Bring a channel's health into line with the send error a counter update
+/// carries, which stays right when the failure or recovery edge was dropped.
+///
+/// Counters come only from a running send loop, so the interface is open:
+/// `None` means sending is up, and `Some` means it is down for sending. A
+/// state the edge already recorded gives no second line.
+fn reconcile_send_health(
+    health: &mut HealthWatch<ChannelId>,
+    channel: ChannelId,
+    active_send_error: Option<&str>,
+    send_retry: &str,
+    now: Instant,
+) -> Option<String> {
+    match active_send_error {
+        Some(message) => health.down(channel, message, send_retry, now),
+        None => health.up(channel, now),
+    }
+}
+
+/// Check that every message fits its channel's interface, as the GUI does
+/// before Start, then compile each channel's schedule without arming it.
+///
+/// Numbering in an interface error is one-based, matching the GUI.
+fn prepare_schedules(profile: &Profile) -> anyhow::Result<Vec<Schedule>> {
+    profile.validate()?;
+    profile
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(i, channel)| {
+            Schedule::compile_unarmed(&channel.messages)
+                .map(|schedule| schedule.with_alignment(channel.cadence_alignment))
+                .with_context(|| format!("compiling channel {i} schedule"))
+        })
+        .collect()
 }
 
 /// A channel's send counters at the stop (§4.4), for the summary.
@@ -702,6 +765,121 @@ fn list_profiles() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::channel::{ChannelConfig, InterfaceConfig, UdpConfig};
+    use crate::core::message::{ChecksumAlgorithm, ChecksumConfig, MessageConfig, PayloadConfig};
+
+    fn udp_profile(destination: &str, message: MessageConfig) -> Profile {
+        let mut profile = Profile::new("t");
+        profile.channels = vec![ChannelConfig::new(
+            InterfaceConfig::Udp(UdpConfig::unicast(destination.parse().unwrap())),
+            vec![message],
+        )];
+        profile
+    }
+
+    fn hex_of_len(bytes: usize) -> MessageConfig {
+        MessageConfig::new(PayloadConfig::raw_hex("AA".repeat(bytes)), 100)
+    }
+
+    #[test]
+    fn an_oversized_ipv4_datagram_is_refused_before_anything_opens() {
+        let profile = udp_profile("127.0.0.1:9", hex_of_len(65_508));
+        let err = prepare_schedules(&profile).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("channel 1 message 1"), "{text}");
+        assert!(text.contains("larger than one UDP datagram"), "{text}");
+        assert!(prepare_schedules(&udp_profile("127.0.0.1:9", hex_of_len(65_507))).is_ok());
+    }
+
+    #[test]
+    fn an_oversized_ipv6_datagram_is_refused_before_anything_opens() {
+        let err = prepare_schedules(&udp_profile("[::1]:9", hex_of_len(65_528))).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("channel 1 message 1"),
+            "{err:#}"
+        );
+        assert!(prepare_schedules(&udp_profile("[::1]:9", hex_of_len(65_527))).is_ok());
+    }
+
+    #[test]
+    fn checksum_overhead_counts_toward_the_datagram_limit() {
+        // The payload alone fits; the 4-byte CRC-32 tips it over.
+        let mut message = hex_of_len(65_505);
+        assert!(prepare_schedules(&udp_profile("127.0.0.1:9", message.clone())).is_ok());
+        message.checksum = Some(ChecksumConfig {
+            algorithm: ChecksumAlgorithm::Crc32,
+            intentionally_wrong: false,
+        });
+        let err = prepare_schedules(&udp_profile("127.0.0.1:9", message)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("larger than one UDP datagram"),
+            "{err:#}"
+        );
+    }
+
+    fn watched() -> (HealthWatch<ChannelId>, ChannelId, String) {
+        let mut health = HealthWatch::new("not retrying, so it stays down");
+        let id = ChannelId::mint();
+        health.add(id, "GPS", true);
+        let _ = health.up(id, Instant::now());
+        (health, id, retry_words().1)
+    }
+
+    #[test]
+    fn only_an_incomplete_log_stop_adds_a_closing_warning() {
+        use wiredata_log::ShutdownOutcome;
+        assert_eq!(log_stop_warning(ShutdownOutcome::Clean), None);
+        let failed = log_stop_warning(ShutdownOutcome::FinalWriteFailed("disk full".into()));
+        assert!(failed.unwrap().ends_with("could not be written: disk full"));
+        let timed_out = log_stop_warning(ShutdownOutcome::TimedOut).unwrap();
+        assert!(timed_out.starts_with("WARNING: the log file was not written out within 2 s"));
+        assert!(log_stop_warning(ShutdownOutcome::WorkerPanicked).is_some());
+    }
+
+    #[test]
+    fn a_counter_update_repairs_a_lost_failure_edge() {
+        let (mut health, id, retry) = watched();
+        let now = Instant::now();
+        let line = reconcile_send_health(&mut health, id, Some("broken pipe"), &retry, now)
+            .expect("a new outage is announced");
+        assert!(
+            line.starts_with("WARNING: [GPS] is down: broken pipe"),
+            "{line}"
+        );
+        assert!(health.degraded());
+
+        // A newer error only refreshes the reason; the edge arriving late
+        // adds no second warning.
+        assert!(reconcile_send_health(&mut health, id, Some("timed out"), &retry, now).is_none());
+        assert!(health.down(id, "broken pipe", &retry, now).is_none());
+        let summary = health.summary(now);
+        assert!(summary[0].1.contains("broken pipe"), "{}", summary[0].1);
+    }
+
+    #[test]
+    fn a_counter_update_repairs_a_lost_recovery_edge() {
+        let (mut health, id, retry) = watched();
+        let now = Instant::now();
+        assert!(health.down(id, "broken pipe", &retry, now).is_some());
+        let line = reconcile_send_health(&mut health, id, None, &retry, now)
+            .expect("the recovery is announced");
+        assert!(
+            line.starts_with("RECOVERED: [GPS] is running again"),
+            "{line}"
+        );
+        assert!(!health.degraded());
+
+        // The edge arriving late, and a later healthy counter, say nothing.
+        assert!(health.up(id, now).is_none());
+        assert!(reconcile_send_health(&mut health, id, None, &retry, now).is_none());
+    }
+
+    #[test]
+    fn a_healthy_counter_update_leaves_a_running_channel_alone() {
+        let (mut health, id, retry) = watched();
+        assert!(reconcile_send_health(&mut health, id, None, &retry, Instant::now()).is_none());
+        assert!(!health.degraded());
+    }
 
     #[test]
     fn a_failed_open_and_a_failed_send_state_their_own_retry_schedules() {

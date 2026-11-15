@@ -1,7 +1,7 @@
 use anyhow::Context;
 
 use super::config::{DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits};
-use super::{write_counted, Interface, MissingRetryConfiguration, WriteFailure};
+use super::{change_or_restore, write_counted, Interface, MissingRetryConfiguration, WriteFailure};
 
 /// How long a serial write may stall, on flow control or a full driver buffer,
 /// before it fails as timed out.
@@ -135,26 +135,22 @@ impl Interface for SerialInterface {
             return Ok(false);
         }
 
-        let Some(port) = self.port.as_mut() else {
+        if self.port.is_none() {
             // The handle was released after a send failure. Let the runner's
             // ordinary replacement-open path apply this edit atomically.
             return Ok(false);
-        };
-
-        if let Err(change_err) = apply_config(port.as_mut(), next) {
-            let rollback = apply_config(port.as_mut(), current);
-            return match rollback {
-                Ok(()) => {
-                    Err(change_err
-                        .context("applying serial settings; previous settings were restored"))
-                }
-                Err(rollback_err) => Err(change_err.context(format!(
-                    "applying serial settings; restoring the previous settings also failed: \
-                     {rollback_err:#}"
-                ))),
-            };
         }
-        Ok(true)
+
+        let changed = change_or_restore(
+            &mut self.port,
+            "serial port",
+            |port| apply_config(port.as_mut(), next),
+            |port| apply_config(port.as_mut(), current),
+            || open_port(current),
+        );
+        // A port left closed is reopened by the next retry.
+        self.reopen_required = self.port.is_none();
+        changed.map(|()| true)
     }
 }
 

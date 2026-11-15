@@ -1,16 +1,20 @@
 # Talker — Program Specification
-**Version:** 2.5.6
+**Version:** 2.5.7
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-14) — times are local unless they say UTC:
+Revision note (2026-11-14) — fixes from the November code review:
 
-- **§5.4 (ADR-067)** — a message timestamp is the computer's local time unless
-  its new **UTC** option is on, and **Zone** appends `Z` or the local offset.
-  It was always UTC, with an optional `Z`.
-- **§9.2** — console and log-file lines are stamped in local time with an
-  offset and milliseconds. They were UTC with microseconds.
-- **§8.1** — the GUI shows a completed run's start and finish in local time.
+- **§3.1 CLI** — the CLI checks every message against its channel's
+  interface before opening anything, and keeps each channel's health in line
+  with its counter updates.
+- **§4.3 (ADR-068)** — a failed live settings change never leaves a serial
+  port or UDP socket half-changed.
+- **§5.8** — with every send sampled, none is skipped to give other messages a
+  turn.
+- **§9.2 (ADR-061)** — the CLI's exit waits at most 2 s for the log file and
+  warns when its last lines may be missing.
+- **§8.1** — a send loop ends when its owner is gone, even when it never waits.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -205,10 +209,18 @@ nobody watches the terminal:
 - **Start what can start.** A channel whose interface fails to open is retried
   with backoff, 1 s doubling to 30 s, while the others send. `--require-all`
   instead stops everything and exits when any channel fails to open.
+- **Check before opening.** The CLI checks every message against its channel's
+  interface before opening anything, as the GUI does before Start. A message too
+  large for its interface, such as a UDP payload larger than one datagram once
+  its timestamp and checksum are counted, is an error naming the channel and the
+  message by their one-based numbers, and the CLI exits with code 2.
 - **Warn loudly.** A WARNING banner on stderr, not hidden by `--quiet`, names each
   channel that did not open and why, using the word rather than colour. A reminder
   repeats every 5 minutes while any channel is down, giving how long it has been
-  down and the latest reason. A line reports each recovery.
+  down and the latest reason. A line reports each recovery. Every counter update
+  repeats the channel's current send error, and the CLI brings the channel's
+  health into line with it, so a lost failure or recovery notice cannot leave
+  these lines, the summary or the exit code wrong.
 - **Final summary.** At exit the CLI prints each channel's outcome, its final send
   counters (§4.4), and the number of `--echo` lines dropped (§5.8).
 - **Stop signals.** Ctrl-C, SIGTERM on Linux, and console close, logoff and
@@ -542,6 +554,14 @@ Interface parameters (port, baud rate, UDP port, host address, etc.) are adjusta
 - The interface is automatically closed, reconfigured, and reopened
 - Output resumes without user action
 
+A live serial port or UDP socket takes a settings change in place (ADR-068). If
+applying the new settings fails, the previous settings are put back. If that
+also fails, the handle is closed and reopened with the previous confirmed
+settings; if the reopen fails too, it stays closed and nothing is sent until
+the ordinary retry reopens it with them. The error names which of the three
+happened. A channel never sends with settings other than the ones shown as
+applied.
+
 If a serial channel is already recovering from an unusable handle, a successful
 live update opens the new settings and clears the pending replacement. If that
 update fails, the previous settings remain confirmed and automatic reopen
@@ -759,6 +779,10 @@ Display panes are available in the GUI only. In CLI mode, stdout echo (Section 5
 ### 5.8 Standard Output Echo
 
 Output data is optionally echoed to stdout. This is toggled by the user and is available in both CLI and GUI modes.
+
+Echo asks for every send, which is a sample interval of zero: every successful
+send is sampled. The rule that skips repeats of one message so that others get
+a turn applies only when a sample interval is set.
 
 ---
 
@@ -1066,6 +1090,8 @@ telemetry shows what the run achieved.
 
 **Completed-run retention (ADR-036):**
 
+- A send loop ends when its owner is gone, even when every send overruns its
+  interval and the loop never waits.
 - A run begins when its schedule is armed, after interface open and any predecessor
   join. Talker captures a wall-clock start beside that monotonic arm instant.
 - On Stop or owner disconnect, the send loop captures wall-clock finish and monotonic
@@ -1241,6 +1267,11 @@ writes each use a non-blocking logger thread rather than the channel's send
 thread. A console can stop taking output, as a classic Windows console window
 does while text in it is selected; a stdout line it does not take is dropped
 and counted, and the run's closing lines say how many (ADR-064).
+
+At exit the CLI asks the file worker to write out and close, and waits at most
+2 s (ADR-061). A worker stuck on a drive or share that stopped answering is left
+behind, and a closing WARNING says the last lines of the log may be missing, or
+that the last write failed, with the error. The exit code is unchanged by it.
 
 #### GUI Logging
 

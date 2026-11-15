@@ -258,7 +258,7 @@ pub struct LoggingHandle {
     /// Counts the stdout log lines dropped at a full queue; `None` when
     /// nothing is logged to stdout.
     console_dropped: Option<ErrorCounter>,
-    _runtime_file_guard: Option<wiredata_log::FileSinkGuard>,
+    runtime_file_guard: Option<wiredata_log::FileSinkGuard>,
     level: LogLevelHandle,
     file_log: Option<FileLogToggle>,
     gui_log_health: Option<GuiLogHealth>,
@@ -292,6 +292,18 @@ impl LoggingHandle {
         self.console_dropped
             .as_ref()
             .map_or(0, |dropped| dropped.dropped_lines() as u64)
+    }
+
+    /// Stop logging at application exit: write out what the queues hold,
+    /// waiting at most `limit` for the log file. `None` when nothing was
+    /// logged to a file.
+    ///
+    /// A log file on a drive that stopped answering cannot be waited out, so
+    /// the outcome says whether its last lines were written.
+    pub fn shutdown(mut self, limit: std::time::Duration) -> Option<wiredata_log::ShutdownOutcome> {
+        self.runtime_file_guard
+            .take()
+            .map(|guard| guard.shutdown(limit))
     }
 }
 
@@ -405,7 +417,7 @@ pub fn init(
     Ok(LoggingHandle {
         _guards: guards,
         console_dropped,
-        _runtime_file_guard: runtime_file_guard,
+        runtime_file_guard,
         level: level_handle,
         file_log,
         gui_log_health,

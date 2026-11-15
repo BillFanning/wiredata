@@ -15,6 +15,15 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-14) — times are local unless they say UTC:
+
+- **§5.4 (ADR-067)** — a message timestamp is the computer's local time unless
+  its new **UTC** option is on, and **Zone** appends `Z` or the local offset.
+  It was always UTC, with an optional `Z`.
+- **§9.2** — console and log-file lines are stamped in local time with an
+  offset and milliseconds. They were UTC with microseconds.
+- **§8.1** — the GUI shows a completed run's start and finish in local time.
+
 Revision note (2026-11-13) — "withheld" in place of "suppressed":
 
 - **§3.2 Send outcomes, §4.4** — a send held back during a retry wait is
@@ -465,6 +474,12 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-11-14) — the time policy:
+
+- **ADR-067** — one policy for every time of day in both apps: local unless
+  a format, a labelled option or the feature's name says UTC; a zone on
+  whatever is written to a file, a log or the wire.
 
 Revision note (2026-11-14) — consolidation:
 
