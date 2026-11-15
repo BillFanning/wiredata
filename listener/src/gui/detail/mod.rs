@@ -106,6 +106,9 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &ListenerRunSummary) {
                     " · final snapshot incomplete"
                 }
             ));
+            if !summary.finalization_complete {
+                ui.weak("The end of the recordings may be missing, because the Channel did not finish closing them in time.");
+            }
         });
     summary_view
         .header_response

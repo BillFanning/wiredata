@@ -54,6 +54,10 @@ pub struct ListenerRunSummary {
     pub end_reason: RunEndReason,
     /// False only when a task panicked or shutdown exceeded its grace window.
     pub final_snapshot_complete: bool,
+    /// False when the end of the run's recordings may be missing: the
+    /// pipeline's own close gave up at the stop grace, or the whole drain was
+    /// abandoned. A final snapshot can exist either way.
+    pub finalization_complete: bool,
     pub total_bytes: u64,
     pub chunk_shape: ChunkShape,
     pub match_boundary_saves: u64,
@@ -81,6 +85,7 @@ impl ListenerRunSummary {
         elapsed: Duration,
         end_reason: RunEndReason,
         snapshot: Option<&ChannelSnapshot>,
+        finalization_complete: bool,
     ) -> Self {
         Self {
             run_id,
@@ -92,6 +97,7 @@ impl ListenerRunSummary {
             elapsed,
             end_reason,
             final_snapshot_complete: snapshot.is_some(),
+            finalization_complete,
             total_bytes: snapshot.map_or(0, |snap| snap.activity.total_bytes),
             chunk_shape: snapshot.map_or_else(ChunkShape::default, |snap| snap.chunk_shape),
             match_boundary_saves: snapshot.map_or(0, |snap| snap.match_boundary_saves),
@@ -164,6 +170,7 @@ impl ListenerRunSummary {
             "final_snapshot_complete={}",
             self.final_snapshot_complete
         );
+        let _ = writeln!(out, "finalization_complete={}", self.finalization_complete);
         let _ = writeln!(out, "received_bytes={}", self.total_bytes);
         let _ = writeln!(out, "received_chunks={}", self.chunk_shape.chunk_count());
         write_byte_histogram(&mut out, "chunk_size", self.chunk_shape.sizes);
@@ -348,6 +355,7 @@ mod tests {
             elapsed: Duration::from_millis(12_345),
             end_reason: RunEndReason::StopRequested,
             final_snapshot_complete: true,
+            finalization_complete: true,
             total_bytes: 1_024,
             chunk_shape,
             match_boundary_saves: 2,

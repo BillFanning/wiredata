@@ -153,11 +153,34 @@ impl RecordingStatus {
     }
 }
 
+/// Where the figures in a [`ChannelSnapshot`] or [`ChannelStats`] came from.
+///
+/// The orchestrator stamps it on every answer it hands out, so a consumer can
+/// tell a measurement taken for this request from one served after the Channel
+/// stopped answering.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Provenance {
+    /// Measured for this request by the running pipeline, or taken from the
+    /// finished run when the Channel has no pipeline (the final figures, exact
+    /// at rest).
+    #[default]
+    Fresh,
+    /// The pipeline did not answer in time, so these are its last answer of
+    /// the current run. `age` is how long ago it was measured, as of the moment
+    /// this answer was handed out; the figures themselves are not aged.
+    Cached { age: Duration },
+    /// The pipeline did not answer in time and has never answered during the
+    /// current run, so these are the figures retained from an earlier run.
+    Retained,
+}
+
 /// Cheap, O(1) health counters for a Channel — everything a multi-channel
 /// overview needs per tab without cloning the stream scrollback (the expensive
 /// part of a full [`ChannelSnapshot`]).
 #[derive(Clone, Debug)]
 pub struct ChannelStats {
+    /// Where these figures came from; stamped by the orchestrator.
+    pub provenance: Provenance,
     /// The Channel's effective lifecycle state (§8) at serve time, stamped by the
     /// orchestrator (the lifecycle authority — the pipeline can't know it and fills
     /// a placeholder). This is what makes the polled lane **self-correcting**
@@ -227,6 +250,8 @@ pub struct ChannelStats {
 #[derive(Clone, Debug)]
 pub struct ChannelSnapshot {
     pub channel_id: ChannelId,
+    /// Where these figures came from; stamped by the orchestrator.
+    pub provenance: Provenance,
     /// Effective lifecycle state at serve time — see [`ChannelStats::state`].
     pub state: ChannelState,
     /// Auto-reconnect armed/in progress — see [`ChannelStats::reconnect_pending`].

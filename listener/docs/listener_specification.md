@@ -1,17 +1,29 @@
-# Listener Specification v2.4.12
+# Listener Specification v2.4.13
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-14) — times are local unless they say UTC:
+Revision note (2026-11-14) — fixes from the November code review:
 
-- **§54, §56.1 (ADR-063).** Gap times, in a `‹GAP …›` line and in a gap
-  record, are ISO 8601 local time with milliseconds and offset. They had a
-  space for the `T` and no offset.
-- **§91.** States the rule, and that the GUI shows a completed run's start
-  and finish in local time.
+- **§50.2 (ADR-064, ADR-065).** A Record action takes effect at its match,
+  and one read fires at most 4,096 matches. A Mark on a multi-byte character
+  is placed against the whole character.
+- **§56.1, §59.** A failed close of a rotated file is a recording fault. A due
+  flush is not put off by queued data.
+- **§9.1.** The 60 s stability window runs from the reconnect's successful
+  start.
+- **§113.** The run summary and the copied report say whether finalization
+  completed.
+- **§99 (ADR-066).** One-time GUI results are never dropped.
+- **§91 (ADR-068).** Status that is not from the latest request says so, and
+  how old it is.
+- **§99 (ADR-069).** The GUI's driver waits on no Channel queue and no file
+  without a limit.
+- **§80.1 (ADR-067).** A profile's defaults are written into each Channel at
+  load.
+- **§118.** The CLI waits at most 2 s for the event log at exit.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -409,8 +421,10 @@ applies to Serial (covering USB hot-plug, §14.4) and UDP Channels. Each attempt
 A successful reconnect does not end the sequence until the Channel has stayed
 up for 60 s (ADR-058). A fault within 60 s of a successful reconnect continues
 it: the next attempt number and the next backoff step, counted towards
-`max_attempts`. Only 60 s of staying up, or a manual stop, starts the count and
-the backoff over. A device that connects and drops repeatedly is therefore
+`max_attempts`. The 60 s run from the moment the reconnect's start succeeds,
+not from when the attempt began, so a slow reopen followed by an immediate fault
+continues the attempt count and the backoff. Only 60 s of staying up, or a
+manual stop, starts the count and the backoff over. A device that connects and drops repeatedly is therefore
 retried at a growing interval and gives up at `max_attempts`, instead of being
 retried at the shortest delay for ever.
 
@@ -938,7 +952,7 @@ enum MatchCondition {
 
 ```rust
 enum MatchAction {
-    Record { target: RecordTarget, control: RecordControl }, // begin/stop, from the match forward
+    Record { target: RecordTarget, control: RecordControl }, // begin at the match's first byte, stop after its last
     Mark { timestamp: Option<MarkTimestamp> },               // marker + optional inline arrival annotation
     Notify { severity: DiagnosticSeverity },                 // raise an event/warning (§92–94)
     PauseDisplay {},                                         // freeze the display view
@@ -960,9 +974,10 @@ enum MarkTimestampStyle { Plain, NmeaZda { talker: String } }
 struct TimestampConfig { include_date: bool, include_millis: bool, include_timezone: bool }
 ```
 
-- **Record** begins or stops recording **from the match forward**; there is **no pre-match backfill** (§158). Pre-trigger capture is deferred.
+- **Record** takes effect at its match, not at the end of the read (ADR-064). A Begin starts the recording at its match's first byte, and a Stop ends it just after its match's last byte, so both triggers are in the recording. The same stream records the same bytes however the transport split it into reads, including a trigger split across two reads, whose first bytes come from the few bytes the matcher keeps for cross-read matching. Actions inside one read apply in stream order, not rule order. A Begin while recording, and a Stop while not recording, do nothing. This holds for the Raw and the Display recording alike, and the Display recording keeps the inline Mark timestamps inside the recorded span. No bytes before a Begin trigger are recorded; there is **no pre-match backfill** (§158), and pre-trigger capture is deferred. An `Idle` rule's Record action has no place in the stream and acts between reads.
+- **Order and limit** (ADR-065). Matches fire in stream order of their first byte, and matches starting on the same byte fire in rule order. One read fires at most 4,096 matches (`MAX_FIRINGS_PER_READ`); later matches in that read do not fire and are not acted on. The first time this happens in a run a warning is recorded, and later ones are only counted. A read cut off this way is the one case where what a rule set does depends on read boundaries.
 - **Mark** correlates the match into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53). A bare `Mark` (`timestamp = None`) writes a `‹MARK …›` marker line into the view's `.disp`. When `timestamp` is `Some`, `Plain` splices the matched chunk's local arrival time, formatted per `TimestampConfig` (time-of-day always shown; date, milliseconds, and local UTC offset independently toggleable). `NmeaZda` instead splices `$<talker>ZDA,<hhmmss[.sss]>,<dd>,<mm>,<yyyy>,<zone-hours>,<zone-minutes>*XX`: time/date are UTC, and the zone fields are NMEA 0183's local zone: the hours and minutes added to local time to get UTC, which is the opposite sign to an ISO 8601 offset, so a zone east of Greenwich is negative and the minutes take the hours' sign (UTC−5 is `+05,00`; UTC+5:30 is `-05,-30`). An offset outside minute precision or the supported ±13:59 range leaves both zone fields empty. Standard two-character talker IDs and custom 1–32-character printable ASCII IDs are accepted; whitespace/control characters and NMEA framing characters `$ ! , *` are invalid. IDs longer than two produce explicitly custom ZDA-shaped output.
-- `Before` attaches immediately before the match's first byte; `After` attaches immediately after its final byte. `separator` is appended after either style and may contain CR/LF. Rendering honors those controls and resets Raw wrap state, Rendered tab columns, and Hex continuation before subsequent data. The style-generated ZDA has no trailing CR/LF of its own. All styles are text insertions in every view mode, not on-screen byte-range styling (contrast removed `Highlight`, ADR-015).
+- `Before` attaches immediately before the match's first byte; `After` attaches immediately after its final byte. A Mark anchored on any byte of a multi-byte character (UTF-8, or UTF-16 including a surrogate pair) is placed against the whole character: Before goes before it and After goes after it. Hex view places it at the byte. `separator` is appended after either style and may contain CR/LF. Rendering honors those controls and resets Raw wrap state, Rendered tab columns, and Hex continuation before subsequent data. The style-generated ZDA has no trailing CR/LF of its own. All styles are text insertions in every view mode, not on-screen byte-range styling (contrast removed `Highlight`, ADR-015).
 - **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes the display view (§50); reception and recording continue.
 
 **Configuration** (persists in profiles):
@@ -1112,6 +1127,16 @@ any state → Stopping → Off
   diagnostics (§93); `RecordingFaulted(ChannelId, RecordingTap)` (§137) is emitted
   when a gap starts. A Display Recording also marks a gap that lost bytes with a
   line in the segment it resumes in (§54).
+- **A failed close is a fault.** When a file is closed at a size or period
+  rotation and its final write fails, that is a recording fault like a failed
+  flush: a gap is opened from the first byte not known to be on disk, it is
+  reported and counted like any other gap, and recording resumes in a new file
+  through the usual retry. When the close fails as recording stops for a full
+  queue or low disk, the gap already being opened is widened back to that byte
+  and the failure is named in its detail.
+- **Flush.** A flush that is due is not put off by a backlog of queued data; it
+  runs before the next queued item is written. A flush hands the data to the
+  operating system. It is not guaranteed to be on the storage medium.
 
 This is the explicit resolution of §5.6 (raw recording authoritative) versus
 §100 (reception highest priority): under sustained overload Listener preserves
@@ -1224,7 +1249,7 @@ Example (Hourly, channel "GPS"): `GPS_2026-06-03_08.raw`.
 
 **Rotation boundary.** At each period boundary Listener finalizes the current file
 (flush + close, §56) and opens the next. A rotation is a clean **file boundary, not
-a gap**: each file stays contiguous and byte-exact for the data it contains (§56),
+a gap**, unless the final write of the closed file fails (§56.1): each file stays contiguous and byte-exact for the data it contains (§56),
 and recording does not backfill across the boundary (§158). Rotation only moves
 forward: a period earlier than the current one (the clock stepped back) keeps
 writing the current file, and no rotation reopens an earlier file.
@@ -1695,6 +1720,8 @@ pub enum DiskThreshold { Bytes(u64), Percent(u8) } // §56.2
 pub enum LowDiskAction { Warn, StopRecording }     // §56.2; Stop gaps, then resumes
 ```
 
+A profile's defaults are resolved once, at load, by one function that validation, the GUI loader and the CLI loader all use (ADR-067). Each Channel that leaves a setting unset takes the profile's default and from then on carries its own explicit value, so a GUI Save writes per-Channel values with an empty defaults section, and loading that file behaves the same. Retention is inherited whole when the Channel sets no limit at all; individual limits are never merged. Display is inherited when the Channel's display equals the built-in default, because display settings have no unset state, so a Channel cannot ask for the built-in display under a profile whose default differs.
+
 ---
 
 # Part XV — Default Templates
@@ -1841,6 +1868,15 @@ A Channel answers a status request within 300 ms. One that does not, such as a
 Channel whose recording close is stuck on a removed disk, is shown with the last
 status it gave in the current run, stamped with its current state, so one stuck
 Channel never holds up the status of the others (ADR-062).
+
+Every status answer says where its figures came from (ADR-068): measured for
+this request, the Channel's last answer with its age, or an earlier run's
+figures when the Channel has not answered in this run. When the figures are not
+from the latest request, the diagnostics card says so in a sentence, such as
+"These figures were measured 12.0 s ago. The Channel is not answering status
+requests." The figures are shown as measured, not adjusted for their age. A
+stopped or faulted Channel's timing window is called its final ten seconds only
+when the figures are its exact final ones.
 
 Examples:
 
@@ -2052,6 +2088,17 @@ Each Channel shall maintain independent:
 
 Only the Transport→Pipeline edge may exert backpressure on the reader. Every
 other edge shall drop, evict, or fault — never stall acquisition.
+
+The GUI's driver is one loop, and it waits on nothing without a limit
+(ADR-069). A recording command or a serial control-line command that its
+Channel does not take within 300 ms is given up, with the error "The Channel
+did not take the command in time. The command was not sent, and it can be tried
+again." Profile reads and writes run off the loop, one at a time in the order
+asked for, and Shutdown does not wait for one. A round of status requests ends
+after 600 ms, and the next round starts with the Channels the last did not
+reach.
+
+The driver sends the GUI two kinds of update (ADR-066). Periodic ones (snapshots, statistics, stream deltas, control lines, and the high-rate advisory events the snapshot also carries) go through a bounded queue and are dropped when it is full, since the next poll repeats them. One-time results (a Channel added, removed, renamed or reconfigured; lifecycle, recording and reconnect events; profile results; errors) go through an unbounded lane and are never dropped. The GUI applies every waiting one-time result before any periodic update.
 
 The runtime records exact observed high-water marks for the Transport→Pipeline and
 Raw-recorder queues, including capacity (§91.2). Reading these scalar counters does
@@ -2268,6 +2315,11 @@ A Channel that faults finalizes its recordings under the same grace period, from
 the moment of the fault, and logs "finalization incomplete" the same way if it
 expires (ADR-062).
 
+The run summary records whether finalization completed separately from whether
+a final snapshot exists. The copied report has the key `finalization_complete`,
+and the GUI's last-run summary says "The end of the recordings may be missing,
+because the Channel did not finish closing them in time." when it did not.
+
 ---
 
 # Part XXI — Logging and Diagnostics
@@ -2328,7 +2380,10 @@ by both the CLI and the GUI:
   how long entries are missing.
 - Log files older than 30 days are deleted at start and at each day's rollover.
   Only log files are deleted, never recordings (§59).
-- The log is flushed at shutdown.
+- The log is flushed at shutdown. The CLI waits for that at most 2 s (talker
+  ADR-061). A worker stuck on a drive or share that stopped answering is left
+  behind, and a closing WARNING says the last lines of the log may be missing,
+  or that the last write failed, with the error. The exit code is unchanged.
 
 ---
 
@@ -3103,8 +3158,8 @@ _Removed (§50.1). Raw recording is byte-exact-or-off; there is no message-frame
 ## 165. Find and Triggers
 
 Each match condition (`BytePattern` scanned across the stream, `Idle`) shall fire
-its actions; `Record` shall begin/stop from the match forward with no pre-match
-backfill; `Mark` shall annotate the display / `.disp` / events but never the raw
+its actions; `Record` shall begin at its match's first byte and stop after its
+match's last byte, with no pre-match backfill; `Mark` shall annotate the display / `.disp` / events but never the raw
 `.raw` stream (§50.2).
 
 ## 166. Liveness

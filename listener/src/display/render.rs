@@ -170,18 +170,39 @@ impl<'a> AnnotationWalker<'a> {
 
     /// The annotations at exactly `offset`, in input order (stable stacking for
     /// multiple marks on one byte). Must be called with non-decreasing offsets;
-    /// annotations at offsets the walk never visits (e.g. pointing mid-way into
-    /// a multi-byte character) are skipped — same as the old behavior.
+    /// an annotation at an offset the walk never visits is skipped.
     fn run_at(&mut self, offset: usize) -> &'a [RenderAnnotation] {
-        while self.next < self.annotations.len() && self.annotations[self.next].offset < offset {
-            self.next += 1;
-        }
-        let start = self.next;
-        while self.next < self.annotations.len() && self.annotations[self.next].offset == offset {
-            self.next += 1;
-        }
-        &self.annotations[start..self.next]
+        self.run_in(offset, offset + 1)
     }
+
+    /// The annotations anchored on any byte of `start..end`, in offset order and
+    /// then input order. The text walks call this with one decoded character's
+    /// byte span, so a mark anchored on a later byte of a multi-byte character
+    /// is placed against that character rather than lost. Spans must not go
+    /// backwards.
+    fn run_in(&mut self, start: usize, end: usize) -> &'a [RenderAnnotation] {
+        while self.next < self.annotations.len() && self.annotations[self.next].offset < start {
+            self.next += 1;
+        }
+        let first = self.next;
+        while self.next < self.annotations.len() && self.annotations[self.next].offset < end {
+            self.next += 1;
+        }
+        &self.annotations[first..self.next]
+    }
+}
+
+/// Each decoded character with the byte span `start..end` it came from. The
+/// decoder's offsets are contiguous, so a character ends where the next begins
+/// and the last ends at `len`.
+fn char_spans(
+    decoded: &[(char, usize)],
+    len: usize,
+) -> impl Iterator<Item = (char, usize, usize)> + '_ {
+    decoded.iter().enumerate().map(move |(i, &(c, start))| {
+        let end = decoded.get(i + 1).map_or(len, |&(_, next)| next);
+        (c, start, end)
+    })
 }
 
 /// Split the annotation run at one offset into the texts spliced **before** and
@@ -418,8 +439,9 @@ fn render_rendered(
             }
         }
     };
-    for (c, offset) in decode_with_offsets(bytes, encoding) {
-        let (before, after) = split_run(walker.run_at(offset));
+    let decoded = decode_with_offsets(bytes, encoding);
+    for (c, start, end) in char_spans(&decoded, bytes.len()) {
+        let (before, after) = split_run(walker.run_in(start, end));
         for s in before {
             push_annotation(&mut out, s, col);
         }
@@ -551,8 +573,9 @@ impl DisplayView {
                 // straight into the output (no per-byte allocation).
                 let mut walker = AnnotationWalker::new(annotations);
                 let mut w = CellWriter::new(if wrap { self.wrap_width } else { None }, bytes.len());
-                for (c, offset) in decode_with_offsets(bytes, self.encoding) {
-                    let (before, after) = split_run(walker.run_at(offset));
+                let decoded = decode_with_offsets(bytes, self.encoding);
+                for (c, start, end) in char_spans(&decoded, bytes.len()) {
+                    let (before, after) = split_run(walker.run_in(start, end));
                     for s in before {
                         w.annotation(s);
                     }
@@ -707,8 +730,9 @@ impl StreamRenderer {
             DisplayMode::Raw => {
                 let mut walker = AnnotationWalker::new(annotations);
                 let mut w = CellWriter::new(None, bytes.len());
-                for (c, offset) in decode_with_offsets(bytes, self.view.encoding) {
-                    let (before, after) = split_run(walker.run_at(offset));
+                let decoded = decode_with_offsets(bytes, self.view.encoding);
+                for (c, start, end) in char_spans(&decoded, bytes.len()) {
+                    let (before, after) = split_run(walker.run_in(start, end));
                     for s in before {
                         w.annotation(s);
                     }
@@ -854,6 +878,126 @@ mod tests {
             offset,
             placement,
             text: text.to_string(),
+        }
+    }
+
+    /// One character's bytes, the encoding they are in, and the character.
+    fn unicode_cases() -> Vec<(DisplayEncoding, Vec<u8>, &'static str)> {
+        vec![
+            (
+                DisplayEncoding::Utf8,
+                "\u{e9}".as_bytes().to_vec(),
+                "\u{e9}",
+            ),
+            (
+                DisplayEncoding::Utf8,
+                "\u{20ac}".as_bytes().to_vec(),
+                "\u{20ac}",
+            ),
+            (
+                DisplayEncoding::Utf8,
+                "\u{1F600}".as_bytes().to_vec(),
+                "\u{1F600}",
+            ),
+            (DisplayEncoding::Utf16Be, vec![0x00, 0xE9], "\u{e9}"),
+            (DisplayEncoding::Utf16Le, vec![0xE9, 0x00], "\u{e9}"),
+            // U+1F600 is the surrogate pair D83D DE00.
+            (
+                DisplayEncoding::Utf16Be,
+                vec![0xD8, 0x3D, 0xDE, 0x00],
+                "\u{1F600}",
+            ),
+            (
+                DisplayEncoding::Utf16Le,
+                vec![0x3D, 0xD8, 0x00, 0xDE],
+                "\u{1F600}",
+            ),
+        ]
+    }
+
+    fn encoded_view(mode: DisplayMode, encoding: DisplayEncoding) -> DisplayView {
+        DisplayView {
+            encoding,
+            ..view(mode, CharacterRendering::Native)
+        }
+    }
+
+    #[test]
+    fn an_after_annotation_anywhere_in_a_character_follows_that_character() {
+        for mode in [DisplayMode::Raw, DisplayMode::Rendered] {
+            for (encoding, bytes, text) in unicode_cases() {
+                let v = encoded_view(mode, encoding);
+                // UTF-8 gets an ASCII lead byte, so the anchor is not offset 0;
+                // UTF-16 starts on the character.
+                let (lead, shift) = if matches!(encoding, DisplayEncoding::Utf8) {
+                    (b"a".as_slice(), 1)
+                } else {
+                    (b"".as_slice(), 0)
+                };
+                let data = [lead, &bytes].concat();
+                let lead = std::str::from_utf8(lead).unwrap();
+                for anchor in 0..bytes.len() {
+                    let anns = [ann(anchor + shift, AnnotationPlacement::After, "[T]")];
+                    assert_eq!(
+                        v.render_text_annotated(&data, &anns),
+                        format!("{lead}{text}[T]"),
+                        "{mode:?} {encoding:?} anchor {anchor}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_before_annotation_inside_a_character_precedes_that_character() {
+        for mode in [DisplayMode::Raw, DisplayMode::Rendered] {
+            for (encoding, bytes, text) in unicode_cases() {
+                let v = encoded_view(mode, encoding);
+                for anchor in 0..bytes.len() {
+                    let anns = [ann(anchor, AnnotationPlacement::Before, "[T]")];
+                    assert_eq!(
+                        v.render_text_annotated(&bytes, &anns),
+                        format!("[T]{text}"),
+                        "{mode:?} {encoding:?} anchor {anchor}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn annotations_inside_one_character_keep_their_order() {
+        let v = encoded_view(DisplayMode::Raw, DisplayEncoding::Utf8);
+        let anns = [
+            ann(0, AnnotationPlacement::After, "[1]"),
+            ann(1, AnnotationPlacement::After, "[2]"),
+            ann(1, AnnotationPlacement::Before, "[0]"),
+        ];
+        assert_eq!(
+            v.render_text_annotated("\u{e9}".as_bytes(), &anns),
+            "[0]\u{e9}[1][2]"
+        );
+    }
+
+    #[test]
+    fn an_after_annotation_on_the_second_half_of_a_split_character_is_kept() {
+        for mode in [DisplayMode::Raw, DisplayMode::Rendered] {
+            let mut r = StreamRenderer::new(encoded_view(mode, DisplayEncoding::Utf8));
+            let mut out = r.render_chunk(&[0xC3], &[]);
+            out.push_str(&r.render_chunk(&[0xA9], &[ann(0, AnnotationPlacement::After, "[T]")]));
+            out.push_str(&r.finish());
+            assert_eq!(out, "\u{e9}[T]", "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn an_after_annotation_on_the_held_back_first_half_waits_for_the_whole_character() {
+        for mode in [DisplayMode::Raw, DisplayMode::Rendered] {
+            let mut r = StreamRenderer::new(encoded_view(mode, DisplayEncoding::Utf8));
+            let mut out = r.render_chunk(&[0xC3], &[ann(0, AnnotationPlacement::After, "[T]")]);
+            out.push_str(&r.render_chunk(&[0xA9], &[]));
+            out.push_str(&r.finish());
+            assert_eq!(out, "\u{e9}[T]", "{mode:?}");
         }
     }
 

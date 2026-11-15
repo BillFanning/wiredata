@@ -55,7 +55,7 @@ use crate::record::{
 };
 use crate::transport::udp::SharedPortStatus;
 use crate::transport::{ReceivedData, SerialStallState, TransportNotice, STALL_WARNING};
-use wiredata_ui::format::{compact_duration, human_bytes};
+use wiredata_ui::format::{compact_duration, human_bytes, thousands};
 
 use super::queue::DropOldestQueue;
 
@@ -96,6 +96,22 @@ fn render_annotations_for_chunk(
             })
         })
         .collect()
+}
+
+/// Which recordings a read's firings drive with a `Record` action placed in
+/// the stream: Raw, then Display. Those recordings take the read's bytes when
+/// the actions are applied.
+fn held_taps(fired: &[FiredRule]) -> (bool, bool) {
+    let (mut raw, mut display) = (false, false);
+    for rule in fired.iter().filter(|rule| rule.match_offset.is_some()) {
+        for action in &rule.actions {
+            if let MatchAction::Record { target, .. } = action {
+                raw |= matches!(target, RecordTarget::Raw | RecordTarget::Both);
+                display |= matches!(target, RecordTarget::Display | RecordTarget::Both);
+            }
+        }
+    }
+    (raw, display)
 }
 
 /// Bounded capacities for a Channel's fan-out edges (§99, §124), within the
@@ -300,6 +316,11 @@ pub struct ChannelPipeline {
     /// `Record` actions queued by rule evaluation, applied asynchronously by
     /// [`apply_pending_records`](Self::apply_pending_records) (file I/O is async).
     pending_record_controls: Vec<PendingRecord>,
+    /// The read the queued `Record` actions fired in, when they fired in one.
+    held_read: Option<HeldRead>,
+    /// Whether the warning for a read cut off at the firing limit has been
+    /// recorded this run; later ones are counted only.
+    match_limit_noted: bool,
     /// Recorder stops detached from the acquisition loop (§56, and §142's
     /// never-block-the-producer rule): each task drains its recorder's
     /// accepted backlog and finalizes off the pipeline task, yielding the
@@ -369,6 +390,29 @@ impl<S> Default for Tap<S> {
 struct PendingRecord {
     target: RecordTarget,
     control: RecordControl,
+    /// Where in the stream the action takes effect: a Begin at its match's
+    /// first byte and a Stop just past its match's last byte, so the trigger
+    /// is recorded either way. `None` for an `Idle` firing, which acts
+    /// between reads.
+    at: Option<u64>,
+}
+
+/// A read that fired `Record` actions (§50.2). Its bytes are not offered to
+/// the recorders those actions drive until the actions are applied, so that
+/// recording begins and stops at the matches, not at the ends of the read.
+struct HeldRead {
+    data: Arc<ReceivedData>,
+    /// Stream offset of the read's first byte.
+    offset: u64,
+    /// The stream just before the read, ending at `offset`: the start of a
+    /// trigger that began in an earlier read.
+    before: Vec<u8>,
+    /// The read's Mark annotations, for the Display recording.
+    marks: Vec<MarkAnnotation>,
+    /// Whether the Raw recording waits for this read's actions.
+    raw: bool,
+    /// Whether the Display recording does.
+    display: bool,
 }
 
 /// What a tap adds to the shared recording settings: its file extension and
@@ -485,6 +529,8 @@ impl ChannelPipeline {
             boundary_split_noted: false,
             recent_matches: DropOldestQueue::with_capacity(RECENT_MATCHES_CAP),
             pending_record_controls: Vec::new(),
+            held_read: None,
+            match_limit_noted: false,
             retiring: JoinSet::new(),
             finalization_abandoned: false,
             created_at: Instant::now(),
@@ -630,12 +676,32 @@ impl ChannelPipeline {
             at: data.received_at.wall_clock,
         };
 
+        // Find/triggers (§50.2): evaluate the `BytePattern` rules first. The
+        // evaluation changes nothing but the rule set; it has to come first
+        // because a `Record` action in this read decides which of the read's
+        // bytes each recording takes. Matching spans earlier reads' boundaries
+        // via the rule set's carry; each firing carries its true match start
+        // (which may fall in an earlier read for a boundary split).
+        let (carry_offset, carry) = self.match_rules.carry();
+        let before = (carry_offset, carry.to_vec());
+        let fired = if self.match_rules.is_empty() {
+            Vec::new()
+        } else {
+            self.match_rules
+                .evaluate_stream(&data.payload, chunk_offset)
+        };
+        self.note_match_limit();
+        let (hold_raw, hold_display) = held_taps(&fired);
+
         // 1. Raw recorder tap (§53). Non-blocking: a full recorder queue gaps
         // the recording rather than stalling reception (§56.1). What the
         // recorder reports is surfaced by the `poll_recorders` call at the end
-        // of this method.
-        if let Some(recorder) = self.raw_recorder.as_mut() {
-            recorder.try_record(Arc::clone(&data), pos);
+        // of this method. A read whose `Record` actions drive this recording
+        // is offered once they are applied (`apply_pending_records`).
+        if !hold_raw {
+            if let Some(recorder) = self.raw_recorder.as_mut() {
+                recorder.try_record(Arc::clone(&data), pos);
+            }
         }
 
         // 2. Stream scrollback (§87): keep the most recent bytes exactly as
@@ -672,20 +738,13 @@ impl ChannelPipeline {
         // firings are translated so the live viewer's splice stays aligned.
         let view_chunk_base = (!view_paused).then(|| self.stream_end_offset() - bytes.len() as u64);
 
-        // 3. Find/triggers (§50.2): evaluate `BytePattern` rules against this chunk
-        // **before** rendering for Display Recording, so a `Mark` timestamp can be
-        // spliced into this same chunk's `.disp` render. Matching spans earlier
-        // chunks' boundaries via the rule set's carry; each firing carries its true
-        // match start offset (which may fall in an earlier chunk for a boundary split).
-        let mark_annotations = if !self.match_rules.is_empty() {
-            let fired = self.match_rules.evaluate_stream(bytes, chunk_offset);
-            if fired.is_empty() {
-                Vec::new()
-            } else {
-                self.apply_fired_rules(fired, data.received_at, view_chunk_base, chunk_offset)
-            }
-        } else {
+        // 3. Apply the firings **before** rendering for Display Recording, so
+        // a `Mark` timestamp can be spliced into this same chunk's `.disp`
+        // render.
+        let mark_annotations = if fired.is_empty() {
             Vec::new()
+        } else {
+            self.apply_fired_rules(fired, data.received_at, view_chunk_base, chunk_offset)
         };
 
         // 4. Display Recording (§54, §58): render this chunk per recording view and
@@ -696,7 +755,9 @@ impl ChannelPipeline {
         let channel_id = self.channel_id;
         let chunk_marks =
             render_annotations_for_chunk(&mark_annotations, chunk_offset, bytes.len());
-        if let Some(rec) = self.display_recorder.as_mut() {
+        if hold_display {
+            // Rendered and recorded once this read's `Record` actions apply.
+        } else if let Some(rec) = self.display_recorder.as_mut() {
             // Streaming render (ADR-018): the concatenated .disp is the exact
             // rendered stream — read boundaries leave no trace. Possibly
             // empty (a chunk held back as an incomplete multi-byte tail).
@@ -714,6 +775,23 @@ impl ChannelPipeline {
                     pos,
                 );
             }
+        }
+
+        if hold_raw || hold_display {
+            let (carry_offset, mut before) = before;
+            // The carry ends where this read begins; anything else means it
+            // is not this read's predecessor, and no trigger reaches back.
+            if carry_offset + before.len() as u64 != chunk_offset {
+                before.clear();
+            }
+            self.held_read = Some(HeldRead {
+                data: Arc::clone(&data),
+                offset: chunk_offset,
+                before,
+                marks: mark_annotations,
+                raw: hold_raw,
+                display: hold_display,
+            });
         }
 
         // 5. Surface what the recorders reported (§56.1).
@@ -1005,9 +1083,14 @@ impl ChannelPipeline {
                     MatchAction::Mark { timestamp: None } => self.write_mark(rule.id, byte_offset),
                     MatchAction::PauseDisplay {} => self.display_pause.pause(),
                     MatchAction::Record { target, control } => {
+                        let at = byte_offset.map(|start| match control {
+                            RecordControl::Begin => start,
+                            RecordControl::Stop => start + rule.match_len as u64,
+                        });
                         self.pending_record_controls.push(PendingRecord {
                             target: *target,
                             control: *control,
+                            at,
                         });
                     }
                 }
@@ -1080,33 +1163,199 @@ impl ChannelPipeline {
     /// recorder, `Display` the rendered `.disp`, `Both` drives both — each through
     /// the same lazy begin / clean finalize paths as the live toggles (ADR-012),
     /// so a missing destination faults with a clear diagnostic, never silently.
+    ///
+    /// Actions that fired inside a read take effect at their place in it, in
+    /// stream order: a Begin records from its match's first byte and a Stop
+    /// through its match's last, so the same stream records the same bytes
+    /// however it was split into reads. A Begin while recording, and a Stop
+    /// while not, do nothing.
     pub async fn apply_pending_records(&mut self) {
         if self.pending_record_controls.is_empty() {
             return;
         }
         let pending = std::mem::take(&mut self.pending_record_controls);
-        for req in pending {
-            let raw = matches!(req.target, RecordTarget::Raw | RecordTarget::Both);
-            let display = matches!(req.target, RecordTarget::Display | RecordTarget::Both);
-            match req.control {
-                RecordControl::Begin => {
-                    if raw {
-                        self.begin_recording().await;
+        let Some(read) = self.held_read.take() else {
+            // `Idle` firings: between reads, in the order they fired.
+            for req in pending {
+                let raw = matches!(req.target, RecordTarget::Raw | RecordTarget::Both);
+                let display = matches!(req.target, RecordTarget::Display | RecordTarget::Both);
+                match req.control {
+                    RecordControl::Begin => {
+                        if raw {
+                            self.begin_recording().await;
+                        }
+                        if display {
+                            self.begin_display_recording().await;
+                        }
                     }
-                    if display {
-                        self.begin_display_recording().await;
-                    }
-                }
-                RecordControl::Stop => {
-                    if raw {
-                        self.stop_recording().await;
-                    }
-                    if display {
-                        self.stop_display_recording().await;
+                    RecordControl::Stop => {
+                        if raw {
+                            self.stop_recording().await;
+                        }
+                        if display {
+                            self.stop_display_recording().await;
+                        }
                     }
                 }
             }
+            return;
+        };
+
+        // The stream from the start of `before` to the end of the read, and
+        // each action's place in it. Firings arrive in stream order of their
+        // match's start; a Stop acts at its match's end, so order by place.
+        let base = read.offset - read.before.len() as u64;
+        let joined = [&read.before[..], &read.data.payload[..]].concat();
+        let read_start = read.before.len();
+        let mut cuts: Vec<(usize, RecordControl, RecordTarget)> = pending
+            .iter()
+            .map(|req| {
+                let at = req.at.unwrap_or(read.offset).saturating_sub(base) as usize;
+                (at.min(joined.len()), req.control, req.target)
+            })
+            .collect();
+        cuts.sort_by_key(|(at, _, _)| *at);
+
+        if read.raw {
+            // Bytes before the read are recorded only when a Begin reaches
+            // back for the start of its trigger.
+            let mut from = read_start;
+            for &(at, control, target) in &cuts {
+                if !matches!(target, RecordTarget::Raw | RecordTarget::Both) {
+                    continue;
+                }
+                let on = self
+                    .raw_recorder
+                    .as_ref()
+                    .is_some_and(|r| r.state() != RecordingState::Faulted);
+                match control {
+                    RecordControl::Begin if !on => {
+                        self.begin_recording().await;
+                        from = at;
+                    }
+                    RecordControl::Stop if on => {
+                        self.record_raw_span(&read, &joined, base, from, at);
+                        self.stop_recording().await;
+                        from = at;
+                    }
+                    RecordControl::Begin | RecordControl::Stop => {}
+                }
+            }
+            self.record_raw_span(&read, &joined, base, from, joined.len());
         }
+
+        if read.display {
+            let mut from = read_start;
+            for &(at, control, target) in &cuts {
+                if !matches!(target, RecordTarget::Display | RecordTarget::Both) {
+                    continue;
+                }
+                let on = self
+                    .display_recorder
+                    .as_ref()
+                    .is_some_and(|r| r.recording.state() != RecordingState::Faulted);
+                match control {
+                    RecordControl::Begin if !on => {
+                        self.begin_display_recording().await;
+                        from = at;
+                    }
+                    RecordControl::Stop if on => {
+                        self.record_display_span(&read, &joined, base, from, at);
+                        self.stop_display_recording().await;
+                        from = at;
+                    }
+                    RecordControl::Begin | RecordControl::Stop => {}
+                }
+            }
+            self.record_display_span(&read, &joined, base, from, joined.len());
+        }
+        self.poll_recorders();
+    }
+
+    /// Offer `joined[from..to]` of a held read to the Raw recording, when one
+    /// is on. `base` is the stream offset of `joined[0]`.
+    fn record_raw_span(
+        &mut self,
+        read: &HeldRead,
+        joined: &[u8],
+        base: u64,
+        from: usize,
+        to: usize,
+    ) {
+        if from >= to {
+            return;
+        }
+        let Some(recorder) = self.raw_recorder.as_mut() else {
+            return;
+        };
+        let whole = from == read.before.len() && to == joined.len();
+        let data = if whole {
+            Arc::clone(&read.data)
+        } else {
+            Arc::new(ReceivedData {
+                channel_id: read.data.channel_id,
+                payload: joined[from..to].to_vec(),
+                received_at: read.data.received_at,
+            })
+        };
+        recorder.try_record(
+            data,
+            StreamPos {
+                offset: base + from as u64,
+                at: read.data.received_at.wall_clock,
+            },
+        );
+    }
+
+    /// Render `joined[from..to]` of a held read, with the Mark annotations
+    /// that fall in it, and offer it to the Display recording when one is on.
+    fn record_display_span(
+        &mut self,
+        read: &HeldRead,
+        joined: &[u8],
+        base: u64,
+        from: usize,
+        to: usize,
+    ) {
+        if from >= to {
+            return;
+        }
+        let channel_id = self.channel_id;
+        let Some(rec) = self.display_recorder.as_mut() else {
+            return;
+        };
+        let offset = base + from as u64;
+        let marks = render_annotations_for_chunk(&read.marks, offset, to - from);
+        let text = rec.renderer.render_chunk(&joined[from..to], &marks);
+        if !text.is_empty() {
+            rec.recording.try_record(
+                RenderedOutput {
+                    channel_id,
+                    text,
+                    timestamp: Some(read.data.received_at),
+                },
+                StreamPos {
+                    offset,
+                    at: read.data.received_at.wall_clock,
+                },
+            );
+        }
+    }
+
+    /// Warn, once a run, that a read held more matches than one read may
+    /// fire (§50.2).
+    fn note_match_limit(&mut self) {
+        if self.match_limit_noted || self.match_rules.limit_hits() == 0 {
+            return;
+        }
+        self.match_limit_noted = true;
+        self.diagnostics.record(Diagnostic::warning(format!(
+            "one read on channel {} matched the match rules more than {} times. The \
+             matches after that many, later in the read, were not acted on. Later \
+             reads like this are counted, not listed",
+            self.channel_name,
+            thousands(super::matchrule::MAX_FIRINGS_PER_READ as u64)
+        )));
     }
 
     /// Begin or stop Raw recording live, without a restart (§50.2, ADR-012). The
@@ -1833,6 +2082,7 @@ impl ChannelPipeline {
     pub fn stats(&self) -> ChannelStats {
         let now = Instant::now();
         ChannelStats {
+            provenance: super::snapshot::Provenance::Fresh,
             // Placeholders: lifecycle is the orchestrator's, not the pipeline's —
             // `Listener::channel_stats` stamps the effective state before serving.
             state: crate::core::ChannelState::Running,
@@ -1941,6 +2191,7 @@ impl ChannelPipeline {
         let diagnostics = self.diagnostics_snapshot();
         ChannelSnapshot {
             channel_id: self.channel_id,
+            provenance: super::snapshot::Provenance::Fresh,
             // Placeholders — the orchestrator stamps the effective lifecycle state
             // before serving (see `ChannelStats::state`).
             state: crate::core::ChannelState::Running,
@@ -3912,8 +4163,9 @@ mod tests {
 
     #[tokio::test]
     async fn record_action_begins_and_stops_from_the_match_forward() {
-        // §50.2/§158: Record{Begin} creates the recording lazily and captures only
-        // data from the match forward; Record{Stop} finalizes it.
+        // §50.2/§158: Record{Begin} creates the recording lazily and captures
+        // from the match's first byte; Record{Stop} finalizes it after the
+        // match's last byte. Both triggers are in the recording.
         let cid = ChannelId::new();
         let path = temp_path("armed");
         let mut p = pipeline(cid, PipelineCapacities::default())
@@ -3951,8 +4203,8 @@ mod tests {
         p.apply_pending_records().await;
         assert!(p.raw_recording_state().is_none());
 
-        // The BEGIN chunk fires the rule; recording starts *from the match forward*
-        // (the BEGIN chunk itself is not backfilled, §158).
+        // The BEGIN chunk fires the rule; recording starts at the match, so
+        // the trigger is recorded. Nothing before it is (§158).
         p.ingest(bytes_chunk(cid, b"BEGIN"));
         p.apply_pending_records().await;
         assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
@@ -3966,8 +4218,141 @@ mod tests {
         p.finish().await;
 
         let written = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(written, b"capturedSTOP");
+        assert_eq!(written, b"BEGINcapturedSTOP");
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// Feed `reads` through a pipeline whose BEGIN and STOP rules drive both
+    /// recordings, and return what the Raw and Display recordings hold.
+    /// `stop_rule_first` lists the Stop rule ahead of the Begin rule.
+    async fn record_through_triggers(
+        name: &str,
+        reads: &[&[u8]],
+        stop_rule_first: bool,
+    ) -> (Vec<u8>, String) {
+        let cid = ChannelId::new();
+        let raw_path = temp_path(&format!("{name}-raw"));
+        let disp_path = temp_path(&format!("{name}-disp"));
+        let record = |control| {
+            vec![MatchAction::Record {
+                target: RecordTarget::Both,
+                control,
+            }]
+        };
+        let mut rules = vec![
+            byte_rule("begin", b"BEGIN", record(RecordControl::Begin)),
+            byte_rule("stop", b"STOP", record(RecordControl::Stop)),
+        ];
+        if stop_rule_first {
+            rules.reverse();
+        }
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_match_rules(&rules)
+            .with_recording_settings(RawRecordingSettings {
+                destination: raw_path.clone(),
+                channel_name: name.to_string(),
+                overwrite: OverwritePolicy::Refuse,
+                extra: RawExtra { timestamps: false },
+                file_rotation: FileRotationPolicy::None,
+                queue_budget: DEFAULT_QUEUE_BUDGET,
+                size_cap: DEFAULT_SIZE_CAP,
+                disk_guard: None,
+            })
+            .with_display_recording_settings(DisplayRecordingSettings {
+                destination: disp_path.clone(),
+                channel_name: name.to_string(),
+                overwrite: OverwritePolicy::Refuse,
+                file_rotation: FileRotationPolicy::None,
+                queue_budget: DEFAULT_QUEUE_BUDGET,
+                size_cap: DEFAULT_SIZE_CAP,
+                extra: DisplayExtra {
+                    renderer: DisplayView::default(),
+                    mark_gaps: false,
+                },
+                disk_guard: None,
+            });
+        for read in reads {
+            p.ingest(bytes_chunk(cid, read));
+            p.apply_pending_records().await;
+        }
+        p.finish().await;
+        let raw = tokio::fs::read(&raw_path).await.unwrap_or_default();
+        let disp = tokio::fs::read_to_string(&disp_path)
+            .await
+            .unwrap_or_default();
+        let _ = tokio::fs::remove_file(&raw_path).await;
+        let _ = tokio::fs::remove_file(&disp_path).await;
+        (raw, disp)
+    }
+
+    #[tokio::test]
+    async fn a_triggered_recording_does_not_depend_on_how_the_stream_was_read() {
+        // §50.2: the same stream records the same bytes whatever the reads
+        // were: both triggers and what lies between them, nothing else.
+        let stream: &[u8] = b"before BEGINcapturedSTOPafter";
+        let bytewise: Vec<&[u8]> = stream.chunks(1).collect();
+        let splits: [(&str, Vec<&[u8]>); 5] = [
+            ("one-read", vec![stream]),
+            ("bytewise", bytewise),
+            // Both triggers split across reads.
+            (
+                "mid-trigger",
+                vec![b"before BEG", b"INcapturedST", b"OPafter"],
+            ),
+            // Each trigger alone in its read.
+            (
+                "alone",
+                vec![b"before ", b"BEGIN", b"captured", b"STOP", b"after"],
+            ),
+            // The Begin ends a read and the Stop starts the next.
+            ("abutting", vec![b"before BEGIN", b"capturedSTOPafter"]),
+        ];
+        for (name, reads) in splits {
+            let (raw, disp) = record_through_triggers(name, &reads, false).await;
+            assert_eq!(
+                String::from_utf8_lossy(&raw),
+                "BEGINcapturedSTOP",
+                "raw, {name}"
+            );
+            assert_eq!(disp, "BEGINcapturedSTOP", "display, {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn record_actions_in_one_read_apply_in_stream_order_not_rule_order() {
+        // A Stop that comes first in the stream finds nothing to stop, then
+        // the Begin records to the end; the rules' order does not matter.
+        for (name, stop_rule_first) in [("begin-rule-first", false), ("stop-rule-first", true)] {
+            let (raw, disp) =
+                record_through_triggers(name, &[b"xSTOPyBEGINz"], stop_rule_first).await;
+            assert_eq!(String::from_utf8_lossy(&raw), "BEGINz", "raw, {name}");
+            assert_eq!(disp, "BEGINz", "display, {name}");
+
+            // Two recordings in one read share one file here (Refuse would
+            // fault the second), so only the first span is checked: it ends
+            // with its Stop trigger and resumes at the next Begin.
+            let (raw, _) = record_through_triggers(name, &[b"BEGINaSTOPb"], stop_rule_first).await;
+            assert_eq!(String::from_utf8_lossy(&raw), "BEGINaSTOP", "raw, {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_cut_off_at_the_firing_limit_warns_once() {
+        let cid = ChannelId::new();
+        let rules: Vec<MatchRule> = (0..64)
+            .map(|i| byte_rule(&i.to_string(), b"A", vec![]))
+            .collect();
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&rules);
+        let read = vec![b'A'; 1_000];
+        p.ingest(bytes_chunk(cid, &read));
+        p.ingest(bytes_chunk(cid, &read));
+        let snapshot = p.snapshot();
+        let warnings = &snapshot.diagnostics.warnings;
+        let cut_off: Vec<_> = warnings
+            .iter()
+            .filter(|d| d.message.contains("more than 4,096 times"))
+            .collect();
+        assert_eq!(cut_off.len(), 1, "{warnings:?}");
     }
 
     #[tokio::test]
@@ -4097,11 +4482,14 @@ mod tests {
         assert!(p.display_recording_state().is_none());
         p.finish().await;
 
-        // Raw is byte-exact from the match forward (the BEGIN chunk itself is not
-        // backfilled, §158); the .disp rendered the same span.
-        assert_eq!(tokio::fs::read(&raw_path).await.unwrap(), b"capturedSTOP");
+        // Raw is byte-exact from the first trigger's first byte to the second
+        // trigger's last; the .disp rendered the same span.
+        assert_eq!(
+            tokio::fs::read(&raw_path).await.unwrap(),
+            b"BEGINcapturedSTOP"
+        );
         let disp = tokio::fs::read_to_string(&disp_path).await.unwrap();
-        assert!(disp.contains("captured"), "{disp:?}");
+        assert_eq!(disp, "BEGINcapturedSTOP");
         let _ = tokio::fs::remove_file(&raw_path).await;
         let _ = tokio::fs::remove_file(&disp_path).await;
     }

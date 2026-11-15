@@ -164,6 +164,14 @@ to settle on their own. Pinned by
 `polled_fault_with_reconnect_pending_reads_reconnecting`, and
 `transitional_polled_states_do_not_flap_the_row`.
 
+**Correction (2026-11-14):** Events are advisory on the way into the driver,
+as stated above, but not on the last hop, from the driver to the GUI. There a
+dropped update was not always repeated by the next poll: a lost "Channel
+added" left a Channel the GUI never showed, a lost "removed" left a ghost, and
+a lost "reconfigured" left an old editor baseline. One-time results now travel
+a lane that never drops, and only the updates the next poll repeats are
+dropped (ADR-066).
+
 ## ADR-007 — Transport data-loss observability boundary
 
 **Authoritative context:** spec §99 (backpressure matrix), §100 (reception
@@ -325,8 +333,9 @@ adapted to listener's Tokio model:
 - The business logic (command handling, view-model fold) lives in testable structs;
   the `gui/` egui code stays thin (AGENTS §5) and is exercised only by eye.
 - Channels carry **owned** snapshots/events, so the UI never shares mutable pipeline
-  state and a slow UI can never stall reception (the driver's pushes are advisory,
-  `try_send`/drop-newest like the other observer edges, §99).
+  state and a slow UI can never stall reception (the driver's periodic pushes are advisory,
+  `try_send`/drop-newest like the other observer edges, §99; its one-time
+  results are never dropped, ADR-066).
 - The GUI's `UiCommand` is the command surface from the App's side; the driver
   translates it into direct `Listener` async method calls. _(Superseded in part by
   ADR-012: there is no separate `core::RuntimeCommand` enum to "align with §136" — the
@@ -1706,6 +1715,12 @@ the format.
 **Consequences:** A profile either means what it says or does not load. Process
 memory has a stated worst case that the soak test can check.
 
+**Correction (2026-11-14):** The worst case above did not hold for dense
+matching. A rule set can be written so that every byte matches many rules, and
+one read then produced every match at once: 64 one-byte rules over a
+65,507-byte UDP datagram is 4,192,448 matches, about 288 MiB of working
+memory in one Channel. One read now fires at most 4,096 matches (ADR-065).
+
 ## ADR-049 — OS stop requests come from one shared crate, `wiredata-stop`
 
 **Status:** Accepted 2026-09-30. Implements the stop signals of §3.1 and talker
@@ -2155,7 +2170,14 @@ already on, so a frequent `Record Begin` rule could hold up reception.
 stuck close and was then stopped did not set the CLI's exit code 4. Its
 pipeline task had already ended, so the stop's drain finished in time and
 counted as complete. The drain now also reports whether the pipeline's own
-close gave up, and that counts as finalization incomplete, named once.
+close gave up, and that counts as finalization incomplete, named once. The run
+summary carries the same fact, separately from whether a final snapshot exists.
+
+**Correction (2026-11-14), on the figures served:** The last good answer was
+handed out with nothing to say it was old, so a throughput or a stall length
+could sit frozen and look live, and a Channel slow to answer could show figures
+much older than one poll. Each answer now says whether it is fresh (ADR-068).
+The cost of stuck Channels to one poll is also limited (ADR-069).
 
 **Consequences:** Every other Channel's status keeps moving while one is
 stuck, and a running Channel slow to answer shows figures at most one poll old.
@@ -2182,6 +2204,159 @@ rotating file names (local), the timestamp sidecar (Unix time) and ZDA marks
 
 **Consequences:** A time read from any listener file can be placed without
 knowing the computer's zone or the season.
+
+## ADR-064 — A Record action takes effect at its match, not at the end of the read
+
+**Status:** Accepted 2026-11-14.
+
+**Context:** Record actions were applied after the whole read that held their
+match had been offered to the recordings. A Begin therefore recorded nothing
+from that read, not even what followed its trigger, and a Stop recorded all of
+it, including what followed its trigger. Where the transport happened to cut
+the stream into reads then decided which bytes were recorded. The owner's
+choice is that both triggers belong in the recording.
+
+**Decision:** A Begin starts the recording at its match's first byte. A Stop
+ends it just after its match's last byte. The same stream therefore records the
+same bytes however the transport split it into reads, including a trigger split
+across two reads, whose first bytes are taken from the few bytes the matcher
+keeps for cross-read matching. Actions inside one read apply in stream order,
+not rule order. A Begin while recording and a Stop while not recording do
+nothing. This holds for the Raw and the Display recording alike, and the
+Display recording keeps its inline Mark timestamps inside the recorded span.
+A read that fired Record actions is offered to the recordings those actions
+drive only when the actions are applied, sliced at the matches.
+
+**Boundary:** No bytes before the Begin trigger are recorded; pre-trigger
+capture stays deferred (§158, Appendix A). An Idle rule's Record action has no
+place in the stream and acts between reads.
+
+**Consequences:** A recording made by triggers holds the trigger bytes and what
+lies between them, and nothing else.
+
+## ADR-065 — One read fires at most 4,096 matches
+
+**Status:** Accepted 2026-11-14. Corrects ADR-048's memory bound.
+
+**Context:** A rule set can be written so that every byte matches many rules.
+64 one-byte rules over a 65,507-byte UDP datagram is 4,192,448 matches, about
+288 MiB of working memory, which broke the per-channel memory bound stated in
+ADR-048.
+
+**Decision:** Matches fire in stream order of their first byte, and matches
+starting on the same byte fire in rule order. One read fires at most 4,096
+matches (`MAX_FIRINGS_PER_READ`). Matches later in that read do not fire and
+are not acted on. The first time this happens in a run a warning is recorded;
+later ones are counted only.
+
+**Boundary:** A read cut off this way is the one case where what a rule set
+does depends on read boundaries. Normal rule sets never reach the limit.
+
+**Consequences:** One read's matching work and memory are fixed whatever the
+rules and the data.
+
+## ADR-066 — One-time GUI results are never dropped
+
+**Status:** Accepted 2026-11-14. Amends ADR-008.
+
+**Context:** The driver sent the GUI every update through one bounded queue
+that drops when full. Most updates are repeated by the next poll, but some are
+said once. A lost "Channel added" left a Channel the GUI never showed, a lost
+"removed" left a ghost, and a lost "reconfigured" left an old editor baseline
+that could later overwrite newer settings.
+
+**Decision:** The driver sends the GUI two kinds of update. Periodic ones
+(snapshots, statistics, stream deltas, control lines, and the high-rate
+advisory events the snapshot also carries) go through a bounded queue and are
+dropped when it is full, since the next poll repeats them. One-time results (a
+Channel added, removed, renamed or reconfigured; lifecycle, recording and
+reconnect events; profile results; errors) go through an unbounded lane and are
+never dropped. The GUI applies every waiting one-time result before any
+periodic update.
+
+**Boundary:** Events into the driver from the runtime stay advisory (ADR-006).
+The unbounded lane is safe because its volume is bounded by user actions and by
+profile size, not by the polling rate.
+
+**Consequences:** The GUI's list of Channels and its editor baselines cannot be
+left wrong by load.
+
+## ADR-067 — Profile defaults are written into each Channel at load
+
+**Status:** Accepted 2026-11-14.
+
+**Context:** Validation accepted a Channel that left its retention unset by
+reading the profile's default, but neither the GUI loader nor the CLI loader
+gave that default to the Channel, and the display default was not used at all.
+A profile could pass validation and run with other limits than it asked for.
+A GUI Save also wrote an empty defaults section.
+
+**Decision:** The defaults are resolved once, at load, by one function that
+validation, the GUI loader and the CLI loader all use. Each Channel that leaves
+a setting unset takes the profile's default and from then on carries its own
+explicit value. A GUI Save therefore writes per-Channel values with an empty
+defaults section, and loading that file behaves the same. Retention is
+inherited whole when the Channel sets no limit at all; individual limits are
+never merged. Display is inherited when the Channel's display equals the
+built-in default.
+
+**Boundary:** Display settings have no unset state, so a Channel cannot ask for
+the built-in display under a profile whose default differs.
+
+**Consequences:** What the CLI runs is what the GUI showed, and a saved profile
+no longer depends on its defaults section.
+
+## ADR-068 — A status answer says whether its figures are fresh
+
+**Status:** Accepted 2026-11-14. Extends ADR-062.
+
+**Context:** ADR-062 serves a Channel's last good answer when it does not
+answer a status request in time. That answer carried no time of measurement,
+so the GUI showed old figures exactly as it shows live ones.
+
+**Decision:** Every snapshot and statistics answer carries where its figures
+came from. Fresh: measured for this request, or the exact final figures of a
+Channel that has stopped. Cached: the Channel's last answer in this run, with
+its age, worked out when the answer is handed out. Retained: an earlier run's
+figures, because the Channel has not answered in this run. When the figures
+shown are not fresh, the diagnostics card says so in a sentence and gives the
+age. A stopped or faulted Channel's timing window is called its final ten
+seconds only when the figures are fresh.
+
+**Boundary:** The figures themselves are shown as measured. A rate or an active
+duration is not aged or zeroed; the sentence is what says it may no longer be
+true. A single slow answer shows the sentence until the next answer arrives.
+
+**Consequences:** Nobody reads a frozen figure as a live one.
+
+## ADR-069 — The GUI's driver waits on nothing without a limit
+
+**Status:** Accepted 2026-11-14. Extends ADR-052.
+
+**Context:** ADR-052 moved starts and stops off the driver's loop. Three other
+waits remained on it: handing a recording command or a serial control-line
+command to a Channel whose queue was full, profile file work, and a round of
+status requests, which costs 300 ms for each Channel that does not answer.
+While the loop waits, status, reconnects and Shutdown stop for every Channel.
+
+**Decision:**
+
+- A recording command or a serial control-line command waits at most 300 ms
+  (`COMMAND_HANDOFF_WAIT`) for its Channel to take it. After that it is given
+  up and reported; it was not sent and can be tried again.
+- Profile reads and writes, and the resume check, run off the loop. They run
+  one at a time, in the order asked for. Shutdown does not wait for one.
+- A round of status requests ends after 600 ms (`POLL_ROUND_LIMIT`). The next
+  round starts with the Channels the last one did not reach, so stuck Channels
+  cannot starve the ones after them.
+
+**Boundary:** Other commands are served while profile file work is
+outstanding, so a Channel can change before a load lands. A round can overrun
+its limit by the requests of the last Channel it visited. A file operation
+that never returns leaves its thread behind until the process exits.
+
+**Consequences:** A hung share, a stalled serial reader or several stuck
+Channels slow the GUI's figures; they do not freeze it or hold up closing it.
 
 ## Open questions
 

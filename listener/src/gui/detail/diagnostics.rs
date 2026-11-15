@@ -12,7 +12,7 @@
 
 use crate::core::{ArrivalTimestampStatus, ChannelId, RecordingState};
 use crate::runtime::{
-    ByteHistogram, CounterAvailability, DurationHistogram, QueueDepth, TransportHealth,
+    ByteHistogram, CounterAvailability, DurationHistogram, Provenance, QueueDepth, TransportHealth,
 };
 use crate::transport::udp::{ReceiveBuffer, SharedPortStatus};
 
@@ -63,13 +63,23 @@ const PIPELINE_TOOLTIP: Hover = Hover::new(
      Processing is the time Listener then spent handling the block. The background recorder's \
      disk work may run at the same time as that handling, and it is not part of Processing.\n\n\
      Recent figures cover about the last ten seconds while the channel runs, and about the \
-     final ten seconds once it has stopped. The window is approximate. The chunk count on the \
-     same line says how many blocks the recent figures are based on.\n\n\
+     final ten seconds once it has stopped. If the channel stops answering, the figures shown are \
+     its last answer and the card says how old they are. The window is approximate. The chunk \
+     count on the same line says how many blocks the recent figures are based on.\n\n\
      The worst value is exact, however few blocks there are. \"99% ≤\" appears beside it only \
      when at least 99 of every 100 blocks were within a time that is lower than the worst. It is \
      an upper bound: the true value is at or below it.\n\n\
      There is no universal good or bad limit for these times. Compare a change with the \
      pressure figures and with how the channel behaves normally.",
+);
+
+const OLDER_FIGURES_TOOLTIP: Hover = Hover::new(
+    "These figures are not from the latest request.\n\n\
+     Listener asked the Channel for fresh figures and did not get an answer in time, so it is \
+     showing the last answer it has. A Channel can be slow to answer while it closes a \
+     recording on a disk that is not responding.\n\n\
+     The figures are shown as they were measured, not adjusted for the time since. A \
+     throughput or an active stall length shown here may no longer be true.",
 );
 
 const UDP_DROP_CALLOUT_TOOLTIP: Hover = Hover::new(
@@ -491,7 +501,7 @@ fn detail_timing(
 }
 
 fn pipeline_signal(view: &ChannelView, status: ChannelStatus) -> DecisionSignal {
-    let window = timing_window(status);
+    let window = timing_window(status, view.figures);
     let recent_chunks = view.recent_ingest_delay.sample_count();
     let value = if view.ingest_delay.sample_count() == 0 {
         // Both boundaries are recorded inside one ingest, so neither has
@@ -530,11 +540,30 @@ fn pipeline_signal(view: &ChannelView, status: ChannelStatus) -> DecisionSignal 
     }
 }
 
-fn timing_window(status: ChannelStatus) -> &'static str {
+/// The label for the window the recent figures cover. "Final" is claimed only
+/// for a stopped or faulted Channel whose figures were measured for the latest
+/// request; an older answer cannot say it was taken at the end.
+fn timing_window(status: ChannelStatus, figures: Provenance) -> &'static str {
     if matches!(status, ChannelStatus::Running | ChannelStatus::Reconnecting) {
         "~last 10 s"
-    } else {
+    } else if figures == Provenance::Fresh {
         "~final 10 s"
+    } else {
+        "~last 10 s measured"
+    }
+}
+
+/// The sentence that says the figures shown are not from the latest request,
+/// or `None` when they are.
+fn older_figures_sentence(figures: Provenance) -> Option<String> {
+    const CAUSE: &str = "The Channel is not answering status requests.";
+    match figures {
+        Provenance::Fresh => None,
+        Provenance::Cached { age } => Some(format!(
+            "These figures were measured {} ago. {CAUSE}",
+            compact_duration(age)
+        )),
+        Provenance::Retained => Some(format!("These figures are from an earlier run. {CAUSE}")),
     }
 }
 
@@ -554,6 +583,10 @@ pub(super) fn show_receive_diagnostics_card(
     // top of the pane, last-run figures by Pipeline's "~final 10 s", and no
     // data yet by the rows' own "awaiting".
     diagnostic_card(ui, |ui| {
+        if let Some(sentence) = older_figures_sentence(view.figures) {
+            ui.label(sentence).on_hover(&OLDER_FIGURES_TOOLTIP);
+            ui.add_space(6.0);
+        }
         signal_grid(ui, ("listener_receive_signals", id), |ui| {
             let help = TRANSPORT_TOOLTIP.layout(ui.style());
             signal_row(ui, "Transport", transport.value, transport.tone, help);
@@ -609,7 +642,7 @@ pub(super) fn show_receive_diagnostics_card(
 }
 
 fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view: &ChannelView) {
-    let window = timing_window(status);
+    let window = timing_window(status, view.figures);
     let timing_text = detail_timing(
         "Handoff timing",
         "chunk",
@@ -815,20 +848,20 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        compact_timing, counted, detail_timing, pressure_signal, queue_level_reaches_half,
-        receive_buffer_words, shared_port_words, size_figures, timing_figures, timing_window,
-        transport_signal, ChannelStatus, ReceiveBuffer, SharedPortStatus,
-        ARRIVAL_TIMESTAMP_TOOLTIP, CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP, INGEST_QUEUE_TOOLTIP,
-        PIPELINE_TOOLTIP, PRESSURE_TOOLTIP, PROCESSING_TOOLTIP, RAW_QUEUE_ACTIVE_TOOLTIP,
-        RAW_QUEUE_FAULTED_TOOLTIP, RAW_QUEUE_GAP_TOOLTIP, RAW_QUEUE_RETAINED_TOOLTIP,
-        RECEIVE_BUFFER_TOOLTIP, RECEIVE_DETAILS_TOOLTIP, SERIAL_BACKPRESSURE_TOOLTIP,
-        SHARED_PORT_TOOLTIP, TRANSPORT_TOOLTIP, UDP_AVAILABLE_TOOLTIP, UDP_DROP_CALLOUT_TOOLTIP,
-        UDP_NOT_APPLICABLE_TOOLTIP, UDP_UNAVAILABLE_TOOLTIP,
+        compact_timing, counted, detail_timing, older_figures_sentence, pressure_signal,
+        queue_level_reaches_half, receive_buffer_words, shared_port_words, size_figures,
+        timing_figures, timing_window, transport_signal, ChannelStatus, ReceiveBuffer,
+        SharedPortStatus, ARRIVAL_TIMESTAMP_TOOLTIP, CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP,
+        INGEST_QUEUE_TOOLTIP, PIPELINE_TOOLTIP, PRESSURE_TOOLTIP, PROCESSING_TOOLTIP,
+        RAW_QUEUE_ACTIVE_TOOLTIP, RAW_QUEUE_FAULTED_TOOLTIP, RAW_QUEUE_GAP_TOOLTIP,
+        RAW_QUEUE_RETAINED_TOOLTIP, RECEIVE_BUFFER_TOOLTIP, RECEIVE_DETAILS_TOOLTIP,
+        SERIAL_BACKPRESSURE_TOOLTIP, SHARED_PORT_TOOLTIP, TRANSPORT_TOOLTIP, UDP_AVAILABLE_TOOLTIP,
+        UDP_DROP_CALLOUT_TOOLTIP, UDP_NOT_APPLICABLE_TOOLTIP, UDP_UNAVAILABLE_TOOLTIP,
     };
     use crate::core::RecordingState;
     use crate::runtime::{
-        ByteHistogram, CounterAvailability, DurationHistogram, QueueDepth, SerialStallSummary,
-        TransportHealth,
+        ByteHistogram, CounterAvailability, DurationHistogram, Provenance, QueueDepth,
+        SerialStallSummary, TransportHealth,
     };
     use wiredata_ui::diagnostics::SignalTone;
     use wiredata_ui::format::compact_duration;
@@ -836,8 +869,51 @@ mod tests {
     /// The window labels the card puts on every recent measurement.
     #[test]
     fn timing_window_names_the_live_and_completed_windows() {
-        assert_eq!(timing_window(ChannelStatus::Running), "~last 10 s");
-        assert_eq!(timing_window(ChannelStatus::Stopped), "~final 10 s");
+        let fresh = Provenance::Fresh;
+        assert_eq!(timing_window(ChannelStatus::Running, fresh), "~last 10 s");
+        assert_eq!(timing_window(ChannelStatus::Stopped, fresh), "~final 10 s");
+        assert_eq!(timing_window(ChannelStatus::Faulted, fresh), "~final 10 s");
+    }
+
+    /// A window is called the final one only when it was measured at the end.
+    #[test]
+    fn a_window_from_an_older_answer_is_not_called_the_final_one() {
+        let cached = Provenance::Cached {
+            age: Duration::from_secs(12),
+        };
+        for figures in [cached, Provenance::Retained] {
+            assert_eq!(
+                timing_window(ChannelStatus::Faulted, figures),
+                "~last 10 s measured"
+            );
+            assert_eq!(
+                timing_window(ChannelStatus::Stopped, figures),
+                "~last 10 s measured"
+            );
+            assert_eq!(timing_window(ChannelStatus::Running, figures), "~last 10 s");
+        }
+    }
+
+    #[test]
+    fn only_figures_from_an_older_answer_get_a_sentence_saying_so() {
+        assert_eq!(older_figures_sentence(Provenance::Fresh), None);
+        assert_eq!(
+            older_figures_sentence(Provenance::Cached {
+                age: Duration::from_secs(12)
+            })
+            .as_deref(),
+            Some(
+                "These figures were measured 12.0 s ago. \
+                 The Channel is not answering status requests."
+            )
+        );
+        assert_eq!(
+            older_figures_sentence(Provenance::Retained).as_deref(),
+            Some(
+                "These figures are from an earlier run. \
+                 The Channel is not answering status requests."
+            )
+        );
     }
     #[test]
     fn active_queue_pressure_preserves_the_existing_half_capacity_reference() {

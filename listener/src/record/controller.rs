@@ -332,6 +332,15 @@ impl Shared {
         lock(&self.gate).gap_start.get_or_insert(pos);
     }
 
+    /// Move the gap's start back to `pos` when that is earlier than the
+    /// start noted so far.
+    fn widen_gap_start(&self, pos: StreamPos) {
+        let mut gate = lock(&self.gate);
+        if gate.gap_start.is_none_or(|noted| pos.offset < noted.offset) {
+            gate.gap_start = Some(pos);
+        }
+    }
+
     fn report(&self, report: RecorderReport) {
         let mut reports = lock(&self.reports);
         if reports.len() == MAX_PENDING_REPORTS {
@@ -519,6 +528,13 @@ struct Controller<I: RecordItem, S: SegmentSource<I>> {
     last_fault: Option<String>,
 }
 
+/// A segment whose finalization failed: what failed, and the earliest stream
+/// position whose bytes may not have reached the disk.
+struct FailedEnd {
+    detail: String,
+    start: Option<StreamPos>,
+}
+
 /// How a controller run ended.
 enum Flow {
     Continue,
@@ -554,11 +570,13 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
                     return self.stop(&mut items).await;
                 }
                 Some(command) = commands.recv() => self.on_command(command, &mut items).await,
+                // Before the items, so a queue that never empties cannot
+                // postpone an overdue flush.
+                _ = flush_tick.tick(), if self.segment.is_some() => self.flush(&mut items).await,
                 maybe = items.recv() => match maybe {
                     Some(queued) => self.on_item(queued, &mut items).await,
                     None => return self.stop(&mut items).await,
                 },
-                _ = flush_tick.tick(), if self.segment.is_some() => self.flush(&mut items).await,
                 _ = tokio::time::sleep_until(retry_at.unwrap_or_else(Instant::now)), if retry_at.is_some() => {}
             }
         }
@@ -678,7 +696,9 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
                 .as_ref()
                 .is_some_and(|current| period > *current)
             {
-                self.end_segment().await;
+                if self.end_rotated_segment(queued.pos, items).await {
+                    return;
+                }
                 if let Flow::Stop(_) = self.open(OpenKind::Rotation, Some(period), items).await {
                     return;
                 }
@@ -688,7 +708,9 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
             let len = segment.bytes_written();
             if len > 0 && len + queued.item.byte_len() as u64 > cap {
                 let period = self.period.clone();
-                self.end_segment().await;
+                if self.end_rotated_segment(queued.pos, items).await {
+                    return;
+                }
                 if let Flow::Stop(_) = self.open(OpenKind::SizeCap, period, items).await {
                     return;
                 }
@@ -741,7 +763,8 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
             }
             Err(error) => {
                 let start = self.unflushed_since.take().unwrap_or(queued.pos);
-                self.end_segment().await;
+                // The gap that follows accounts for a failed finalize.
+                let _ = self.end_segment().await;
                 self.begin_gap(
                     GapReason::WriteFailed,
                     error.to_string(),
@@ -756,15 +779,22 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
     /// written; once they are, the segment ends and the gap begins.
     async fn end_after_overflow(&mut self, items: &mut mpsc::UnboundedReceiver<Queued<I>>) {
         if self.shared.overflowed() && items.is_empty() {
-            self.end_segment().await;
-            // The producer reported this gap when the loss began.
+            let failed = self.end_segment().await;
+            // The producer reported this gap when the loss began, so a failed
+            // finalize cannot be a report of its own: it widens the gap back
+            // to the bytes that may not have reached the disk and is named in
+            // the fault's detail.
+            let detail = match failed {
+                Some(failed) => {
+                    if let Some(start) = failed.start {
+                        self.shared.widen_gap_start(start);
+                    }
+                    format!("{OVERFLOW_DETAIL}; {}", failed.detail)
+                }
+                None => OVERFLOW_DETAIL.to_owned(),
+            };
             self.gap.get_or_insert(GapReason::QueueOverflow);
-            self.begin_gap(
-                GapReason::QueueOverflow,
-                OVERFLOW_DETAIL.to_owned(),
-                None,
-                items,
-            );
+            self.begin_gap(GapReason::QueueOverflow, detail, None, items);
         }
     }
 
@@ -777,17 +807,20 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
             Command::Overflowed => self.end_after_overflow(items).await,
             Command::LowDisk(true) if !self.low_disk => {
                 self.low_disk = true;
-                if self.segment.is_some() {
-                    self.end_segment().await;
+                let mut detail = "free disk space is below the guard's threshold".to_owned();
+                if let Some(failed) = self.end_segment().await {
+                    // Low disk is a condition, not a fault, so the failed
+                    // finalize rides in the gap's detail and widens the gap
+                    // back to the bytes that may not have reached the disk.
+                    if let Some(start) = failed.start {
+                        self.shared.widen_gap_start(start);
+                    }
+                    detail = format!("{detail}; {}", failed.detail);
                 }
-                // Low disk is a condition, not a fault: it does not count
-                // toward instability, and it waits for space, not a timer.
+                // It does not count toward instability, and it waits for
+                // space, not a timer.
                 self.retry_at = None;
-                self.enter_gap(
-                    GapReason::LowDisk,
-                    "free disk space is below the guard's threshold".to_owned(),
-                    items,
-                );
+                self.enter_gap(GapReason::LowDisk, detail, items);
             }
             Command::LowDisk(false) if self.low_disk => {
                 self.low_disk = false;
@@ -805,22 +838,45 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
             Ok(()) => self.unflushed_since = None,
             Err(error) => {
                 let start = self.unflushed_since.take();
-                self.end_segment().await;
+                // The gap that follows accounts for a failed finalize.
+                let _ = self.end_segment().await;
                 self.begin_gap(GapReason::WriteFailed, error.to_string(), start, items);
             }
         }
     }
 
-    /// Finalize the current segment as a clean boundary. A failure here is
-    /// ignored beyond the gap that usually follows: the segment's bytes are
-    /// already accounted for by the gap's start.
-    async fn end_segment(&mut self) {
-        if let Some(mut segment) = self.segment.take() {
-            let _ = segment.finalize().await;
-        }
-        self.unflushed_since = None;
+    /// Finalize the current segment. A failed finalize is returned with the
+    /// earliest position whose bytes were not known to be on disk; the caller
+    /// reports it unless a gap that already covers those bytes follows.
+    async fn end_segment(&mut self) -> Option<FailedEnd> {
+        let start = self.unflushed_since.take();
+        let failed = match self.segment.take() {
+            Some(mut segment) => segment.finalize().await.err().map(|error| FailedEnd {
+                detail: format!("the segment could not be finalized: {error}"),
+                start,
+            }),
+            None => None,
+        };
         *lock(&self.shared.file) = None;
         self.shared.file_len.store(0, Ordering::Relaxed);
+        failed
+    }
+
+    /// End the segment at a rotation boundary. A failed finalize is a fault:
+    /// it opens a gap from the first uncertain byte, or from `next` when
+    /// every earlier byte was flushed, and the next segment opens through
+    /// recovery. Returns whether that happened, so the caller omits `next`.
+    async fn end_rotated_segment(
+        &mut self,
+        next: StreamPos,
+        items: &mut mpsc::UnboundedReceiver<Queued<I>>,
+    ) -> bool {
+        let Some(failed) = self.end_segment().await else {
+            return false;
+        };
+        let start = failed.start.unwrap_or(next);
+        self.begin_gap(GapReason::WriteFailed, failed.detail, Some(start), items);
+        true
     }
 
     /// A fault: open a gap, count the fault, and schedule the retry.
@@ -959,6 +1015,7 @@ mod tests {
     #[derive(Default)]
     struct SegmentLog {
         written: Mutex<Vec<Vec<u8>>>,
+        flushes: AtomicUsize,
     }
 
     struct ScriptedSegment {
@@ -968,6 +1025,7 @@ mod tests {
         fail_write_at: Option<usize>,
         writes: usize,
         write_delay: Duration,
+        fail_finalize: bool,
     }
 
     #[async_trait::async_trait]
@@ -984,9 +1042,13 @@ mod tests {
             Ok(())
         }
         async fn flush(&mut self) -> Result<(), RecordError> {
+            self.log.flushes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn finalize(&mut self) -> Result<(), RecordError> {
+            if self.fail_finalize {
+                return Err(RecordError::Io(std::io::Error::other("final write failed")));
+            }
             Ok(())
         }
         fn bytes_written(&self) -> u64 {
@@ -1005,6 +1067,10 @@ mod tests {
         open_delay: Duration,
         write_delay: Duration,
         cap: Option<u64>,
+        /// Hours per rotation period, when the recording rotates.
+        period_hours: Option<u64>,
+        /// The open attempts whose segment fails its finalize.
+        fail_finalize_on: Vec<u32>,
     }
 
     impl ScriptedSource {
@@ -1016,6 +1082,8 @@ mod tests {
                 open_delay: Duration::ZERO,
                 write_delay: Duration::ZERO,
                 cap: None,
+                period_hours: None,
+                fail_finalize_on: Vec::new(),
             }
         }
     }
@@ -1024,6 +1092,11 @@ mod tests {
     impl SegmentSource<Item> for ScriptedSource {
         fn size_cap(&self) -> Option<u64> {
             self.cap
+        }
+        fn period_of(&self, at: SystemTime) -> Option<String> {
+            let hours = self.period_hours?;
+            let secs = at.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+            Some(format!("{:010}", secs / (hours * 3600)))
         }
         async fn open(
             &mut self,
@@ -1041,6 +1114,7 @@ mod tests {
                 fail_write_at,
                 writes: 0,
                 write_delay: self.write_delay,
+                fail_finalize: self.fail_finalize_on.contains(&attempt),
             }))
         }
     }
@@ -1392,6 +1466,134 @@ mod tests {
             written(&segments),
             vec![vec![b"AB".to_vec()], vec![b"EF".to_vec()]]
         );
+    }
+
+    fn pos_at(offset: u64, at: SystemTime) -> StreamPos {
+        StreamPos { offset, at }
+    }
+
+    /// Wait until a Recovery segment has opened, returning every report seen
+    /// on the way.
+    async fn reports_until_recovery(recording: &mut Recording<Item>) -> Vec<RecorderReport> {
+        let mut reports = Vec::new();
+        wait_for("the recovery segment", || {
+            reports.extend(recording.take_reports());
+            reports.iter().any(|r| {
+                matches!(
+                    r,
+                    RecorderReport::SegmentOpened {
+                        kind: OpenKind::Recovery,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+        reports
+    }
+
+    fn finalize_gap(reports: &[RecorderReport]) -> Option<&RecorderReport> {
+        reports.iter().find(|r| {
+            matches!(
+                r,
+                RecorderReport::GapOpened {
+                    reason: GapReason::WriteFailed,
+                    detail,
+                } if detail.contains("final write failed")
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn a_failed_finalize_at_the_size_cap_is_reported_as_a_gap() {
+        let mut source = ScriptedSource::new(|_| Ok(None));
+        source.cap = Some(5);
+        source.fail_finalize_on = vec![1];
+        let segments = Arc::clone(&source.segments);
+        let mut recording = start_recording(source, DEFAULT_QUEUE_BUDGET, fast());
+        recording.try_record(chunk(b"AB"), pos(0));
+        recording.try_record(chunk(b"CD"), pos(2));
+        recording.try_record(chunk(b"EF"), pos(4)); // rotates; the first finalize fails
+        let mut reports = reports_until_recovery(&mut recording).await;
+        recording.try_record(chunk(b"GH"), pos(6));
+        let finalized = recording.finalize().await;
+        reports.extend(finalized.reports);
+
+        assert!(finalized.fault.is_none(), "the later segment is clean");
+        assert!(finalize_gap(&reports).is_some(), "{reports:?}");
+        let closed = reports.iter().find_map(|r| match r {
+            RecorderReport::GapClosed { start, end, .. } => Some((*start, *end)),
+            _ => None,
+        });
+        let (start, end) = closed.expect("the gap closed");
+        assert_eq!(start.map(|p| p.offset), Some(0), "from the unflushed bytes");
+        assert_eq!(end.offset, 6);
+        assert_eq!(
+            written(&segments),
+            vec![vec![b"AB".to_vec(), b"CD".to_vec()], vec![b"GH".to_vec()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_finalize_at_a_period_change_is_reported_as_a_gap() {
+        let mut source = ScriptedSource::new(|_| Ok(None));
+        source.period_hours = Some(1);
+        source.fail_finalize_on = vec![1];
+        let segments = Arc::clone(&source.segments);
+        let mut recording = start_recording(source, DEFAULT_QUEUE_BUDGET, fast());
+        let now = SystemTime::now();
+        let later = now + Duration::from_secs(3 * 3600);
+        recording.try_record(chunk(b"AB"), pos_at(0, now));
+        recording.try_record(chunk(b"CD"), pos_at(2, later)); // a new period
+        let mut reports = reports_until_recovery(&mut recording).await;
+        recording.try_record(chunk(b"EF"), pos_at(4, now)); // an earlier period keeps the file
+        let finalized = recording.finalize().await;
+        reports.extend(finalized.reports);
+
+        assert!(finalized.fault.is_none(), "the later segment is clean");
+        assert!(finalize_gap(&reports).is_some(), "{reports:?}");
+        let closed = reports.iter().find_map(|r| match r {
+            RecorderReport::GapClosed { start, .. } => Some(*start),
+            _ => None,
+        });
+        assert_eq!(closed.flatten().map(|p| p.offset), Some(0));
+        assert_eq!(
+            written(&segments),
+            vec![vec![b"AB".to_vec()], vec![b"EF".to_vec()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_finalize_at_stop_is_still_reported_as_a_fault() {
+        let mut source = ScriptedSource::new(|_| Ok(None));
+        source.fail_finalize_on = vec![1];
+        let mut recording = start_recording(source, DEFAULT_QUEUE_BUDGET, fast());
+        recording.try_record(chunk(b"AB"), pos(0));
+        let finalized = recording.finalize().await;
+        assert!(finalized
+            .fault
+            .is_some_and(|fault| fault.contains("finalize failed")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_backlog_does_not_postpone_the_periodic_flush() {
+        let mut source = ScriptedSource::new(|_| Ok(None));
+        source.write_delay = Duration::from_millis(1);
+        let segments = Arc::clone(&source.segments);
+        let timings = Timings {
+            flush: Duration::from_millis(5),
+            ..fast()
+        };
+        let mut recording = start_recording(source, DEFAULT_QUEUE_BUDGET, timings);
+        for i in 0..60u64 {
+            recording.try_record(chunk(b"X"), pos(i));
+        }
+        // 25 ms of writing against a queue holding 60 items: the queue never
+        // empties, so every flush is one the timer forced.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let flushes = lock(&segments)[0].flushes.load(Ordering::SeqCst);
+        assert!(flushes >= 3, "only {flushes} flushes before Stop");
+        let _ = recording.finalize().await;
     }
 
     // -- the overflow transition, interleaved with a segment open ----------

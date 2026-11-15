@@ -15,8 +15,10 @@
 //!   which fires once when the stream has been quiet for the timeout and re-arms
 //!   when data resumes ([`note_activity`](MatchRuleSet::note_activity)).
 //!
-//! Evaluation is bounded (a linear scan of the rule list) and never stalls
-//! reception (§100).
+//! Evaluation is bounded and never stalls reception (§100): one read yields
+//! at most [`MAX_FIRINGS_PER_READ`] firings, in stream order, and a read that
+//! holds more is cut off there and counted
+//! ([`limit_hits`](MatchRuleSet::limit_hits)).
 //!
 //! ## Cross-chunk matching
 //!
@@ -38,6 +40,12 @@ use std::time::Duration;
 
 use crate::config::{MatchAction, MatchCondition, MatchRule};
 use crate::core::MatchRuleId;
+
+/// The most firings one read can yield. Each firing costs memory and pipeline
+/// time, and a rule set can be written so that every byte matches many rules;
+/// this keeps one read's work and memory fixed whatever the rules and data.
+/// Matches past the limit, later in that read, do not fire.
+pub const MAX_FIRINGS_PER_READ: usize = 4_096;
 
 /// One configured rule in runtime form: its minted id, condition, actions, the
 /// enabled flag (fixed at compile time; rules change through Apply & Restart),
@@ -91,6 +99,8 @@ pub struct MatchRuleSet {
     /// The largest enabled `BytePattern` length, recomputed when rules change. The
     /// carry never needs more than `max_pattern_len - 1` bytes.
     max_pattern_len: usize,
+    /// How many reads were cut off at [`MAX_FIRINGS_PER_READ`].
+    limit_hits: u64,
 }
 
 impl MatchRuleSet {
@@ -113,6 +123,7 @@ impl MatchRuleSet {
             carry: Vec::new(),
             carry_offset: 0,
             max_pattern_len: 0,
+            limit_hits: 0,
         };
         set.recompute_max_pattern_len();
         set
@@ -174,6 +185,19 @@ impl MatchRuleSet {
         self.rules.iter().map(|r| r.boundary_saves).sum()
     }
 
+    /// How many reads held more matches than [`MAX_FIRINGS_PER_READ`] and
+    /// were cut off there. Monotonic since Start.
+    pub fn limit_hits(&self) -> u64 {
+        self.limit_hits
+    }
+
+    /// The bytes of the stream just before the next chunk, and the stream
+    /// offset of the first of them: what a match that began in an earlier
+    /// read is made of. At most `max_pattern_len - 1` bytes.
+    pub fn carry(&self) -> (u64, &[u8]) {
+        (self.carry_offset, &self.carry)
+    }
+
     /// Evaluate the `BytePattern` conditions against one received chunk (§50.2),
     /// matching **across the previous chunk's boundary** via the retained carry.
     /// `chunk_offset` is the absolute stream offset of `chunk[0]`. `Idle` rules are
@@ -182,13 +206,17 @@ impl MatchRuleSet {
     /// rule three times, each anchored at its own start offset, so per-match
     /// actions (a Mark timestamp next to *each* occurrence) see every one.
     /// Overlapping occurrences all fire (scanning resumes one byte after each
-    /// match start). Firings are rule-major, then in stream order within a rule.
-    /// The carry is updated for the next chunk.
+    /// match start). Firings are in stream order of their first byte; matches
+    /// that start on the same byte fire in rule order. At most
+    /// [`MAX_FIRINGS_PER_READ`] are returned: later matches in this chunk do
+    /// not fire, and the cut is counted. The carry is updated for the next
+    /// chunk.
     pub fn evaluate_stream(&mut self, chunk: &[u8], chunk_offset: u64) -> Vec<FiredRule> {
         let mut fired = Vec::new();
         if chunk.is_empty() {
             return fired;
         }
+        let mut cut_off = false;
 
         let carry_len = self.carry.len();
         // Boundary region: the carry plus just enough of the chunk for the longest
@@ -228,6 +256,10 @@ impl MatchRuleSet {
                         break; // starts in the chunk — the chunk scan reports it
                     }
                     if match_start + pattern.len() > carry_len {
+                        if fired.len() == MAX_FIRINGS_PER_READ {
+                            cut_off = true;
+                            break;
+                        }
                         rule.boundary_saves += 1;
                         fired.push(FiredRule {
                             id: rule.id,
@@ -240,22 +272,58 @@ impl MatchRuleSet {
                     start = match_start + 1;
                 }
             }
-            // 2. In-chunk matches, one firing per occurrence (a chunk holding
-            // several occurrences fires the rule once per occurrence, so per-match
-            // actions — Mark timestamps, Notify — see each one), scanned on the
-            // chunk slice directly.
-            let mut start = 0;
-            while let Some(rel) = find_subslice(&chunk[start..], pattern) {
-                let match_start = start + rel;
-                fired.push(FiredRule {
-                    id: rule.id,
-                    actions: rule.actions.clone(),
-                    match_offset: Some(chunk_offset + match_start as u64),
-                    match_len: pattern.len(),
-                    boundary_split: false,
-                });
-                start = match_start + 1;
+        }
+        // Boundary splits all start before the chunk; put them in stream order.
+        fired.sort_by_key(|f| f.match_offset);
+
+        // 2. In-chunk matches, one firing per occurrence (a chunk holding
+        // several occurrences fires the rule once per occurrence, so per-match
+        // actions — Mark timestamps, Notify — see each one), scanned on the
+        // chunk slice directly. Each rule keeps the start of its next match,
+        // and the earliest of them fires next, so the firings come out in
+        // stream order without first collecting every one.
+        let mut next: Vec<(usize, usize)> = self
+            .rules
+            .iter()
+            .enumerate()
+            .filter_map(|(index, rule)| {
+                let MatchCondition::BytePattern { pattern } = &rule.condition else {
+                    return None;
+                };
+                if !rule.enabled {
+                    return None;
+                }
+                find_subslice(chunk, pattern).map(|start| (start, index))
+            })
+            .collect();
+        // The minimum of (start, rule index): the earliest match, and among
+        // matches starting on one byte, the first rule.
+        while let Some(at) = (0..next.len()).min_by_key(|&i| next[i]) {
+            if fired.len() >= MAX_FIRINGS_PER_READ {
+                cut_off = true;
+                break;
             }
+            let (match_start, index) = next[at];
+            let rule = &self.rules[index];
+            let MatchCondition::BytePattern { pattern } = &rule.condition else {
+                break;
+            };
+            fired.push(FiredRule {
+                id: rule.id,
+                actions: rule.actions.clone(),
+                match_offset: Some(chunk_offset + match_start as u64),
+                match_len: pattern.len(),
+                boundary_split: false,
+            });
+            match find_subslice(&chunk[match_start + 1..], pattern) {
+                Some(rel) => next[at].0 = match_start + 1 + rel,
+                None => {
+                    next.swap_remove(at);
+                }
+            }
+        }
+        if cut_off {
+            self.limit_hits += 1;
         }
 
         // The next carry is the newest `max_pattern_len - 1` bytes of the stream:
@@ -627,5 +695,71 @@ mod tests {
         assert_eq!(set.evaluate_stream(b"AA..ZZ", 6).len(), 2);
         // Neither matches when absent.
         assert!(set.evaluate_stream(b"BBBB", 12).is_empty());
+    }
+
+    fn pattern(name: &str, bytes: &[u8]) -> MatchRule {
+        rule(
+            name,
+            MatchCondition::BytePattern {
+                pattern: bytes.to_vec(),
+            },
+        )
+    }
+
+    #[test]
+    fn firings_come_in_stream_order_whatever_the_rule_order() {
+        // The later rule's match comes first in the stream.
+        let mut set = MatchRuleSet::compile(&[pattern("z", b"ZZ"), pattern("a", b"A")]);
+        let ids = set.ids();
+        let fired = set.evaluate_stream(b"A.ZZ.A", 10);
+        let order: Vec<_> = fired.iter().map(|f| (f.match_offset, f.id)).collect();
+        assert_eq!(
+            order,
+            vec![(Some(10), ids[1]), (Some(12), ids[0]), (Some(15), ids[1])]
+        );
+    }
+
+    #[test]
+    fn matches_starting_on_one_byte_fire_in_rule_order() {
+        let mut set = MatchRuleSet::compile(&[pattern("long", b"AB"), pattern("short", b"A")]);
+        let ids = set.ids();
+        let fired = set.evaluate_stream(b"AB", 0);
+        assert_eq!(
+            fired.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[1]]
+        );
+    }
+
+    #[test]
+    fn a_boundary_split_fires_before_the_matches_inside_the_chunk() {
+        let mut set = MatchRuleSet::compile(&[pattern("b", b"B"), pattern("split", b"XY")]);
+        let ids = set.ids();
+        assert!(set.evaluate_stream(b"..X", 0).is_empty());
+        let fired = set.evaluate_stream(b"YB", 3);
+        let order: Vec<_> = fired.iter().map(|f| (f.match_offset, f.id)).collect();
+        assert_eq!(order, vec![(Some(2), ids[1]), (Some(4), ids[0])]);
+    }
+
+    #[test]
+    fn a_read_that_matches_everywhere_is_cut_off_at_the_limit_and_counted() {
+        // Every byte matches every rule: 64 rules over a full UDP datagram
+        // would otherwise be more than four million firings.
+        let rules: Vec<MatchRule> = (0..64).map(|i| pattern(&i.to_string(), b"A")).collect();
+        let mut set = MatchRuleSet::compile(&rules);
+        let chunk = vec![b'A'; 65_507];
+
+        let fired = set.evaluate_stream(&chunk, 0);
+
+        assert_eq!(fired.len(), MAX_FIRINGS_PER_READ);
+        assert_eq!(set.limit_hits(), 1);
+        // The firings kept are the earliest in the stream: 64 per byte.
+        assert_eq!(fired[0].match_offset, Some(0));
+        assert_eq!(
+            fired.last().unwrap().match_offset,
+            Some((MAX_FIRINGS_PER_READ / 64 - 1) as u64)
+        );
+        // A later read under the limit is whole again.
+        assert_eq!(set.evaluate_stream(b"A", 65_507).len(), 64);
+        assert_eq!(set.limit_hits(), 1);
     }
 }

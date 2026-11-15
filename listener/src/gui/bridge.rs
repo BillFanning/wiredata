@@ -23,13 +23,20 @@ use crate::config::{
 };
 use crate::core::{ChannelId, ChannelName, ChannelState, RuntimeEvent};
 use crate::runtime::{
-    ChannelSnapshot, ChannelStats, DrainedStop, Listener, OpenedStart, PipelineCapacities,
-    ReconnectAttempt, StreamDelta,
+    ChannelSnapshot, ChannelStats, DrainedStop, Listener, OpenedStart, OrchestratorError,
+    PipelineCapacities, ReconnectAttempt, StreamDelta,
 };
 use crate::transport::udp::UdpMode;
 use crate::transport::SerialControlLines;
 
 use super::bind_scope::{local_addresses, BindScope, LocalAddress};
+
+/// The longest one poll round may run before the Channels it has not reached
+/// are left for the next round. Each request already waits at most
+/// `STATUS_REPLY_WAIT`; this keeps several unresponsive Channels from
+/// multiplying that wait. Checked between Channels, so a round can overrun by
+/// the requests of the last Channel it started.
+const POLL_ROUND_LIMIT: Duration = crate::runtime::channel::POLL_ROUND_LIMIT;
 
 /// How often the driver polls running Channels for a fresh snapshot (the pull
 /// surface, ADR-006). 5 Hz is responsive without busy-polling.
@@ -204,6 +211,123 @@ pub enum UiUpdate {
     LocalAddresses(Result<Vec<LocalAddress>, String>),
 }
 
+impl UiUpdate {
+    /// Whether the next poll re-sends what this update says, so losing it is
+    /// harmless. Periodic updates ride the bounded best-effort lane; every other
+    /// update is a one-time result that nothing re-sends, and rides the reliable
+    /// lane (see [`update_lanes`]).
+    ///
+    /// The match is exhaustive, so a new update must be classified to compile.
+    /// A runtime event is periodic only when the GUI does not act on it
+    /// directly and the periodic snapshot carries what it reports.
+    pub fn is_periodic(&self) -> bool {
+        match self {
+            Self::Snapshot(..)
+            | Self::Stats(..)
+            | Self::ControlLines(..)
+            | Self::StreamDelta(..) => true,
+            Self::Event(event) => match event {
+                RuntimeEvent::ChannelStarted(_)
+                | RuntimeEvent::ChannelStopped(_)
+                | RuntimeEvent::ChannelFaulted(_)
+                | RuntimeEvent::RecordingFaulted(..)
+                | RuntimeEvent::RecordingStarted(..)
+                | RuntimeEvent::ChannelReconnecting(..)
+                | RuntimeEvent::ChannelReconnected(_)
+                | RuntimeEvent::ChannelReconnectGaveUp(_) => false,
+                RuntimeEvent::WarningRaised(_)
+                | RuntimeEvent::ReceptionStalled(..)
+                | RuntimeEvent::ReceptionResumed(..)
+                | RuntimeEvent::ControlLinesChanged(_)
+                | RuntimeEvent::DiskSpaceLow(_)
+                | RuntimeEvent::RecordingStoppedLowDisk(_)
+                | RuntimeEvent::MatchTriggered(..) => true,
+            },
+            Self::ChannelAdded(..)
+            | Self::ChannelReconfigured(..)
+            | Self::ChannelRenamed(..)
+            | Self::ChannelRemoved(_)
+            | Self::ChannelError(..)
+            | Self::ProfileSaved(_)
+            | Self::ProfileLoaded(_)
+            | Self::ProfileError(_)
+            | Self::ResumeChecked(..)
+            | Self::Resumed(..)
+            | Self::LocalAddresses(_) => false,
+        }
+    }
+}
+
+/// The driver's end of the two update lanes made by [`update_lanes`].
+pub struct UpdateSender {
+    periodic: Sender<UiUpdate>,
+    reliable: mpsc::UnboundedSender<UiUpdate>,
+}
+
+impl UpdateSender {
+    /// Queue one update on the lane its [`UiUpdate::is_periodic`] names. Never
+    /// blocks. Returns whether the update was queued: a periodic update is
+    /// dropped when its bounded lane is full, and a one-time update is dropped
+    /// only when the receiver has gone.
+    fn send(&self, update: UiUpdate) -> bool {
+        if update.is_periodic() {
+            self.periodic.try_send(update).is_ok()
+        } else {
+            self.reliable.send(update).is_ok()
+        }
+    }
+}
+
+/// The GUI's end of the two update lanes made by [`update_lanes`].
+pub struct UpdateReceiver {
+    periodic: Receiver<UiUpdate>,
+    reliable: mpsc::UnboundedReceiver<UiUpdate>,
+}
+
+impl UpdateReceiver {
+    /// The next update without waiting. Every one-time update queued is
+    /// returned before any periodic one, each lane in the order it was sent, so
+    /// telemetry never arrives ahead of the channel it describes.
+    pub fn try_recv(&mut self) -> Result<UiUpdate, mpsc::error::TryRecvError> {
+        if let Ok(update) = self.reliable.try_recv() {
+            return Ok(update);
+        }
+        self.periodic.try_recv()
+    }
+
+    /// The next update, waiting for one; `None` once the driver is gone and
+    /// both lanes are empty. Ordered as [`try_recv`](Self::try_recv).
+    pub async fn recv(&mut self) -> Option<UiUpdate> {
+        tokio::select! {
+            biased;
+            Some(update) = self.reliable.recv() => Some(update),
+            update = self.periodic.recv() => update,
+        }
+    }
+}
+
+/// Make the two lanes between the driver and the GUI.
+///
+/// The periodic lane holds `periodic_capacity` updates and drops what does not
+/// fit: the next poll sends fresh telemetry anyway. The reliable lane is
+/// unbounded and never drops, because one-time results are not re-sent and the
+/// GUI cannot rebuild a missing one. Its volume is bounded by what users do
+/// and by the size of a loaded profile, not by the polling rate.
+pub fn update_lanes(periodic_capacity: usize) -> (UpdateSender, UpdateReceiver) {
+    let (periodic_tx, periodic_rx) = mpsc::channel(periodic_capacity);
+    let (reliable_tx, reliable_rx) = mpsc::unbounded_channel();
+    (
+        UpdateSender {
+            periodic: periodic_tx,
+            reliable: reliable_tx,
+        },
+        UpdateReceiver {
+            periodic: periodic_rx,
+            reliable: reliable_rx,
+        },
+    )
+}
+
 /// Run file work on the blocking pool and await it, so a slow disk or network
 /// share occupies a blocking thread and not an async worker. A panic in the
 /// work comes back as an error message.
@@ -376,6 +500,151 @@ struct ChannelSteps {
 enum StepDone {
     Opened(Box<OpenedStart>),
     Drained(Box<DrainedStop>),
+    /// Profile file work finished (see [`ProfileWork`]).
+    Profile(Box<ProfileDone>),
+}
+
+/// Profile file work, run off the loop so a slow or hung disk or network share
+/// cannot hold the driver. One piece runs at a time, in the order the commands
+/// came; a command issued while one is outstanding waits behind it. The loop
+/// keeps serving every other command meanwhile, so a Channel's state may change
+/// before the work lands.
+enum ProfileWork {
+    /// Write the Channel configs gathered when the command was issued.
+    Save {
+        path: std::path::PathBuf,
+        profile: Box<Profile>,
+    },
+    Load {
+        path: std::path::PathBuf,
+    },
+    CheckResume {
+        path: std::path::PathBuf,
+    },
+    Resume {
+        path: std::path::PathBuf,
+    },
+}
+
+type LoadedProfile = Result<(Profile, Vec<String>), String>;
+
+/// What finished [`ProfileWork`] hands back to the loop.
+enum ProfileDone {
+    Saved {
+        path: std::path::PathBuf,
+        result: Result<(), String>,
+    },
+    Loaded(LoadedProfile),
+    Checked {
+        path: std::path::PathBuf,
+        result: Result<String, String>,
+    },
+    ResumeRead {
+        path: std::path::PathBuf,
+        result: LoadedProfile,
+    },
+}
+
+impl ProfileWork {
+    /// Do the file work, on the blocking pool. `before_files` runs first on that
+    /// thread (tests use it to hold the work).
+    async fn run(self, before_files: FileHook) -> ProfileDone {
+        let hold = move || {
+            if let Some(hook) = before_files {
+                hook();
+            }
+        };
+        match self {
+            Self::Save { path, profile } => {
+                let saving = path.clone();
+                let result = run_blocking(move || {
+                    hold();
+                    profile.save(&saving).map_err(|err| err.to_string())
+                })
+                .await
+                .and_then(|saved| saved);
+                ProfileDone::Saved { path, result }
+            }
+            Self::Load { path } => ProfileDone::Loaded(
+                run_blocking(move || {
+                    hold();
+                    Profile::load_with_warnings(&path).map_err(|err| err.to_string())
+                })
+                .await
+                .and_then(|loaded| loaded),
+            ),
+            Self::CheckResume { path } => {
+                let checking = path.clone();
+                let result = run_blocking(move || {
+                    hold();
+                    resume_check(&checking)
+                })
+                .await
+                .and_then(|checked| checked)
+                .map(|(profile, _)| profile.name);
+                ProfileDone::Checked { path, result }
+            }
+            Self::Resume { path } => {
+                let checking = path.clone();
+                let result = run_blocking(move || {
+                    hold();
+                    resume_check(&checking)
+                })
+                .await
+                .and_then(|checked| checked);
+                ProfileDone::ResumeRead { path, result }
+            }
+        }
+    }
+}
+
+/// Runs on the blocking thread before any profile file is touched. Always
+/// `None` outside tests.
+type FileHook = Option<std::sync::Arc<dyn Fn() + Send + Sync>>;
+
+/// Where each poll round starts, so that Channels left unreached by one round
+/// are the first of the next.
+#[derive(Default)]
+struct PollRotation {
+    /// Where the next round starts.
+    next: usize,
+    /// Where this round started, and how many Channels it has visited.
+    start: usize,
+    visited: usize,
+}
+
+impl PollRotation {
+    /// Begin a round over `len` Channels, from where the last round stopped.
+    fn begin(&mut self, len: usize) {
+        self.start = if len == 0 { 0 } else { self.next % len };
+        self.visited = 0;
+    }
+
+    /// The next Channel to visit in this round, or `None` when the round is
+    /// over: every Channel visited, or `limit` passed since `began`, in which
+    /// case the next round starts with the first Channel not visited. At least
+    /// one Channel is visited per round, so a round always makes progress.
+    fn next_in_round(
+        &mut self,
+        ids: &[ChannelId],
+        began: tokio::time::Instant,
+        limit: Duration,
+    ) -> Option<ChannelId> {
+        if ids.is_empty() {
+            return None;
+        }
+        if self.visited >= ids.len() {
+            self.next = 0;
+            return None;
+        }
+        let at = (self.start + self.visited) % ids.len();
+        if self.visited > 0 && began.elapsed() >= limit {
+            self.next = at;
+            return None;
+        }
+        self.visited += 1;
+        Some(ids[at])
+    }
 }
 
 /// A workspace change, made once no Channel has steps left (ADR-052).
@@ -397,7 +666,7 @@ pub struct Driver {
     listener: Listener,
     events: Receiver<RuntimeEvent>,
     commands: Receiver<UiCommand>,
-    updates: Sender<UiUpdate>,
+    updates: UpdateSender,
     repaint: Box<dyn Fn() + Send>,
     /// Channels registered so far, polled for stats.
     channels: Vec<ChannelId>,
@@ -416,6 +685,16 @@ pub struct Driver {
     /// has at most one step running.
     done_tx: mpsc::UnboundedSender<StepDone>,
     done_rx: mpsc::UnboundedReceiver<StepDone>,
+    /// Profile file work waiting its turn behind the piece running now.
+    profile_work: VecDeque<ProfileWork>,
+    /// A piece of profile file work is running off the loop. It is not a
+    /// Channel step: Shutdown does not wait for it.
+    profile_running: bool,
+    /// Where the next status poll round starts.
+    poll_rotation: PollRotation,
+    /// Held by the profile file work before it touches a file (tests only).
+    #[cfg(test)]
+    file_hook: FileHook,
 }
 
 impl Driver {
@@ -425,7 +704,7 @@ impl Driver {
         listener: Listener,
         events: Receiver<RuntimeEvent>,
         commands: Receiver<UiCommand>,
-        updates: Sender<UiUpdate>,
+        updates: UpdateSender,
         repaint: Box<dyn Fn() + Send>,
     ) -> Self {
         let (done_tx, done_rx) = mpsc::unbounded_channel();
@@ -442,6 +721,22 @@ impl Driver {
             workspace: VecDeque::new(),
             done_tx,
             done_rx,
+            profile_work: VecDeque::new(),
+            profile_running: false,
+            poll_rotation: PollRotation::default(),
+            #[cfg(test)]
+            file_hook: None,
+        }
+    }
+
+    fn file_hook(&self) -> FileHook {
+        #[cfg(test)]
+        {
+            self.file_hook.clone()
+        }
+        #[cfg(not(test))]
+        {
+            None
         }
     }
 
@@ -509,6 +804,7 @@ impl Driver {
     /// Run every step that can run now and, once no Channel has steps left,
     /// the next workspace change (ADR-052).
     async fn pump(&mut self) {
+        self.start_profile_work();
         loop {
             let ready: Vec<ChannelId> = self
                 .steps
@@ -586,7 +882,8 @@ impl Driver {
             }
             Step::Reconnected(attempt) => {
                 let started = self.steps.get(&id).is_some_and(|steps| steps.started);
-                self.listener.finish_reconnect(*attempt, started);
+                self.listener
+                    .finish_reconnect(*attempt, started, std::time::Instant::now());
             }
         }
     }
@@ -647,6 +944,81 @@ impl Driver {
                 self.listener.finish_stop(*drained);
                 self.steps.entry(id).or_default().running = false;
             }
+            StepDone::Profile(done) => {
+                self.profile_running = false;
+                self.land_profile(*done);
+            }
+        }
+    }
+
+    /// Start the next piece of profile file work unless one is running, off
+    /// the loop.
+    fn start_profile_work(&mut self) {
+        if self.profile_running {
+            return;
+        }
+        let Some(work) = self.profile_work.pop_front() else {
+            return;
+        };
+        self.profile_running = true;
+        let done = self.done_tx.clone();
+        let hook = self.file_hook();
+        tokio::spawn(async move {
+            let _ = done.send(StepDone::Profile(Box::new(work.run(hook).await)));
+        });
+    }
+
+    /// Land profile file work that finished: report it, or queue the
+    /// workspace change it asked for.
+    fn land_profile(&mut self, done: ProfileDone) {
+        match done {
+            ProfileDone::Saved { path, result } => match result {
+                Ok(()) => {
+                    self.push(UiUpdate::ProfileSaved(path));
+                }
+                Err(err) => {
+                    self.push(UiUpdate::ProfileError(format!("save failed: {err}")));
+                }
+            },
+            ProfileDone::Loaded(result) => match result {
+                Ok((profile, warnings)) => self.replace_workspace(profile, warnings, false, None),
+                Err(err) => {
+                    self.push(UiUpdate::ProfileError(format!("load failed: {err}")));
+                }
+            },
+            ProfileDone::Checked { path, result } => {
+                self.push(UiUpdate::ResumeChecked(path, result));
+            }
+            ProfileDone::ResumeRead { path, result } => match result {
+                Ok((profile, warnings)) => {
+                    let name = profile.name.clone();
+                    self.replace_workspace(profile, warnings, true, Some(name));
+                }
+                Err(why) => {
+                    self.push(UiUpdate::ResumeChecked(path, Err(why)));
+                }
+            },
+        }
+    }
+
+    /// Queue the teardown of every Channel, then registering `profile`'s: and
+    /// for a resume, starting them and announcing it as `resumed`.
+    fn replace_workspace(
+        &mut self,
+        profile: Profile,
+        warnings: Vec<String>,
+        start: bool,
+        resumed: Option<String>,
+    ) {
+        self.queue_removal_of_all();
+        self.workspace.push_back(WorkspaceStep::Clear);
+        self.workspace.push_back(WorkspaceStep::Load {
+            profile: Box::new(profile),
+            warnings,
+            start,
+        });
+        if let Some(name) = resumed {
+            self.workspace.push_back(WorkspaceStep::Resumed(name));
         }
     }
 
@@ -703,6 +1075,9 @@ impl Driver {
         let deadline = tokio::time::Instant::now() + Listener::STOP_GRACE;
         while self.steps.values().any(|steps| steps.running) {
             match tokio::time::timeout_at(deadline, self.done_rx.recv()).await {
+                // Profile file work that lands now changes nothing: the app is
+                // closing, and starting a teardown here would only delay it.
+                Ok(Some(StepDone::Profile(_))) => {}
                 Ok(Some(done)) => self.on_done(done),
                 _ => break,
             }
@@ -778,11 +1153,15 @@ impl Driver {
             UiCommand::ResumeDisplay(id) => {
                 let _ = self.listener.resume_display(id);
             }
+            // A line command for a Channel that is not a running serial Channel
+            // is ignored; one its serial reader did not take in time is said so.
             UiCommand::SetRts(id, on) => {
-                let _ = self.listener.set_rts(id, on).await;
+                let result = self.listener.set_rts(id, on).await;
+                self.report_untaken(id, result);
             }
             UiCommand::SetDtr(id, on) => {
-                let _ = self.listener.set_dtr(id, on).await;
+                let result = self.listener.set_dtr(id, on).await;
+                self.report_untaken(id, result);
             }
             UiCommand::SetRecording(id, enabled, raw_config) => {
                 // Arm from the settings read at click time (passed from the editor), so
@@ -790,8 +1169,11 @@ impl Driver {
                 // `false` return means the command didn't reach a running data channel;
                 // a begin that reaches the pipeline but can't open the file reports
                 // separately via RecordingFaulted (§55).
-                if !self.listener.set_recording(id, enabled, *raw_config).await {
-                    self.push_channel_error(id, "can't change recording — channel isn't running");
+                match self.listener.set_recording(id, enabled, *raw_config).await {
+                    Ok(true) => {}
+                    Ok(false) => self
+                        .push_channel_error(id, "can't change recording — channel isn't running"),
+                    Err(err) => self.push_channel_error(id, err),
                 }
             }
             UiCommand::SetRawRecordingConfig(id, raw) => {
@@ -803,15 +1185,17 @@ impl Driver {
             UiCommand::SetDisplayRecording(id, enabled, display) => {
                 // The Raw toggle's sibling (§54): arm from click-time settings; a begin
                 // that can't open the file reports via RecordingFaulted (§55).
-                if !self
+                match self
                     .listener
                     .set_display_recording(id, enabled, *display)
                     .await
                 {
-                    self.push_channel_error(
+                    Ok(true) => {}
+                    Ok(false) => self.push_channel_error(
                         id,
                         "can't change display recording — channel isn't running",
-                    );
+                    ),
+                    Err(err) => self.push_channel_error(id, err),
                 }
             }
             UiCommand::SetDisplayRecordingConfig(id, display) => {
@@ -833,17 +1217,15 @@ impl Driver {
                 // bytes that arrived while it was off-screen.
                 self.selected = id;
             }
-            UiCommand::SaveProfile(path) => self.save_profile(path).await,
-            UiCommand::LoadProfile(path) => self.load_profile(path).await,
+            // Profile file work runs off the loop, one piece at a time (see
+            // `ProfileWork`).
+            UiCommand::SaveProfile(path) => self.save_profile(path),
+            UiCommand::LoadProfile(path) => self.profile_work.push_back(ProfileWork::Load { path }),
             UiCommand::CheckResume(path) => {
-                let checked_path = path.clone();
-                let checked = match run_blocking(move || resume_check(&checked_path)).await {
-                    Ok(checked) => checked.map(|(profile, _)| profile.name),
-                    Err(why) => Err(why),
-                };
-                self.push(UiUpdate::ResumeChecked(path, checked));
+                self.profile_work
+                    .push_back(ProfileWork::CheckResume { path });
             }
-            UiCommand::Resume(path) => self.resume(path).await,
+            UiCommand::Resume(path) => self.profile_work.push_back(ProfileWork::Resume { path }),
             UiCommand::ListLocalAddresses => {
                 self.push(UiUpdate::LocalAddresses(local_addresses()));
             }
@@ -853,26 +1235,22 @@ impl Driver {
         true
     }
 
-    /// Save every registered channel's config to a TOML profile (§67). Gathers
-    /// configs from the authoritative `Listener` in `self.channels` order; a missing
-    /// config (a channel removed mid-flight) is skipped. Non-fatal: an I/O or
-    /// serialization error is reported via `ProfileError`, not a panic.
-    async fn save_profile(&mut self, path: std::path::PathBuf) {
+    /// Queue saving every registered channel's config to a TOML profile (§67).
+    /// Gathers configs from the authoritative `Listener` in `self.channels`
+    /// order when the command arrives; a missing config (a channel removed
+    /// mid-flight) is skipped. Non-fatal: an I/O or serialization error is
+    /// reported via `ProfileError`, not a panic.
+    fn save_profile(&mut self, path: std::path::PathBuf) {
         let mut profile = Profile::new(profile_name_from_path(&path));
         profile.channels = self
             .channels
             .iter()
             .filter_map(|id| self.listener.config(*id).cloned())
             .collect();
-        let saving = path.clone();
-        match run_blocking(move || profile.save(&saving).map_err(|err| err.to_string())).await {
-            Ok(Ok(())) => {
-                self.push(UiUpdate::ProfileSaved(path));
-            }
-            Ok(Err(err)) | Err(err) => {
-                self.push(UiUpdate::ProfileError(format!("save failed: {err}")));
-            }
-        }
+        self.profile_work.push_back(ProfileWork::Save {
+            path,
+            profile: Box::new(profile),
+        });
     }
 
     /// Tear the workspace down and leave it empty: every Channel is stopped
@@ -882,55 +1260,13 @@ impl Driver {
         self.workspace.push_back(WorkspaceStep::Clear);
     }
 
-    /// Resume a registered profile (ADR-045): check it again — the countdown
-    /// gave a drive time to go — then load it and start every channel. A
-    /// channel that cannot start is reported and left to its reconnect policy.
-    async fn resume(&mut self, path: std::path::PathBuf) {
-        let checking = path.clone();
-        let (profile, warnings) = match run_blocking(move || resume_check(&checking))
-            .await
-            .and_then(|checked| checked)
-        {
-            Ok(checked) => checked,
-            Err(why) => {
-                self.push(UiUpdate::ResumeChecked(path, Err(why)));
-                return;
-            }
-        };
-        let name = profile.name.clone();
-        self.queue_removal_of_all();
-        self.workspace.push_back(WorkspaceStep::Clear);
-        self.workspace.push_back(WorkspaceStep::Load {
-            profile: Box::new(profile),
-            warnings,
-            start: true,
-        });
-        self.workspace.push_back(WorkspaceStep::Resumed(name));
-    }
-
-    /// Replace the workspace with the profile at `path` (§70): every Channel
-    /// is stopped and removed first, and the profile's Channels are registered
-    /// Stopped (load never starts a channel).
-    async fn load_profile(&mut self, path: std::path::PathBuf) {
-        let loading = path.clone();
-        let loaded = run_blocking(move || {
-            Profile::load_with_warnings(&loading).map_err(|err| err.to_string())
-        })
-        .await;
-        let (profile, warnings) = match loaded {
-            Ok(Ok(loaded)) => loaded,
-            Ok(Err(err)) | Err(err) => {
-                self.push(UiUpdate::ProfileError(format!("load failed: {err}")));
-                return;
-            }
-        };
-        self.queue_removal_of_all();
-        self.workspace.push_back(WorkspaceStep::Clear);
-        self.workspace.push_back(WorkspaceStep::Load {
-            profile: Box::new(profile),
-            warnings,
-            start: false,
-        });
+    /// Say so when a line command was not taken in time. Any other refusal
+    /// (not a running serial Channel) is ignored, as the lines are not shown
+    /// then.
+    fn report_untaken(&self, id: ChannelId, result: Result<(), OrchestratorError>) {
+        if let Err(err @ OrchestratorError::NotTakenInTime(_)) = result {
+            self.push_channel_error(id, err);
+        }
     }
 
     /// Register a profile's Channels Stopped, and return their ids. Each
@@ -944,7 +1280,9 @@ impl Driver {
         let results = profile.validate();
         let mut skipped: Vec<String> = Vec::new();
         let mut added = Vec::new();
-        for (config, (name, result)) in profile.channels.into_iter().zip(results) {
+        let profile_name = profile.name.clone();
+        let channels = profile.into_effective_channels();
+        for (config, (name, result)) in channels.into_iter().zip(results) {
             if let Err(errors) = result {
                 skipped.push(format!("\"{name}\": {}", describe_channel_errors(&errors)));
                 continue;
@@ -959,18 +1297,18 @@ impl Driver {
         }
         // The skip notice goes after ProfileLoaded: both set the one status
         // line, so the other way round "Loaded" replaced the reasons at once.
-        self.push(UiUpdate::ProfileLoaded(profile.name.clone()));
+        self.push(UiUpdate::ProfileLoaded(profile_name.clone()));
         if !warnings.is_empty() {
             self.push(UiUpdate::ProfileError(format!(
                 "Loaded “{}” with changes to its old settings:\n{}",
-                profile.name,
+                profile_name,
                 warnings.join("\n")
             )));
         }
         if !skipped.is_empty() {
             self.push(UiUpdate::ProfileError(format!(
                 "Loaded “{}” with {} channel(s) skipped (invalid):\n{}",
-                profile.name,
+                profile_name,
                 skipped.len(),
                 skipped.join("\n")
             )));
@@ -989,61 +1327,71 @@ impl Driver {
     /// `Receiver` is not. The real driver runs via `block_on` (no `Send` needed),
     /// but keeping it `Send` lets it run on a multi-thread runtime and be spawned.
     async fn poll_snapshots(&mut self) {
-        for id in self.channels.clone() {
-            if Some(id) == self.selected {
-                // Two requests to the pipeline per poll, the snapshot and the
-                // stream delta, where one would do. Not worth changing on its
-                // own: fold them together when `PipelineRequest` next changes.
-                if let Some(snap) = self.listener.snapshot(id).await {
-                    self.push(UiUpdate::Snapshot(id, Box::new(snap)));
-                }
-                // Incremental live stream (§87, ADR-009): fetch only the bytes new
-                // since our cursor, so we never re-ship the whole scrollback. A
-                // "caught up" empty delta is a no-op (just advance past it). For a
-                // non-empty delta, advance the cursor ONLY if the push was accepted —
-                // if the bounded update channel was full and dropped it, keep the
-                // cursor so the next poll re-fetches those bytes instead of skipping
-                // them. (Previously the cursor advanced unconditionally, so a dropped
-                // delta was lost forever and the view froze while bytes kept counting.)
-                let cursor = self.stream_cursors.get(&id).copied().unwrap_or_default();
-                if let Some(delta) = self.listener.stream_delta(id, cursor.offset).await {
-                    let end = delta.end_offset;
-                    let generation = delta.generation;
-                    // Empty caught-up deltas normally stay off the UI channel. A new
-                    // generation is different: forward even an empty window so a
-                    // restart clears stale bytes when no new data has arrived yet.
-                    let needs_update =
-                        Some(generation) != cursor.generation || !delta.bytes.is_empty();
-                    let advance =
-                        !needs_update || self.push(UiUpdate::StreamDelta(id, Box::new(delta)));
-                    if advance {
-                        self.stream_cursors.insert(
-                            id,
-                            StreamPollCursor {
-                                generation: Some(generation),
-                                offset: end,
-                            },
-                        );
-                    }
-                }
-            } else if let Some(stats) = self.listener.channel_stats(id).await {
-                self.push(UiUpdate::Stats(id, Box::new(stats)));
-            }
-            // Live serial control/status lines (§161); `None` for non-serial or
-            // stopped channels.
-            if let Some(lines) = self.listener.serial_control_lines(id) {
-                self.push(UiUpdate::ControlLines(id, lines));
-            }
+        let ids = self.channels.clone();
+        let began = tokio::time::Instant::now();
+        self.poll_rotation.begin(ids.len());
+        while let Some(id) = self
+            .poll_rotation
+            .next_in_round(&ids, began, POLL_ROUND_LIMIT)
+        {
+            self.poll_channel(id).await;
         }
     }
 
-    /// Hand one update to the GUI and wake it. Advisory and non-blocking: a full
-    /// update channel drops the item rather than stalling the driver (§99). Returns
-    /// whether the update was actually enqueued — the stream-delta poll uses this to
-    /// avoid advancing its cursor past bytes the UI never received (a dropped delta
-    /// would otherwise be lost forever, freezing the view while bytes kept arriving).
+    /// One Channel's share of a poll round.
+    async fn poll_channel(&mut self, id: ChannelId) {
+        if Some(id) == self.selected {
+            // Two requests to the pipeline per poll, the snapshot and the
+            // stream delta, where one would do. Not worth changing on its
+            // own: fold them together when `PipelineRequest` next changes.
+            if let Some(snap) = self.listener.snapshot(id).await {
+                self.push(UiUpdate::Snapshot(id, Box::new(snap)));
+            }
+            // Incremental live stream (§87, ADR-009): fetch only the bytes new
+            // since our cursor, so we never re-ship the whole scrollback. A
+            // "caught up" empty delta is a no-op (just advance past it). For a
+            // non-empty delta, advance the cursor ONLY if the push was accepted —
+            // if the bounded update channel was full and dropped it, keep the
+            // cursor so the next poll re-fetches those bytes instead of skipping
+            // them. (Previously the cursor advanced unconditionally, so a dropped
+            // delta was lost forever and the view froze while bytes kept counting.)
+            let cursor = self.stream_cursors.get(&id).copied().unwrap_or_default();
+            if let Some(delta) = self.listener.stream_delta(id, cursor.offset).await {
+                let end = delta.end_offset;
+                let generation = delta.generation;
+                // Empty caught-up deltas normally stay off the UI channel. A new
+                // generation is different: forward even an empty window so a
+                // restart clears stale bytes when no new data has arrived yet.
+                let needs_update = Some(generation) != cursor.generation || !delta.bytes.is_empty();
+                let advance =
+                    !needs_update || self.push(UiUpdate::StreamDelta(id, Box::new(delta)));
+                if advance {
+                    self.stream_cursors.insert(
+                        id,
+                        StreamPollCursor {
+                            generation: Some(generation),
+                            offset: end,
+                        },
+                    );
+                }
+            }
+        } else if let Some(stats) = self.listener.channel_stats(id).await {
+            self.push(UiUpdate::Stats(id, Box::new(stats)));
+        }
+        // Live serial control/status lines (§161); `None` for non-serial or
+        // stopped channels.
+        if let Some(lines) = self.listener.serial_control_lines(id) {
+            self.push(UiUpdate::ControlLines(id, lines));
+        }
+    }
+
+    /// Hand one update to the GUI and wake it. Non-blocking (§99): a periodic
+    /// update is dropped when its bounded lane is full rather than stalling the
+    /// driver, while a one-time result always has room (see [`update_lanes`]).
+    /// Returns whether the update was actually enqueued — the stream-delta poll
+    /// uses this to avoid advancing its cursor past bytes the UI never received.
     fn push(&self, update: UiUpdate) -> bool {
-        let sent = self.updates.try_send(update).is_ok();
+        let sent = self.updates.send(update);
         (self.repaint)();
         sent
     }
@@ -1066,7 +1414,7 @@ impl Driver {
 /// runtime thread's join handle (kept alive for the App's lifetime).
 pub struct BridgeHandle {
     pub commands: Sender<UiCommand>,
-    pub updates: Receiver<UiUpdate>,
+    pub updates: UpdateReceiver,
     /// The runtime thread, taken and joined by [`shutdown_and_join`](Self::shutdown_and_join)
     /// on app exit. `Option` so it can be moved out of `&mut self` (in `on_exit`).
     runtime_thread: Option<std::thread::JoinHandle<()>>,
@@ -1088,8 +1436,8 @@ impl BridgeHandle {
     }
 }
 
-/// Channel depths for the bridge. Commands are rare (user clicks); updates are
-/// higher-volume (events + 5 Hz snapshots) but advisory.
+/// Channel depths for the bridge. Commands are rare (user clicks); periodic
+/// updates are higher-volume (5 Hz snapshots) but advisory.
 const COMMAND_CAPACITY: usize = 64;
 const UPDATE_CAPACITY: usize = 256;
 
@@ -1099,7 +1447,7 @@ const UPDATE_CAPACITY: usize = 256;
 /// `egui::Context::request_repaint` so a streaming source wakes the UI.
 pub fn spawn(repaint: impl Fn() + Send + 'static) -> anyhow::Result<BridgeHandle> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
-    let (upd_tx, upd_rx) = tokio::sync::mpsc::channel(UPDATE_CAPACITY);
+    let (upd_tx, upd_rx) = update_lanes(UPDATE_CAPACITY);
 
     let runtime_thread = std::thread::Builder::new()
         .name("listener-runtime".into())
@@ -1179,7 +1527,7 @@ mod tests {
         let events = listener.take_events().unwrap();
         listener.delay_opens_for_test(OPEN_TAKES);
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(4096);
+        let (upd_tx, mut upd_rx) = update_lanes(4096);
         let handle =
             tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
 
@@ -1230,7 +1578,7 @@ mod tests {
         n: usize,
     ) -> (
         Sender<UiCommand>,
-        Receiver<UiUpdate>,
+        UpdateReceiver,
         Vec<ChannelId>,
         tokio::task::JoinHandle<()>,
     ) {
@@ -1238,7 +1586,7 @@ mod tests {
         let events = listener.take_events().unwrap();
         listener.delay_opens_for_test(open_takes);
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(4096);
+        let (upd_tx, mut upd_rx) = update_lanes(4096);
         let handle =
             tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
         let mut ids = Vec::new();
@@ -1342,7 +1690,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_driver_lists_local_addresses() {
-        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+        async fn next(rx: &mut UpdateReceiver) -> UiUpdate {
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("driver update timed out")
@@ -1351,7 +1699,7 @@ mod tests {
         let mut listener = Listener::with_default_capacities();
         let events = listener.take_events().unwrap();
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
-        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let (upd_tx, mut upd_rx) = update_lanes(64);
         let handle =
             tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
         cmd_tx.send(UiCommand::ListLocalAddresses).await.unwrap();
@@ -1371,7 +1719,7 @@ mod tests {
     #[tokio::test]
     async fn driver_adds_starts_reports_and_snapshots_a_channel() {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let (upd_tx, mut upd_rx) = update_lanes(64);
 
         let mut listener = Listener::with_default_capacities();
         let events = listener.take_events().unwrap();
@@ -1379,7 +1727,7 @@ mod tests {
         let handle = tokio::spawn(driver.run());
 
         // Helper: await the next update of interest within a timeout.
-        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+        async fn next(rx: &mut UpdateReceiver) -> UiUpdate {
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("driver update timed out")
@@ -1455,13 +1803,13 @@ mod tests {
     #[tokio::test]
     async fn starting_two_channels_on_one_udp_port_reports_the_conflict() {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let (upd_tx, mut upd_rx) = update_lanes(64);
         let mut listener = Listener::with_default_capacities();
         let events = listener.take_events().unwrap();
         let driver = Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {}));
         let handle = tokio::spawn(driver.run());
 
-        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+        async fn next(rx: &mut UpdateReceiver) -> UiUpdate {
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("driver update timed out")
@@ -1531,7 +1879,7 @@ mod tests {
     /// round-trip proves SaveProfile/LoadProfile are wired end to end.
     #[tokio::test]
     async fn save_then_load_round_trips_the_workspace_through_the_driver() {
-        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+        async fn next(rx: &mut UpdateReceiver) -> UiUpdate {
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("driver update timed out")
@@ -1542,7 +1890,7 @@ mod tests {
 
         // First driver: add two channels, then save.
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let (upd_tx, mut upd_rx) = update_lanes(64);
         let mut listener = Listener::with_default_capacities();
         let events = listener.take_events().unwrap();
         let handle =
@@ -1608,7 +1956,7 @@ mod tests {
 
         // Second, fresh driver: load the saved profile; the channels come back.
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let (upd_tx, mut upd_rx) = update_lanes(64);
         let mut listener = Listener::with_default_capacities();
         let events = listener.take_events().unwrap();
         let handle =
@@ -1719,7 +2067,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_loads_the_profile_and_starts_its_channels() {
-        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+        async fn next(rx: &mut UpdateReceiver) -> UiUpdate {
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("driver update timed out")
@@ -1731,7 +2079,7 @@ mod tests {
         let path = resume_profile(&recordings);
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let (upd_tx, mut upd_rx) = update_lanes(64);
         let mut listener = Listener::with_default_capacities();
         let events = listener.take_events().unwrap();
         let handle =
@@ -1763,7 +2111,7 @@ mod tests {
     /// existing workspace untouched (no channels removed).
     #[tokio::test]
     async fn loading_a_missing_profile_errors_without_touching_the_workspace() {
-        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+        async fn next(rx: &mut UpdateReceiver) -> UiUpdate {
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("driver update timed out")
@@ -1771,7 +2119,7 @@ mod tests {
         }
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let (upd_tx, mut upd_rx) = update_lanes(64);
         let mut listener = Listener::with_default_capacities();
         let events = listener.take_events().unwrap();
         let handle =
@@ -1811,7 +2159,7 @@ mod tests {
     /// rather than registering every channel blindly.
     #[tokio::test]
     async fn loading_a_profile_with_duplicate_names_skips_them_and_loads_the_rest() {
-        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+        async fn next(rx: &mut UpdateReceiver) -> UiUpdate {
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("driver update timed out")
@@ -1831,7 +2179,7 @@ mod tests {
         profile.save(&path).unwrap();
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let (upd_tx, mut upd_rx) = update_lanes(64);
         let mut listener = Listener::with_default_capacities();
         let events = listener.take_events().unwrap();
         let handle =
@@ -1883,11 +2231,235 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Holds profile file work on its blocking thread until released, as a
+    /// hung network share would.
+    struct FileGate {
+        open: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+
+    impl FileGate {
+        /// A closed gate, and a guard that opens it when dropped, so a failing
+        /// test leaves no thread behind to hold up the runtime's shutdown.
+        fn closed() -> (std::sync::Arc<Self>, ReleaseOnDrop) {
+            let gate = std::sync::Arc::new(Self {
+                open: std::sync::Mutex::new(false),
+                changed: std::sync::Condvar::new(),
+            });
+            let guard = ReleaseOnDrop(gate.clone());
+            (gate, guard)
+        }
+
+        fn hook(self: &std::sync::Arc<Self>) -> FileHook {
+            let gate = self.clone();
+            Some(std::sync::Arc::new(move || {
+                let mut open = gate.open.lock().unwrap();
+                while !*open {
+                    open = gate.changed.wait(open).unwrap();
+                }
+            }))
+        }
+
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct ReleaseOnDrop(std::sync::Arc<FileGate>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// Wait for three status updates, failing if they stop coming or if any
+    /// profile result arrives: the file work is being held.
+    async fn three_polls_while_held(upd_rx: &mut UpdateReceiver) {
+        let waiting = async {
+            let mut polls = 0;
+            while polls < 3 {
+                match upd_rx.recv().await.expect("the driver keeps running") {
+                    UiUpdate::Stats(..) | UiUpdate::Snapshot(..) => polls += 1,
+                    UiUpdate::ProfileSaved(_)
+                    | UiUpdate::ProfileLoaded(_)
+                    | UiUpdate::ProfileError(_) => {
+                        panic!("the file work finished while held")
+                    }
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("status stopped updating while the file work was held");
+    }
+
+    /// A driver with `file_hook` installed and one Channel added.
+    async fn driver_with_file_hook(
+        file_hook: FileHook,
+    ) -> (
+        Sender<UiCommand>,
+        UpdateReceiver,
+        ChannelId,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = update_lanes(4096);
+        let mut driver = Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {}));
+        driver.file_hook = file_hook;
+        let handle = tokio::spawn(driver.run());
+        cmd_tx
+            .send(UiCommand::AddChannel(Box::new(udp_config(free_udp_port()))))
+            .await
+            .unwrap();
+        let id = loop {
+            if let Some(UiUpdate::ChannelAdded(id, ..)) = upd_rx.recv().await {
+                break id;
+            }
+        };
+        (cmd_tx, upd_rx, id, handle)
+    }
+
+    /// Profile file work that never returns leaves the loop free: status keeps
+    /// updating and Shutdown is served and completes. These run in real time:
+    /// Tokio's paused clock does not advance while a blocking task is running.
+    #[tokio::test]
+    async fn a_profile_save_that_never_completes_does_not_stop_status_or_shutdown() {
+        let (gate, _release) = FileGate::closed();
+        let (cmd_tx, mut upd_rx, _id, handle) = driver_with_file_hook(gate.hook()).await;
+        cmd_tx
+            .send(UiCommand::SaveProfile(temp_profile_path()))
+            .await
+            .unwrap();
+
+        three_polls_while_held(&mut upd_rx).await;
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("Shutdown waited for the file work")
+            .unwrap();
+    }
+
+    /// A profile command issued while one is outstanding waits behind it: a
+    /// load queued behind a save of the same file finds the file the save wrote.
+    #[tokio::test]
+    async fn a_second_profile_command_waits_behind_the_first() {
+        let (gate, _release) = FileGate::closed();
+        let (cmd_tx, mut upd_rx, _id, handle) = driver_with_file_hook(gate.hook()).await;
+        let path = temp_profile_path();
+        cmd_tx
+            .send(UiCommand::SaveProfile(path.clone()))
+            .await
+            .unwrap();
+        cmd_tx
+            .send(UiCommand::LoadProfile(path.clone()))
+            .await
+            .unwrap();
+        // Neither has finished while the first is held.
+        three_polls_while_held(&mut upd_rx).await;
+        gate.release();
+        let mut order = Vec::new();
+        while order.len() < 2 {
+            match upd_rx.recv().await.expect("the driver keeps running") {
+                UiUpdate::ProfileSaved(_) => order.push("saved"),
+                UiUpdate::ProfileLoaded(_) => order.push("loaded"),
+                UiUpdate::ProfileError(why) => panic!("profile work failed: {why}"),
+                _ => {}
+            }
+        }
+        assert_eq!(order, ["saved", "loaded"]);
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        handle.await.unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The fake time a poll visit takes in the rotation tests.
+    const VISIT: Duration = Duration::from_millis(300);
+
+    /// Run one round over `ids`, each visit taking [`VISIT`] of paused time;
+    /// returns the Channels visited.
+    async fn run_round(
+        rotation: &mut PollRotation,
+        ids: &[ChannelId],
+        limit: Duration,
+    ) -> Vec<ChannelId> {
+        let began = tokio::time::Instant::now();
+        rotation.begin(ids.len());
+        let mut visited = Vec::new();
+        while let Some(id) = rotation.next_in_round(ids, began, limit) {
+            tokio::time::sleep(VISIT).await;
+            visited.push(id);
+        }
+        visited
+    }
+
+    /// With Channels that each take a full request wait, a round ends at the
+    /// round limit and the next one starts with the Channels the first left.
+    #[tokio::test(start_paused = true)]
+    async fn a_poll_round_ends_at_its_limit_and_the_next_starts_where_it_stopped() {
+        let ids: Vec<ChannelId> = (0..5).map(|_| ChannelId::new()).collect();
+        let mut rotation = PollRotation::default();
+        let began = tokio::time::Instant::now();
+
+        let first = run_round(&mut rotation, &ids, POLL_ROUND_LIMIT).await;
+        assert_eq!(first, ids[0..2], "two waits fit in the round limit");
+        assert!(began.elapsed() <= POLL_ROUND_LIMIT + VISIT);
+
+        let second = run_round(&mut rotation, &ids, POLL_ROUND_LIMIT).await;
+        assert_eq!(
+            second,
+            ids[2..4],
+            "the next round starts where this one stopped"
+        );
+        let third = run_round(&mut rotation, &ids, POLL_ROUND_LIMIT).await;
+        assert_eq!(third, [ids[4], ids[0]], "and wraps around the list");
+    }
+
+    /// A round over Channels that all answer promptly visits every one, and the
+    /// next starts again at the head of the list.
+    #[tokio::test(start_paused = true)]
+    async fn a_poll_round_over_prompt_channels_visits_them_all() {
+        let ids: Vec<ChannelId> = (0..3).map(|_| ChannelId::new()).collect();
+        let mut rotation = PollRotation::default();
+        // The limit is never reached when nothing takes time.
+        let began = tokio::time::Instant::now();
+        rotation.begin(ids.len());
+        let mut visited = Vec::new();
+        while let Some(id) = rotation.next_in_round(&ids, began, POLL_ROUND_LIMIT) {
+            visited.push(id);
+        }
+        assert_eq!(visited, ids);
+        rotation.begin(ids.len());
+        assert_eq!(
+            rotation.next_in_round(&ids, began, POLL_ROUND_LIMIT),
+            Some(ids[0])
+        );
+    }
+
+    /// A round visits at least one Channel, whatever the limit, and no round
+    /// is run for an empty list.
+    #[tokio::test(start_paused = true)]
+    async fn a_poll_round_always_makes_progress() {
+        let ids: Vec<ChannelId> = (0..3).map(|_| ChannelId::new()).collect();
+        let mut rotation = PollRotation::default();
+        let visited = run_round(&mut rotation, &ids, Duration::ZERO).await;
+        assert_eq!(visited, ids[0..1]);
+        let visited = run_round(&mut rotation, &ids, Duration::ZERO).await;
+        assert_eq!(visited, ids[1..2]);
+        assert!(run_round(&mut rotation, &[], POLL_ROUND_LIMIT)
+            .await
+            .is_empty());
+    }
+
     /// Dropping the command sender ends the driver (the App closed).
     #[tokio::test]
     async fn dropping_the_command_sender_stops_the_driver() {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<UiCommand>(4);
-        let (upd_tx, _upd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, _upd_rx) = update_lanes(16);
         let mut listener = Listener::with_default_capacities();
         let events = listener.take_events().unwrap();
         let driver = Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {}));
@@ -1905,7 +2477,7 @@ mod tests {
     /// the channel to Faulted with a bad bind, then commits a good config + starts.
     #[tokio::test]
     async fn commit_and_start_recovers_a_faulted_channel_through_the_driver() {
-        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+        async fn next(rx: &mut UpdateReceiver) -> UiUpdate {
             tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("driver update timed out")
@@ -1913,7 +2485,7 @@ mod tests {
         }
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let (upd_tx, mut upd_rx) = update_lanes(64);
         let mut listener = Listener::with_default_capacities();
         let events = listener.take_events().unwrap();
         let handle =
@@ -1967,5 +2539,143 @@ mod tests {
 
         cmd_tx.send(UiCommand::Shutdown).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[test]
+    fn one_time_results_survive_a_full_periodic_lane() {
+        let (tx, mut rx) = update_lanes(1);
+        let id = ChannelId::new();
+        let telemetry = || UiUpdate::ControlLines(id, SerialControlLines::default());
+        assert!(tx.send(telemetry()), "the first periodic update fits");
+        assert!(
+            !tx.send(telemetry()),
+            "a periodic update past capacity is dropped"
+        );
+
+        let config = udp_config(10110);
+        assert!(tx.send(UiUpdate::ChannelAdded(
+            id,
+            "A".into(),
+            "details".into(),
+            Box::new(config.clone())
+        )));
+        assert!(tx.send(UiUpdate::ChannelReconfigured(
+            id,
+            "details".into(),
+            Box::new(config)
+        )));
+        assert!(tx.send(UiUpdate::ChannelRenamed(id, "B".into())));
+        assert!(tx.send(UiUpdate::ChannelRemoved(id)));
+        assert!(tx.send(UiUpdate::ProfileError("x".into())));
+
+        let mut kinds = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            kinds.push(match update {
+                UiUpdate::ChannelAdded(..) => "added",
+                UiUpdate::ChannelReconfigured(..) => "reconfigured",
+                UiUpdate::ChannelRenamed(..) => "renamed",
+                UiUpdate::ChannelRemoved(_) => "removed",
+                UiUpdate::ProfileError(_) => "error",
+                UiUpdate::ControlLines(..) => "telemetry",
+                other => panic!("unexpected {other:?}"),
+            });
+        }
+        // Every one-time result arrives, in the order sent, before the one
+        // periodic update that fit.
+        assert_eq!(
+            kinds,
+            [
+                "added",
+                "reconfigured",
+                "renamed",
+                "removed",
+                "error",
+                "telemetry"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_reliable_lane_is_applied_before_the_periodic_lane() {
+        let (tx, mut rx) = update_lanes(8);
+        let id = ChannelId::new();
+        // Telemetry is queued first, yet must not be applied ahead of the
+        // ChannelAdded it refers to.
+        assert!(tx.send(UiUpdate::ControlLines(id, SerialControlLines::default())));
+        assert!(tx.send(UiUpdate::ChannelAdded(
+            id,
+            "A".into(),
+            "details".into(),
+            Box::new(udp_config(10110))
+        )));
+        assert!(matches!(rx.try_recv(), Ok(UiUpdate::ChannelAdded(..))));
+        assert!(matches!(rx.try_recv(), Ok(UiUpdate::ControlLines(..))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn waiting_for_an_update_also_prefers_the_reliable_lane() {
+        let (tx, mut rx) = update_lanes(8);
+        let id = ChannelId::new();
+        assert!(tx.send(UiUpdate::ControlLines(id, SerialControlLines::default())));
+        assert!(tx.send(UiUpdate::ChannelRemoved(id)));
+        assert!(matches!(rx.recv().await, Some(UiUpdate::ChannelRemoved(_))));
+        assert!(matches!(rx.recv().await, Some(UiUpdate::ControlLines(..))));
+        drop(tx);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn stale_telemetry_for_a_removed_channel_is_ignored_and_ids_are_not_reused() {
+        use crate::gui::state::AppState;
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        let added =
+            |id| UiUpdate::ChannelAdded(id, "A".into(), "d".into(), Box::new(udp_config(10110)));
+        state.apply(added(id));
+        state.apply(UiUpdate::ChannelRemoved(id));
+        // Telemetry queued before the removal is applied after it.
+        state.apply(UiUpdate::ControlLines(id, SerialControlLines::default()));
+        assert!(state.channel_ids().is_empty());
+        // A channel added again is a different id, so the stale update above
+        // can never land on it.
+        let again = ChannelId::new();
+        assert_ne!(id, again);
+        state.apply(added(again));
+        assert_eq!(state.channel_ids(), vec![again]);
+    }
+
+    /// A channel that leaves retention unset is registered with the profile's
+    /// default, and a channel with its own value keeps it.
+    #[tokio::test]
+    async fn registering_a_profile_applies_its_defaults_to_the_channels() {
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = update_lanes(64);
+        let mut driver = Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {}));
+
+        let mut inherits = udp_config(free_udp_port());
+        inherits.name = ChannelName::new("Inherits");
+        inherits.retention = crate::config::RetentionConfig::default();
+        let mut own = udp_config(free_udp_port());
+        own.name = ChannelName::new("Own");
+        own.retention = crate::config::RetentionConfig::with_byte_limit(1_000);
+        let mut profile = Profile::new("defaults");
+        profile.channels = vec![inherits, own];
+        profile.defaults.retention = Some(crate::config::RetentionConfig::with_byte_limit(4_096));
+
+        let ids = driver.register_profile(profile, &[]);
+        let limit = |id| driver.listener.config(id).unwrap().retention.byte_limit;
+        assert_eq!(limit(ids[0]), Some(4_096));
+        assert_eq!(limit(ids[1]), Some(1_000));
+        // The GUI's copy of the config says the same, so a Save writes it.
+        let mut echoed = Vec::new();
+        while let Ok(update) = upd_rx.try_recv() {
+            if let UiUpdate::ChannelAdded(_, _, _, config) = update {
+                echoed.push(config.retention.byte_limit);
+            }
+        }
+        assert_eq!(echoed, vec![Some(4_096), Some(1_000)]);
     }
 }

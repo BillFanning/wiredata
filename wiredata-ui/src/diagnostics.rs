@@ -59,7 +59,10 @@
 //!
 //! *Expired* and *Final* are Talker-only, and deliberately so: Talker pushes
 //! collapsed snapshots that age between emissions, while Listener collapses each
-//! window when a request is served and so cannot serve a stale one. That
+//! window when a request is served. A Listener answer can still be old, because
+//! when a Channel does not answer a request in time Listener serves its last
+//! answer; each answer says whether it was measured for the request or is an
+//! older one, with its age, and Listener's panel says so in words. That
 //! asymmetry follows from the two runtime models and is recorded in talker
 //! ADR-043 and listener ADR-035 — it is not a gap to be filled on either side.
 

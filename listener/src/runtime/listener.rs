@@ -33,14 +33,17 @@ use crate::transport::{
 
 use super::activity::ChannelActivity;
 use super::build::{build_display_view, build_serial, build_udp, BuildError};
-use super::channel::{spawn_monitored_channel, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES};
+use super::channel::{
+    hand_off, spawn_monitored_channel, HandOffError, MatchSetup, MonitoredChannel,
+    TRANSPORT_NOTICES,
+};
 use super::pipeline::{
     DisplayExtra, DisplayPause, DisplayRecordingSettings, PipelineCapacities, RawExtra,
     RawRecordingSettings,
 };
 use super::run_summary::{ListenerRunSummary, RunEndReason, RunId};
 use super::snapshot::{
-    ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, ReconnectProgress, StreamDelta,
+    ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, Provenance, ReconnectProgress, StreamDelta,
 };
 use super::telemetry::{ChunkShape, DurationHistogram, TransportHealth};
 
@@ -100,12 +103,34 @@ impl Default for RetainedTelemetry {
     }
 }
 
+/// Map a command hand-off to the `Result<bool, _>` contract of the live
+/// recording commands: `true` when the pipeline's queue took it, `false` when
+/// the pipeline had ended.
+fn hand_off_result(
+    id: ChannelId,
+    handed: Result<(), HandOffError>,
+) -> Result<bool, OrchestratorError> {
+    match handed {
+        Ok(()) => Ok(true),
+        Err(HandOffError::Ended) => Ok(false),
+        Err(HandOffError::TimedOut) => Err(OrchestratorError::NotTakenInTime(id)),
+    }
+}
+
+/// The provenance of an answer measured at `measured` and served now.
+fn cached_provenance(measured: tokio::time::Instant) -> Provenance {
+    Provenance::Cached {
+        age: measured.elapsed(),
+    }
+}
+
 /// A minimal [`ChannelSnapshot`] for a stopped/faulted Channel (no live pipeline):
 /// retained diagnostics plus the completed run's activity and timing summaries.
 fn retained_snapshot(id: ChannelId, channel: &ManagedChannel) -> ChannelSnapshot {
     let kept = &channel.retained;
     ChannelSnapshot {
         channel_id: id,
+        provenance: Provenance::Fresh,
         // Placeholders — the caller stamps the effective lifecycle state, exactly
         // as it does over a live pipeline's snapshot.
         state: ChannelState::Stopped,
@@ -152,6 +177,7 @@ fn retained_stats(channel: &ManagedChannel) -> ChannelStats {
     }
     let kept = &channel.retained;
     ChannelStats {
+        provenance: Provenance::Fresh,
         // Placeholders — the caller stamps the effective lifecycle state.
         state: ChannelState::Stopped,
         reconnect_pending: false,
@@ -231,7 +257,7 @@ struct ReconnectCarry {
     attempts: u32,
     /// The backoff the next attempt would wait.
     backoff: Duration,
-    /// When the reconnect succeeded.
+    /// When the successful start landed.
     reconnected_at: Instant,
 }
 
@@ -369,9 +395,6 @@ pub struct ReconnectAttempt {
     id: ChannelId,
     attempt: u32,
     previous: ReconnectState,
-    /// The clock reading the attempt was issued at, so a success is timed on
-    /// the caller's clock.
-    now: Instant,
 }
 
 impl ReconnectAttempt {
@@ -397,11 +420,13 @@ fn transport_name(interface: &InterfaceConfig) -> &'static str {
     }
 }
 
-/// The most recent successful pipeline replies for the current run.
+/// The most recent successful pipeline replies for the current run, each with
+/// the monotonic moment the pipeline measured it, so a reply served later can
+/// say how old it is.
 #[derive(Default)]
 struct LastGood {
-    snapshot: Option<ChannelSnapshot>,
-    stats: Option<ChannelStats>,
+    snapshot: Option<(ChannelSnapshot, tokio::time::Instant)>,
+    stats: Option<(ChannelStats, tokio::time::Instant)>,
 }
 
 /// Registry entry: the configuration, any accepted-but-unapplied change (§13),
@@ -575,6 +600,10 @@ pub enum OrchestratorError {
     Bind(#[source] std::io::Error),
     #[error("serial control is not available (not a running serial channel)")]
     SerialControlUnavailable(ChannelId),
+    /// A command's bounded queue stayed full (see `COMMAND_HANDOFF_WAIT`), so the
+    /// Channel's task is not reading it.
+    #[error("The Channel did not take the command in time. The command was not sent, and it can be tried again.")]
+    NotTakenInTime(ChannelId),
     /// A setting outside its limit (ADR-048): the Channel is not built.
     #[error(transparent)]
     Limit(#[from] crate::config::LimitError),
@@ -749,22 +778,36 @@ impl Listener {
     /// reads exact at rest). Every reply is stamped with the **effective lifecycle
     /// state**, which is what lets a polling consumer self-correct a lifecycle
     /// event that dropped (ADR-006: events are advisory; the poll is the truth).
+    /// Each reply's `provenance` says whether it was measured for this request,
+    /// is the last answer of this run served because the pipeline did not
+    /// answer in time (with its age), or is retained from an earlier run.
     /// `None` only for an unknown id.
     pub async fn snapshot(&self, id: ChannelId) -> Option<ChannelSnapshot> {
         let channel = self.channels.get(&id)?;
         let live = match channel.handle.as_ref() {
             Some(tasks) => match tasks.snapshot().await {
                 Some(fresh) => {
-                    lock_recover(&channel.last_good).snapshot = Some(fresh.clone());
+                    lock_recover(&channel.last_good).snapshot =
+                        Some((fresh.clone(), tokio::time::Instant::now()));
                     Some(fresh)
                 }
                 // No reply in time: this run's last answer, not the retained
                 // figures of an earlier run.
-                None => lock_recover(&channel.last_good).snapshot.clone(),
+                None => {
+                    let cached = lock_recover(&channel.last_good).snapshot.clone();
+                    cached.map(|(mut old, measured)| {
+                        old.provenance = cached_provenance(measured);
+                        old
+                    })
+                }
             },
             None => None,
         };
+        let unanswered = channel.handle.is_some() && live.is_none();
         let mut snap = live.unwrap_or_else(|| retained_snapshot(id, channel));
+        if unanswered {
+            snap.provenance = Provenance::Retained;
+        }
         snap.state = channel.effective_state();
         snap.reconnect_pending = channel.reconnect_pending();
         snap.reconnect = channel.reconnect_progress(Instant::now());
@@ -784,14 +827,25 @@ impl Listener {
         let live = match channel.handle.as_ref() {
             Some(tasks) => match tasks.stats().await {
                 Some(fresh) => {
-                    lock_recover(&channel.last_good).stats = Some(fresh.clone());
+                    lock_recover(&channel.last_good).stats =
+                        Some((fresh.clone(), tokio::time::Instant::now()));
                     Some(fresh)
                 }
-                None => lock_recover(&channel.last_good).stats.clone(),
+                None => {
+                    let cached = lock_recover(&channel.last_good).stats.clone();
+                    cached.map(|(mut old, measured)| {
+                        old.provenance = cached_provenance(measured);
+                        old
+                    })
+                }
             },
             None => None,
         };
+        let unanswered = channel.handle.is_some() && live.is_none();
         let mut stats = live.unwrap_or_else(|| retained_stats(channel));
+        if unanswered {
+            stats.provenance = Provenance::Retained;
+        }
         stats.state = channel.effective_state();
         stats.reconnect_pending = channel.reconnect_pending();
         stats.reconnect = channel.reconnect_progress(Instant::now());
@@ -821,7 +875,10 @@ impl Listener {
     /// (§50.2, ADR-012) — the manual counterpart of the match-rule `Record` action,
     /// sharing the pipeline's lazy begin / clean finalize path. `enabled = true`
     /// begins (a no-op if already recording); `false` stops and finalizes. Returns
-    /// `false` when the Channel is unknown or not running. The outcome
+    /// `Ok(false)` when the Channel is unknown or not running, and
+    /// [`OrchestratorError::NotTakenInTime`] when its command queue stayed full
+    /// for `COMMAND_HANDOFF_WAIT`, so the caller is never held behind a stuck
+    /// pipeline. The outcome
     /// is observed via the snapshot's recording state; a begin failure — including no
     /// destination configured, or the destination in use (§121) — records a diagnostic
     /// and raises a `RecordingFaulted` event (§55), leaving the Channel Running.
@@ -830,18 +887,18 @@ impl Listener {
         id: ChannelId,
         enabled: bool,
         raw: crate::config::RawRecordingConfig,
-    ) -> bool {
+    ) -> Result<bool, OrchestratorError> {
         // Use the settings the caller read at click time (the editor's current
         // values), not committed config — so Record records to exactly what's on
         // screen, with no Apply/restart (ADR-012). The channel name comes from the
         // committed config (it's a live rename, not part of the recording settings).
         let Some(channel) = self.channels.get(&id) else {
-            return false;
+            return Ok(false);
         };
         let settings = self.settings_from(&raw, channel.config.name.as_str());
         match channel.handle.as_ref() {
-            Some(tasks) => tasks.set_recording(enabled, settings).await,
-            None => false,
+            Some(tasks) => hand_off_result(id, tasks.set_recording(enabled, settings).await),
+            None => Ok(false),
         }
     }
 
@@ -856,9 +913,9 @@ impl Listener {
         id: ChannelId,
         enabled: bool,
         display: crate::config::DisplayRecordingConfig,
-    ) -> bool {
+    ) -> Result<bool, OrchestratorError> {
         let Some(channel) = self.channels.get(&id) else {
-            return false;
+            return Ok(false);
         };
         let settings = self.display_settings_from(
             &display,
@@ -866,8 +923,10 @@ impl Listener {
             display_renderer(&channel.config),
         );
         match channel.handle.as_ref() {
-            Some(tasks) => tasks.set_display_recording(enabled, settings).await,
-            None => false,
+            Some(tasks) => {
+                hand_off_result(id, tasks.set_display_recording(enabled, settings).await)
+            }
+            None => Ok(false),
         }
     }
 
@@ -924,11 +983,12 @@ impl Listener {
             .get(&id)
             .and_then(|c| c.serial_control.as_ref())
             .ok_or(OrchestratorError::SerialControlUnavailable(id))?;
-        control
-            .commands
-            .send(command)
+        hand_off(&control.commands, command)
             .await
-            .map_err(|_| OrchestratorError::SerialControlUnavailable(id))
+            .map_err(|err| match err {
+                HandOffError::Ended => OrchestratorError::SerialControlUnavailable(id),
+                HandOffError::TimedOut => OrchestratorError::NotTakenInTime(id),
+            })
     }
 
     /// The current serial control-line state of a running serial Channel (§161, the
@@ -1139,10 +1199,10 @@ impl Listener {
     fn finish_drained(&mut self, id: ChannelId, drained: Option<Drained>) -> Option<String> {
         let Some(drained) = drained else {
             // A timed-out drain has no final snapshot, and nothing has said so.
-            self.land_stopped(id, None);
+            self.land_stopped(id, None, false);
             return Some(self.note_finalization_incomplete(id));
         };
-        self.land_stopped(id, drained.snapshot);
+        self.land_stopped(id, drained.snapshot, !drained.abandoned);
         // The pipeline gave up closing on its own, at a fault or within this
         // stop; its snapshot already carries the diagnostic.
         drained.abandoned.then(|| self.channel_name(id))
@@ -1185,8 +1245,15 @@ impl Listener {
 
     /// Land a Channel in Stopped: clear its Display Views, reset the fault flag
     /// (so a previously-faulted Channel reads Stopped, not Faulted), and announce
-    /// the stop (§110).
-    fn land_stopped(&mut self, id: ChannelId, final_snapshot: Option<ChannelSnapshot>) {
+    /// the stop (§110). `finalization_complete` is false when the pipeline's
+    /// close or the whole drain was abandoned; the run summary records it
+    /// apart from whether a final snapshot exists.
+    fn land_stopped(
+        &mut self,
+        id: ChannelId,
+        final_snapshot: Option<ChannelSnapshot>,
+        finalization_complete: bool,
+    ) {
         if let Some(channel) = self.channels.get_mut(&id) {
             let ended_by_fault =
                 channel.faulted.load(Ordering::Relaxed) || channel.state == ChannelState::Faulted;
@@ -1206,6 +1273,7 @@ impl Listener {
                         RunEndReason::StopRequested
                     },
                     final_snapshot.as_ref(),
+                    finalization_complete,
                 ));
             }
             channel.display_pause = None;
@@ -1464,7 +1532,7 @@ impl Listener {
         for attempt in self.reconnects_due(Instant::now(), |_| false) {
             let _ = self.stop(attempt.id).await;
             let started = self.start(attempt.id).await.is_ok();
-            self.finish_reconnect(attempt, started);
+            self.finish_reconnect(attempt, started, Instant::now());
         }
     }
 
@@ -1557,7 +1625,6 @@ impl Listener {
                         id,
                         attempt,
                         previous: s,
-                        now,
                     });
                 }
             }
@@ -1568,13 +1635,14 @@ impl Listener {
     /// Record how a reconnect attempt's stop and start went (§9.1): announce
     /// the reconnect, back off for the next attempt, or give up when this was
     /// the last one `max_attempts` allows. Stopping cleared the reconnect
-    /// state, so a failure re-establishes it.
-    pub fn finish_reconnect(&mut self, attempt: ReconnectAttempt, started: bool) {
+    /// state, so a failure re-establishes it. `now` is the caller's clock
+    /// reading as the start landed: a Channel is stable from then, not from
+    /// when the attempt was issued.
+    pub fn finish_reconnect(&mut self, attempt: ReconnectAttempt, started: bool, now: Instant) {
         let ReconnectAttempt {
             id,
             attempt,
             previous,
-            now,
         } = attempt;
         let Some(policy) = self.channels.get(&id).map(|c| c.config.reconnect) else {
             return;
@@ -2083,11 +2151,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_stalled_pipeline_serves_its_last_good_status_not_the_retained_one() {
-        // A Running Channel answers once, then its pipeline stalls past the
-        // reply wait. The next status is that run's last answer (its byte
-        // total), not the retained figures of an earlier run (zero here).
+    /// A Running Channel that answers once (three bytes), then faults into a
+    /// stuck recording close, so its pipeline no longer reads requests.
+    async fn stalled_after_one_answer() -> (Listener, ChannelId) {
         use crate::core::ChunkTime;
         use crate::record::{start_raw_recording, RawRecorder, DEFAULT_QUEUE_BUDGET};
         use crate::transport::{ReceivedData, TransportJoinHandle, TransportOutcome};
@@ -2168,8 +2234,10 @@ mod tests {
         .await
         .expect("the chunk never arrived");
         assert_eq!(answered.state, ChannelState::Running);
+        assert_eq!(answered.provenance, Provenance::Fresh);
         let stats = listener.channel_stats(id).await.unwrap();
         assert_eq!(stats.activity.total_bytes, 3);
+        assert_eq!(stats.provenance, Provenance::Fresh);
 
         let _ = cue.send(());
         while !faulted.load(Ordering::Relaxed) {
@@ -2177,6 +2245,14 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(100)).await; // now inside `finish`
 
+        (listener, id)
+    }
+
+    #[tokio::test]
+    async fn a_stalled_pipeline_serves_its_last_good_status_not_the_retained_one() {
+        // The next status is that run's last answer (its byte total), not the
+        // retained figures of an earlier run (zero here).
+        let (listener, id) = stalled_after_one_answer().await;
         let stalled = listener.snapshot(id).await.unwrap();
         assert_eq!(stalled.state, ChannelState::Faulted, "state is restamped");
         assert_eq!(stalled.activity.total_bytes, 3, "last good, not retained");
@@ -2184,6 +2260,106 @@ mod tests {
         assert_eq!(stalled.state, ChannelState::Faulted);
         assert_eq!(stalled.activity.total_bytes, 3);
         assert!(listener.stream_delta(id, 0).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recording_command_for_a_full_queue_gives_up_within_the_limit() {
+        let (mut listener, id) = stalled_after_one_answer().await;
+        listener
+            .channels
+            .get_mut(&id)
+            .and_then(|channel| channel.handle.as_mut())
+            .expect("the Channel has a handle")
+            .fill_requests_for_test();
+
+        let asked = tokio::time::Instant::now();
+        let raw = crate::config::RawRecordingConfig::default();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            listener.set_recording(id, true, raw),
+        )
+        .await
+        .expect("the command waited on a queue nobody reads");
+        assert!(
+            matches!(outcome, Err(OrchestratorError::NotTakenInTime(_))),
+            "{outcome:?}"
+        );
+        assert!(asked.elapsed() <= super::super::channel::COMMAND_HANDOFF_WAIT);
+
+        let display = crate::config::DisplayRecordingConfig::default();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            listener.set_display_recording(id, true, display),
+        )
+        .await
+        .expect("the command waited on a queue nobody reads");
+        assert!(matches!(outcome, Err(OrchestratorError::NotTakenInTime(_))));
+
+        // The orchestrator is free afterwards: a status request is still answered.
+        let snapshot = listener.snapshot(id).await.unwrap();
+        assert!(matches!(snapshot.provenance, Provenance::Cached { .. }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_line_command_for_a_serial_reader_with_a_full_inbox_gives_up_within_the_limit() {
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        // An inbox of one that nothing reads, already holding a command.
+        let (commands, _unread) = mpsc::channel(1);
+        commands
+            .try_send(SerialControlCommand::SetDtr(true))
+            .unwrap();
+        listener.channels.get_mut(&id).unwrap().serial_control = Some(SerialControl {
+            commands,
+            state: Arc::new(Mutex::new(Default::default())),
+        });
+
+        let asked = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), listener.set_rts(id, true))
+            .await
+            .expect("the command waited on an inbox nobody reads");
+        assert!(matches!(outcome, Err(OrchestratorError::NotTakenInTime(_))));
+        assert!(asked.elapsed() <= super::super::channel::COMMAND_HANDOFF_WAIT);
+        // The orchestrator is free afterwards.
+        assert!(listener.snapshot(id).await.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pipeline_that_never_answered_this_run_serves_retained_figures() {
+        let (listener, id) = stalled_after_one_answer().await;
+        *lock_recover(&listener.channels[&id].last_good) = LastGood::default();
+
+        let snapshot = listener.snapshot(id).await.unwrap();
+        assert_eq!(snapshot.provenance, Provenance::Retained);
+        assert_eq!(snapshot.activity.total_bytes, 0, "an earlier run's figures");
+        let stats = listener.channel_stats(id).await.unwrap();
+        assert_eq!(stats.provenance, Provenance::Retained);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_status_says_so_and_its_age_grows_with_time() {
+        let (listener, id) = stalled_after_one_answer().await;
+
+        let first = listener.snapshot(id).await.unwrap();
+        let Provenance::Cached { age: first_age } = first.provenance else {
+            panic!("expected cached, got {:?}", first.provenance);
+        };
+        assert!(first_age > Duration::ZERO, "the answer is not new");
+
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let later = listener.snapshot(id).await.unwrap();
+        let Provenance::Cached { age: later_age } = later.provenance else {
+            panic!("expected cached, got {:?}", later.provenance);
+        };
+        assert!(later_age >= first_age + Duration::from_secs(12));
+        assert_eq!(later.activity.total_bytes, 3, "the figures are kept");
+
+        let stats = listener.channel_stats(id).await.unwrap();
+        let Provenance::Cached { age } = stats.provenance else {
+            panic!("expected cached, got {:?}", stats.provenance);
+        };
+        assert!(age >= Duration::from_secs(12));
     }
 
     #[tokio::test]
@@ -2898,7 +3074,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("attempt {attempt} is due"));
             let _ = listener.stop(id).await;
             let started = listener.start(id).await.is_ok();
-            listener.finish_reconnect(due, started);
+            listener.finish_reconnect(due, started, Instant::now());
             if attempt == 1 {
                 assert!(!listener.reconnect_exhausted(id));
                 assert!(matches!(
@@ -2922,6 +3098,11 @@ mod tests {
             }
         }
         assert_eq!(gave_up, 1, "one give-up notice");
+    }
+
+    /// Report a reconnect's outcome as of the clock reading `landed`.
+    fn landed(listener: &mut Listener, due: ReconnectAttempt, started: bool, at: Instant) {
+        listener.finish_reconnect(due, started, at);
     }
 
     /// A Running UDP Channel with reconnect on, and a driver step that
@@ -2950,7 +3131,7 @@ mod tests {
         let attempt = due.attempt;
         let _ = listener.stop(id).await;
         let started = listener.start(id).await.is_ok();
-        listener.finish_reconnect(due, started);
+        listener.finish_reconnect(due, started, due_at);
         assert!(started);
         attempt
     }
@@ -2997,6 +3178,50 @@ mod tests {
         );
         let due = listener.reconnects_due(at(42), |_| false).pop().unwrap();
         assert_eq!(due.attempt, 2);
+        let _ = listener.stop(id).await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_reopen_followed_by_a_fault_continues_the_sequence() {
+        // The stability window runs from the moment the start lands, not from
+        // when the attempt was issued: a device that takes longer than the
+        // window to reopen and then drops at once has not been stable.
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let mut config = udp_channel();
+        config.reconnect = quick_policy(None);
+        let id = listener.add_channel(config);
+        listener.start(id).await.unwrap();
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+
+        listener
+            .channels
+            .get(&id)
+            .unwrap()
+            .faulted
+            .store(true, Ordering::Relaxed);
+        assert!(listener.reconnects_due(at(0), |_| false).is_empty());
+        let due = listener.reconnects_due(at(10), |_| false).pop().unwrap();
+        let _ = listener.stop(id).await;
+        let started = listener.start(id).await.is_ok();
+        assert!(started);
+        // The open took 90 s: the start landed at 100 s.
+        landed(&mut listener, due, started, at(100));
+        // It faults at once, 1 s after landing and 91 s after the attempt.
+        listener
+            .channels
+            .get(&id)
+            .unwrap()
+            .faulted
+            .store(true, Ordering::Relaxed);
+        assert!(listener.reconnects_due(at(101), |_| false).is_empty());
+        assert!(
+            listener.reconnects_due(at(102), |_| false).is_empty(),
+            "the initial 1 s delay must not apply: the next step is 2 s"
+        );
+        let due = listener.reconnects_due(at(103), |_| false).pop().unwrap();
+        assert_eq!(due.attempt, 2, "the sequence continues");
         let _ = listener.stop(id).await;
     }
 
@@ -3418,6 +3643,13 @@ mod tests {
         // so an overview tab (stats) and the detail pane (snapshot) both read
         // exact at rest and self-correct a dropped ChannelStopped event.
         let stats = listener.channel_stats(id).await.expect("retained stats");
+        assert_eq!(
+            stats.provenance,
+            Provenance::Fresh,
+            "the final figures of a completed stop are exact"
+        );
+        let snapshot = listener.snapshot(id).await.expect("retained snapshot");
+        assert_eq!(snapshot.provenance, Provenance::Fresh);
         assert_eq!(stats.state, ChannelState::Stopped, "state served at rest");
         assert_eq!(stats.activity.total_bytes, expected, "exact total at rest");
         assert_eq!(
@@ -3462,6 +3694,61 @@ mod tests {
         assert!(summary
             .to_report_text()
             .contains(&format!("received_bytes={expected}\n")));
+    }
+
+    /// Stop a started Channel by hand and land the drain `outcome` makes of
+    /// the real one, returning the run summary it retained.
+    async fn summary_after_drain(
+        outcome: impl FnOnce(Drained) -> Option<Drained>,
+    ) -> ListenerRunSummary {
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+        let handle = listener.take_for_stop(id).unwrap();
+        let drained = drain_handle(handle).await;
+        listener.finish_drained(id, outcome(drained));
+        listener.channels[&id]
+            .last_run_summary
+            .clone()
+            .expect("a run summary is retained")
+    }
+
+    #[tokio::test]
+    async fn a_normal_stop_summarizes_a_complete_snapshot_and_finalization() {
+        let summary = summary_after_drain(Some).await;
+        assert!(summary.final_snapshot_complete);
+        assert!(summary.finalization_complete);
+        let report = summary.to_report_text();
+        assert!(report.contains("final_snapshot_complete=true\n"));
+        assert!(report.contains("finalization_complete=true\n"));
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_close_keeps_its_snapshot_but_is_not_complete() {
+        let summary = summary_after_drain(|drained| {
+            assert!(drained.snapshot.is_some());
+            Some(Drained {
+                abandoned: true,
+                ..drained
+            })
+        })
+        .await;
+        assert!(summary.final_snapshot_complete);
+        assert!(!summary.finalization_complete);
+        let report = summary.to_report_text();
+        assert!(report.contains("final_snapshot_complete=true\n"));
+        assert!(report.contains("finalization_complete=false\n"));
+    }
+
+    #[tokio::test]
+    async fn a_drain_that_timed_out_has_neither_snapshot_nor_finalization() {
+        let summary = summary_after_drain(|_| None).await;
+        assert!(!summary.final_snapshot_complete);
+        assert!(!summary.finalization_complete);
+        let report = summary.to_report_text();
+        assert!(report.contains("final_snapshot_complete=false\n"));
+        assert!(report.contains("finalization_complete=false\n"));
     }
 
     #[tokio::test]

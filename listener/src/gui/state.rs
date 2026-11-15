@@ -110,6 +110,10 @@ pub struct ChannelView {
     pub display_recording: Option<RecordingState>,
     /// Bounded-queue occupancy from the latest snapshot/stats (§99) — for stress
     /// testing / backpressure diagnosis. Shown in the detail pane.
+    /// Where the timing and throughput figures below came from: measured for
+    /// the latest request, or served from an older answer because the Channel
+    /// stopped answering. The panel says so in words.
+    pub figures: crate::runtime::Provenance,
     pub ingest_delay: crate::runtime::DurationHistogram,
     pub recent_ingest_delay: crate::runtime::DurationHistogram,
     pub ingest_processing: crate::runtime::DurationHistogram,
@@ -180,6 +184,7 @@ impl ChannelView {
             control_lines: None,
             recording: None,
             display_recording: None,
+            figures: crate::runtime::Provenance::Fresh,
             ingest_delay: crate::runtime::DurationHistogram::default(),
             recent_ingest_delay: crate::runtime::DurationHistogram::default(),
             ingest_processing: crate::runtime::DurationHistogram::default(),
@@ -524,6 +529,7 @@ impl AppState {
                     view.errors = snapshot.diagnostics.errors.len();
                     view.recording = snapshot.raw_recording;
                     view.display_recording = snapshot.display_recording;
+                    view.figures = snapshot.provenance;
                     view.ingest_delay = snapshot.ingest_delay;
                     view.recent_ingest_delay = snapshot.recent_ingest_delay;
                     view.ingest_processing = snapshot.ingest_processing;
@@ -555,6 +561,7 @@ impl AppState {
                     view.errors = stats.error_count;
                     view.recording = stats.raw_recording;
                     view.display_recording = stats.display_recording;
+                    view.figures = stats.provenance;
                     view.ingest_delay = stats.ingest_delay;
                     view.recent_ingest_delay = stats.recent_ingest_delay;
                     view.ingest_processing = stats.ingest_processing;
@@ -676,6 +683,7 @@ impl AppState {
                     // the first poll of the fresh pipeline.
                     view.bytes_total = 0;
                     view.bytes_per_sec = 0.0;
+                    view.figures = crate::runtime::Provenance::Fresh;
                     view.ingest_delay = crate::runtime::DurationHistogram::default();
                     view.recent_ingest_delay = crate::runtime::DurationHistogram::default();
                     view.ingest_processing = crate::runtime::DurationHistogram::default();
@@ -895,6 +903,7 @@ mod tests {
     ) -> ChannelSnapshot {
         ChannelSnapshot {
             channel_id: id,
+            provenance: crate::runtime::Provenance::Fresh,
             state: ChannelState::Running,
             reconnect_pending: false,
             reconnect: None,
@@ -1082,6 +1091,7 @@ mod tests {
         UiUpdate::Stats(
             id,
             Box::new(crate::runtime::ChannelStats {
+                provenance: crate::runtime::Provenance::Fresh,
                 state,
                 reconnect_pending,
                 reconnect: None,

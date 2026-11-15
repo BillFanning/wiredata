@@ -146,6 +146,26 @@ impl Profile {
         Ok(())
     }
 
+    /// This profile's channels as they will run: every profile-level default
+    /// written into each channel that leaves that setting unset, so the
+    /// channel carries its own explicit value and the `defaults` section is no
+    /// longer needed. Order is kept. This is the one place defaults are
+    /// resolved; both loaders and [`validate`](Self::validate) use it.
+    ///
+    /// The inherited settings are:
+    /// - `retention`: a channel with no limit set takes the default's whole
+    ///   retention. A channel with any limit of its own keeps only its own.
+    /// - `display`: a channel whose display is the built-in default takes the
+    ///   default's display. A channel cannot ask for the built-in display
+    ///   while the profile default says otherwise.
+    pub fn into_effective_channels(self) -> Vec<ChannelConfig> {
+        let defaults = self.defaults;
+        self.channels
+            .into_iter()
+            .map(|channel| effective_channel(channel, &defaults))
+            .collect()
+    }
+
     /// Validate every channel without starting anything (§71). A channel's
     /// validity is reported independently — one invalid channel does not
     /// invalidate the others. Returns `(channel name, result)` per channel.
@@ -183,6 +203,22 @@ impl Profile {
     }
 }
 
+/// A channel with each profile default written in where the channel leaves
+/// that setting unset. See [`Profile::into_effective_channels`].
+fn effective_channel(mut channel: ChannelConfig, defaults: &DefaultConfig) -> ChannelConfig {
+    if channel.retention.is_unbounded() {
+        if let Some(retention) = &defaults.retention {
+            channel.retention = retention.clone();
+        }
+    }
+    if channel.display == DisplayConfig::default() {
+        if let Some(display) = &defaults.display {
+            channel.display = display.clone();
+        }
+    }
+    channel
+}
+
 /// Validate one channel's configuration (§71). Resource existence (e.g. whether
 /// a COM port is present) is deferred to Start; this checks only structural
 /// validity.
@@ -202,6 +238,8 @@ pub fn validate_channel(
     defaults: &DefaultConfig,
 ) -> Result<(), Vec<ChannelConfigError>> {
     let mut errors = Vec::new();
+    // Judge the channel as it will run.
+    let channel = &effective_channel(channel.clone(), defaults);
 
     // The Channel Kind must match its interface.
     let kind_matches = matches!(
@@ -256,22 +294,14 @@ pub fn validate_channel(
         }
     }
 
-    // Retention must be bounded (§80): use the channel's own limits, or the
-    // profile default if the channel sets none.
-    let effective = if channel.retention.is_unbounded() {
-        defaults
-            .retention
-            .clone()
-            .unwrap_or_else(|| channel.retention.clone())
-    } else {
-        channel.retention.clone()
-    };
-    if effective.is_unbounded() {
+    // Retention must be bounded (§80).
+    if channel.retention.is_unbounded() {
         errors.push(ChannelConfigError::UnboundedRetention);
     }
 
     // Limits (ADR-048, §71): the runtime refuses the same values at Start.
-    let limits = effective
+    let limits = channel
+        .retention
         .limit_errors()
         .into_iter()
         .chain(limits::match_rule_errors(&channel.match_rules))
@@ -1231,5 +1261,79 @@ mode = \"Unicast\"
         assert!(profile.channels.is_empty());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("conn"), "{warnings:?}");
+    }
+
+    fn profile_with_defaults(channels: Vec<ChannelConfig>) -> Profile {
+        let mut profile = Profile::new("defaults");
+        profile.channels = channels;
+        profile.defaults = DefaultConfig {
+            display: Some(DisplayConfig { view: hex_view() }),
+            retention: Some(RetentionConfig::with_byte_limit(4_096)),
+        };
+        profile
+    }
+
+    fn unset_channel(name: &str) -> ChannelConfig {
+        let mut channel = templates::udp_template();
+        channel.name = crate::core::ChannelName::new(name);
+        channel.retention = RetentionConfig::default();
+        channel.display = DisplayConfig::default();
+        channel
+    }
+
+    #[test]
+    fn effective_channels_carry_the_profile_defaults_they_leave_unset() {
+        let channels = profile_with_defaults(vec![unset_channel("A")]).into_effective_channels();
+        assert_eq!(channels[0].retention.byte_limit, Some(4_096));
+        assert_eq!(channels[0].display.view, hex_view());
+    }
+
+    #[test]
+    fn effective_channels_keep_the_values_they_set_themselves() {
+        let mut own = unset_channel("Own");
+        own.retention = RetentionConfig {
+            event_limit: Some(7),
+            ..RetentionConfig::default()
+        };
+        let mut view = hex_view();
+        view.font_size = Some(30.0);
+        own.display = DisplayConfig { view: view.clone() };
+        let channels = profile_with_defaults(vec![own]).into_effective_channels();
+        assert_eq!(channels[0].retention.byte_limit, None);
+        assert_eq!(channels[0].retention.event_limit, Some(7));
+        assert_eq!(channels[0].display.view, view);
+    }
+
+    #[test]
+    fn effective_channels_keep_their_order_and_everything_else() {
+        let profile = profile_with_defaults(vec![unset_channel("A"), unset_channel("B")]);
+        let before = profile.channels.clone();
+        let channels = profile.into_effective_channels();
+        assert_eq!(channels.len(), 2);
+        for (after, before) in channels.iter().zip(&before) {
+            assert_eq!(after.name, before.name);
+            assert_eq!(after.interface, before.interface);
+            assert_eq!(after.match_rules, before.match_rules);
+        }
+    }
+
+    #[test]
+    fn validation_judges_the_effective_channel() {
+        let mut profile = profile_with_defaults(vec![unset_channel("A")]);
+        assert!(profile.validate()[0].1.is_ok());
+        profile.defaults.retention = None;
+        assert!(profile.validate()[0].1.is_err());
+    }
+
+    #[test]
+    fn effective_settings_survive_a_save_with_empty_defaults() {
+        let effective = profile_with_defaults(vec![unset_channel("A")]).into_effective_channels();
+        // What a GUI Save writes: the channels as registered, empty defaults.
+        let mut saved = Profile::new("saved");
+        saved.channels = effective.clone();
+        let reloaded = Profile::from_toml(&saved.to_toml().unwrap()).unwrap();
+        assert_eq!(reloaded.defaults, DefaultConfig::default());
+        assert!(reloaded.validate()[0].1.is_ok());
+        assert_eq!(reloaded.into_effective_channels(), effective);
     }
 }

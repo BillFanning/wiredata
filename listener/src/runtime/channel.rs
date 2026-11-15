@@ -94,6 +94,41 @@ const SNAPSHOT_REQUESTS: usize = 8;
 /// that a briefly busy pipeline is not mistaken for a stuck one.
 const STATUS_REPLY_WAIT: Duration = Duration::from_millis(300);
 
+/// How long a command waits for a bounded queue to take it: a recording
+/// command for the pipeline, or a control-line command for a serial reader.
+/// The GUI's driver awaits the hand-off, so the wait must be short for the same
+/// reason as [`STATUS_REPLY_WAIT`], and the same figure serves: a healthy
+/// consumer takes a command in microseconds, and a full queue means the
+/// consumer is stuck. Only the hand-off is bounded, as there is no reply.
+pub(crate) const COMMAND_HANDOFF_WAIT: Duration = STATUS_REPLY_WAIT;
+
+/// How long one round of status polling may run before it leaves the Channels
+/// it has not reached for the next round: two request waits, so that a few
+/// unresponsive Channels cannot multiply [`STATUS_REPLY_WAIT`] by their number
+/// and hold up every other Channel's readout.
+pub(crate) const POLL_ROUND_LIMIT: Duration =
+    Duration::from_millis(2 * STATUS_REPLY_WAIT.as_millis() as u64);
+
+/// Why a command was not handed to a Channel's queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandOffError {
+    /// The receiving task has ended.
+    Ended,
+    /// The queue stayed full for [`COMMAND_HANDOFF_WAIT`].
+    TimedOut,
+}
+
+/// Put `command` on a bounded queue, waiting at most [`COMMAND_HANDOFF_WAIT`].
+pub(crate) async fn hand_off<T>(sender: &Sender<T>, command: T) -> Result<(), HandOffError> {
+    sender
+        .send_timeout(command, COMMAND_HANDOFF_WAIT)
+        .await
+        .map_err(|err| match err {
+            tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => HandOffError::TimedOut,
+            tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => HandOffError::Ended,
+        })
+}
+
 /// Bounded capacity for the transport-notice channel (§95, §101, ADR-007).
 ///
 /// Advisory stall notices are bounded and use `try_send` (§99): blocking the live
@@ -255,6 +290,22 @@ pub(crate) struct MonitoredChannel {
 }
 
 impl MonitoredChannel {
+    /// Swap the request queue for a full one that nothing reads, as a
+    /// pipeline stuck outside its request loop has (tests only).
+    #[cfg(test)]
+    pub(crate) fn fill_requests_for_test(&mut self) {
+        let (requests, unread) = mpsc::channel(1);
+        requests
+            .try_send(PipelineRequest::SetRecording {
+                enabled: false,
+                settings: None,
+            })
+            .expect("a queue of one has room");
+        // Kept open for the life of the test, so the sender never sees it close.
+        std::mem::forget(unread);
+        self.requests = requests;
+    }
+
     /// The pause handle for this Channel's Display View (§11, §48).
     pub(crate) fn display_pause(&self) -> &DisplayPause {
         &self.display_pause
@@ -302,18 +353,20 @@ impl MonitoredChannel {
     }
 
     /// Begin/stop Raw recording live, without a restart (§50.2, ADR-012). Fire-and-
-    /// forget: returns `true` if the command reached the pipeline, `false` if the
-    /// task has already ended. The outcome is observed via the next snapshot's
-    /// recording state (and a `RecordingFaulted` event on a begin failure, §55).
+    /// forget: `Ok` if the command reached the pipeline's queue, an error if the
+    /// task has ended or the queue stayed full for [`COMMAND_HANDOFF_WAIT`]. The
+    /// outcome is observed via the next snapshot's recording state (and a
+    /// `RecordingFaulted` event on a begin failure, §55).
     pub(crate) async fn set_recording(
         &self,
         enabled: bool,
         settings: Option<RawRecordingSettings>,
-    ) -> bool {
-        self.requests
-            .send(PipelineRequest::SetRecording { enabled, settings })
-            .await
-            .is_ok()
+    ) -> Result<(), HandOffError> {
+        hand_off(
+            &self.requests,
+            PipelineRequest::SetRecording { enabled, settings },
+        )
+        .await
     }
 
     /// Begin/stop **Display** recording live (§54, ADR-012) — the Raw variant's
@@ -322,11 +375,12 @@ impl MonitoredChannel {
         &self,
         enabled: bool,
         settings: Option<DisplayRecordingSettings>,
-    ) -> bool {
-        self.requests
-            .send(PipelineRequest::SetDisplayRecording { enabled, settings })
-            .await
-            .is_ok()
+    ) -> Result<(), HandOffError> {
+        hand_off(
+            &self.requests,
+            PipelineRequest::SetDisplayRecording { enabled, settings },
+        )
+        .await
     }
 
     /// Graceful stop (§110): stop reception; the transport's sender drops, the
@@ -500,7 +554,7 @@ impl RunningChannel {
         enabled: bool,
         settings: Option<RawRecordingSettings>,
     ) -> bool {
-        self.tasks.set_recording(enabled, settings).await
+        self.tasks.set_recording(enabled, settings).await.is_ok()
     }
 
     /// The runtime→UI event stream for this Channel (§137).

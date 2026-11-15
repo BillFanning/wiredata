@@ -12,6 +12,14 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-14) — times are local unless they say UTC:
+
+- **§54, §56.1 (ADR-063).** Gap times, in a `‹GAP …›` line and in a gap
+  record, are ISO 8601 local time with milliseconds and offset. They had a
+  space for the `T` and no offset.
+- **§91.** States the rule, and that the GUI shows a completed run's start
+  and finish in local time.
+
 Revision note (2026-11-14) — the ZDA zone sign and disk-guard limits:
 
 - **§50.2.** ZDA marks write NMEA's local zone, the hours added to local

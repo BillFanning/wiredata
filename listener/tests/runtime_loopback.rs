@@ -542,7 +542,13 @@ async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
     assert!(listener.snapshot(id).await.unwrap().raw_recording.is_none());
 
     // Live Begin with the settings supplied now (no restart), then data to capture.
-    assert!(listener.set_recording(id, true, live_raw.clone()).await);
+    assert_eq!(
+        listener
+            .set_recording(id, true, live_raw.clone())
+            .await
+            .ok(),
+        Some(true)
+    );
     let _ = await_snapshot(&listener, id, |s| s.raw_recording.is_some()).await;
     client
         .send_to(b"DURING", ("127.0.0.1", port))
@@ -551,7 +557,10 @@ async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
     let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 12).await;
 
     // Live Stop finalizes; later data is not written.
-    assert!(listener.set_recording(id, false, live_raw).await);
+    assert_eq!(
+        listener.set_recording(id, false, live_raw).await.ok(),
+        Some(true)
+    );
     let _ = await_snapshot(&listener, id, |s| s.raw_recording.is_none()).await;
     client.send_to(b"after", ("127.0.0.1", port)).await.unwrap();
     let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 17).await;
@@ -617,10 +626,12 @@ async fn set_display_recording_toggles_display_recording_live_through_the_orches
         .is_none());
 
     // Live Begin with the settings supplied now (no restart), then data to capture.
-    assert!(
+    assert_eq!(
         listener
             .set_display_recording(id, true, live_display.clone())
             .await
+            .ok(),
+        Some(true)
     );
     let _ = await_snapshot(&listener, id, |s| s.display_recording.is_some()).await;
     client
@@ -630,10 +641,12 @@ async fn set_display_recording_toggles_display_recording_live_through_the_orches
     let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 12).await;
 
     // Live Stop finalizes; later data is not written.
-    assert!(
+    assert_eq!(
         listener
             .set_display_recording(id, false, live_display)
             .await
+            .ok(),
+        Some(true)
     );
     let _ = await_snapshot(&listener, id, |s| s.display_recording.is_none()).await;
     client.send_to(b"after", ("127.0.0.1", port)).await.unwrap();

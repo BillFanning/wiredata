@@ -373,12 +373,22 @@ impl EventLogStatus {
 #[must_use = "dropping the event log stops it; hold it until the process exits"]
 pub struct EventLog {
     status: EventLogStatus,
-    _guard: Option<FileSinkGuard>,
+    guard: Option<FileSinkGuard>,
 }
 
 impl EventLog {
     pub fn status(&self) -> EventLogStatus {
         self.status.clone()
+    }
+
+    /// Stop the event log at application exit: write out the queued lines
+    /// and flush the file, waiting at most `limit`. `None` when no event log
+    /// was being written.
+    ///
+    /// A log on a drive that stopped answering cannot be waited out, so the
+    /// outcome says whether its last lines were written.
+    pub fn shutdown(mut self, limit: Duration) -> Option<wiredata_log::ShutdownOutcome> {
+        self.guard.take().map(|guard| guard.shutdown(limit))
     }
 
     fn unavailable(folder: Option<PathBuf>, problem: String) -> Self {
@@ -390,7 +400,7 @@ impl EventLog {
                 setup_problem: Some(problem),
                 track: Arc::default(),
             },
-            _guard: None,
+            guard: None,
         }
     }
 }
@@ -422,7 +432,7 @@ where
             setup_problem: None,
             track: Arc::default(),
         },
-        _guard: Some(sink.guard),
+        guard: Some(sink.guard),
     };
     Ok((layer, log))
 }

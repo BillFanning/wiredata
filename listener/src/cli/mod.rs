@@ -159,7 +159,11 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_LIMIT);
     // Only once the event log is flushed may a Windows logoff or shutdown that
     // is waiting on the stop go ahead: it may end the process straight away.
-    drop(event_log);
+    // The wait is limited, so a log on a drive that stopped answering cannot
+    // keep the process alive.
+    let log_warning = event_log
+        .shutdown(EVENT_LOG_STOP_LIMIT)
+        .and_then(event_log_stop_warning);
     stop_requests.finish();
     // Nothing is left for a slow console to hold up. Write out what is queued,
     // then the closing lines directly, so the summary cannot be among the
@@ -176,7 +180,33 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     if not_shown > 0 {
         eprintln!("{}", lines_not_shown_warning(not_shown));
     }
+    if let Some(warning) = log_warning {
+        eprintln!("{warning}");
+    }
     Ok(end.code)
+}
+
+/// How long the exit waits for the event log to be written out.
+const EVENT_LOG_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The closing warning for an event log that was not completely written;
+/// `None` when it was.
+fn event_log_stop_warning(outcome: wiredata_log::ShutdownOutcome) -> Option<String> {
+    use wiredata_log::ShutdownOutcome;
+    match outcome {
+        ShutdownOutcome::Clean => None,
+        ShutdownOutcome::FinalWriteFailed(error) => Some(format!(
+            "WARNING: the last lines of the event log could not be written: {error}"
+        )),
+        ShutdownOutcome::TimedOut => Some(format!(
+            "WARNING: the event log was not written out within {} s, so its last lines \
+             may be missing: the drive it is on is not answering",
+            EVENT_LOG_STOP_LIMIT.as_secs()
+        )),
+        ShutdownOutcome::WorkerPanicked => Some(
+            "WARNING: the event log's writer failed, so its last lines may be missing".to_owned(),
+        ),
+    }
 }
 
 /// The closing warning when the console's queue dropped lines (§114).
@@ -483,10 +513,11 @@ fn build_channel_configs(cli: &Cli, console: &Console) -> Result<Vec<ChannelConf
         for warning in warnings {
             console.err(format_args!("warning: {warning}"));
         }
+        let results = profile.validate();
         let mut valid = Vec::new();
-        for (config, (name, result)) in profile.channels.iter().zip(profile.validate()) {
+        for (config, (name, result)) in profile.into_effective_channels().into_iter().zip(results) {
             match result {
-                Ok(()) => valid.push(config.clone()),
+                Ok(()) => valid.push(config),
                 Err(errors) => console.err(format_args!(
                     "skipping invalid channel \"{name}\": {}",
                     describe_channel_errors(&errors)
@@ -880,6 +911,33 @@ mod tests {
         let configs = build_channel_configs(&cli, &Console::discard()).unwrap();
         // The valid channel loads; the unbounded-retention one is skipped.
         assert_eq!(configs.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_profile_default_reaches_the_channels_that_leave_it_unset() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("listener-cli-{}.toml", uuid::Uuid::new_v4()));
+
+        let mut profile = Profile::new("defaults");
+        let mut inherits = templates::udp_template();
+        inherits.name = crate::core::ChannelName::new("Inherits");
+        inherits.retention = crate::config::RetentionConfig::default();
+        let mut own = templates::udp_template();
+        own.name = crate::core::ChannelName::new("Own");
+        own.retention = crate::config::RetentionConfig::with_byte_limit(1_000);
+        profile.channels = vec![inherits, own];
+        profile.defaults.retention = Some(crate::config::RetentionConfig::with_byte_limit(4_096));
+        profile.save(&path).unwrap();
+
+        let cli = Cli {
+            profile: Some(path.clone()),
+            ..base_cli()
+        };
+        let configs = build_channel_configs(&cli, &Console::discard()).unwrap();
+        assert_eq!(configs[0].retention.byte_limit, Some(4_096));
+        assert_eq!(configs[1].retention.byte_limit, Some(1_000));
 
         let _ = std::fs::remove_file(&path);
     }
