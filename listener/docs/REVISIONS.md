@@ -12,6 +12,26 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-14) — fixes from the November code review:
+
+- **§50.2 (ADR-064, ADR-065).** A Record action takes effect at its match,
+  and one read fires at most 4,096 matches. A Mark on a multi-byte character
+  is placed against the whole character.
+- **§56.1, §59.** A failed close of a rotated file is a recording fault. A due
+  flush is not put off by queued data.
+- **§9.1.** The 60 s stability window runs from the reconnect's successful
+  start.
+- **§113.** The run summary and the copied report say whether finalization
+  completed.
+- **§99 (ADR-066).** One-time GUI results are never dropped.
+- **§91 (ADR-068).** Status that is not from the latest request says so, and
+  how old it is.
+- **§99 (ADR-069).** The GUI's driver waits on no Channel queue and no file
+  without a limit.
+- **§80.1 (ADR-067).** A profile's defaults are written into each Channel at
+  load.
+- **§118.** The CLI waits at most 2 s for the event log at exit.
+
 Revision note (2026-11-14) — times are local unless they say UTC:
 
 - **§54, §56.1 (ADR-063).** Gap times, in a `‹GAP …›` line and in a gap

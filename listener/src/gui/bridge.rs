@@ -212,37 +212,27 @@ pub enum UiUpdate {
 }
 
 impl UiUpdate {
-    /// Whether the next poll re-sends what this update says, so losing it is
-    /// harmless. Periodic updates ride the bounded best-effort lane; every other
-    /// update is a one-time result that nothing re-sends, and rides the reliable
-    /// lane (see [`update_lanes`]).
+    /// Whether this update rides the bounded best-effort lane. Telemetry and
+    /// every runtime event are periodic; only structural results, which
+    /// nothing re-sends, ride the reliable lane (see [`update_lanes`]).
+    ///
+    /// A runtime event is periodic so that it keeps its order relative to the
+    /// snapshots and stats around it, and so that no autonomous source can
+    /// fill the unbounded lane. Dropping one under a full queue costs only
+    /// lateness: the next poll carries the Channel's state, totals, timing
+    /// and recording state, and the stream delta's generation tells the GUI a
+    /// new run began. What a dropped event cannot restore is the one-off
+    /// notice `RecordingFaulted` raises, whose reason stays in the Channel's
+    /// diagnostics.
     ///
     /// The match is exhaustive, so a new update must be classified to compile.
-    /// A runtime event is periodic only when the GUI does not act on it
-    /// directly and the periodic snapshot carries what it reports.
     pub fn is_periodic(&self) -> bool {
         match self {
             Self::Snapshot(..)
             | Self::Stats(..)
             | Self::ControlLines(..)
-            | Self::StreamDelta(..) => true,
-            Self::Event(event) => match event {
-                RuntimeEvent::ChannelStarted(_)
-                | RuntimeEvent::ChannelStopped(_)
-                | RuntimeEvent::ChannelFaulted(_)
-                | RuntimeEvent::RecordingFaulted(..)
-                | RuntimeEvent::RecordingStarted(..)
-                | RuntimeEvent::ChannelReconnecting(..)
-                | RuntimeEvent::ChannelReconnected(_)
-                | RuntimeEvent::ChannelReconnectGaveUp(_) => false,
-                RuntimeEvent::WarningRaised(_)
-                | RuntimeEvent::ReceptionStalled(..)
-                | RuntimeEvent::ReceptionResumed(..)
-                | RuntimeEvent::ControlLinesChanged(_)
-                | RuntimeEvent::DiskSpaceLow(_)
-                | RuntimeEvent::RecordingStoppedLowDisk(_)
-                | RuntimeEvent::MatchTriggered(..) => true,
-            },
+            | Self::StreamDelta(..)
+            | Self::Event(_) => true,
             Self::ChannelAdded(..)
             | Self::ChannelReconfigured(..)
             | Self::ChannelRenamed(..)
@@ -267,8 +257,8 @@ pub struct UpdateSender {
 impl UpdateSender {
     /// Queue one update on the lane its [`UiUpdate::is_periodic`] names. Never
     /// blocks. Returns whether the update was queued: a periodic update is
-    /// dropped when its bounded lane is full, and a one-time update is dropped
-    /// only when the receiver has gone.
+    /// dropped when its bounded lane is full, and a structural result is
+    /// dropped only when the receiver has gone.
     fn send(&self, update: UiUpdate) -> bool {
         if update.is_periodic() {
             self.periodic.try_send(update).is_ok()
@@ -285,9 +275,9 @@ pub struct UpdateReceiver {
 }
 
 impl UpdateReceiver {
-    /// The next update without waiting. Every one-time update queued is
-    /// returned before any periodic one, each lane in the order it was sent, so
-    /// telemetry never arrives ahead of the channel it describes.
+    /// The next update without waiting. Every structural result queued is
+    /// returned before any periodic update, each lane in the order it was sent,
+    /// so telemetry never arrives ahead of the channel it describes.
     pub fn try_recv(&mut self) -> Result<UiUpdate, mpsc::error::TryRecvError> {
         if let Ok(update) = self.reliable.try_recv() {
             return Ok(update);
@@ -309,10 +299,13 @@ impl UpdateReceiver {
 /// Make the two lanes between the driver and the GUI.
 ///
 /// The periodic lane holds `periodic_capacity` updates and drops what does not
-/// fit: the next poll sends fresh telemetry anyway. The reliable lane is
-/// unbounded and never drops, because one-time results are not re-sent and the
-/// GUI cannot rebuild a missing one. Its volume is bounded by what users do
-/// and by the size of a loaded profile, not by the polling rate.
+/// fit: the next poll sends fresh telemetry anyway. Runtime events ride this
+/// lane too, so they stay in order with the telemetry they precede. The
+/// reliable lane is unbounded and never drops, because structural results are
+/// not re-sent and the GUI cannot rebuild a missing one. Only a user action or
+/// a loaded profile produces one, so its volume follows what users do and the
+/// size of a profile, never the polling rate or what the Channels do on their
+/// own.
 pub fn update_lanes(periodic_capacity: usize) -> (UpdateSender, UpdateReceiver) {
     let (periodic_tx, periodic_rx) = mpsc::channel(periodic_capacity);
     let (reliable_tx, reliable_rx) = mpsc::unbounded_channel();
@@ -1387,7 +1380,7 @@ impl Driver {
 
     /// Hand one update to the GUI and wake it. Non-blocking (§99): a periodic
     /// update is dropped when its bounded lane is full rather than stalling the
-    /// driver, while a one-time result always has room (see [`update_lanes`]).
+    /// driver, while a structural result always has room (see [`update_lanes`]).
     /// Returns whether the update was actually enqueued — the stream-delta poll
     /// uses this to avoid advancing its cursor past bytes the UI never received.
     fn push(&self, update: UiUpdate) -> bool {
@@ -2086,20 +2079,20 @@ mod tests {
             tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
         cmd_tx.send(UiCommand::Resume(path.clone())).await.unwrap();
 
-        let (mut added, mut started) = (false, false);
-        loop {
+        // The started event rides the periodic lane, so it may arrive after
+        // the structural `Resumed`.
+        let (mut added, mut started, mut resumed) = (false, false, false);
+        while !(added && started && resumed) {
             match next(&mut upd_rx).await {
                 UiUpdate::ChannelAdded(..) => added = true,
                 UiUpdate::Event(RuntimeEvent::ChannelStarted(_)) => started = true,
                 UiUpdate::Resumed(name, _) => {
                     assert_eq!(name, "Logging");
-                    break;
+                    resumed = true;
                 }
                 _ => {}
             }
         }
-        assert!(added, "the profile was loaded");
-        assert!(started, "its channel was started");
 
         cmd_tx.send(UiCommand::Shutdown).await.unwrap();
         handle.await.unwrap();
@@ -2623,6 +2616,107 @@ mod tests {
         assert!(matches!(rx.recv().await, Some(UiUpdate::ControlLines(..))));
         drop(tx);
         assert!(rx.recv().await.is_none());
+    }
+
+    fn running_stats(id: ChannelId) -> UiUpdate {
+        use crate::runtime::{ChannelActivity, ChannelStats, ChunkShape, DurationHistogram};
+        use crate::runtime::{Provenance, QueueDepth, TransportHealth};
+        UiUpdate::Stats(
+            id,
+            Box::new(ChannelStats {
+                provenance: Provenance::Fresh,
+                state: ChannelState::Running,
+                reconnect_pending: false,
+                reconnect: None,
+                activity: ChannelActivity {
+                    last_data_at: None,
+                    bytes_per_sec: 0.0,
+                    total_bytes: 0,
+                },
+                event_count: 0,
+                warning_count: 0,
+                error_count: 0,
+                raw_recording: None,
+                display_recording: None,
+                match_boundary_saves: 0,
+                ingest_delay: DurationHistogram::default(),
+                recent_ingest_delay: DurationHistogram::default(),
+                ingest_processing: DurationHistogram::default(),
+                recent_ingest_processing: DurationHistogram::default(),
+                chunk_shape: ChunkShape::default(),
+                transport_health: TransportHealth::default(),
+                ingest_queue: QueueDepth::default(),
+                raw_recording_queue: None,
+                raw_recording_status: None,
+                display_recording_status: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn running_stats_queued_before_a_stop_leave_the_model_stopped() {
+        use crate::gui::state::{AppState, ChannelStatus};
+        let (tx, mut rx) = update_lanes(8);
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        assert!(tx.send(UiUpdate::ChannelAdded(
+            id,
+            "A".into(),
+            "details".into(),
+            Box::new(udp_config(10110))
+        )));
+        assert!(tx.send(running_stats(id)));
+        assert!(tx.send(UiUpdate::Event(RuntimeEvent::ChannelStopped(id))));
+        while let Ok(update) = rx.try_recv() {
+            state.apply(update);
+        }
+        assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Stopped);
+    }
+
+    #[test]
+    fn the_reliable_lane_receives_no_runtime_events() {
+        let (tx, mut rx) = update_lanes(1);
+        let id = ChannelId::new();
+        let events = [
+            RuntimeEvent::ChannelStarted(id),
+            RuntimeEvent::ChannelStopped(id),
+            RuntimeEvent::ChannelFaulted(id),
+            RuntimeEvent::RecordingFaulted(id, crate::core::RecordingTap::Raw),
+            RuntimeEvent::RecordingStarted(id, crate::core::RecordingTap::Raw),
+            RuntimeEvent::ChannelReconnecting(id, 1),
+            RuntimeEvent::ChannelReconnected(id),
+            RuntimeEvent::ChannelReconnectGaveUp(id),
+            RuntimeEvent::DiskSpaceLow(id),
+        ];
+        for event in events {
+            assert!(UiUpdate::Event(event.clone()).is_periodic(), "{event:?}");
+            // Only the first fits the one-slot periodic lane; none may reach
+            // the unbounded lane, so the rest are dropped.
+            tx.send(UiUpdate::Event(event));
+        }
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, 1, "events never ride the reliable lane");
+    }
+
+    #[test]
+    fn a_full_periodic_queue_drops_events_and_telemetry_but_not_structural_results() {
+        let (tx, mut rx) = update_lanes(1);
+        let id = ChannelId::new();
+        assert!(tx.send(running_stats(id)));
+        assert!(!tx.send(running_stats(id)), "telemetry is dropped");
+        assert!(
+            !tx.send(UiUpdate::Event(RuntimeEvent::ChannelStopped(id))),
+            "an event is dropped"
+        );
+        assert!(tx.send(UiUpdate::ChannelRemoved(id)));
+        assert!(tx.send(UiUpdate::ChannelError(id, "x".into())));
+        assert!(matches!(rx.try_recv(), Ok(UiUpdate::ChannelRemoved(_))));
+        assert!(matches!(rx.try_recv(), Ok(UiUpdate::ChannelError(..))));
+        assert!(matches!(rx.try_recv(), Ok(UiUpdate::Stats(..))));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

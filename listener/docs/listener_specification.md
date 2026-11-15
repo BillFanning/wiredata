@@ -1,29 +1,23 @@
-# Listener Specification v2.4.13
+# Listener Specification v2.4.14
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-14) — fixes from the November code review:
+Revision note (2026-11-15) — fixes from the follow-up code review:
 
-- **§50.2 (ADR-064, ADR-065).** A Record action takes effect at its match,
-  and one read fires at most 4,096 matches. A Mark on a multi-byte character
-  is placed against the whole character.
-- **§56.1, §59.** A failed close of a rotated file is a recording fault. A due
-  flush is not put off by queued data.
-- **§9.1.** The 60 s stability window runs from the reconnect's successful
-  start.
-- **§113.** The run summary and the copied report say whether finalization
-  completed.
-- **§99 (ADR-066).** One-time GUI results are never dropped.
-- **§91 (ADR-068).** Status that is not from the latest request says so, and
-  how old it is.
-- **§99 (ADR-069).** The GUI's driver waits on no Channel queue and no file
-  without a limit.
-- **§80.1 (ADR-067).** A profile's defaults are written into each Channel at
-  load.
-- **§118.** The CLI waits at most 2 s for the event log at exit.
+- **§71 (ADR-064, ADR-065).** A rule may have at most 16 actions and a Mark
+  separator at most 256 bytes. Record triggers whose Stop match can end inside
+  their Begin match are refused.
+- **§50.2.** A bare Mark is placed before its match, in the recording span
+  its read goes to.
+- **§91 (ADR-068).** Figures left from an earlier run are labelled as such
+  when the latest run left no final answer.
+- **§99 (ADR-066).** Runtime events travel with the periodic updates; only
+  results of user actions and profile loads are never dropped.
+- **§113.** A Channel whose pipeline failed before confirming its close
+  counts as finalization incomplete.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -976,7 +970,7 @@ struct TimestampConfig { include_date: bool, include_millis: bool, include_timez
 
 - **Record** takes effect at its match, not at the end of the read (ADR-064). A Begin starts the recording at its match's first byte, and a Stop ends it just after its match's last byte, so both triggers are in the recording. The same stream records the same bytes however the transport split it into reads, including a trigger split across two reads, whose first bytes come from the few bytes the matcher keeps for cross-read matching. Actions inside one read apply in stream order, not rule order. A Begin while recording, and a Stop while not recording, do nothing. This holds for the Raw and the Display recording alike, and the Display recording keeps the inline Mark timestamps inside the recorded span. No bytes before a Begin trigger are recorded; there is **no pre-match backfill** (§158), and pre-trigger capture is deferred. An `Idle` rule's Record action has no place in the stream and acts between reads.
 - **Order and limit** (ADR-065). Matches fire in stream order of their first byte, and matches starting on the same byte fire in rule order. One read fires at most 4,096 matches (`MAX_FIRINGS_PER_READ`); later matches in that read do not fire and are not acted on. The first time this happens in a run a warning is recorded, and later ones are only counted. A read cut off this way is the one case where what a rule set does depends on read boundaries.
-- **Mark** correlates the match into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53). A bare `Mark` (`timestamp = None`) writes a `‹MARK …›` marker line into the view's `.disp`. When `timestamp` is `Some`, `Plain` splices the matched chunk's local arrival time, formatted per `TimestampConfig` (time-of-day always shown; date, milliseconds, and local UTC offset independently toggleable). `NmeaZda` instead splices `$<talker>ZDA,<hhmmss[.sss]>,<dd>,<mm>,<yyyy>,<zone-hours>,<zone-minutes>*XX`: time/date are UTC, and the zone fields are NMEA 0183's local zone: the hours and minutes added to local time to get UTC, which is the opposite sign to an ISO 8601 offset, so a zone east of Greenwich is negative and the minutes take the hours' sign (UTC−5 is `+05,00`; UTC+5:30 is `-05,-30`). An offset outside minute precision or the supported ±13:59 range leaves both zone fields empty. Standard two-character talker IDs and custom 1–32-character printable ASCII IDs are accepted; whitespace/control characters and NMEA framing characters `$ ! , *` are invalid. IDs longer than two produce explicitly custom ZDA-shaped output.
+- **Mark** correlates the match into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53). A bare `Mark` (`timestamp = None`) writes a `‹MARK …›` marker line into the view's `.disp`, placed just before its match, so it goes into whatever recording span the match's bytes go into (ADR-064). For a match that began in an earlier read, the line is placed at the start of the read where it completed. A bare `Mark` from an `Idle` rule is written between reads. When `timestamp` is `Some`, `Plain` splices the matched chunk's local arrival time, formatted per `TimestampConfig` (time-of-day always shown; date, milliseconds, and local UTC offset independently toggleable). `NmeaZda` instead splices `$<talker>ZDA,<hhmmss[.sss]>,<dd>,<mm>,<yyyy>,<zone-hours>,<zone-minutes>*XX`: time/date are UTC, and the zone fields are NMEA 0183's local zone: the hours and minutes added to local time to get UTC, which is the opposite sign to an ISO 8601 offset, so a zone east of Greenwich is negative and the minutes take the hours' sign (UTC−5 is `+05,00`; UTC+5:30 is `-05,-30`). An offset outside minute precision or the supported ±13:59 range leaves both zone fields empty. Standard two-character talker IDs and custom 1–32-character printable ASCII IDs are accepted; whitespace/control characters and NMEA framing characters `$ ! , *` are invalid. IDs longer than two produce explicitly custom ZDA-shaped output.
 - `Before` attaches immediately before the match's first byte; `After` attaches immediately after its final byte. A Mark anchored on any byte of a multi-byte character (UTF-8, or UTF-16 including a surrogate pair) is placed against the whole character: Before goes before it and After goes after it. Hex view places it at the byte. `separator` is appended after either style and may contain CR/LF. Rendering honors those controls and resets Raw wrap state, Rendered tab columns, and Hex continuation before subsequent data. The style-generated ZDA has no trailing CR/LF of its own. All styles are text insertions in every view mode, not on-screen byte-range styling (contrast removed `Highlight`, ADR-015).
 - **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes the display view (§50); reception and recording continue.
 
@@ -1427,8 +1421,15 @@ the runtime's constructors shall enforce the same limits:
 | Diagnostics (each of `event_limit`, `warning_limit`, `error_limit`) | ≤ 2,000 |
 | Match pattern | ≤ 256 bytes |
 | Match rules | ≤ 64 per Channel |
+| Actions on one match rule | ≤ 16 |
+| Mark `separator` | ≤ 256 bytes |
 | `ReconnectPolicy` | initial backoff ≤ max backoff; multiplier 1.0–10 |
 | Recording `size_cap` | ≥ 64 MiB (§59) |
+
+Validation shall reject Record triggers that would record different bytes
+depending on how the data arrived (ADR-064): a Stop pattern whose match can end
+inside a match of a Begin pattern, after its first byte and before its last,
+where both drive the same recording. The error names both rules.
 
 Validation shall also reject a `ChannelName` that is not **filesystem-safe**
 (§59), because the name is used to generate recording filenames: a name is rejected
@@ -1871,7 +1872,8 @@ Channel never holds up the status of the others (ADR-062).
 
 Every status answer says where its figures came from (ADR-068): measured for
 this request, the Channel's last answer with its age, or an earlier run's
-figures when the Channel has not answered in this run. When the figures are not
+figures when the Channel has not answered in this run or its latest run ended
+without a final answer. When the figures are not
 from the latest request, the diagnostics card says so in a sentence, such as
 "These figures were measured 12.0 s ago. The Channel is not answering status
 requests." The figures are shown as measured, not adjusted for their age. A
@@ -2098,7 +2100,7 @@ asked for, and Shutdown does not wait for one. A round of status requests ends
 after 600 ms, and the next round starts with the Channels the last did not
 reach.
 
-The driver sends the GUI two kinds of update (ADR-066). Periodic ones (snapshots, statistics, stream deltas, control lines, and the high-rate advisory events the snapshot also carries) go through a bounded queue and are dropped when it is full, since the next poll repeats them. One-time results (a Channel added, removed, renamed or reconfigured; lifecycle, recording and reconnect events; profile results; errors) go through an unbounded lane and are never dropped. The GUI applies every waiting one-time result before any periodic update.
+The driver sends the GUI two kinds of update (ADR-066). Periodic ones (snapshots, statistics, stream deltas, control lines, and every runtime event) go through a bounded queue, in the order they happened, and are dropped when it is full, since the next poll repeats the state they carry. Results of user actions and profile loads (a Channel added, removed, renamed or reconfigured; profile results; errors) go through an unbounded lane and are never dropped. The GUI applies every waiting result before any periodic update.
 
 The runtime records exact observed high-water marks for the Transport→Pipeline and
 Raw-recorder queues, including capacity (§91.2). Reading these scalar counters does
@@ -2316,7 +2318,9 @@ the moment of the fault, and logs "finalization incomplete" the same way if it
 expires (ADR-062).
 
 The run summary records whether finalization completed separately from whether
-a final snapshot exists. The copied report has the key `finalization_complete`,
+a final snapshot exists. Finalization is complete only when the Channel confirmed
+its close, or never had a pipeline to close; a pipeline that failed first counts
+as incomplete. The copied report has the key `finalization_complete`,
 and the GUI's last-run summary says "The end of the recordings may be missing,
 because the Channel did not finish closing them in time." when it did not.
 

@@ -482,8 +482,10 @@ pub enum MatchCondition {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum MatchAction {
-    /// Begin or stop recording **from the match forward** — no pre-match backfill
-    /// (§158). Requires the Channel to have a recording destination configured.
+    /// Begin recording at the match's first byte, or stop it after the match's
+    /// last byte, so the trigger is recorded either way (§50.2, ADR-064). There
+    /// is no pre-match backfill (§158). Requires the Channel to have a
+    /// recording destination configured.
     Record {
         target: RecordTarget,
         control: RecordControl,

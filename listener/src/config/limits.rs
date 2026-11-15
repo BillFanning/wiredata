@@ -6,8 +6,8 @@
 //! scrollback and about 2 MiB of diagnostics (ADR-048).
 
 use super::{
-    DiskGuard, DiskThreshold, MatchCondition, MatchRule, ReconnectPolicy, RetentionConfig,
-    MIN_SIZE_CAP,
+    DiskGuard, DiskThreshold, MatchAction, MatchCondition, MatchRule, ReconnectPolicy,
+    RecordControl, RecordTarget, RetentionConfig, MIN_SIZE_CAP,
 };
 
 /// Stream scrollback per Channel (§71, §88).
@@ -18,6 +18,11 @@ pub const MAX_DIAGNOSTICS_PER_SEVERITY: usize = 2_000;
 pub const MAX_MATCH_PATTERN_BYTES: usize = 256;
 /// Match rules per Channel (§71).
 pub const MAX_MATCH_RULES: usize = 64;
+/// Actions on one match rule (§71). With the limit on Mark text, this bounds
+/// what one firing can cost, so the firing limit bounds one read (ADR-065).
+pub const MAX_MATCH_ACTIONS: usize = 16;
+/// The text a timestamped Mark adds after its timestamp (§71).
+pub const MAX_MARK_SEPARATOR_BYTES: usize = 256;
 /// The reconnect backoff multiplier's range (§71).
 pub const RECONNECT_MULTIPLIER: std::ops::RangeInclusive<f64> = 1.0..=10.0;
 /// The receive queue, in chunks of up to 64 KiB: 16 MiB at most (ADR-048).
@@ -47,6 +52,19 @@ pub enum LimitError {
     MatchPattern { rule: String, found: usize },
     #[error("{found} match rules; the limit is {MAX_MATCH_RULES} per Channel")]
     MatchRules { found: usize },
+    #[error("match rule \"{rule}\" has {found} actions; the limit is {MAX_MATCH_ACTIONS}")]
+    MatchActions { rule: String, found: usize },
+    #[error(
+        "match rule \"{rule}\" has a {found}-byte Mark separator; the limit is \
+         {MAX_MARK_SEPARATOR_BYTES} bytes"
+    )]
+    MarkSeparator { rule: String, found: usize },
+    #[error(
+        "match rules \"{stop}\" and \"{begin}\" overlap. A match of the Stop pattern can end \
+         inside a match of the Begin pattern, so what is recorded would depend on how the \
+         data arrived. Change one of the two patterns so that they cannot overlap that way."
+    )]
+    TriggerOverlap { stop: String, begin: String },
     #[error("reconnect initial backoff of {initial} ms is longer than its maximum of {max} ms")]
     BackoffOrder { initial: u64, max: u64 },
     /// The multiplier as written, since a float has no `Eq`.
@@ -130,8 +148,93 @@ pub fn match_rule_errors(rules: &[MatchRule]) -> Vec<LimitError> {
                 });
             }
         }
+        if rule.actions.len() > MAX_MATCH_ACTIONS {
+            errors.push(LimitError::MatchActions {
+                rule: rule.name.clone(),
+                found: rule.actions.len(),
+            });
+        }
+        for action in &rule.actions {
+            if let MatchAction::Mark {
+                timestamp: Some(timestamp),
+            } = action
+            {
+                if timestamp.separator.len() > MAX_MARK_SEPARATOR_BYTES {
+                    errors.push(LimitError::MarkSeparator {
+                        rule: rule.name.clone(),
+                        found: timestamp.separator.len(),
+                    });
+                }
+            }
+        }
+    }
+    errors.extend(trigger_overlaps(rules));
+    errors
+}
+
+/// Pairs of rules whose Record actions would record different bytes depending
+/// on how the data arrived (ADR-064).
+///
+/// A Record action takes effect at its match: a Begin at the match's first
+/// byte, a Stop after its last. The two are put in stream order only among the
+/// matches of one read, and a match fires in the read where it completes. A
+/// Stop that ends inside a Begin's match, for the same recording, completes
+/// first; whether both land in one read is then up to the transport, and the
+/// recording differs. Every other arrangement gives one result.
+fn trigger_overlaps(rules: &[MatchRule]) -> Vec<LimitError> {
+    let triggers = |control: RecordControl| {
+        rules.iter().filter_map(move |rule| {
+            let MatchCondition::BytePattern { pattern } = &rule.condition else {
+                return None;
+            };
+            let targets: Vec<RecordTarget> = rule
+                .actions
+                .iter()
+                .filter_map(|action| match action {
+                    MatchAction::Record { target, control: c } if *c == control => Some(*target),
+                    _ => None,
+                })
+                .collect();
+            (!targets.is_empty()).then_some((rule, pattern.as_slice(), targets))
+        })
+    };
+    let shares_a_recording = |a: RecordTarget, b: RecordTarget| {
+        let raw = |t| matches!(t, RecordTarget::Raw | RecordTarget::Both);
+        let display = |t| matches!(t, RecordTarget::Display | RecordTarget::Both);
+        (raw(a) && raw(b)) || (display(a) && display(b))
+    };
+    let mut errors = Vec::new();
+    for (stop_rule, stop, stop_targets) in triggers(RecordControl::Stop) {
+        for (begin_rule, begin, begin_targets) in triggers(RecordControl::Begin) {
+            let same_recording = stop_targets
+                .iter()
+                .any(|&s| begin_targets.iter().any(|&b| shares_a_recording(s, b)));
+            if same_recording && stop_can_end_inside_begin(stop, begin) {
+                errors.push(LimitError::TriggerOverlap {
+                    stop: stop_rule.name.clone(),
+                    begin: begin_rule.name.clone(),
+                });
+            }
+        }
     }
     errors
+}
+
+/// Whether some stream holds a match of `stop` that ends strictly inside a
+/// match of `begin`: after its first byte and before its last.
+///
+/// Take the Stop ending `end` bytes into the Begin, for each `end` from 1 to
+/// one short of the Begin's length. The bytes the two would share are the
+/// last `min(end, stop.len())` of the Stop and the Begin's bytes just before
+/// `end`; the arrangement exists when those agree.
+fn stop_can_end_inside_begin(stop: &[u8], begin: &[u8]) -> bool {
+    if stop.is_empty() || begin.len() < 2 {
+        return false;
+    }
+    (1..begin.len()).any(|end| {
+        let shared = end.min(stop.len());
+        begin[end - shared..end] == stop[stop.len() - shared..]
+    })
 }
 
 /// A configured recording size cap under the minimum (§59). The runtime never
@@ -267,6 +370,97 @@ mod tests {
             match_rule_errors(&many),
             [LimitError::MatchRules {
                 found: MAX_MATCH_RULES + 1
+            }]
+        );
+    }
+
+    fn trigger(
+        name: &str,
+        pattern: &[u8],
+        target: RecordTarget,
+        control: RecordControl,
+    ) -> MatchRule {
+        MatchRule {
+            name: name.to_owned(),
+            condition: MatchCondition::BytePattern {
+                pattern: pattern.to_vec(),
+            },
+            actions: vec![MatchAction::Record { target, control }],
+            enabled: true,
+        }
+    }
+
+    fn overlaps(stop: &[u8], begin: &[u8], stop_on: RecordTarget, begin_on: RecordTarget) -> bool {
+        let rules = [
+            trigger("stop", stop, stop_on, RecordControl::Stop),
+            trigger("begin", begin, begin_on, RecordControl::Begin),
+        ];
+        match_rule_errors(&rules)
+            .iter()
+            .any(|e| matches!(e, LimitError::TriggerOverlap { .. }))
+    }
+
+    #[test]
+    fn a_stop_that_can_end_inside_a_begin_is_refused() {
+        use RecordTarget::{Both, Display, Raw};
+        // Inside: the review's case. One read recorded ABC, two reads ABCDE.
+        assert!(overlaps(b"BC", b"ABCDE", Raw, Raw));
+        // Its end overlapping the Begin's start: "XAB" then "ABC" over "XABC".
+        assert!(overlaps(b"XAB", b"ABC", Raw, Raw));
+        // Both, against either recording.
+        assert!(overlaps(b"BC", b"ABCDE", Both, Display));
+        assert!(overlaps(b"BC", b"ABCDE", Raw, Both));
+    }
+
+    #[test]
+    fn triggers_that_give_one_result_however_the_data_arrives_are_accepted() {
+        use RecordTarget::{Display, Raw};
+        // Ordinary sentence triggers never overlap.
+        assert!(!overlaps(b"$GPRMC", b"$GPGGA", Raw, Raw));
+        // Ending with the Begin: both complete on the same byte, in one read.
+        assert!(!overlaps(b"CDE", b"ABCDE", Raw, Raw));
+        // A Stop that ends after the Begin completes later, whatever the reads.
+        assert!(!overlaps(b"DEF", b"ABCDE", Raw, Raw));
+        // A Begin inside a Stop is in order either way.
+        assert!(!overlaps(b"ABCDE", b"BC", Raw, Raw));
+        // Different recordings do not interact.
+        assert!(!overlaps(b"BC", b"ABCDE", Raw, Display));
+    }
+
+    #[test]
+    fn a_rules_actions_and_mark_text_are_measured() {
+        use crate::config::{MarkTimestamp, MarkTimestampStyle};
+        let mut rule = MatchRule {
+            name: "busy".to_owned(),
+            condition: MatchCondition::BytePattern {
+                pattern: b"x".to_vec(),
+            },
+            actions: vec![MatchAction::PauseDisplay {}; MAX_MATCH_ACTIONS],
+            enabled: true,
+        };
+        assert_eq!(match_rule_errors(std::slice::from_ref(&rule)), []);
+        rule.actions.push(MatchAction::PauseDisplay {});
+        assert_eq!(
+            match_rule_errors(std::slice::from_ref(&rule)),
+            [LimitError::MatchActions {
+                rule: "busy".to_owned(),
+                found: MAX_MATCH_ACTIONS + 1
+            }]
+        );
+
+        rule.actions = vec![MatchAction::Mark {
+            timestamp: Some(MarkTimestamp {
+                position: Default::default(),
+                style: MarkTimestampStyle::Plain {},
+                format: Default::default(),
+                separator: " ".repeat(MAX_MARK_SEPARATOR_BYTES + 1),
+            }),
+        }];
+        assert_eq!(
+            match_rule_errors(std::slice::from_ref(&rule)),
+            [LimitError::MarkSeparator {
+                rule: "busy".to_owned(),
+                found: MAX_MARK_SEPARATOR_BYTES + 1
             }]
         );
     }

@@ -782,6 +782,11 @@ impl AppState {
 /// alone: they resolve within the runtime's own command call, and the event (or
 /// the next poll) settles the row without flapping it through an intermediate.
 fn reconcile_status(view: &mut ChannelView, state: ChannelState, reconnect_pending: bool) {
+    // A stopped Channel has no live control lines, so a dropped stop event
+    // cannot leave them on screen.
+    if state == ChannelState::Stopped {
+        view.control_lines = None;
+    }
     view.status = match state {
         ChannelState::Running => ChannelStatus::Running,
         ChannelState::Stopped => ChannelStatus::Stopped,
@@ -1118,6 +1123,21 @@ mod tests {
                 display_recording_status: None,
             }),
         )
+    }
+
+    #[test]
+    fn a_poll_showing_stopped_clears_control_lines_a_dropped_stop_event_left() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "A", "d"));
+        state.apply(stats_with_state(id, ChannelState::Running, false));
+        state.apply(UiUpdate::ControlLines(
+            id,
+            crate::transport::SerialControlLines::default(),
+        ));
+        assert!(state.channel(id).unwrap().control_lines.is_some());
+        state.apply(stats_with_state(id, ChannelState::Stopped, false));
+        assert!(state.channel(id).unwrap().control_lines.is_none());
     }
 
     #[test]

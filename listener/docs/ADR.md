@@ -2182,6 +2182,11 @@ The cost of stuck Channels to one poll is also limited (ADR-069).
 **Consequences:** Every other Channel's status keeps moving while one is
 stuck, and a running Channel slow to answer shows figures at most one poll old.
 
+**Correction (2026-11-15), on a failed pipeline:** A pipeline task that
+failed before handing back its close was treated like a Channel with no
+pipeline, and counted as complete. It now counts as finalization incomplete,
+is named at shutdown, and logs that it failed before confirming its close.
+
 ## ADR-063 — Listener follows the workspace time policy
 
 **Status:** Accepted 2026-11-14.
@@ -2234,6 +2239,15 @@ place in the stream and acts between reads.
 **Consequences:** A recording made by triggers holds the trigger bytes and what
 lies between them, and nothing else.
 
+**Correction (2026-11-15):** The guarantee above did not hold for overlapping
+triggers. A Stop whose match ends inside a Begin's match completes first, so
+whether the two land in one read decided the result: with Begin `ABCDE` and
+Stop `BC`, one read recorded `ABC` and two reads recorded `ABCDE`. Validation
+now refuses such a pair when both drive the same recording (§71); every other
+arrangement gives one result. A bare Mark is now placed before its match, in
+the same recording span as the match's bytes; it was written at once, before
+the read's Record actions applied, so one read lost it and two reads kept it.
+
 ## ADR-065 — One read fires at most 4,096 matches
 
 **Status:** Accepted 2026-11-14. Corrects ADR-048's memory bound.
@@ -2254,6 +2268,15 @@ does depends on read boundaries. Normal rule sets never reach the limit.
 
 **Consequences:** One read's matching work and memory are fixed whatever the
 rules and the data.
+
+**Correction (2026-11-15):** Limiting the firings did not fix the work and
+memory of one read as stated: each firing copied its rule's whole action list,
+and nothing limited how many actions a rule had. 4,096 firings of a rule with
+1,024 actions was 224 MiB. A firing now shares its rule's actions, a rule may
+have at most 16 actions, and a Mark separator at most 256 bytes (§71). Matches
+that began in an earlier read are now put in stream order before the limit is
+applied; they were cut in rule order, which could keep later matches and drop
+earlier ones.
 
 ## ADR-066 — One-time GUI results are never dropped
 
@@ -2280,6 +2303,16 @@ profile size, not by the polling rate.
 
 **Consequences:** The GUI's list of Channels and its editor baselines cannot be
 left wrong by load.
+
+**Correction (2026-11-15):** Two parts of the decision above were wrong.
+Lifecycle, recording and reconnect events on the reliable lane were applied
+ahead of older periodic updates, so a Running status already queued could land
+after a newer Stop and show the Channel running. They also need no user
+action, so the unbounded lane was not bounded by user actions after all. Every
+runtime event now travels on the periodic lane, in order with the snapshots;
+the next poll rebuilds the state an event carries. A dropped recording-fault
+event can miss its inline notice, but not the recording's state or its
+diagnostic. Only results of user actions and profile loads are never dropped.
 
 ## ADR-067 — Profile defaults are written into each Channel at load
 
@@ -2328,6 +2361,11 @@ duration is not aged or zeroed; the sentence is what says it may no longer be
 true. A single slow answer shows the sentence until the next answer arrives.
 
 **Consequences:** Nobody reads a frozen figure as a live one.
+
+**Correction (2026-11-15):** A stopped Channel's figures were always labelled
+fresh. When its latest run ended without a final snapshot, they were the
+previous run's figures, or none. They are now labelled as an earlier run's
+figures, and the card says the latest run has no status answer to show.
 
 ## ADR-069 — The GUI's driver waits on nothing without a limit
 

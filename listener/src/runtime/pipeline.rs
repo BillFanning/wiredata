@@ -98,13 +98,23 @@ fn render_annotations_for_chunk(
         .collect()
 }
 
+/// The marker line a bare `Mark` writes into the Display Recording (§50.2).
+/// Framed with explicit newlines: the recorder appends verbatim (ADR-018), so
+/// the marker provides its own line breaks.
+fn mark_line(rule_id: MatchRuleId, byte_offset: Option<u64>) -> String {
+    let suffix = byte_offset
+        .map(|n| format!(" offset={n}"))
+        .unwrap_or_default();
+    format!("\n\u{2039}MARK rule={rule_id}{suffix}\u{203a}\n")
+}
+
 /// Which recordings a read's firings drive with a `Record` action placed in
 /// the stream: Raw, then Display. Those recordings take the read's bytes when
 /// the actions are applied.
 fn held_taps(fired: &[FiredRule]) -> (bool, bool) {
     let (mut raw, mut display) = (false, false);
     for rule in fired.iter().filter(|rule| rule.match_offset.is_some()) {
-        for action in &rule.actions {
+        for action in rule.actions.iter() {
             if let MatchAction::Record { target, .. } = action {
                 raw |= matches!(target, RecordTarget::Raw | RecordTarget::Both);
                 display |= matches!(target, RecordTarget::Display | RecordTarget::Both);
@@ -1014,7 +1024,7 @@ impl ChannelPipeline {
                     rule.id, self.channel_name
                 )));
             }
-            for action in &rule.actions {
+            for action in rule.actions.iter() {
                 match action {
                     MatchAction::Notify { severity } => {
                         let where_ = byte_offset
@@ -1080,7 +1090,19 @@ impl ChannelPipeline {
                             }
                         }
                     }
-                    MatchAction::Mark { timestamp: None } => self.write_mark(rule.id, byte_offset),
+                    // A bare Mark in a read is placed before its match, like
+                    // a Before timestamp, so it goes wherever the read's
+                    // bytes go: into the same recording span, in order. A
+                    // match that began in an earlier read is marked at the
+                    // start of this one, since that read is already recorded.
+                    MatchAction::Mark { timestamp: None } => match byte_offset {
+                        Some(start) => annotations.push(MarkAnnotation {
+                            offset: start.max(chunk_offset),
+                            before: true,
+                            text: mark_line(rule.id, byte_offset),
+                        }),
+                        None => self.write_mark(rule.id),
+                    },
                     MatchAction::PauseDisplay {} => self.display_pause.pause(),
                     MatchAction::Record { target, control } => {
                         let at = byte_offset.map(|start| match control {
@@ -1105,17 +1127,13 @@ impl ChannelPipeline {
         annotations
     }
 
-    /// `Mark` action (§50.2): drop a correlation marker into the
-    /// Display Recording (`.disp`) — **never** the raw `.raw` stream, which stays
-    /// byte-exact (§5.6/§49). The `MatchTriggered` event and `recent_matches` log
-    /// (written by the caller) are the marker's display/event surfaces.
-    fn write_mark(&mut self, rule_id: MatchRuleId, byte_offset: Option<u64>) {
-        let suffix = byte_offset
-            .map(|n| format!(" offset={n}"))
-            .unwrap_or_default();
-        // Framed with explicit newlines: the recorder appends verbatim
-        // (ADR-018), so the marker provides its own line breaks.
-        let text = format!("\n\u{2039}MARK rule={rule_id}{suffix}\u{203a}\n");
+    /// A bare `Mark` with no place in the stream, from an `Idle` rule (§50.2):
+    /// drop the marker line into the Display Recording (`.disp`) between reads
+    /// — **never** the raw `.raw` stream, which stays byte-exact (§5.6/§49).
+    /// The `MatchTriggered` event and `recent_matches` log (written by the
+    /// caller) are the marker's display/event surfaces.
+    fn write_mark(&mut self, rule_id: MatchRuleId) {
+        let text = mark_line(rule_id, None);
         let channel_id = self.channel_id;
         let pos = self.stream_pos_now();
         if let Some(rec) = self.display_recorder.as_mut() {
@@ -2449,6 +2467,15 @@ pub(crate) fn finalization_incomplete(channel_name: &str, grace: Duration) -> Di
         "finalization incomplete on channel {channel_name}: its stop did not finish within {} s, \
          so the end of its recordings may be missing",
         grace.as_secs()
+    ))
+}
+
+/// The error for a Channel whose pipeline task failed before it confirmed
+/// that its recordings were closed.
+pub(crate) fn finalization_failed(channel_name: &str) -> Diagnostic {
+    Diagnostic::error(format!(
+        "finalization incomplete on channel {channel_name}: it failed before it confirmed that \
+         its recordings were closed, so the end of its recordings may be missing"
     ))
 }
 
@@ -4946,6 +4973,59 @@ mod tests {
         assert!(disp_written.contains("MARK rule="));
         let _ = tokio::fs::remove_file(&raw_path).await;
         let _ = tokio::fs::remove_file(&disp_path).await;
+    }
+
+    #[tokio::test]
+    async fn a_bare_mark_lands_at_its_match_in_the_recording_however_the_stream_was_read() {
+        // The review's case: Begin, bare Mark on X, Stop, all on the Display
+        // recording. One read used to lose the marker; two reads put it in.
+        let cid_rules = |control| {
+            vec![MatchAction::Record {
+                target: RecordTarget::Display,
+                control,
+            }]
+        };
+        for (name, reads) in [
+            ("bare-mark-one", vec![&b"BEGINXSTOP"[..]]),
+            ("bare-mark-two", vec![&b"BEGIN"[..], &b"XSTOP"[..]]),
+        ] {
+            let cid = ChannelId::new();
+            let disp_path = temp_path(name);
+            let mut p = pipeline(cid, PipelineCapacities::default())
+                .with_match_rules(&[
+                    byte_rule("begin", b"BEGIN", cid_rules(RecordControl::Begin)),
+                    byte_rule("mark", b"X", vec![MatchAction::Mark { timestamp: None }]),
+                    byte_rule("stop", b"STOP", cid_rules(RecordControl::Stop)),
+                ])
+                .with_display_recording_settings(DisplayRecordingSettings {
+                    destination: disp_path.clone(),
+                    channel_name: name.to_string(),
+                    overwrite: OverwritePolicy::Refuse,
+                    file_rotation: FileRotationPolicy::None,
+                    queue_budget: DEFAULT_QUEUE_BUDGET,
+                    size_cap: DEFAULT_SIZE_CAP,
+                    extra: DisplayExtra {
+                        renderer: DisplayView::default(),
+                        mark_gaps: false,
+                    },
+                    disk_guard: None,
+                });
+            for read in reads {
+                p.ingest(bytes_chunk(cid, read));
+                p.apply_pending_records().await;
+            }
+            p.finish().await;
+            let disp = tokio::fs::read_to_string(&disp_path).await.unwrap();
+            let _ = tokio::fs::remove_file(&disp_path).await;
+            let (before, after) = disp
+                .split_once("\u{2039}MARK rule=")
+                .unwrap_or_else(|| panic!("{name}: no marker in {disp:?}"));
+            assert_eq!(before, "BEGIN\n", "{name}");
+            assert!(
+                after.ends_with(" offset=5\u{203a}\nXSTOP"),
+                "{name}: {disp:?}"
+            );
+        }
     }
 
     #[tokio::test]

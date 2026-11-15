@@ -161,8 +161,8 @@ impl RecordingStatus {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Provenance {
     /// Measured for this request by the running pipeline, or taken from the
-    /// finished run when the Channel has no pipeline (the final figures, exact
-    /// at rest).
+    /// finished run when the Channel has no pipeline and its latest run left
+    /// a final snapshot (the final figures, exact at rest).
     #[default]
     Fresh,
     /// The pipeline did not answer in time, so these are its last answer of
@@ -170,7 +170,8 @@ pub enum Provenance {
     /// this answer was handed out; the figures themselves are not aged.
     Cached { age: Duration },
     /// The pipeline did not answer in time and has never answered during the
-    /// current run, so these are the figures retained from an earlier run.
+    /// current run, or the latest run ended without a final snapshot, so these
+    /// are the figures retained from an earlier run, or empty ones.
     Retained,
 }
 

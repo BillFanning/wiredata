@@ -563,7 +563,11 @@ fn older_figures_sentence(figures: Provenance) -> Option<String> {
             "These figures were measured {} ago. {CAUSE}",
             compact_duration(age)
         )),
-        Provenance::Retained => Some(format!("These figures are from an earlier run. {CAUSE}")),
+        Provenance::Retained => Some(
+            "These figures are from an earlier run, or are empty. \
+             The latest run has no status answer to show."
+                .to_owned(),
+        ),
     }
 }
 
@@ -910,8 +914,8 @@ mod tests {
         assert_eq!(
             older_figures_sentence(Provenance::Retained).as_deref(),
             Some(
-                "These figures are from an earlier run. \
-                 The Channel is not answering status requests."
+                "These figures are from an earlier run, or are empty. \
+                 The latest run has no status answer to show."
             )
         );
     }

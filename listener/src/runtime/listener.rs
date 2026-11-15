@@ -54,6 +54,10 @@ use super::telemetry::{ChunkShape, DurationHistogram, TransportHealth};
 /// (talker semantics).
 #[derive(Clone, Copy, Debug)]
 struct RetainedTelemetry {
+    /// These are the exact final figures of the Channel's latest run, or the
+    /// Channel has not run. `false` when the latest run left no final
+    /// snapshot, so the figures are an earlier run's, or none.
+    latest_run_final: bool,
     activity: ChannelActivity,
     boundary_saves: u64,
     ingest_delay: DurationHistogram,
@@ -68,6 +72,7 @@ impl RetainedTelemetry {
     /// The retained form of a run's final snapshot.
     fn from_final(snap: &ChannelSnapshot) -> Self {
         Self {
+            latest_run_final: true,
             activity: ChannelActivity {
                 bytes_per_sec: 0.0,
                 ..snap.activity
@@ -83,10 +88,22 @@ impl RetainedTelemetry {
     }
 }
 
+impl RetainedTelemetry {
+    /// The provenance of these figures served with no live pipeline.
+    fn provenance(&self) -> Provenance {
+        if self.latest_run_final {
+            Provenance::Fresh
+        } else {
+            Provenance::Retained
+        }
+    }
+}
+
 impl Default for RetainedTelemetry {
     /// A Channel that has not yet run: no data, no total.
     fn default() -> Self {
         Self {
+            latest_run_final: true,
             activity: ChannelActivity {
                 last_data_at: None,
                 bytes_per_sec: 0.0,
@@ -130,7 +147,7 @@ fn retained_snapshot(id: ChannelId, channel: &ManagedChannel) -> ChannelSnapshot
     let kept = &channel.retained;
     ChannelSnapshot {
         channel_id: id,
-        provenance: Provenance::Fresh,
+        provenance: kept.provenance(),
         // Placeholders — the caller stamps the effective lifecycle state, exactly
         // as it does over a live pipeline's snapshot.
         state: ChannelState::Stopped,
@@ -177,7 +194,7 @@ fn retained_stats(channel: &ManagedChannel) -> ChannelStats {
     }
     let kept = &channel.retained;
     ChannelStats {
-        provenance: Provenance::Fresh,
+        provenance: kept.provenance(),
         // Placeholders — the caller stamps the effective lifecycle state.
         state: ChannelState::Stopped,
         reconnect_pending: false,
@@ -1188,24 +1205,36 @@ impl Listener {
 
     /// Land a drained stop in Stopped (ADR-052). Returns the Channel's name
     /// when its finalization is incomplete: the drain was abandoned at the
-    /// grace period, or the pipeline's own close gave up.
+    /// grace period, the pipeline's own close gave up, or the pipeline panicked.
     pub fn finish_stop(&mut self, drained: DrainedStop) -> Option<String> {
         self.finish_drained(drained.id, drained.drained)
     }
 
     /// Land a drained Channel in Stopped (see [`drain_all`]); `None` marks a
     /// drain abandoned at the grace period, which is logged as "finalization
-    /// incomplete". Returns the Channel's name when it was abandoned.
+    /// incomplete". Returns the Channel's name when its finalization is
+    /// incomplete: abandoned, given up by the pipeline, or a pipeline that
+    /// panicked (logged here, as it logged nothing itself).
     fn finish_drained(&mut self, id: ChannelId, drained: Option<Drained>) -> Option<String> {
         let Some(drained) = drained else {
             // A timed-out drain has no final snapshot, and nothing has said so.
             self.land_stopped(id, None, false);
             return Some(self.note_finalization_incomplete(id));
         };
-        self.land_stopped(id, drained.snapshot, !drained.abandoned);
-        // The pipeline gave up closing on its own, at a fault or within this
-        // stop; its snapshot already carries the diagnostic.
-        drained.abandoned.then(|| self.channel_name(id))
+        self.land_stopped(id, drained.snapshot, drained.finalized);
+        if drained.finalized {
+            return None;
+        }
+        // A pipeline that gave up closing on its own, at a fault or within this
+        // stop, already carries the diagnostic in its snapshot; one that
+        // panicked logged nothing.
+        if drained.diagnosed {
+            Some(self.channel_name(id))
+        } else {
+            let name = self.channel_name(id);
+            let diagnostic = super::pipeline::finalization_failed(&name);
+            Some(self.note_finalization(id, diagnostic))
+        }
     }
 
     /// A Channel's name for output, or its id when it is not known.
@@ -1257,6 +1286,7 @@ impl Listener {
         if let Some(channel) = self.channels.get_mut(&id) {
             let ended_by_fault =
                 channel.faulted.load(Ordering::Relaxed) || channel.state == ChannelState::Faulted;
+            let ran = channel.active_run.is_some();
             if let Some(run) = channel.active_run.take() {
                 let finished_at = SystemTime::now();
                 channel.last_run_summary = Some(ListenerRunSummary::completed(
@@ -1297,6 +1327,10 @@ impl Listener {
                 // The stopped channel is polled at the same cadence as a live one,
                 // so keep the served form ready rather than regrouping per poll.
                 channel.retained_diagnostics_snapshot = Arc::clone(&snap.diagnostics);
+            } else if ran {
+                // The run ended without a final snapshot: the figures kept are
+                // an earlier run's, or none.
+                channel.retained.latest_run_final = false;
             }
         }
         let _ = self.events_tx.try_send(RuntimeEvent::ChannelStopped(id));
@@ -1507,11 +1541,22 @@ impl Listener {
     /// §118), and return its name.
     fn note_finalization_incomplete(&mut self, id: ChannelId) -> String {
         let name = self.channel_name(id);
+        let diagnostic = super::pipeline::finalization_incomplete(&name, Self::STOP_GRACE);
+        self.note_finalization(id, diagnostic)
+    }
+
+    /// Log a finalization `diagnostic` for `id` to the event log and the
+    /// Channel's retained errors, and return the Channel's name.
+    fn note_finalization(
+        &mut self,
+        id: ChannelId,
+        diagnostic: crate::diagnostics::Diagnostic,
+    ) -> String {
+        let name = self.channel_name(id);
         let Some(channel) = self.channels.get(&id) else {
             return name;
         };
         let limit = self.error_retention(&channel.config);
-        let diagnostic = super::pipeline::finalization_incomplete(&name, Self::STOP_GRACE);
         crate::diagnostics::emit_to_event_log(&name, id, &diagnostic);
         if let Some(channel) = self.channels.get_mut(&id) {
             channel.retain_diagnostic(diagnostic, limit);
@@ -1931,20 +1976,49 @@ impl ShutdownOutcome {
 pub const RUNTIME_SHUTDOWN_LIMIT: Duration = Duration::from_secs(2);
 
 /// What a drain that finished hands back.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Drained {
     /// The final snapshot; `None` when there was no pipeline to take one
     /// from (a start-time fault, or a pipeline task that panicked).
     snapshot: Option<ChannelSnapshot>,
-    /// The pipeline's own close gave up at the stop grace
-    /// ([`ChannelPipeline::finalization_abandoned`]).
-    abandoned: bool,
+    /// The pipeline confirmed its close. `false` when its own close gave up at
+    /// the stop grace ([`ChannelPipeline::finalization_abandoned`]) or when a
+    /// pipeline existed and its task panicked, so no close was confirmed.
+    /// `true` when there was no pipeline: nothing was ever recorded.
+    finalized: bool,
+    /// The incomplete finalization is already in `snapshot`'s diagnostics, so
+    /// landing the drain does not log it again. `false` for a panic, which
+    /// logged nothing.
+    diagnosed: bool,
+}
+
+impl Default for Drained {
+    /// A Channel with no pipeline to close, as after a start-time fault.
+    fn default() -> Self {
+        Self {
+            snapshot: None,
+            finalized: true,
+            diagnosed: true,
+        }
+    }
+}
+
+impl Drained {
+    /// A pipeline existed and its task, or the drain around it, panicked
+    /// before confirming a close.
+    fn pipeline_panicked() -> Self {
+        Self {
+            snapshot: None,
+            finalized: false,
+            diagnosed: false,
+        }
+    }
 }
 
 /// Drain every Channel at once, each bounded by `grace` (§113: each Channel
 /// shuts down independently). `None` marks a drain that did not finish in
-/// time; it is abandoned. A drain that panicked counts as finished, without a
-/// final snapshot.
+/// time; it is abandoned. A drain that panicked finished without a final
+/// snapshot and without a confirmed close.
 async fn drain_all<F>(
     drains: Vec<(ChannelId, F)>,
     grace: Duration,
@@ -1962,7 +2036,7 @@ where
     while let Some(joined) = set.join_next_with_id().await {
         match joined {
             Ok((task, result)) => drained.push((ids[&task], result)),
-            Err(error) => drained.push((ids[&error.id()], Some(Drained::default()))),
+            Err(error) => drained.push((ids[&error.id()], Some(Drained::pipeline_panicked()))),
         }
     }
     drained
@@ -1988,9 +2062,10 @@ async fn drain_handle(handle: Option<MonitoredChannel>) -> Drained {
     match handle.stop().await {
         Some(mut pipeline) => Drained {
             snapshot: Some(pipeline.snapshot()),
-            abandoned: pipeline.finalization_abandoned(),
+            finalized: !pipeline.finalization_abandoned(),
+            diagnosed: true,
         },
-        None => Drained::default(),
+        None => Drained::pipeline_panicked(),
     }
 }
 
@@ -3729,7 +3804,7 @@ mod tests {
         let summary = summary_after_drain(|drained| {
             assert!(drained.snapshot.is_some());
             Some(Drained {
-                abandoned: true,
+                finalized: false,
                 ..drained
             })
         })
@@ -3749,6 +3824,126 @@ mod tests {
         let report = summary.to_report_text();
         assert!(report.contains("final_snapshot_complete=false\n"));
         assert!(report.contains("finalization_complete=false\n"));
+    }
+
+    fn count_finalization_incomplete(listener: &Listener, id: ChannelId) -> usize {
+        listener.channels[&id]
+            .retained_diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("finalization incomplete"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_drain_that_panicked_lands_as_incomplete_and_is_named_and_logged_once() {
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+        let handle = listener.take_for_stop(id).unwrap();
+        drop(handle);
+
+        type Drain = std::pin::Pin<Box<dyn std::future::Future<Output = Drained> + Send>>;
+        let panicking: Drain = Box::pin(async { panic!("the drain task failed") });
+        let mut results = drain_all(vec![(id, panicking)], Duration::from_secs(5)).await;
+        let (_, drained) = results.pop().unwrap();
+
+        let expected = listener.channel_name(id);
+        let named = listener.finish_drained(id, drained);
+        assert_eq!(named, Some(expected));
+        let summary = listener.channels[&id].last_run_summary.clone().unwrap();
+        assert!(!summary.finalization_complete);
+        assert!(!summary.final_snapshot_complete);
+        assert_eq!(count_finalization_incomplete(&listener, id), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_that_panicked_is_not_a_finished_close() {
+        assert!(!Drained::pipeline_panicked().finalized);
+        assert!(
+            Drained::default().finalized,
+            "no pipeline: nothing to close"
+        );
+        assert!(Drained::default().snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_pipeline_lands_complete_and_logs_nothing() {
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+        let handle = listener.take_for_stop(id).unwrap();
+        drop(handle);
+
+        assert_eq!(listener.finish_drained(id, Some(Drained::default())), None);
+        let summary = listener.channels[&id].last_run_summary.clone().unwrap();
+        assert!(summary.finalization_complete);
+        assert_eq!(count_finalization_incomplete(&listener, id), 0);
+    }
+
+    /// Land a stop that kept no final snapshot, after the Channel retained
+    /// `bytes` from an earlier completed run, and return its stats and snapshot.
+    async fn after_retained_bytes_then(
+        newer_stop_abandoned: bool,
+        bytes: u64,
+    ) -> (ChannelStats, ChannelSnapshot) {
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+        let handle = listener.take_for_stop(id).unwrap();
+        let mut drained = drain_handle(handle).await;
+        drained.snapshot.as_mut().unwrap().activity.total_bytes = bytes;
+        listener.finish_drained(id, Some(drained));
+
+        listener.start(id).await.unwrap();
+        let handle = listener.take_for_stop(id).unwrap();
+        if newer_stop_abandoned {
+            drop(handle);
+            listener.finish_drained(id, None);
+        } else {
+            listener.finish_drained(id, Some(drain_handle(handle).await));
+        }
+        (
+            listener.channel_stats(id).await.unwrap(),
+            listener.snapshot(id).await.unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_newer_run_does_not_serve_the_earlier_run_as_fresh() {
+        let (stats, snapshot) = after_retained_bytes_then(true, 123).await;
+        assert_eq!(stats.provenance, Provenance::Retained);
+        assert_eq!(snapshot.provenance, Provenance::Retained);
+        assert_eq!(
+            snapshot.activity.total_bytes, 123,
+            "the earlier run's figures"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_newer_run_serves_its_final_figures_as_fresh() {
+        let (stats, snapshot) = after_retained_bytes_then(false, 123).await;
+        assert_eq!(stats.provenance, Provenance::Fresh);
+        assert_eq!(snapshot.provenance, Provenance::Fresh);
+        assert_eq!(
+            snapshot.activity.total_bytes, 0,
+            "the newer run's own total"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_run_without_a_final_snapshot_serves_default_figures_as_retained() {
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+        drop(listener.take_for_stop(id).unwrap());
+        listener.finish_drained(id, None);
+        let snapshot = listener.snapshot(id).await.unwrap();
+        assert_eq!(snapshot.provenance, Provenance::Retained);
+        assert_eq!(snapshot.activity.total_bytes, 0);
     }
 
     #[tokio::test]

@@ -36,15 +36,17 @@
 //! counted and flagged so the pipeline can measure where, why, and how often
 //! splitting actually occurs (§50.2).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{MatchAction, MatchCondition, MatchRule};
 use crate::core::MatchRuleId;
 
-/// The most firings one read can yield. Each firing costs memory and pipeline
-/// time, and a rule set can be written so that every byte matches many rules;
-/// this keeps one read's work and memory fixed whatever the rules and data.
-/// Matches past the limit, later in that read, do not fire.
+/// The most firings one read can yield. A rule set can be written so that
+/// every byte matches many rules; this keeps the number of firings, and with
+/// the limits on actions per rule and on Mark text (`config::limits`), one
+/// read's matching work and memory, within a fixed bound. Matches past the
+/// limit, later in that read, do not fire.
 pub const MAX_FIRINGS_PER_READ: usize = 4_096;
 
 /// One configured rule in runtime form: its minted id, condition, actions, the
@@ -54,7 +56,9 @@ pub const MAX_FIRINGS_PER_READ: usize = 4_096;
 struct CompiledRule {
     id: MatchRuleId,
     condition: MatchCondition,
-    actions: Vec<MatchAction>,
+    /// Shared with every firing of the rule, so a firing costs a pointer, not
+    /// a copy of the actions.
+    actions: Arc<[MatchAction]>,
     enabled: bool,
     /// For an `Idle` rule: whether it has already fired during the current quiet
     /// episode (reset by `note_activity` when data resumes). Unused otherwise.
@@ -65,13 +69,13 @@ struct CompiledRule {
     boundary_saves: u64,
 }
 
-/// A rule that fired, with the actions the pipeline should apply. Actions are
-/// cloned (only for the rare matched rule) so the caller can apply them while
-/// holding `&mut` to the rest of the pipeline.
+/// A rule that fired, with the actions the pipeline should apply. The actions
+/// are the rule's own, shared, so the caller can apply them while holding
+/// `&mut` to the rest of the pipeline.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FiredRule {
     pub id: MatchRuleId,
-    pub actions: Vec<MatchAction>,
+    pub actions: Arc<[MatchAction]>,
     /// Absolute stream offset of the **first byte** of the match that fired
     /// (§50.2: matches are anchored on byte offsets — the stream-only model has no
     /// message numbers). `None` for an `Idle` firing, not tied to a data position.
@@ -112,7 +116,7 @@ impl MatchRuleSet {
             .map(|r| CompiledRule {
                 id: MatchRuleId::new(),
                 condition: r.condition.clone(),
-                actions: r.actions.clone(),
+                actions: r.actions.as_slice().into(),
                 enabled: r.enabled,
                 idle_fired: false,
                 boundary_saves: 0,
@@ -234,18 +238,22 @@ impl MatchRuleSet {
             b
         };
 
-        for rule in &mut self.rules {
-            let MatchCondition::BytePattern { pattern } = &rule.condition else {
-                continue;
-            };
-            if !rule.enabled || pattern.is_empty() || pattern.len() > carry_len + chunk.len() {
-                continue;
-            }
-            // 1. Boundary splits: matches that start in the carry and end in the
-            // chunk — a per-chunk scan would miss them. Matches fully inside the
-            // carry were reported last chunk; a start at/after the carry belongs
-            // to the chunk scan below (so nothing is double-reported).
-            if carry_len > 0 && pattern.len() >= 2 {
+        // 1. Boundary splits: matches that start in the carry and end in the
+        // chunk — a per-chunk scan would miss them. Matches fully inside the
+        // carry were reported last chunk; a start at/after the carry belongs
+        // to the chunk scan below (so nothing is double-reported). They are
+        // gathered as (start, rule) first: at most one per carry byte per rule,
+        // so a few thousand at most. Put in stream order before the limit is
+        // applied, the earliest ones are the ones kept.
+        let mut splits: Vec<(usize, usize)> = Vec::new();
+        if carry_len > 0 {
+            for (index, rule) in self.rules.iter().enumerate() {
+                let MatchCondition::BytePattern { pattern } = &rule.condition else {
+                    continue;
+                };
+                if !rule.enabled || pattern.len() < 2 || pattern.len() > carry_len + chunk.len() {
+                    continue;
+                }
                 let mut start = 0;
                 while start < carry_len {
                     let Some(rel) = find_subslice(&boundary[start..], pattern) else {
@@ -256,25 +264,33 @@ impl MatchRuleSet {
                         break; // starts in the chunk — the chunk scan reports it
                     }
                     if match_start + pattern.len() > carry_len {
-                        if fired.len() == MAX_FIRINGS_PER_READ {
-                            cut_off = true;
-                            break;
-                        }
-                        rule.boundary_saves += 1;
-                        fired.push(FiredRule {
-                            id: rule.id,
-                            actions: rule.actions.clone(),
-                            match_offset: Some(self.carry_offset + match_start as u64),
-                            match_len: pattern.len(),
-                            boundary_split: true,
-                        });
+                        splits.push((match_start, index));
                     }
                     start = match_start + 1;
                 }
             }
         }
-        // Boundary splits all start before the chunk; put them in stream order.
-        fired.sort_by_key(|f| f.match_offset);
+        // Stable on the rule index too: matches starting on one byte stay in
+        // rule order.
+        splits.sort_unstable();
+        if splits.len() > MAX_FIRINGS_PER_READ {
+            splits.truncate(MAX_FIRINGS_PER_READ);
+            cut_off = true;
+        }
+        for (match_start, index) in splits {
+            let rule = &mut self.rules[index];
+            let MatchCondition::BytePattern { pattern } = &rule.condition else {
+                continue;
+            };
+            rule.boundary_saves += 1;
+            fired.push(FiredRule {
+                id: rule.id,
+                actions: Arc::clone(&rule.actions),
+                match_offset: Some(self.carry_offset + match_start as u64),
+                match_len: pattern.len(),
+                boundary_split: true,
+            });
+        }
 
         // 2. In-chunk matches, one firing per occurrence (a chunk holding
         // several occurrences fires the rule once per occurrence, so per-match
@@ -310,7 +326,7 @@ impl MatchRuleSet {
             };
             fired.push(FiredRule {
                 id: rule.id,
-                actions: rule.actions.clone(),
+                actions: Arc::clone(&rule.actions),
                 match_offset: Some(chunk_offset + match_start as u64),
                 match_len: pattern.len(),
                 boundary_split: false,
@@ -364,7 +380,7 @@ impl MatchRuleSet {
                 rule.idle_fired = true;
                 fired.push(FiredRule {
                     id: rule.id,
-                    actions: rule.actions.clone(),
+                    actions: Arc::clone(&rule.actions),
                     match_offset: None,
                     match_len: 0,
                     boundary_split: false,
@@ -738,6 +754,42 @@ mod tests {
         let fired = set.evaluate_stream(b"YB", 3);
         let order: Vec<_> = fired.iter().map(|f| (f.match_offset, f.id)).collect();
         assert_eq!(order, vec![(Some(2), ids[1]), (Some(4), ids[0])]);
+    }
+
+    #[test]
+    fn the_limit_keeps_the_earliest_boundary_splits_whatever_the_rule_order() {
+        // The review's case: 32 rules whose boundary splits alone exceed the
+        // limit, then a later rule with a split at offset 0.
+        let mut rules: Vec<MatchRule> = (0..32)
+            .map(|i| pattern(&i.to_string(), &[b'A'; 129]))
+            .collect();
+        rules.push(pattern("last", &[b'A'; 256]));
+        let mut set = MatchRuleSet::compile(&rules);
+        let last = set.ids()[32];
+        let chunk = vec![b'A'; 255];
+        set.evaluate_stream(&chunk, 0);
+
+        let fired = set.evaluate_stream(&chunk, 255);
+
+        assert_eq!(fired.len(), MAX_FIRINGS_PER_READ);
+        assert_eq!(set.limit_hits(), 1);
+        assert_eq!(fired[0].match_offset, Some(0));
+        assert!(
+            fired
+                .iter()
+                .any(|f| f.id == last && f.match_offset == Some(0)),
+            "the last rule's split at offset 0 was dropped"
+        );
+        assert!(fired
+            .windows(2)
+            .all(|w| w[0].match_offset <= w[1].match_offset));
+    }
+
+    #[test]
+    fn firings_share_their_rules_actions() {
+        let mut set = MatchRuleSet::compile(&[pattern("a", b"A")]);
+        let fired = set.evaluate_stream(b"AA", 0);
+        assert!(Arc::ptr_eq(&fired[0].actions, &fired[1].actions));
     }
 
     #[test]
