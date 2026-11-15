@@ -374,10 +374,11 @@ fn spawn_with_capacity(
         drops: Arc::clone(&generation_drops),
     };
     let worker_notify = Arc::clone(&notify);
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
     let thread = std::thread::Builder::new()
         .name(format!("{}-file-log", label.to_ascii_lowercase()))
         .spawn(move || {
-            run_worker(
+            let result = run_worker(
                 event_rx,
                 command_rx,
                 worker_state,
@@ -385,7 +386,8 @@ fn spawn_with_capacity(
                 worker_generations,
                 worker_notify,
                 Opener { label, open },
-            )
+            );
+            let _ = done_tx.send(result);
         })
         .context("starting file-log worker")?;
 
@@ -408,6 +410,7 @@ fn spawn_with_capacity(
         guard: FileSinkGuard {
             commands: command_tx,
             thread: Some(thread),
+            done: done_rx,
         },
     })
 }
@@ -439,7 +442,7 @@ fn run_worker(
     generations: WorkerGenerations,
     notify: Arc<Mutex<Option<Notify>>>,
     opener: Opener,
-) {
+) -> Option<String> {
     let mut file: Option<ActiveFile> = None;
     loop {
         crossbeam_channel::select_biased! {
@@ -535,8 +538,9 @@ fn run_worker(
                 }
                 Ok(FileCommand::Shutdown) | Err(_) => {
                     accepting.store(false, Ordering::Release);
-                    let _ = finish_file(&events, &mut file);
-                    break;
+                    return finish_file(&events, &mut file)
+                        .err()
+                        .map(|error| error.to_string());
                 }
             },
             recv(events) -> event => match event {
@@ -562,7 +566,7 @@ fn run_worker(
                         );
                     }
                 }
-                Err(_) => break,
+                Err(_) => return None,
             }
         }
     }
@@ -910,17 +914,78 @@ fn record_full_queue_drop(
     }
 }
 
+/// How long dropping a [`FileSinkGuard`] that was never shut down explicitly
+/// waits for the worker before giving up on it.
+pub const DROP_SHUTDOWN_LIMIT: Duration = Duration::from_millis(500);
+
+/// How a bounded [`FileSinkGuard::shutdown`] ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "an unfinished or failed file-log shutdown should be reported"]
+pub enum ShutdownOutcome {
+    /// The worker drained its queue, flushed and closed the file.
+    Clean,
+    /// The worker stopped, but writing the last records or flushing the file
+    /// failed. Carries the error text.
+    FinalWriteFailed(String),
+    /// The worker had not finished when the limit passed, for example because
+    /// the drive or share it writes to stopped answering. Its thread is left
+    /// running, since an operating-system write cannot be cancelled; records
+    /// still queued may not reach the file.
+    TimedOut,
+    /// The worker thread panicked.
+    WorkerPanicked,
+}
+
+/// Stops the file-log worker. See [`FileSinkGuard::shutdown`].
+///
+/// Dropping a guard that was not shut down explicitly stops the worker too, but
+/// waits at most [`DROP_SHUTDOWN_LIMIT`] and discards the outcome.
 pub struct FileSinkGuard {
     commands: crossbeam_channel::Sender<FileCommand>,
     thread: Option<JoinHandle<()>>,
+    /// The worker's final result, sent as the last thing it does.
+    done: crossbeam_channel::Receiver<Option<String>>,
+}
+
+impl FileSinkGuard {
+    /// Ask the worker to drain, flush and close its file, and wait at most
+    /// `limit` for it to finish.
+    ///
+    /// On a timeout the thread is detached rather than joined, so the caller
+    /// stops waiting even though the worker may stay blocked in the operating
+    /// system.
+    pub fn shutdown(mut self, limit: Duration) -> ShutdownOutcome {
+        self.stop(limit)
+    }
+
+    fn stop(&mut self, limit: Duration) -> ShutdownOutcome {
+        let Some(thread) = self.thread.take() else {
+            return ShutdownOutcome::Clean;
+        };
+        // The command queue is unbounded, so this never blocks. It fails only
+        // when the worker has already exited, which `done` then reports.
+        let _ = self.commands.send(FileCommand::Shutdown);
+        match self.done.recv_timeout(limit) {
+            Ok(result) => {
+                // The result is the worker's last act, so this join is immediate.
+                let _ = thread.join();
+                result.map_or(ShutdownOutcome::Clean, ShutdownOutcome::FinalWriteFailed)
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                drop(thread);
+                ShutdownOutcome::TimedOut
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => match thread.join() {
+                Ok(()) => ShutdownOutcome::Clean,
+                Err(_) => ShutdownOutcome::WorkerPanicked,
+            },
+        }
+    }
 }
 
 impl Drop for FileSinkGuard {
     fn drop(&mut self) {
-        let _ = self.commands.send(FileCommand::Shutdown);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        let _ = self.stop(DROP_SHUTDOWN_LIMIT);
     }
 }
 
@@ -2341,5 +2406,118 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Err(io::Error::other("flush denied"))
         }
+    }
+
+    /// A writer whose flush waits until the test releases it, as a write to a
+    /// removed drive or a dead share would.
+    struct StuckFlushWriter {
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    }
+
+    impl Write for StuckFlushWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            Ok(())
+        }
+    }
+
+    /// A sink whose worker is blocked inside its final flush once shutdown starts.
+    /// Dropping the returned sender lets the worker finish.
+    fn stuck_sink() -> (FileSink, crossbeam_channel::Sender<()>) {
+        let (entered, _entered_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release) = crossbeam_channel::bounded::<()>(0);
+        let sink = spawn_with(Box::new(move |_| {
+            Ok(Box::new(StuckFlushWriter {
+                entered: entered.clone(),
+                release: release.clone(),
+            }))
+        }))
+        .unwrap();
+        sink.toggle.enable(config()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+        (sink, release_tx)
+    }
+
+    #[test]
+    fn shutdown_of_a_healthy_worker_is_clean_and_its_lines_are_on_disk() {
+        let dir = temp_folder("shutdown_clean");
+        let sink = super::spawn(LABEL).unwrap();
+        sink.toggle
+            .enable(LogFileConfig::new(dir.clone(), "talker.log"))
+            .unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+        emit(&sink.writer, b"kept line\n");
+
+        let outcome = sink.guard.shutdown(Duration::from_secs(5));
+
+        assert_eq!(outcome, ShutdownOutcome::Clean);
+        let text: String = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .collect();
+        assert!(text.contains("kept line"), "{text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shutdown_reports_the_final_flush_error() {
+        let sink = spawn_with(Box::new(|_| Ok(Box::new(FlushFailingWriter)))).unwrap();
+        sink.toggle.enable(config()).unwrap();
+        wait_for_state(&sink.toggle, |state| {
+            matches!(state, FileLogState::Enabled { .. })
+        });
+
+        let outcome = sink.guard.shutdown(Duration::from_secs(5));
+
+        assert!(
+            matches!(&outcome, ShutdownOutcome::FinalWriteFailed(message) if message.contains("flush denied")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn shutdown_of_a_stuck_worker_gives_up_at_the_limit() {
+        let (sink, release) = stuck_sink();
+        let limit = Duration::from_millis(100);
+
+        let started = Instant::now();
+        let outcome = sink.guard.shutdown(limit);
+        let waited = started.elapsed();
+
+        assert_eq!(outcome, ShutdownOutcome::TimedOut);
+        assert!(waited >= limit, "gave up early after {waited:?}");
+        assert!(waited < Duration::from_secs(2), "waited {waited:?}");
+        drop(release);
+    }
+
+    #[test]
+    fn dropping_a_guard_with_a_stuck_worker_returns_within_the_drop_limit() {
+        let (sink, release) = stuck_sink();
+        let FileSink { guard, .. } = sink;
+
+        let started = Instant::now();
+        drop(guard);
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= DROP_SHUTDOWN_LIMIT,
+            "gave up early after {waited:?}"
+        );
+        assert!(
+            waited < DROP_SHUTDOWN_LIMIT + Duration::from_secs(2),
+            "waited {waited:?}"
+        );
+        drop(release);
     }
 }
