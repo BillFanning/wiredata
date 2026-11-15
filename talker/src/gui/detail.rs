@@ -663,8 +663,9 @@ impl TalkerApp {
                 ui.add_space(4.0);
                 let hover = Hover::new(
                     "Windows refused the channel's request for 1 ms timer resolution.\n\n\
-                     The channel keeps sending, using ordinary waits, which on Windows can end \
-                     up to about 16 ms late.\n\n\
+                     The channel keeps sending, using ordinary waits, which on Windows have \
+                     about 16 ms granularity. A send can be later than that when the computer \
+                     is busy.\n\n\
                      That does not mean any send was late. For what actually happened, see the \
                      Cadence row and the missed count on the Send outcomes line.",
                 )

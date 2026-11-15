@@ -717,9 +717,15 @@ impl TalkerSupervisor {
     }
 
     /// Join every runner thread — running, draining, and orphaned.
-    /// **Blocks**, bounded by the interfaces' send timeouts; exit path only,
-    /// so serial ports and sockets close cleanly before the process dies
-    /// instead of being killed mid-write.
+    /// **Blocks**; exit path only, so serial ports and sockets close cleanly
+    /// before the process dies instead of being killed mid-write.
+    ///
+    /// Each runner stops at its next command check, which comes after the
+    /// send it is in. A send writes until the whole message is out, and the
+    /// interface's write timeout applies to each write, not to the message:
+    /// a peer that keeps taking a few bytes before each timeout keeps one
+    /// large send going for longer. The runners are joined one after another.
+    /// So the wait is usually short, and has no fixed upper bound.
     ///
     /// Safe on live handles: the command sender is dropped *before* the join,
     /// so a runner that never received Stop still exits on the disconnect
@@ -982,9 +988,7 @@ fn drain_control_statuses(
                     }
                     CommandExecution::Failed(message) => {
                         let message = match target {
-                            CommandTarget::Interface => format!(
-                                "interface update failed; the previous interface settings remain in use: {message}"
-                            ),
+                            CommandTarget::Interface => interface_update_failed_line(&message),
                             CommandTarget::MessageInterval(index) => {
                                 format!("message {} interval update failed: {message}", index + 1)
                             }
@@ -1011,6 +1015,13 @@ fn drain_control_statuses(
             }
         }
     }
+}
+
+/// The line for a failed interface update. It makes no claim about which
+/// settings are in use: the transport's own error says whether the previous
+/// ones were restored, reopened, or left the interface closed.
+fn interface_update_failed_line(message: &str) -> String {
+    format!("interface update failed: {message}")
 }
 
 /// Drain a stopped predecessor's reliable lane without allowing stale live
@@ -1191,6 +1202,24 @@ mod tests {
     use super::*;
     use crate::core::channel::{Interface, TcpClientConfig, UdpConfig};
     use crate::core::message::{MessageConfig, PayloadConfig};
+
+    #[test]
+    fn an_update_that_left_the_interface_closed_does_not_claim_settings_remain_in_use() {
+        let mut handle = Some(());
+        let error = crate::core::channel::change_or_restore(
+            &mut handle,
+            "serial port",
+            |_| anyhow::bail!("the new baud rate was refused"),
+            |_| anyhow::bail!("the old baud rate was refused"),
+            || anyhow::bail!("the port is busy"),
+        )
+        .unwrap_err();
+        let line = interface_update_failed_line(&format!("{error:#}"));
+        assert!(line.starts_with("interface update failed: "), "{line}");
+        assert!(line.contains("The serial port is closed"), "{line}");
+        assert!(!line.contains("remain in use"), "{line}");
+        assert!(!line.contains("remains in use"), "{line}");
+    }
 
     /// Start slot `i` on a caller-supplied interface (no real I/O), through
     /// the same prologue/spawn shape as [`TalkerSupervisor::start`].

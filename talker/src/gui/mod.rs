@@ -1379,9 +1379,11 @@ impl eframe::App for TalkerApp {
     }
 
     /// On window close (the X button) or any app exit: orderly shutdown.
-    /// Every runner gets Stop and is then joined (bounded by the interface
-    /// send timeouts), so serial ports and sockets close cleanly before the
-    /// process dies instead of being killed mid-write.
+    /// Every runner gets Stop and is then joined, so serial ports and sockets
+    /// close cleanly before the process dies instead of being killed
+    /// mid-write. The join has no limit of its own; see
+    /// [`Supervisor::join_all`](crate::core::supervisor::Supervisor::join_all)
+    /// for how long it can take.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_all();
         self.sup.join_all();

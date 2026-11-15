@@ -42,7 +42,8 @@ pub use wiredata_timing::{
 pub const REQUESTED_TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 
 /// Windows' default timer tick (15.625 ms), rounded up to a whole millisecond:
-/// the most a send can be late when the timer-resolution request is refused.
+/// the granularity of a wait when the timer-resolution request is refused. It
+/// is not a limit on lateness: a busy computer can run a thread later still.
 pub const WINDOWS_DEFAULT_TICK: Duration = Duration::from_millis(16);
 
 /// Intervals shorter than this want 1 ms timer resolution: two default

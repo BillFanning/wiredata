@@ -441,10 +441,20 @@ fn clock_step_line(label: &str, step: ClockStep) -> String {
     )
 }
 
+/// The failure of an interface update whose replacement could not be opened.
+/// The interface already in use was never touched, and the message says so.
+fn replacement_open_failed(error: &anyhow::Error) -> String {
+    format!(
+        "the replacement interface could not be opened, so the interface already in use was \
+         left unchanged: {error:#}"
+    )
+}
+
 /// The warning for a refused Windows timer-resolution request.
 fn timer_refused_line(label: &str) -> String {
     format!(
-        "channel {label}: Windows refused {} timer resolution; sends may be up to {} late",
+        "channel {label}: Windows refused {} timer resolution, so waits have about {} \
+         granularity, and a send can be later than that when the computer is busy",
         whole_ms(timing::REQUESTED_TIMER_RESOLUTION),
         whole_ms(timing::WINDOWS_DEFAULT_TICK)
     )
@@ -993,7 +1003,7 @@ impl<'a> RunState<'a> {
                                 self.interface = new;
                                 CommandExecution::Applied
                             }
-                            Err(e) => CommandExecution::Failed(format!("{e:#}")),
+                            Err(e) => CommandExecution::Failed(replacement_open_failed(&e)),
                         },
                         Err(e) => CommandExecution::Failed(format!("{e:#}")),
                     },
@@ -1002,7 +1012,7 @@ impl<'a> RunState<'a> {
                             self.interface = new;
                             CommandExecution::Applied
                         }
-                        Err(e) => CommandExecution::Failed(format!("{e:#}")),
+                        Err(e) => CommandExecution::Failed(replacement_open_failed(&e)),
                     },
                 };
                 match &execution {
@@ -1457,10 +1467,11 @@ impl<'a> RunState<'a> {
         // totals are exact at rest. A **blocking** send, deliberately: the runner
         // is exiting so cadence no longer matters, and this is the one status
         // that must not be lost to a momentarily full queue ("exact at rest" is
-        // a promise, not best-effort). The owner keeps draining a stopped
+        // a promise, not best-effort). It waits only while the owner neither
+        // drains nor drops the receiver; every owner keeps draining a stopped
         // runner's receiver until the thread exits (supervisor `poll`/`join_all`,
         // the CLI's funnel loop), and a dropped receiver returns an error
-        // immediately — so this cannot hang.
+        // immediately.
         let finished_mono = Instant::now();
         let finished_at = SystemTime::now();
         let missed_sends = self.schedule.missed_sends();
@@ -1868,10 +1879,11 @@ mod tests {
     }
 
     #[test]
-    fn the_timer_refused_line_states_the_request_and_the_worst_lateness() {
+    fn the_timer_refused_line_states_the_granularity_and_not_a_lateness_limit() {
         assert_eq!(
             timer_refused_line("GPS"),
-            "channel GPS: Windows refused 1 ms timer resolution; sends may be up to 16 ms late"
+            "channel GPS: Windows refused 1 ms timer resolution, so waits have about 16 ms \
+             granularity, and a send can be later than that when the computer is busy"
         );
     }
 
