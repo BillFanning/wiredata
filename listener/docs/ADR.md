@@ -2396,6 +2396,50 @@ that never returns leaves its thread behind until the process exits.
 **Consequences:** A hung share, a stalled serial reader or several stuck
 Channels slow the GUI's figures; they do not freeze it or hold up closing it.
 
+## ADR-070 — Linemon: a window for one stream
+
+**Status:** Accepted 2026-11-15. Not yet built.
+
+**Context:** Listener serves two uses of equal weight: unattended logging on
+many Channels for weeks, and looking at one stream to understand it. The first
+is well covered. The second was not. Three cases showed it: finding a GPS among
+four serial ports and working out its serial settings; clicking through a dozen
+consecutive UDP ports to find one instrument; and checking a serial stream for
+unexpected characters. In each, the Channel list and the recording controls
+were in the way, the display had to be dug for, and it could not be made
+larger.
+
+**Decision:** Linemon is a second window for one stream, opened by one button
+in the main window (§50.3).
+
+- It reads one serial port or one UDP port, and only that port is open.
+- A drop-down and step buttons choose the port. Every port and setting change
+  takes effect at once; there is no Apply button.
+- The display keeps its data across changes, with a marker line at each one,
+  until Clear. A checkbox clears it on a change of port.
+- It has Pause and Copy, and the renderings and view controls a Channel's
+  display has.
+- It remembers its last port, settings and view. It is not a Channel and is
+  never in a profile, a recording or a run summary.
+- A port held by a running Channel is not opened; Linemon names the Channel.
+
+It is built on what exists. A hidden Channel in the runtime backs the window,
+so the transports, the pipeline and the renderer are reused, and a change of
+port or setting restarts that Channel. Two things are new: a display buffer in
+the window that survives those restarts, and a second live stream to the GUI
+beside the selected Channel's.
+
+**Boundary:** Linemon does no decoding (ADR-010 stands) and shows one view
+(ADR-023 stands). It reads serial and UDP only. Viewing a running Channel's
+stream, a record button, time stamps on each line, finding the baud rate
+automatically, TCP and find are deferred (Appendix A). A counterpart in talker
+is undecided.
+
+**Consequences:** Looking at a stream no longer means setting up a Channel.
+While the window is open it costs one more Channel's memory, within the same
+limits (ADR-048); closed, it costs nothing. A logging run is not disturbed by
+it, since it never opens a port a Channel holds.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

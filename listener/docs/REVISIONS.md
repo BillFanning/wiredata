@@ -12,6 +12,20 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-15) — fixes from the follow-up code review:
+
+- **§71 (ADR-064, ADR-065).** A rule may have at most 16 actions and a Mark
+  separator at most 256 bytes. Record triggers whose Stop match can end inside
+  their Begin match are refused.
+- **§50.2.** A bare Mark is placed before its match, in the recording span
+  its read goes to.
+- **§91 (ADR-068).** Figures left from an earlier run are labelled as such
+  when the latest run left no final answer.
+- **§99 (ADR-066).** Runtime events travel with the periodic updates; only
+  results of user actions and profile loads are never dropped.
+- **§113.** A Channel whose pipeline failed before confirming its close
+  counts as finalization incomplete.
+
 Revision note (2026-11-14) — fixes from the November code review:
 
 - **§50.2 (ADR-064, ADR-065).** A Record action takes effect at its match,

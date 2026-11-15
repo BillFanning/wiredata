@@ -1,23 +1,14 @@
-# Listener Specification v2.4.14
+# Listener Specification v2.5.0
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-15) — fixes from the follow-up code review:
+Revision note (2026-11-15) — Linemon:
 
-- **§71 (ADR-064, ADR-065).** A rule may have at most 16 actions and a Mark
-  separator at most 256 bytes. Record triggers whose Stop match can end inside
-  their Begin match are refused.
-- **§50.2.** A bare Mark is placed before its match, in the recording span
-  its read goes to.
-- **§91 (ADR-068).** Figures left from an earlier run are labelled as such
-  when the latest run left no final answer.
-- **§99 (ADR-066).** Runtime events travel with the periodic updates; only
-  results of user actions and profile loads are never dropped.
-- **§113.** A Channel whose pipeline failed before confirming its close
-  counts as finalization incomplete.
+- **§50.3 (ADR-070).** New: Linemon, a window for looking at one stream.
+- **Appendix A.** Lists what Linemon leaves for later.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -988,6 +979,37 @@ struct MatchRule {
 Rules are part of `ChannelConfig` (§72) as `match_rules: Vec<MatchRule>`.
 
 **Evaluation and constraints.** `BytePattern` rules evaluate as bytes arrive (the scanner keeps a carry of the newest `pattern.len() − 1` stream bytes, however many chunks they came from); `Idle` uses one recomputed earliest-deadline wait, not a periodic rule poll. Evaluation is bounded and shall not stall reception (§100). Listener is not hard real-time (§126). One condition per rule; no cross-channel rules; no pre-trigger capture — all deferred.
+
+## 50.3 Linemon
+
+Linemon is a window for looking at one stream (ADR-070). It opens from one
+button in the main window, and it works while Channels are running and
+recording.
+
+- **Source.** Linemon reads one serial port or one UDP port. Only that port is
+  open. Closing the window closes the port.
+- **Choosing a port.** A drop-down lists the ports. Step-up and step-down
+  buttons move to the next serial port or the next UDP port number.
+- **Settings.** The bar holds the baud rate, data bits, parity, stop bits and
+  flow control for a serial port, and the port number for UDP. A More button
+  holds the multicast group, the network interface and port sharing. There is
+  no Apply button: every change takes effect at once.
+- **A port a Channel is using.** Linemon does not open it. It says which
+  Channel has it.
+- **Display.** Linemon shows the stream in Raw, Rendered or Hex (§42–§47), with
+  the view controls a Channel's display has. The data stays on screen when the
+  port or a setting changes, and a marker line records each change, naming the
+  port and its settings. **Clear** empties the display. With **Clear on port
+  change** ticked, choosing another port empties it too; it starts unticked.
+- **Pause and Copy.** Pause stops the display, not reception. Copy puts the
+  selection, or the whole display, on the clipboard.
+- **What it keeps.** Linemon remembers its last port, settings and view between
+  launches, with the window's own saved settings. It is not a Channel: it is
+  not in the Channel list, a profile, a recording or a run summary.
+- **Limit.** The display holds at most the scroll-buffer size (§87) and drops
+  the oldest data past that.
+
+Linemon does no decoding (ADR-010). What it leaves for later is in Appendix A.
 
 ---
 
@@ -3208,6 +3230,16 @@ Deferred (ADR-023/ADR-024/ADR-047):
 - Export (§60–§64)
 - Network live adjustment: receive buffer and multicast membership without a
   re-bind (§76.1, §167)
+
+Deferred from Linemon (§50.3, ADR-070):
+
+- Viewing a running Channel's stream in Linemon, including the Channel that
+  holds the port Linemon was asked for
+- A record button
+- Time stamps at the start of each line
+- Finding the baud rate automatically
+- TCP
+- Find
 
 Deferred from Version 1:
 
