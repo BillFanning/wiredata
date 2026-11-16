@@ -1,20 +1,13 @@
 # Talker — Program Specification
-**Version:** 2.5.7
+**Version:** 2.5.8
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-14) — fixes from the November code review:
+Revision note (2026-11-15) — button names in lower case:
 
-- **§3.1 CLI** — the CLI checks every message against its channel's
-  interface before opening anything, and keeps each channel's health in line
-  with its counter updates.
-- **§4.3 (ADR-068)** — a failed live settings change never leaves a serial
-  port or UDP socket half-changed.
-- **§5.8** — with every send sampled, none is skipped to give other messages a
-  turn.
-- **§9.2 (ADR-061)** — the CLI's exit waits at most 2 s for the log file and
-  warns when its last lines may be missing.
-- **§8.1** — a send loop ends when its owner is gone, even when it never waits.
+- **§3.2, §4.2** — the buttons read Start channel, Retry
+  channel and Stop channel. On screen, "channel" is lower case unless it
+  begins a sentence or is part of a channel's name.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -443,7 +436,7 @@ The **detail pane** (right) shows the selected channel:
   button's action, a keyboard shortcut, a path) stays one plain line. A
   separator never reuses `/`, which on these screens means "per".
 - **Lifecycle buttons** — the labeled pair (shared with listener):
-  [Start Channel / Apply & Restart / Retry Channel] + [Stop Channel]; the Start
+  [Start channel / Apply & Restart / Retry channel] + [Stop channel]; the Start
   side's label and enabled state derive from run state, drift, and draft
   validity (a disabled Start's tooltip lists the exact blockers).
 - **Last completed run** — one collapsed process-local summary retained for the
@@ -534,7 +527,7 @@ run resumes without user action. On Windows, an operation-aborted result still
 replaces the handle even when the operating system categorizes it as a timeout.
 
 Automatic replacement begins only after the run opened successfully. An initial
-open failure still ends that run; the GUI uses its existing **Retry Channel**
+open failure still ends that run; the GUI uses its existing **Retry channel**
 action, while CLI mode must start a new run. Recovery does not search for a
 renamed port: if the replacement appears under a different name, the configured
 port must be changed. A failed write may have transferred a prefix before the

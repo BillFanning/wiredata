@@ -17,7 +17,7 @@ pub(super) use status::{
 pub(super) use wiredata_ui::format::human_bytes;
 
 use crate::config::{
-    templates, ChannelConfig, DataBits, FlowControl, InterfaceConfig, Parity, StopBits,
+    templates, ChannelConfig, DataBits, FlowControl, InterfaceConfig, Parity, StopBits, UdpConfig,
 };
 use crate::core::ChannelId;
 use crate::transport::udp::UdpMode;
@@ -136,32 +136,32 @@ pub(super) const MSG_FONT_SIZES: &[f32] = &[
 /// Serial option tables (value, label) for the radio rows (§74).
 /// Widest first: 8 is the overwhelmingly common setting, so it sits leftmost
 /// where the eye lands, matching talker's row.
-const DATA_BITS: &[(DataBits, &str)] = &[
+pub(super) const DATA_BITS: &[(DataBits, &str)] = &[
     (DataBits::Eight, "8"),
     (DataBits::Seven, "7"),
     (DataBits::Six, "6"),
     (DataBits::Five, "5"),
 ];
-const PARITY: &[(Parity, &str)] = &[
+pub(super) const PARITY: &[(Parity, &str)] = &[
     (Parity::None, "None"),
     (Parity::Even, "Even"),
     (Parity::Odd, "Odd"),
     (Parity::Mark, "Mark"),
     (Parity::Space, "Space"),
 ];
-const STOP_BITS: &[(StopBits, &str)] = &[
+pub(super) const STOP_BITS: &[(StopBits, &str)] = &[
     (StopBits::One, "1"),
     (StopBits::OnePointFive, "1.5"),
     (StopBits::Two, "2"),
 ];
 /// Flow control: None first, RTS/CTS last (§74).
-const FLOW_CONTROL: &[(FlowControl, &str)] = &[
+pub(super) const FLOW_CONTROL: &[(FlowControl, &str)] = &[
     (FlowControl::None, "None"),
     (FlowControl::XonXoff, "Xon/Xoff"),
     (FlowControl::RtsCts, "RTS/CTS"),
 ];
 /// Common serial baud rates for the baud radio row (§14.4).
-const BAUD_RATES: &[u32] = &[4800, 9600, 19200, 38400, 57600, 115200, 230400];
+pub(super) const BAUD_RATES: &[u32] = &[4800, 9600, 19200, 38400, 57600, 115200, 230400];
 
 /// One labelled row of radios inside the serial grid, bound to an enum value
 /// with a fixed option table.
@@ -315,108 +315,10 @@ pub(super) fn edit_interface(
                 .num_columns(2)
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
-                    ui.label("Mode")
-                        .on_hover_text("How this UDP socket receives datagrams.");
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut udp.mode, UdpMode::Broadcast, "Broadcast")
-                            .on_hover(&BROADCAST_HOVER);
-                        ui.radio_value(&mut udp.mode, UdpMode::Unicast, "Unicast")
-                            .on_hover(&UNICAST_HOVER);
-                        ui.radio_value(&mut udp.mode, UdpMode::Multicast, "Multicast")
-                            .on_hover(&MULTICAST_HOVER);
-                    });
-                    ui.end_row();
-
-                    // Binding address + port — always directly under Mode, so it
-                    // never moves when switching modes (#2, #3). The multicast Group
-                    // row appears *below* it.
-                    // The bind-address tip is mode-aware: All interfaces is the right
-                    // default in every mode (accept on any local interface), but *why*
-                    // differs.
-                    let bind_hint = match udp.mode {
-                        UdpMode::Broadcast => BROADCAST_BIND_HOVER,
-                        UdpMode::Unicast => UNICAST_BIND_HOVER,
-                        UdpMode::Multicast => MULTICAST_BIND_HOVER,
-                    };
-                    ui.label("Binding address").on_hover(&bind_hint);
-                    ui.horizontal(|ui| {
-                        // The choices say who can reach the socket (§15, ADR-047).
-                        // If the OS cannot list its addresses, the address is typed.
-                        if let LocalAddresses::Failed(why) = local_addresses {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut udp.bind_address)
-                                    .id_salt("udp_bind")
-                                    .desired_width(130.0)
-                                    .hint_text(ALL_INTERFACES_ADDRESS),
-                            )
-                            .on_hover(
-                                &bind_hint.clone().with_paragraph(&format!(
-                                    "This computer's addresses could not be listed, so type \
-                                 the address instead. The system reported: {why}"
-                                )),
-                            );
-                        } else {
-                            let listed = local_addresses.listed();
-                            let combo = egui::ComboBox::from_id_salt("udp_bind")
-                                .selected_text(bind_choice_label(&udp.bind_address, listed))
-                                .width(280.0)
-                                .show_ui(ui, |ui| {
-                                    for (address, label) in bind_choices(&udp.bind_address, listed)
-                                    {
-                                        ui.selectable_value(&mut udp.bind_address, address, label);
-                                    }
-                                });
-                            // Listed again as the choice opens, as the serial
-                            // port list is: an adapter may have come or gone.
-                            if combo.response.on_hover(&bind_hint).clicked() {
-                                refresh = Some(Refresh::LocalAddresses);
-                            }
-                        }
-                        if ui
-                            .small_button("\u{2B6E}")
-                            .on_hover_text("Refresh this computer's addresses")
-                            .clicked()
-                        {
-                            refresh = Some(Refresh::LocalAddresses);
-                        }
-                        ui.label("port").on_hover_text(
-                            "The UDP port to listen on — i.e. the destination port the \
-                             sending machine sends to.",
-                        );
-                        port_field(ui, "udp_port", &mut udp.port);
-                    });
-                    ui.end_row();
-
-                    if udp.mode == UdpMode::Multicast {
-                        ui.label("Group").on_hover(&GROUP_HINT);
-                        let mut group = udp.multicast_group.clone().unwrap_or_default();
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut group)
-                                    .id_salt("udp_group")
-                                    .desired_width(130.0)
-                                    .hint_text("239.0.0.1"),
-                            )
-                            .on_hover(&GROUP_HINT)
-                            .changed()
-                        {
-                            let g = group.trim();
-                            udp.multicast_group = (!g.is_empty()).then(|| g.to_string());
-                        }
-                        ui.end_row();
-                    }
-
-                    // Not offered for unicast (§15, ADR-047), so switching to it
-                    // clears the request rather than leaving a profile that fails
-                    // validation.
-                    if udp.mode == UdpMode::Unicast {
-                        udp.shared_port = false;
-                    } else {
-                        ui.label("Port sharing").on_hover(&SHARED_HINT);
-                        ui.checkbox(&mut udp.shared_port, "Request shared port")
-                            .on_hover(&SHARED_HINT);
-                        ui.end_row();
-                    }
+                    udp_mode_row(ui, udp);
+                    udp_bind_row(ui, udp, local_addresses, &mut refresh, true);
+                    udp_group_row(ui, udp);
+                    udp_shared_row(ui, udp);
 
                     ui.label("Arrival timing").on_hover_text(
                         "Choose who takes the arrival time of each UDP datagram: Listener \
@@ -541,6 +443,125 @@ pub(super) fn edit_interface(
     ui.separator();
     edit_reconnect(ui, &mut config.reconnect);
     refresh
+}
+
+/// The UDP "Mode" row of a two-column grid: Broadcast, Unicast or Multicast.
+pub(super) fn udp_mode_row(ui: &mut egui::Ui, udp: &mut UdpConfig) {
+    ui.label("Mode")
+        .on_hover_text("How this UDP socket receives datagrams.");
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut udp.mode, UdpMode::Broadcast, "Broadcast")
+            .on_hover(&BROADCAST_HOVER);
+        ui.radio_value(&mut udp.mode, UdpMode::Unicast, "Unicast")
+            .on_hover(&UNICAST_HOVER);
+        ui.radio_value(&mut udp.mode, UdpMode::Multicast, "Multicast")
+            .on_hover(&MULTICAST_HOVER);
+    });
+    ui.end_row();
+}
+
+/// The UDP "Binding address" row of a two-column grid, with the port field
+/// after it when `with_port` is set. Always directly under Mode, so it never
+/// moves when switching modes. Sets `refresh` when the address list should be
+/// listed again.
+pub(super) fn udp_bind_row(
+    ui: &mut egui::Ui,
+    udp: &mut UdpConfig,
+    local_addresses: &LocalAddresses,
+    refresh: &mut Option<Refresh>,
+    with_port: bool,
+) {
+    // The bind-address tip is mode-aware: All interfaces is the right default
+    // in every mode (accept on any local interface), but *why* differs.
+    let bind_hint = match udp.mode {
+        UdpMode::Broadcast => BROADCAST_BIND_HOVER,
+        UdpMode::Unicast => UNICAST_BIND_HOVER,
+        UdpMode::Multicast => MULTICAST_BIND_HOVER,
+    };
+    ui.label("Binding address").on_hover(&bind_hint);
+    ui.horizontal(|ui| {
+        // The choices say who can reach the socket (§15, ADR-047). If the OS
+        // cannot list its addresses, the address is typed.
+        if let LocalAddresses::Failed(why) = local_addresses {
+            ui.add(
+                egui::TextEdit::singleline(&mut udp.bind_address)
+                    .id_salt("udp_bind")
+                    .desired_width(130.0)
+                    .hint_text(ALL_INTERFACES_ADDRESS),
+            )
+            .on_hover(&bind_hint.clone().with_paragraph(&format!(
+                "This computer's addresses could not be listed, so type \
+                 the address instead. The system reported: {why}"
+            )));
+        } else {
+            let listed = local_addresses.listed();
+            let combo = egui::ComboBox::from_id_salt("udp_bind")
+                .selected_text(bind_choice_label(&udp.bind_address, listed))
+                .width(280.0)
+                .show_ui(ui, |ui| {
+                    for (address, label) in bind_choices(&udp.bind_address, listed) {
+                        ui.selectable_value(&mut udp.bind_address, address, label);
+                    }
+                });
+            // Listed again as the choice opens, as the serial port list is: an
+            // adapter may have come or gone.
+            if combo.response.on_hover(&bind_hint).clicked() {
+                *refresh = Some(Refresh::LocalAddresses);
+            }
+        }
+        if ui
+            .small_button("\u{2B6E}")
+            .on_hover_text("Refresh this computer's addresses")
+            .clicked()
+        {
+            *refresh = Some(Refresh::LocalAddresses);
+        }
+        if with_port {
+            ui.label("port").on_hover_text(
+                "The UDP port to listen on \u{2014} i.e. the destination port the \
+                 sending machine sends to.",
+            );
+            port_field(ui, "udp_port", &mut udp.port);
+        }
+    });
+    ui.end_row();
+}
+
+/// The multicast "Group" row of a two-column grid; nothing for other modes.
+pub(super) fn udp_group_row(ui: &mut egui::Ui, udp: &mut UdpConfig) {
+    if udp.mode != UdpMode::Multicast {
+        return;
+    }
+    ui.label("Group").on_hover(&GROUP_HINT);
+    let mut group = udp.multicast_group.clone().unwrap_or_default();
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut group)
+                .id_salt("udp_group")
+                .desired_width(130.0)
+                .hint_text("239.0.0.1"),
+        )
+        .on_hover(&GROUP_HINT)
+        .changed()
+    {
+        let g = group.trim();
+        udp.multicast_group = (!g.is_empty()).then(|| g.to_string());
+    }
+    ui.end_row();
+}
+
+/// The "Port sharing" row of a two-column grid. Not offered for unicast (§15,
+/// ADR-047), so switching to it clears the request rather than leaving a
+/// profile that fails validation.
+pub(super) fn udp_shared_row(ui: &mut egui::Ui, udp: &mut UdpConfig) {
+    if udp.mode == UdpMode::Unicast {
+        udp.shared_port = false;
+        return;
+    }
+    ui.label("Port sharing").on_hover(&SHARED_HINT);
+    ui.checkbox(&mut udp.shared_port, "Request shared port")
+        .on_hover(&SHARED_HINT);
+    ui.end_row();
 }
 
 /// The "Reconnect automatically" choice (§9.1, ADR-045), with what it does in
@@ -685,12 +706,12 @@ mod tests {
         // Stopped → plain Start, enabled.
         assert_eq!(
             start_button(ChannelStatus::Stopped, false),
-            ("Start Channel", true)
+            ("Start channel", true)
         );
         // Running with no edits → disabled (nothing to apply).
         assert_eq!(
             start_button(ChannelStatus::Running, false),
-            ("Start Channel", false)
+            ("Start channel", false)
         );
         // Running with pending edits → Apply & Restart, enabled.
         assert_eq!(
@@ -700,16 +721,16 @@ mod tests {
         // Faulted → Retry, enabled (config_changed irrelevant).
         assert_eq!(
             start_button(ChannelStatus::Faulted, false),
-            ("Retry Channel", true)
+            ("Retry channel", true)
         );
         assert_eq!(
             start_button(ChannelStatus::Faulted, true),
-            ("Retry Channel", true)
+            ("Retry channel", true)
         );
         // Reconnecting → disabled: a Start would be an illegal Reconnecting→Starting.
         assert_eq!(
             start_button(ChannelStatus::Reconnecting, false),
-            ("Start Channel", false)
+            ("Start channel", false)
         );
     }
 

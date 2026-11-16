@@ -619,7 +619,7 @@ pub enum OrchestratorError {
     SerialControlUnavailable(ChannelId),
     /// A command's bounded queue stayed full (see `COMMAND_HANDOFF_WAIT`), so the
     /// Channel's task is not reading it.
-    #[error("The Channel did not take the command in time. The command was not sent, and it can be tried again.")]
+    #[error("The channel did not take the command in time. The command was not sent, and it can be tried again.")]
     NotTakenInTime(ChannelId),
     /// A setting outside its limit (ADR-048): the Channel is not built.
     #[error(transparent)]

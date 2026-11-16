@@ -12,12 +12,15 @@ again. Remove an item when it is done: the commit says what changed.
 
 ## Features
 
-- [ ] **Linemon (§50.3, ADR-070).** Not built. The window, its serial and UDP
-  bar with changes that take effect at once, the display that keeps its data
-  across restarts with a marker line at each change, Clear and Clear on port
-  change, Pause, Copy, the remembered state, and naming the Channel that holds
-  a port. It needs a hidden Channel in the runtime and a second live stream
-  beside the selected Channel's in `gui/bridge.rs`.
+- [ ] **Check Linemon's serial bar by hand (§50.3).** Its UDP side was checked
+  by hand; the serial side waits for a USB serial adapter. Open a port; change
+  the baud and the other settings while started; type a custom baud; Previous
+  and Next wrap at the ends of the list; the refresh button lists a port
+  plugged in or removed; unplugging the adapter shows the fault and Start
+  reopens it.
+- [ ] **Linemon's buttons stay on their rows (§50.3).** In `Linemon::draw` the
+  button row wraps, so buttons move from row to row as the window is resized.
+  Give the buttons fixed rows, so each stays where the hand expects it.
 - [ ] **Disk guard in the GUI (§56.2).** Neither recording editor,
   `edit_raw_recording` nor `edit_display_recording`, sets `disk_guard`, so a
   guard comes only from a profile.

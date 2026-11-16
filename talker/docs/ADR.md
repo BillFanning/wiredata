@@ -1,17 +1,12 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.30
-**Date:** 2026-11-14
+**Version:** 1.31
+**Date:** 2026-11-15
 **Status:** Accepted
 
-Revision note (2026-11-14) — fixes from the November code review:
+Revision note (2026-11-15) — button names in lower case:
 
-- **ADR-068** — a settings change on a live serial port or UDP socket never
-  leaves it half-changed.
-- **ADR-061** — stopping the log file at exit is bounded, and a log that may be
-  missing its last lines is reported.
-
-Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
+- **ADR-060** — quotes the button as it now reads, Retry channel.
 
 ---
 
@@ -2188,7 +2183,7 @@ logging every open attempt or reporting recovery before a write has proved the
 new handle usable.
 
 **Boundary:** This is recovery for a run that opened successfully. An initial
-open failure still ends the run; the GUI uses **Retry Channel**, and CLI mode
+open failure still ends the run; the GUI uses **Retry channel**, and CLI mode
 must start another run. Automatic recovery reopens only the configured port name
 and does not search for a replacement that enumerated elsewhere. Backoff grows
 from 250 ms to five seconds, but an open is attempted only at the next due send

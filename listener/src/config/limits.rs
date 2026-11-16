@@ -50,7 +50,7 @@ pub enum LimitError {
         "match rule \"{rule}\" has a {found}-byte pattern; the limit is {MAX_MATCH_PATTERN_BYTES} bytes"
     )]
     MatchPattern { rule: String, found: usize },
-    #[error("{found} match rules; the limit is {MAX_MATCH_RULES} per Channel")]
+    #[error("{found} match rules; the limit is {MAX_MATCH_RULES} per channel")]
     MatchRules { found: usize },
     #[error("match rule \"{rule}\" has {found} actions; the limit is {MAX_MATCH_ACTIONS}")]
     MatchActions { rule: String, found: usize },

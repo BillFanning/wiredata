@@ -12,6 +12,8 @@ pub mod bind_scope;
 pub mod bridge;
 mod channels;
 mod detail;
+mod linemon;
+mod linemon_window;
 
 pub mod state;
 mod view_prefs;
@@ -213,6 +215,8 @@ struct ListenerApp {
     /// lasting top banner: unattended logging that silently stopped saving
     /// its log would leave nothing to diagnose later.
     event_log: crate::diagnostics::EventLogStatus,
+    /// Linemon's window and display (spec §50.3).
+    linemon: linemon_window::Linemon,
 }
 
 /// How long the dropped-command banner stays up if not dismissed.
@@ -317,6 +321,11 @@ impl ListenerApp {
             .and_then(|s| s.get_string(RESUME_PROFILE_KEY))
             .filter(|path| !path.is_empty())
             .map(std::path::PathBuf::from);
+        let linemon = linemon_window::Linemon::new(
+            storage
+                .and_then(|s| s.get_string(linemon_window::LINEMON_KEY))
+                .as_deref(),
+        );
         let mut app = Self {
             bridge,
             repaint,
@@ -341,6 +350,7 @@ impl ListenerApp {
             recent_profiles,
             command_drop: None,
             event_log,
+            linemon,
         };
         // Resume on launch (ADR-045): the driver checks the registered profile,
         // opening nothing; the countdown follows only if the check passes.
@@ -360,6 +370,16 @@ impl ListenerApp {
         self.recent_profiles.truncate(MAX_RECENT_PROFILES);
     }
 
+    /// Draw Linemon's window while it is open and send what it asks of the
+    /// runtime.
+    fn show_linemon(&mut self, ctx: &egui::Context) {
+        let mut commands = Vec::new();
+        self.linemon.show(ctx, &self.state, &mut commands);
+        for command in commands {
+            self.send(command);
+        }
+    }
+
     pub(super) fn refresh_serial_ports(&mut self) {
         self.serial_ports = list_serial_ports();
     }
@@ -375,6 +395,14 @@ impl ListenerApp {
     /// added channel takes focus; a removed one that was selected clears it.
     fn drain_updates(&mut self) {
         while let Ok(update) = self.bridge.updates.try_recv() {
+            // Linemon's hidden Channel is not in the main model.
+            let update = match update {
+                bridge::UiUpdate::Linemon(update) => {
+                    self.linemon.handle(update);
+                    continue;
+                }
+                other => other,
+            };
             match &update {
                 bridge::UiUpdate::ChannelAdded(id, ..) => self.selected = Some(*id),
                 // When the selected channel goes away, fall back to the one above it
@@ -621,6 +649,12 @@ impl ListenerApp {
             self.complain_unconfigured(id);
             return None;
         }
+        // Linemon's port is checked here, before anything opens, so the
+        // Channel names Linemon as Linemon names a Channel that has its port.
+        if let Some(reason) = self.linemon.refuse_channel(&config.interface) {
+            self.state.apply(bridge::UiUpdate::ChannelError(id, reason));
+            return None;
+        }
         Some(config)
     }
 
@@ -713,6 +747,7 @@ impl eframe::App for ListenerApp {
             .and_then(std::path::Path::to_str)
             .unwrap_or_default();
         storage.set_string(RESUME_PROFILE_KEY, resume.to_owned());
+        storage.set_string(linemon_window::LINEMON_KEY, self.linemon.to_stored());
     }
 
     /// On window close (the X button) or any app exit, shut the driver down and wait
@@ -723,12 +758,23 @@ impl eframe::App for ListenerApp {
         self.bridge.shutdown_and_join();
     }
 
-    // This workspace's eframe surfaces a `Ui` directly (App::ui), like talker's GUI.
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// What has to happen every frame, whether or not the main window is
+    /// visible: eframe calls this before each [`ui`](Self::ui), and also while
+    /// the window is minimized or hidden, when `ui` is not called at all.
+    ///
+    /// Updates are folded here so that they keep arriving while the main window
+    /// is minimized, and Linemon's window is shown here so that it stays up
+    /// then: a window not shown during a frame is taken down.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Re-arm the coalescer BEFORE draining, so a push arriving mid-drain
         // either lands in this frame's batch or triggers a fresh wake.
         self.repaint.frame_started();
         self.drain_updates();
+        self.show_linemon(ctx);
+    }
+
+    // This workspace's eframe surfaces a `Ui` directly (App::ui), like talker's GUI.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_tab_keys(ui.ctx());
         self.show_command_drop_banner(ui);
         self.show_resume_banner(ui);

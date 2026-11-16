@@ -9,20 +9,20 @@ use wiredata_ui::palette::Palette;
 /// The Start/Apply/Retry button's label and enabled state, from the channel status
 /// and whether the edit draft has pending changes (§8.5). Pure decision, unit-tested;
 /// the detail pane just renders the result and dispatches on click:
-/// - Stopped → "Start Channel", enabled (Stopped→Starting is legal)
+/// - Stopped → "Start channel", enabled (Stopped→Starting is legal)
 /// - Running + pending edits → "Apply & Restart", enabled (a coordinated restart)
-/// - Running + no edits → "Start Channel", **disabled** (nothing to do)
-/// - Faulted → "Retry Channel", enabled — one `CommitAndStart`; the runtime
+/// - Running + no edits → "Start channel", **disabled** (nothing to do)
+/// - Faulted → "Retry channel", enabled — one `CommitAndStart`; the runtime
 ///   normalizes Faulted→Stopped before starting (§8.5), no client-side Stop step
-/// - Reconnecting → "Start Channel", **disabled** — Stop is the only valid action
+/// - Reconnecting → "Start channel", **disabled** — Stop is the only valid action
 ///   mid-reconnect.
 pub(crate) fn start_button(status: ChannelStatus, config_changed: bool) -> (&'static str, bool) {
     match status {
-        ChannelStatus::Stopped => ("Start Channel", true),
+        ChannelStatus::Stopped => ("Start channel", true),
         ChannelStatus::Running if config_changed => ("Apply & Restart", true),
-        ChannelStatus::Running => ("Start Channel", false),
-        ChannelStatus::Faulted => ("Retry Channel", true),
-        ChannelStatus::Reconnecting => ("Start Channel", false),
+        ChannelStatus::Running => ("Start channel", false),
+        ChannelStatus::Faulted => ("Retry channel", true),
+        ChannelStatus::Reconnecting => ("Start channel", false),
     }
 }
 

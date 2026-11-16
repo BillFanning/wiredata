@@ -43,7 +43,7 @@ pub struct StreamMark {
 
 /// Safety cap on retained marks per channel, alongside the byte-window trim —
 /// bounds memory if a dense rule marks nearly every byte of a large window.
-const MAX_STREAM_MARKS: usize = 4096;
+pub(super) const MAX_STREAM_MARKS: usize = 4096;
 
 /// A Channel's lifecycle as the GUI understands it. Events are the *advisory*
 /// push surface (a wake-up); the folded state is reconciled against the polled
@@ -484,6 +484,9 @@ impl AppState {
     /// Fold one update into the model.
     pub fn apply(&mut self, update: UiUpdate) {
         match update {
+            // Linemon's hidden Channel is not in this model (§50.3); its
+            // window folds these itself.
+            UiUpdate::Linemon(_) => {}
             UiUpdate::ChannelAdded(id, name, details, config) => {
                 if !self.views.contains_key(&id) {
                     self.order.push(id);

@@ -154,6 +154,11 @@ pub enum UiCommand {
     /// emitting the usual `ChannelRemoved` updates so the UI folds the change.
     /// The teardown half of `LoadProfile` with nothing loaded after it.
     NewProfile,
+    /// Open Linemon's hidden Channel with this config, or re-open it with a new
+    /// one (spec §50.3). The newest config wins.
+    LinemonOpen(Box<ChannelConfig>),
+    /// Close Linemon's port. The hidden Channel stops; nothing else is touched.
+    LinemonClose,
     /// Stop all channels and end the driver (the App is closing).
     Shutdown,
 }
@@ -209,6 +214,20 @@ pub enum UiUpdate {
     Resumed(String, std::time::SystemTime),
     /// The host's local addresses, or why the OS could not list them (§15).
     LocalAddresses(Result<Vec<LocalAddress>, String>),
+    /// Something about Linemon's hidden Channel (spec §50.3).
+    Linemon(LinemonUpdate),
+}
+
+/// An update about Linemon's hidden Channel. It never appears as an ordinary
+/// Channel update, so the main window's model never sees it.
+#[derive(Debug)]
+pub enum LinemonUpdate {
+    /// New bytes of the stream (the same incremental delta a Channel's view gets).
+    Stream(Box<StreamDelta>),
+    /// The hidden Channel's snapshot: its state, totals and diagnostics.
+    Snapshot(Box<ChannelSnapshot>),
+    /// Opening or re-opening failed; the reason, as a sentence for the window.
+    Error(String),
 }
 
 impl UiUpdate {
@@ -232,6 +251,7 @@ impl UiUpdate {
             | Self::Stats(..)
             | Self::ControlLines(..)
             | Self::StreamDelta(..)
+            | Self::Linemon(LinemonUpdate::Stream(_) | LinemonUpdate::Snapshot(_))
             | Self::Event(_) => true,
             Self::ChannelAdded(..)
             | Self::ChannelReconfigured(..)
@@ -243,7 +263,8 @@ impl UiUpdate {
             | Self::ProfileError(_)
             | Self::ResumeChecked(..)
             | Self::Resumed(..)
-            | Self::LocalAddresses(_) => false,
+            | Self::LocalAddresses(_)
+            | Self::Linemon(LinemonUpdate::Error(_)) => false,
         }
     }
 }
@@ -477,6 +498,64 @@ enum Step {
     Reconnected(Box<ReconnectAttempt>),
 }
 
+/// What Linemon's window last asked of its hidden Channel (spec §50.3).
+enum LinemonRequest {
+    /// Run on this config.
+    Open(Box<ChannelConfig>),
+    /// Stop.
+    Close,
+}
+
+/// Linemon's hidden Channel. It is registered with the runtime but never in
+/// the driver's `channels`, so nothing that walks the user's Channels reaches
+/// it, and everything about it goes out as [`UiUpdate::Linemon`].
+struct LinemonChannel {
+    id: ChannelId,
+    /// The window wants the port open. Polling and error reports follow it.
+    open: bool,
+    /// The newest request that arrived while a step of the hidden Channel was
+    /// in flight. It replaces any older one and runs when the Channel's steps
+    /// are done, so a burst of changes ends on the last without queueing the
+    /// ones between.
+    waiting: Option<LinemonRequest>,
+    /// Where the window's stream is up to.
+    cursor: StreamPollCursor,
+}
+
+/// The name the hidden Channel has in the runtime. The runtime does not check
+/// names for uniqueness, so a user Channel of the same name cannot collide.
+const LINEMON_CHANNEL_NAME: &str = "Linemon";
+
+/// `config` as Linemon's hidden Channel runs it: named for Linemon, and with
+/// no recording, since Linemon is never a recording (spec §50.3).
+fn linemon_config(mut config: ChannelConfig) -> ChannelConfig {
+    config.name = ChannelName::new(LINEMON_CHANNEL_NAME);
+    config.raw_recording.enabled = false;
+    config.display_recording.enabled = false;
+    config
+}
+
+/// The Channel a runtime event is about.
+fn event_channel(event: &RuntimeEvent) -> ChannelId {
+    match event {
+        RuntimeEvent::ChannelStarted(id)
+        | RuntimeEvent::ChannelStopped(id)
+        | RuntimeEvent::ChannelFaulted(id)
+        | RuntimeEvent::RecordingFaulted(id, _)
+        | RuntimeEvent::RecordingStarted(id, _)
+        | RuntimeEvent::WarningRaised(id)
+        | RuntimeEvent::ReceptionStalled(id, _)
+        | RuntimeEvent::ReceptionResumed(id, _)
+        | RuntimeEvent::ControlLinesChanged(id)
+        | RuntimeEvent::ChannelReconnecting(id, _)
+        | RuntimeEvent::ChannelReconnected(id)
+        | RuntimeEvent::ChannelReconnectGaveUp(id)
+        | RuntimeEvent::DiskSpaceLow(id)
+        | RuntimeEvent::RecordingStoppedLowDisk(id)
+        | RuntimeEvent::MatchTriggered(id, _) => *id,
+    }
+}
+
 /// A Channel's queued steps, and how its last step off the loop went.
 #[derive(Default)]
 struct ChannelSteps {
@@ -685,6 +764,8 @@ pub struct Driver {
     profile_running: bool,
     /// Where the next status poll round starts.
     poll_rotation: PollRotation,
+    /// Linemon's hidden Channel, once the window has opened it.
+    linemon: Option<LinemonChannel>,
     /// Held by the profile file work before it touches a file (tests only).
     #[cfg(test)]
     file_hook: FileHook,
@@ -717,6 +798,7 @@ impl Driver {
             profile_work: VecDeque::new(),
             profile_running: false,
             poll_rotation: PollRotation::default(),
+            linemon: None,
             #[cfg(test)]
             file_hook: None,
         }
@@ -799,6 +881,7 @@ impl Driver {
     async fn pump(&mut self) {
         self.start_profile_work();
         loop {
+            self.dispatch_linemon_waiting();
             let ready: Vec<ChannelId> = self
                 .steps
                 .iter()
@@ -812,13 +895,108 @@ impl Driver {
             }
             self.steps
                 .retain(|_, steps| steps.running || !steps.queue.is_empty());
-            if !self.steps.is_empty() {
+            if self.linemon_ready() {
+                continue;
+            }
+            // Linemon's hidden Channel is not part of the workspace, so its
+            // steps do not hold a workspace change back.
+            if self.steps.keys().any(|id| !self.is_linemon(*id)) {
                 break;
             }
             match self.workspace.pop_front() {
                 Some(change) => self.run_workspace(change),
                 None => break,
             }
+        }
+    }
+
+    /// The interface of the port Linemon has open or is opening: its window
+    /// wants it open, no newer request waits, and its hidden Channel is
+    /// running or starting.
+    fn linemon_port(&self) -> Option<InterfaceConfig> {
+        let linemon = self.linemon.as_ref()?;
+        if !linemon.open || linemon.waiting.is_some() {
+            return None;
+        }
+        let live = matches!(
+            self.listener.state(linemon.id),
+            Some(ChannelState::Running | ChannelState::Starting)
+        );
+        if !live {
+            return None;
+        }
+        self.listener
+            .config(linemon.id)
+            .map(|config| config.interface.clone())
+    }
+
+    fn is_linemon(&self, id: ChannelId) -> bool {
+        self.linemon
+            .as_ref()
+            .is_some_and(|linemon| linemon.id == id)
+    }
+
+    /// Whether a request is waiting for Linemon's hidden Channel and the
+    /// Channel has no steps left to wait for.
+    fn linemon_ready(&self) -> bool {
+        self.linemon.as_ref().is_some_and(|linemon| {
+            linemon.waiting.is_some() && !self.steps.contains_key(&linemon.id)
+        })
+    }
+
+    /// Queue the steps of the request waiting for Linemon's hidden Channel,
+    /// once it is free.
+    fn dispatch_linemon_waiting(&mut self) {
+        if !self.linemon_ready() {
+            return;
+        }
+        let Some(linemon) = self.linemon.as_mut() else {
+            return;
+        };
+        let id = linemon.id;
+        if let Some(request) = linemon.waiting.take() {
+            self.queue_linemon(id, request);
+        }
+    }
+
+    /// Queue the steps that carry out one Linemon request: the same stop,
+    /// commit and start "Apply & Restart" runs (§13).
+    fn queue_linemon(&mut self, id: ChannelId, request: LinemonRequest) {
+        let steps = match request {
+            LinemonRequest::Open(config) => Self::commit_steps(Some(config), true),
+            LinemonRequest::Close => vec![Step::StopIfLive],
+        };
+        self.queue(id, steps);
+    }
+
+    /// Take a request from Linemon's window. The hidden Channel is registered on
+    /// the first open and reused after. A request that arrives while a step of
+    /// the Channel is in flight waits as the one newest request.
+    fn linemon_request(&mut self, request: LinemonRequest) {
+        let id = match (&self.linemon, &request) {
+            (Some(linemon), _) => linemon.id,
+            (None, LinemonRequest::Open(config)) => {
+                let id = self.listener.add_channel((**config).clone());
+                self.linemon = Some(LinemonChannel {
+                    id,
+                    open: false,
+                    waiting: None,
+                    cursor: StreamPollCursor::default(),
+                });
+                id
+            }
+            (None, LinemonRequest::Close) => return,
+        };
+        let busy = self.steps.contains_key(&id);
+        let Some(linemon) = self.linemon.as_mut() else {
+            return;
+        };
+        linemon.open = matches!(request, LinemonRequest::Open(_));
+        if busy {
+            linemon.waiting = Some(request);
+        } else {
+            linemon.waiting = None;
+            self.queue_linemon(id, request);
         }
     }
 
@@ -860,6 +1038,8 @@ impl Driver {
             Step::Commit(config) => {
                 let details = describe_interface(&config);
                 match self.listener.commit_config(id, (*config).clone()) {
+                    // The window knows what it asked for.
+                    Ok(()) if self.is_linemon(id) => {}
                     Ok(()) => {
                         self.push(UiUpdate::ChannelReconfigured(id, details, config));
                     }
@@ -1017,12 +1197,32 @@ impl Driver {
 
     /// Queue the reconnect attempts now due (§9.1): each a stop and a start,
     /// off the loop like any other (ADR-052). A Channel mid-step waits.
+    ///
+    /// An attempt on the port Linemon has does not run: it counts as a failed
+    /// attempt, so the backoff and the attempt limit carry on, and the
+    /// Channel's error names Linemon, as a Start in the main window does.
     fn queue_reconnects(&mut self) {
+        // Linemon's hidden Channel is never reconnected: the window opens it
+        // again when it wants it.
+        let linemon = self.linemon.as_ref().map(|linemon| linemon.id);
+        let linemon_port = self.linemon_port();
         let attempts = self
             .listener
-            .reconnects_due(std::time::Instant::now(), |id| self.steps.contains_key(&id));
+            .reconnects_due(std::time::Instant::now(), |id| {
+                self.steps.contains_key(&id) || Some(id) == linemon
+            });
         for attempt in attempts {
             let id = attempt.id();
+            let refusal = linemon_port.as_ref().and_then(|held| {
+                let wanted = &self.listener.config(id)?.interface;
+                super::linemon_window::reconnect_refusal(held, wanted)
+            });
+            if let Some(reason) = refusal {
+                self.listener
+                    .finish_reconnect(attempt, false, std::time::Instant::now());
+                self.push_channel_error(id, reason);
+                continue;
+            }
             self.queue(
                 id,
                 [
@@ -1085,6 +1285,18 @@ impl Driver {
         // generation remains the fallback when the runtime event itself is dropped.
         if let RuntimeEvent::ChannelStarted(id) | RuntimeEvent::ChannelReconnected(id) = ev {
             self.stream_cursors.remove(&id);
+        }
+        // Linemon's hidden Channel is not a Channel to the main window: its
+        // state reaches Linemon through the snapshot.
+        let about = event_channel(&ev);
+        if let Some(linemon) = self.linemon.as_mut().filter(|l| l.id == about) {
+            if matches!(
+                ev,
+                RuntimeEvent::ChannelStarted(_) | RuntimeEvent::ChannelReconnected(_)
+            ) {
+                linemon.cursor = StreamPollCursor::default();
+            }
+            return;
         }
         self.push(UiUpdate::Event(ev));
     }
@@ -1223,6 +1435,10 @@ impl Driver {
                 self.push(UiUpdate::LocalAddresses(local_addresses()));
             }
             UiCommand::NewProfile => self.new_profile(),
+            UiCommand::LinemonOpen(config) => {
+                self.linemon_request(LinemonRequest::Open(Box::new(linemon_config(*config))));
+            }
+            UiCommand::LinemonClose => self.linemon_request(LinemonRequest::Close),
             UiCommand::Shutdown => return false,
         }
         true
@@ -1323,11 +1539,46 @@ impl Driver {
         let ids = self.channels.clone();
         let began = tokio::time::Instant::now();
         self.poll_rotation.begin(ids.len());
+        // Linemon's Channel goes first, so a round that runs out of time
+        // never starves it; the limit still ends the round after it.
+        self.poll_linemon().await;
         while let Some(id) = self
             .poll_rotation
             .next_in_round(&ids, began, POLL_ROUND_LIMIT)
         {
             self.poll_channel(id).await;
+        }
+    }
+
+    /// Linemon's share of a poll round: a snapshot and the stream's new bytes,
+    /// with the cursor rules of [`poll_channel`](Self::poll_channel). Nothing is
+    /// sent once the window has closed the port, or while a newer request waits
+    /// for the Channel: what the Channel shows then is about to change.
+    async fn poll_linemon(&mut self) {
+        let Some(linemon) = self.linemon.as_ref() else {
+            return;
+        };
+        if !linemon.open || linemon.waiting.is_some() {
+            return;
+        }
+        let (id, cursor) = (linemon.id, linemon.cursor);
+        if let Some(snap) = self.listener.snapshot(id).await {
+            self.push(UiUpdate::Linemon(LinemonUpdate::Snapshot(Box::new(snap))));
+        }
+        if let Some(delta) = self.listener.stream_delta(id, cursor.offset).await {
+            let end = delta.end_offset;
+            let generation = delta.generation;
+            let needs_update = Some(generation) != cursor.generation || !delta.bytes.is_empty();
+            let advance = !needs_update
+                || self.push(UiUpdate::Linemon(LinemonUpdate::Stream(Box::new(delta))));
+            if advance {
+                if let Some(linemon) = self.linemon.as_mut() {
+                    linemon.cursor = StreamPollCursor {
+                        generation: Some(generation),
+                        offset: end,
+                    };
+                }
+            }
         }
     }
 
@@ -1399,6 +1650,14 @@ impl Driver {
     /// from talker's for the same failure, and from Listener's own
     /// `complain_unconfigured`, which never prefixed.
     fn push_channel_error(&self, id: ChannelId, error: impl std::fmt::Display) {
+        // Linemon's hidden Channel reports to its window, and only for the
+        // newest request: a failure of one already replaced is not news.
+        if let Some(linemon) = self.linemon.as_ref().filter(|l| l.id == id) {
+            if linemon.open && linemon.waiting.is_none() {
+                self.push(UiUpdate::Linemon(LinemonUpdate::Error(error.to_string())));
+            }
+            return;
+        }
         self.push(UiUpdate::ChannelError(id, error.to_string()));
     }
 }
@@ -2771,5 +3030,471 @@ mod tests {
             }
         }
         assert_eq!(echoed, vec![Some(4_096), Some(1_000)]);
+    }
+
+    // ---- Linemon's hidden Channel (spec §50.3) ----
+
+    fn udp_port_of(config: &ChannelConfig) -> u16 {
+        match &config.interface {
+            InterfaceConfig::Udp(udp) => udp.port,
+            InterfaceConfig::Serial(_) => unreachable!("these tests use UDP"),
+        }
+    }
+
+    /// A driver that is stepped by hand, not run, so a test can look between
+    /// steps. Every interface open takes `open_takes`.
+    fn stepped_driver(open_takes: Duration) -> Driver {
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        listener.delay_opens_for_test(open_takes);
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (upd_tx, _upd_rx) = update_lanes(256);
+        Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {}))
+    }
+
+    /// Land the step running off the loop, then run what that unblocks.
+    async fn land_one_step(driver: &mut Driver) {
+        let done = driver.done_rx.recv().await.expect("a step is running");
+        driver.on_done(done);
+        driver.pump().await;
+    }
+
+    async fn open_linemon(driver: &mut Driver, port: u16) {
+        driver
+            .handle(UiCommand::LinemonOpen(Box::new(udp_config(port))))
+            .await;
+        driver.pump().await;
+    }
+
+    /// A reconnect due on the port Linemon has does not run: no steps are
+    /// queued, the attempt counts as failed, and the Channel's error names
+    /// Linemon.
+    #[tokio::test]
+    async fn a_reconnect_on_linemons_port_does_not_run_and_names_linemon() {
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (upd_tx, mut upd_rx) = update_lanes(256);
+        let mut driver = Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {}));
+
+        let port = free_udp_port();
+        open_linemon(&mut driver, port).await;
+        land_one_step(&mut driver).await;
+        assert_eq!(
+            driver.linemon_port().map(|i| udp_port_of_interface(&i)),
+            Some(port)
+        );
+
+        // A user Channel on the same port, faulted, with reconnect on.
+        let mut config = udp_config(port);
+        if let InterfaceConfig::Udp(udp) = &mut config.interface {
+            udp.bind_address = "not-an-ip-address".to_string();
+        }
+        config.reconnect = crate::config::ReconnectPolicy {
+            enabled: true,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            multiplier: 1.0,
+            max_attempts: None,
+        };
+        let id = driver.listener.add_channel(config);
+        driver.channels.push(id);
+        assert!(driver.listener.start(id).await.is_err());
+
+        driver.queue_reconnects(); // arms the backoff
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        driver.queue_reconnects(); // the attempt is due
+        assert!(!driver.steps.contains_key(&id), "nothing is opened");
+
+        let mut errors = Vec::new();
+        while let Ok(update) = upd_rx.try_recv() {
+            if let UiUpdate::ChannelError(cid, text) = update {
+                if cid == id {
+                    errors.push(text);
+                }
+            }
+        }
+        assert_eq!(
+            errors,
+            vec![format!(
+                "UDP port {port} is in use by Linemon, so this channel could not reconnect. \
+                 Stop Linemon to let it reconnect."
+            )]
+        );
+    }
+
+    fn udp_port_of_interface(interface: &InterfaceConfig) -> u16 {
+        match interface {
+            InterfaceConfig::Udp(udp) => udp.port,
+            InterfaceConfig::Serial(_) => unreachable!("this test uses UDP"),
+        }
+    }
+
+    /// Three opens while the first is in flight leave one waiting request, the
+    /// newest, and the earlier two are never committed.
+    #[tokio::test(start_paused = true)]
+    async fn rapid_linemon_opens_keep_only_the_newest_waiting() {
+        let mut driver = stepped_driver(Duration::from_secs(10));
+        let ports: Vec<u16> = (0..4).map(|_| free_udp_port()).collect();
+        open_linemon(&mut driver, ports[0]).await;
+        let id = driver.linemon.as_ref().expect("registered").id;
+        assert!(driver.steps[&id].running, "the first open is in flight");
+
+        for port in &ports[1..] {
+            open_linemon(&mut driver, *port).await;
+            assert!(
+                driver.steps[&id].queue.is_empty(),
+                "a request waits beside the queue, never in it"
+            );
+            let waiting = driver.linemon.as_ref().and_then(|l| l.waiting.as_ref());
+            let Some(LinemonRequest::Open(config)) = waiting else {
+                panic!("the newest open waits");
+            };
+            assert_eq!(udp_port_of(config), *port);
+        }
+        assert_eq!(udp_port_of(driver.listener.config(id).unwrap()), ports[0]);
+
+        // The first open lands; the waiting request stops it, then commits.
+        land_one_step(&mut driver).await;
+        assert_eq!(driver.listener.state(id), Some(ChannelState::Stopping));
+        land_one_step(&mut driver).await;
+        assert_eq!(
+            udp_port_of(driver.listener.config(id).unwrap()),
+            ports[3],
+            "only the newest config was applied"
+        );
+        land_one_step(&mut driver).await;
+        assert_eq!(driver.listener.state(id), Some(ChannelState::Running));
+        assert!(driver.linemon.as_ref().unwrap().waiting.is_none());
+        assert!(driver.steps.is_empty());
+        driver.listener.shutdown().await;
+    }
+
+    /// A close that arrives during an open replaces the waiting open.
+    #[tokio::test(start_paused = true)]
+    async fn a_linemon_close_wins_over_an_older_waiting_open() {
+        let mut driver = stepped_driver(Duration::from_secs(10));
+        open_linemon(&mut driver, free_udp_port()).await;
+        let id = driver.linemon.as_ref().unwrap().id;
+        open_linemon(&mut driver, free_udp_port()).await;
+        driver.handle(UiCommand::LinemonClose).await;
+        driver.pump().await;
+        assert!(matches!(
+            driver.linemon.as_ref().unwrap().waiting,
+            Some(LinemonRequest::Close)
+        ));
+        land_one_step(&mut driver).await;
+        land_one_step(&mut driver).await;
+        assert_eq!(driver.listener.state(id), Some(ChannelState::Stopped));
+        assert!(driver.steps.is_empty());
+    }
+
+    /// The hidden Channel is registered under its own name, whatever the
+    /// config carried, and with no recording.
+    #[tokio::test]
+    async fn the_hidden_channel_is_named_linemon_and_never_records() {
+        let mut driver = stepped_driver(Duration::ZERO);
+        let mut config = udp_config(free_udp_port());
+        config.name = ChannelName::new("UDP_Channel");
+        config.raw_recording.enabled = true;
+        config.display_recording.enabled = true;
+        driver
+            .handle(UiCommand::LinemonOpen(Box::new(config)))
+            .await;
+        let id = driver.linemon.as_ref().unwrap().id;
+        let stored = driver.listener.config(id).unwrap();
+        assert_eq!(stored.name.as_str(), "Linemon");
+        assert!(!stored.raw_recording.enabled && !stored.display_recording.enabled);
+        assert!(driver.channels.is_empty(), "not in the user's Channels");
+    }
+
+    /// A driver run as the GUI runs it.
+    fn run_driver() -> (
+        Sender<UiCommand>,
+        UpdateReceiver,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, upd_rx) = update_lanes(4096);
+        let handle =
+            tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
+        (cmd_tx, upd_rx, handle)
+    }
+
+    async fn next_update(rx: &mut UpdateReceiver, wait: Duration) -> Option<UiUpdate> {
+        tokio::time::timeout(wait, rx.recv()).await.ok().flatten()
+    }
+
+    /// The Channel an ordinary (non-Linemon) update is about, if it is about one.
+    fn ordinary_channel(update: &UiUpdate) -> Option<ChannelId> {
+        match update {
+            UiUpdate::ChannelAdded(id, ..)
+            | UiUpdate::ChannelReconfigured(id, ..)
+            | UiUpdate::ChannelRenamed(id, _)
+            | UiUpdate::ChannelRemoved(id)
+            | UiUpdate::ChannelError(id, _)
+            | UiUpdate::Snapshot(id, _)
+            | UiUpdate::Stats(id, _)
+            | UiUpdate::ControlLines(id, _)
+            | UiUpdate::StreamDelta(id, _) => Some(*id),
+            UiUpdate::Event(event) => Some(event_channel(event)),
+            _ => None,
+        }
+    }
+
+    /// Wait until a Linemon snapshot says Running, and return the datagram
+    /// target's port for convenience. Panics after five seconds, or on a
+    /// Linemon error.
+    async fn until_linemon_running(rx: &mut UpdateReceiver) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match next_update(rx, Duration::from_millis(250)).await {
+                Some(UiUpdate::Linemon(LinemonUpdate::Snapshot(snap)))
+                    if snap.state == ChannelState::Running =>
+                {
+                    return;
+                }
+                Some(UiUpdate::Linemon(LinemonUpdate::Error(why))) => {
+                    panic!("Linemon did not open: {why}")
+                }
+                _ => {}
+            }
+        }
+        panic!("Linemon did not reach Running");
+    }
+
+    /// Send datagrams to `port` until a Linemon stream update carries bytes.
+    async fn until_linemon_bytes(rx: &mut UpdateReceiver, port: u16) -> Vec<u8> {
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let _ = client.send_to(b"linemon", ("127.0.0.1", port)).await;
+            if let Some(UiUpdate::Linemon(LinemonUpdate::Stream(delta))) =
+                next_update(rx, Duration::from_millis(250)).await
+            {
+                if !delta.bytes.is_empty() {
+                    return delta.bytes.to_vec();
+                }
+            }
+        }
+        panic!("no Linemon stream bytes arrived on port {port}");
+    }
+
+    fn port_is_free(port: u16) -> bool {
+        std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+    }
+
+    /// Linemon's stream and snapshot reach the GUI as Linemon updates; no
+    /// ordinary update is about its Channel; and a saved profile, Stop all and
+    /// New leave it alone.
+    #[tokio::test]
+    async fn linemon_updates_stay_apart_from_the_workspace() {
+        let (cmd_tx, mut rx, handle) = run_driver();
+        cmd_tx
+            .send(UiCommand::AddChannel(Box::new(udp_config(free_udp_port()))))
+            .await
+            .unwrap();
+        let user = loop {
+            if let Some(UiUpdate::ChannelAdded(id, ..)) =
+                next_update(&mut rx, Duration::from_secs(5)).await
+            {
+                break id;
+            }
+        };
+
+        let port = free_udp_port();
+        cmd_tx
+            .send(UiCommand::LinemonOpen(Box::new(udp_config(port))))
+            .await
+            .unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut snapshot, mut stream) = (false, false);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !(snapshot && stream) {
+            assert!(tokio::time::Instant::now() < deadline, "no Linemon updates");
+            let _ = client.send_to(b"hello", ("127.0.0.1", port)).await;
+            let Some(update) = next_update(&mut rx, Duration::from_millis(250)).await else {
+                continue;
+            };
+            match &update {
+                UiUpdate::Linemon(LinemonUpdate::Snapshot(_)) => snapshot = true,
+                UiUpdate::Linemon(LinemonUpdate::Stream(delta)) => {
+                    stream |= !delta.bytes.is_empty();
+                }
+                UiUpdate::Linemon(LinemonUpdate::Error(why)) => panic!("{why}"),
+                other => assert!(
+                    ordinary_channel(other).is_none_or(|id| id == user),
+                    "an ordinary update is about the hidden Channel: {other:?}"
+                ),
+            }
+        }
+
+        // Save: the profile holds the user's Channel and not Linemon's.
+        let path = temp_profile_path();
+        cmd_tx
+            .send(UiCommand::SaveProfile(path.clone()))
+            .await
+            .unwrap();
+        loop {
+            match next_update(&mut rx, Duration::from_secs(5)).await {
+                Some(UiUpdate::ProfileSaved(_)) => break,
+                Some(UiUpdate::ProfileError(why)) => panic!("{why}"),
+                Some(other) => assert!(ordinary_channel(&other).is_none_or(|id| id == user)),
+                None => panic!("no save result"),
+            }
+        }
+        let (saved, _) = Profile::load_with_warnings(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(saved.channels.len(), 1);
+        assert_eq!(saved.channels[0].name.as_str(), "UDP_Channel");
+
+        // Stop all and New tear down the workspace; Linemon keeps running.
+        cmd_tx.send(UiCommand::StopAll).await.unwrap();
+        cmd_tx.send(UiCommand::NewProfile).await.unwrap();
+        loop {
+            match next_update(&mut rx, Duration::from_secs(5)).await {
+                Some(UiUpdate::ChannelRemoved(id)) => {
+                    assert_eq!(id, user);
+                    break;
+                }
+                Some(UiUpdate::Linemon(LinemonUpdate::Snapshot(snap))) => {
+                    assert_eq!(snap.state, ChannelState::Running);
+                }
+                Some(_) => {}
+                None => panic!("no removal"),
+            }
+        }
+        until_linemon_running(&mut rx).await;
+        assert!(!port_is_free(port), "Linemon still holds its port");
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A second open with another config restarts the hidden Channel on it.
+    #[tokio::test]
+    async fn a_second_linemon_open_restarts_on_the_new_config() {
+        let (cmd_tx, mut rx, handle) = run_driver();
+        let (first, second) = (free_udp_port(), free_udp_port());
+        cmd_tx
+            .send(UiCommand::LinemonOpen(Box::new(udp_config(first))))
+            .await
+            .unwrap();
+        until_linemon_running(&mut rx).await;
+        assert!(!port_is_free(first));
+
+        cmd_tx
+            .send(UiCommand::LinemonOpen(Box::new(udp_config(second))))
+            .await
+            .unwrap();
+        let bytes = until_linemon_bytes(&mut rx, second).await;
+        assert!(bytes.ends_with(b"linemon"));
+        assert!(port_is_free(first), "the old port was released");
+        assert!(!port_is_free(second));
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    /// Close stops the hidden Channel and its updates, and keeps it registered
+    /// so the next open reuses it.
+    #[tokio::test]
+    async fn closing_linemon_stops_the_channel_and_its_updates() {
+        let (cmd_tx, mut rx, handle) = run_driver();
+        let port = free_udp_port();
+        cmd_tx
+            .send(UiCommand::LinemonOpen(Box::new(udp_config(port))))
+            .await
+            .unwrap();
+        until_linemon_running(&mut rx).await;
+
+        cmd_tx.send(UiCommand::LinemonClose).await.unwrap();
+        // A reliable result is sent after the close was handled; what was
+        // queued before it is old.
+        cmd_tx.send(UiCommand::ListLocalAddresses).await.unwrap();
+        loop {
+            if let Some(UiUpdate::LocalAddresses(_)) =
+                next_update(&mut rx, Duration::from_secs(5)).await
+            {
+                break;
+            }
+        }
+        while rx.try_recv().is_ok() {}
+        // Several poll rounds pass.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        if let Ok(update) = rx.try_recv() {
+            panic!("an update arrived after the close: {update:?}");
+        }
+        assert!(port_is_free(port), "the port was released");
+
+        // The same hidden Channel opens again.
+        cmd_tx
+            .send(UiCommand::LinemonOpen(Box::new(udp_config(port))))
+            .await
+            .unwrap();
+        until_linemon_running(&mut rx).await;
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A port that cannot be opened comes back as a Linemon error, in the
+    /// start path's own words and with no ordinary Channel error.
+    #[tokio::test]
+    async fn a_failed_linemon_open_is_a_linemon_error() {
+        let (cmd_tx, mut rx, handle) = run_driver();
+        let port = free_udp_port();
+        let _held = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        cmd_tx
+            .send(UiCommand::LinemonOpen(Box::new(udp_config(port))))
+            .await
+            .unwrap();
+        let why = loop {
+            match next_update(&mut rx, Duration::from_secs(5)).await {
+                Some(UiUpdate::Linemon(LinemonUpdate::Error(why))) => break why,
+                Some(UiUpdate::ChannelError(_, why)) => panic!("an ordinary error: {why}"),
+                Some(_) => {}
+                None => panic!("no error arrived"),
+            }
+        };
+        assert!(why.contains("failed to bind interface"), "{why}");
+        assert!(why.starts_with("failed"), "no Channel-name prefix: {why}");
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    /// Shutdown stops the hidden Channel along with the rest.
+    #[tokio::test]
+    async fn shutdown_stops_linemons_channel() {
+        let (cmd_tx, mut rx, handle) = run_driver();
+        let port = free_udp_port();
+        cmd_tx
+            .send(UiCommand::LinemonOpen(Box::new(udp_config(port))))
+            .await
+            .unwrap();
+        until_linemon_running(&mut rx).await;
+        assert!(!port_is_free(port));
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the driver stopped")
+            .unwrap();
+        assert!(port_is_free(port), "Shutdown released the port");
+    }
+
+    #[test]
+    fn linemon_stream_is_periodic_and_its_error_is_not() {
+        let stream = UiUpdate::Linemon(LinemonUpdate::Stream(Box::new(StreamDelta {
+            generation: 1,
+            base_offset: 0,
+            bytes: std::sync::Arc::from(&[][..]),
+            end_offset: 0,
+        })));
+        assert!(stream.is_periodic());
+        let error = UiUpdate::Linemon(LinemonUpdate::Error("x".to_string()));
+        assert!(!error.is_periodic());
     }
 }

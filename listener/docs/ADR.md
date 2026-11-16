@@ -1881,6 +1881,10 @@ during a 10 s start.
   profile, a new profile and a resume. It then removes, registers and starts
   as before.
 
+**Added decision (2026-11-15):** Linemon's hidden Channel (ADR-070) is not part of
+the workspace, so a workspace change does not wait for its steps. A slow serial
+open in Linemon does not hold up a profile load.
+
 **Boundary:** The CLI keeps awaiting. An interface open still cannot be cancelled,
 so a Stop waits for the open to land. At exit the driver lands opens and drains
 in flight, within the stop grace, before stopping what is live.
@@ -2398,7 +2402,7 @@ Channels slow the GUI's figures; they do not freeze it or hold up closing it.
 
 ## ADR-070 — Linemon: a window for one stream
 
-**Status:** Accepted 2026-11-15. Not yet built.
+**Status:** Accepted 2026-11-15.
 
 **Context:** Listener serves two uses of equal weight: unattended logging on
 many Channels for weeks, and looking at one stream to understand it. The first
@@ -2428,6 +2432,26 @@ so the transports, the pipeline and the renderer are reused, and a change of
 port or setting restarts that Channel. Two things are new: a display buffer in
 the window that survives those restarts, and a second live stream to the GUI
 beside the selected Channel's.
+
+The window is drawn from the part of the application that runs every frame,
+whether or not the main window is visible. eframe calls the main window's
+drawing only while that window is visible, and takes down any window that was
+not drawn in a frame, so Linemon drawn from there vanished whenever the main
+window was minimized.
+
+**Added decision (2026-11-15):** Start and Stop buttons open and close the port,
+and Stop keeps the display. A checkbox, Reopen port on start, decides whether
+opening the window opens the last port or waits for Start. While Linemon is
+stopped, a change waits for Start. A value typed into a field, such as a
+multicast group, takes effect only when the field is left, so a half-typed
+value never opens a port.
+
+A port held by the other side is refused the same way in both directions, before
+anything opens: Linemon names the Channel that has the port, and a Channel names
+Linemon. A refused port never opens on its own when it comes free; Start opens
+it. Each of the other automatic opens (reconnect, resume, talker's recovery and
+its CLI's open retry) is switched on by the user or reopens a port already
+started, and this one would have been neither.
 
 **Boundary:** Linemon does no decoding (ADR-010 stands) and shows one view
 (ADR-023 stands). It reads serial and UDP only. Viewing a running Channel's

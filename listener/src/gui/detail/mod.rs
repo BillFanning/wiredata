@@ -4,7 +4,7 @@
 //! the stream viewer, lives in [`stream_view`].
 
 mod diagnostics;
-mod stream_view;
+pub(super) mod stream_view;
 
 use crate::core::{ChannelId, RecordingState};
 use crate::diagnostics::DiagnosticSeverity;
@@ -107,7 +107,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &ListenerRunSummary) {
                 }
             ));
             if !summary.finalization_complete {
-                ui.weak("The end of the recordings may be missing, because the Channel did not finish closing them in time.");
+                ui.weak("The end of the recordings may be missing, because the channel did not finish closing them in time.");
             }
         });
     summary_view
@@ -553,7 +553,7 @@ impl ListenerApp {
             if ui
                 .add_enabled(
                     stop_enabled(status),
-                    egui::Button::new("Stop Channel").min_size(size),
+                    egui::Button::new("Stop channel").min_size(size),
                 )
                 .clicked()
             {

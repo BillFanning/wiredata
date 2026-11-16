@@ -76,11 +76,11 @@ pub(super) fn lifecycle_indicator(
 /// `start_button` decision mapped onto talker's states, so the two detail
 /// panes carry drift and recovery the same way. Pure, unit-tested; the
 /// detail pane renders the result and defers the click:
-/// - not running, no error → "Start Channel", enabled iff the draft is valid
-/// - not running, error → "Retry Channel" (the open/run failed), iff valid
+/// - not running, no error → "Start channel", enabled iff the draft is valid
+/// - not running, error → "Retry channel" (the open/run failed), iff valid
 /// - running + pending edits (interface or messages) → "Apply & Restart",
 ///   enabled iff the complete replacement draft is valid
-/// - running, no edits → "Start Channel", **disabled** (nothing to do)
+/// - running, no edits → "Start channel", **disabled** (nothing to do)
 pub(super) fn start_button(
     running: bool,
     has_error: bool,
@@ -89,12 +89,12 @@ pub(super) fn start_button(
 ) -> (&'static str, bool) {
     match (running, drift) {
         (true, true) => ("Apply & Restart", can_start),
-        (true, false) => ("Start Channel", false),
+        (true, false) => ("Start channel", false),
         (false, _) => (
             if has_error {
-                "Retry Channel"
+                "Retry channel"
             } else {
-                "Start Channel"
+                "Start channel"
             },
             can_start,
         ),
@@ -2559,26 +2559,26 @@ mod tests {
         // Stopped, valid → plain Start, enabled.
         assert_eq!(
             start_button(false, false, false, true),
-            ("Start Channel", true)
+            ("Start channel", true)
         );
         // Stopped, invalid draft → Start, disabled (blockers on hover).
         assert_eq!(
             start_button(false, false, false, false),
-            ("Start Channel", false)
+            ("Start channel", false)
         );
         // Stopped with an error from the last run/open → Retry.
         assert_eq!(
             start_button(false, true, false, true),
-            ("Retry Channel", true)
+            ("Retry channel", true)
         );
         assert_eq!(
             start_button(false, true, false, false),
-            ("Retry Channel", false)
+            ("Retry channel", false)
         );
         // Drift on a stopped channel is irrelevant — Start applies drafts anyway.
         assert_eq!(
             start_button(false, false, true, true),
-            ("Start Channel", true)
+            ("Start channel", true)
         );
         // Running with valid pending edits → the coordinated restart.
         assert_eq!(
@@ -2593,7 +2593,7 @@ mod tests {
         // Running, nothing to apply → disabled Start.
         assert_eq!(
             start_button(true, false, false, false),
-            ("Start Channel", false)
+            ("Start channel", false)
         );
     }
 

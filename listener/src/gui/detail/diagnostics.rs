@@ -75,8 +75,8 @@ const PIPELINE_TOOLTIP: Hover = Hover::new(
 
 const OLDER_FIGURES_TOOLTIP: Hover = Hover::new(
     "These figures are not from the latest request.\n\n\
-     Listener asked the Channel for fresh figures and did not get an answer in time, so it is \
-     showing the last answer it has. A Channel can be slow to answer while it closes a \
+     Listener asked the channel for fresh figures and did not get an answer in time, so it is \
+     showing the last answer it has. A channel can be slow to answer while it closes a \
      recording on a disk that is not responding.\n\n\
      The figures are shown as they were measured, not adjusted for the time since. A \
      throughput or an active stall length shown here may no longer be true.",
@@ -556,7 +556,7 @@ fn timing_window(status: ChannelStatus, figures: Provenance) -> &'static str {
 /// The sentence that says the figures shown are not from the latest request,
 /// or `None` when they are.
 fn older_figures_sentence(figures: Provenance) -> Option<String> {
-    const CAUSE: &str = "The Channel is not answering status requests.";
+    const CAUSE: &str = "The channel is not answering status requests.";
     match figures {
         Provenance::Fresh => None,
         Provenance::Cached { age } => Some(format!(
@@ -908,7 +908,7 @@ mod tests {
             .as_deref(),
             Some(
                 "These figures were measured 12.0 s ago. \
-                 The Channel is not answering status requests."
+                 The channel is not answering status requests."
             )
         );
         assert_eq!(

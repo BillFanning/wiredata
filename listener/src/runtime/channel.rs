@@ -482,7 +482,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         let fault = match transport.join().await {
             TransportOutcome::Faulted(cause) => Some(cause),
             TransportOutcome::Completed if !monitor_cancel.is_cancelled() => {
-                Some("the Channel's processing task ended unexpectedly".to_string())
+                Some("the channel's processing task ended unexpectedly".to_string())
             }
             TransportOutcome::Completed | TransportOutcome::Cancelled => None,
         };
@@ -879,12 +879,12 @@ mod tests {
                     &notices,
                     cid,
                     "GPS",
-                    "the Channel's processing task ended unexpectedly".to_string(),
+                    "the channel's processing task ended unexpectedly".to_string(),
                 ));
         });
         assert!(text.contains("ERROR"), "{text}");
         assert!(
-            text.contains("fault on channel GPS: the Channel's processing task ended unexpectedly"),
+            text.contains("fault on channel GPS: the channel's processing task ended unexpectedly"),
             "{text}"
         );
         assert!(text.contains(&cid.to_string()), "{text}");

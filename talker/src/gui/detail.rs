@@ -905,8 +905,8 @@ impl TalkerApp {
         }
     }
 
-    /// The lifecycle button pair (listener's control row): [Start Channel /
-    /// Apply & Restart / Retry Channel] [Stop Channel], both always present
+    /// The lifecycle button pair (listener's control row): [Start channel /
+    /// Apply & Restart / Retry channel] [Stop channel], both always present
     /// at the shared control size; the Start side's label/enabled state is
     /// the pure [`start_button`] decision. Start, Retry, and Apply & Restart
     /// are all the same deferred action — `start_connection` stops any
@@ -960,7 +960,7 @@ impl TalkerApp {
                 self.deferred.start = Some(i);
             }
             if ui
-                .add_enabled(running, egui::Button::new("Stop Channel").min_size(SIZE))
+                .add_enabled(running, egui::Button::new("Stop channel").min_size(SIZE))
                 .clicked()
             {
                 self.deferred.stop = Some(i);

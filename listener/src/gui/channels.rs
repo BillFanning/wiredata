@@ -6,6 +6,7 @@ use wiredata_ui::hover::{Hover, ShowHover};
 use wiredata_ui::selection;
 
 use super::bridge::UiCommand;
+use super::linemon_window::LINEMON_HOVER;
 use super::state::ChannelStatus;
 use super::widgets::{human_bytes, status_color, status_glyph, AddKind};
 use super::ListenerApp;
@@ -106,7 +107,7 @@ impl ListenerApp {
         // these two buttons in the header row the floor exceeded the panel's own
         // default width, so the divider could be dragged right but never back
         // left.
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Start all").clicked() {
                 // Only Stopped channels — starting an already-Running one would be an
                 // illegal Running→Starting transition. Validate each (unconfigured ones
@@ -121,6 +122,10 @@ impl ListenerApp {
                 // event channel), leaving some channels stuck Running in the UI. The
                 // driver iterates server-side and skips already-Stopped channels.
                 self.send(UiCommand::StopAll);
+            }
+            if ui.button("Linemon").on_hover(&LINEMON_HOVER).clicked() {
+                let ctx = ui.ctx().clone();
+                self.linemon.open_or_focus(&ctx);
             }
             // "+ Add" rides with the bulk actions rather than the title row, so
             // the header carries only the title, theme toggle and Profile. That

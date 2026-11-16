@@ -81,7 +81,7 @@ fn upgrade_display(display: &mut Table, who: &str, out: &mut Upgrade) {
     let dropped = views.len().saturating_sub(1);
     if dropped > 0 {
         out.warnings.push(format!(
-            "{who} had {} display views; a Channel has one now, so the first was kept \
+            "{who} had {} display views; a channel has one now, so the first was kept \
              and the other {dropped} dropped",
             views.len()
         ));

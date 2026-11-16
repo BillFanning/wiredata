@@ -111,7 +111,7 @@ impl ListenerApp {
             }
         })
         .body(|ui| {
-            self.show_view_controls(ui, &mut prefs, stream_len);
+            show_view_controls(ui, &mut prefs, stream_len);
             // Inline Mark timestamps (§50.2) live here — they shape what the view
             // (and `.disp`) show. They edit the draft config; committing goes
             // through Apply & Restart (config_needs_restart counts match_rules).
@@ -139,360 +139,17 @@ impl ListenerApp {
             }
         }
 
-        let msg_mode = prefs.mode;
-        let msg_chars = prefs.chars;
-        let font_size = prefs.font_size;
-        let mono_family = prefs.mono.family();
-        let fg = prefs.colors.fg();
-        let bg = prefs.colors.bg();
-
         let has_snapshot = self
             .state
             .channel(id)
             .map(|v| v.snapshot.is_some())
             .unwrap_or(false);
-        // The stream viewer (§41): there is one source — the verbatim byte stream.
-        // Hex line length is filled in below, once the pane's width is known, so
-        // that every Hex byte wrap happens in the renderer — the only place a
-        // cell boundary is known. `split_stream_rows` is still character-based
-        // and still wraps the text modes; a Hex *byte* row never reaches it with
-        // anything left to cut (see `hex_line_bytes`). A Hex *Mark* row can, and
-        // that is deliberate: a Mark wider than the pane is cut as text, which
-        // is the one overrun ADR-042 accepts.
-        let hex_grouping = prefs.hex_grouping;
-        let mut renderer = DisplayView {
-            mode: msg_mode,
-            encoding: DisplayEncoding::Utf8,
-            character_rendering: msg_chars,
-            wrapping: WrappingMode::NoWrap,
-            wrap_width: None,
-            hex_separator: " ".to_string(),
-            hex_bytes_per_group: usize::from(hex_grouping.bytes_per_group.max(1)),
-            hex_bytes_per_line: 0,
-        };
-        // Verbatim received bytes (§17–18, §41): line breaks come only from the
-        // data — Rendered honors real CR/LF (§44), Raw shows control pictures, Hex
-        // is a byte run. Serial and UDP render identically (no reframing).
-        //
-        // Performance (§100): the scrollback can reach the 256 KB scroll cap. The
-        // bytes arrive incrementally (StreamDelta) so the driver never re-ships the
-        // whole buffer; here we (a) memoize the split rows, re-rendering only when
-        // data arrives or the view mode changes — keyed on the stream cursor — and
-        // (b) virtualize the layout with `show_rows`, laying out only visible rows.
-        // Both matter: a non-virtualized selectable Label over the full buffer
-        // stalled the UI.
-        let font = egui::FontId::new(font_size, mono_family.clone());
-        // Monospace metrics: row height and the width of one glyph ('0' as a stand-in),
-        // so we can convert the available pixel width into a column count for wrapping.
-        let (row_h, char_w) =
-            ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0').max(1.0)));
-        // Width of the (non-floating) vertical scrollbar. Used both to size the bar
-        // below and to reserve its space when wrapping, so a full row ends just before
-        // the bar instead of under it. One const so the two uses can't drift apart.
-        const SCROLLBAR_WIDTH: f32 = 12.0;
-        // Pin the viewer to exactly the height left in the pane, so the ScrollArea owns
-        // the scrolling (and `stick_to_bottom` keeps the newest bytes pinned to the
-        // bottom edge) instead of the content overflowing and scrolling the whole pane —
-        // which left the latest data stranded below the window fold ("never reaches the
-        // bottom"). The Frame's 4px inner margin top+bottom is subtracted.
-        let viewer_height = (ui.available_height() - 8.0).max(0.0);
-        egui::Frame::new()
-            .fill(bg)
-            .inner_margin(4.0)
-            .show(ui, |ui| {
-                // Pre-wrap each cached row to the columns that fit the viewer's inner
-                // width (less the scrollbar), so every row is exactly one visual line —
-                // uniform height, which `show_rows` needs to virtualize. Re-wraps only
-                // when the column count changes (the cache key includes it).
-                let avail_w = (ui.available_width() - SCROLLBAR_WIDTH).max(char_w);
-                let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
-                // Resolve Hex line length against the pane now that its width is
-                // known, so the renderer wraps at a whole group and the row
-                // splitter below never has a Hex byte line left to cut. The
-                // column bound that goes with it is attached by `rebuild_rows`,
-                // which receives `wrap_cols` anyway and so cannot be given one
-                // setting without the other.
-                renderer.hex_bytes_per_line = hex_line_bytes(hex_grouping, wrap_cols);
-                self.refresh_stream_rows(id, &renderer, wrap_cols);
-                let rows: &[String] = self
-                    .stream_cache
-                    .as_ref()
-                    .filter(|c| c.channel == id)
-                    .map(|c| c.rows.as_slice())
-                    .unwrap_or(&[]);
-                // The viewer fills its full height whether or not data is flowing — the
-                // ScrollArea (`auto_shrink([false,false])`) reserves the space, so the
-                // window doesn't pop open when a channel starts. Empty state shows a
-                // weak note *inside* the scroll area rather than collapsing the frame.
-                // Text selection across the (non-interactive) row labels.
-                ui.style_mut().interaction.selectable_labels = true;
-                // Give the scrollbar a visible track + handle, distinct from the text
-                // background, so the strip on the right edge reads as the scrollbar (not
-                // mysterious empty space). Both contrast with `bg`, the handle more
-                // strongly (see `scrollbar_colors`). Set before the per-widget overrides.
-                let (track, handle) = scrollbar_colors(bg);
-                ui.visuals_mut().extreme_bg_color = track;
-                // A solid, constant-width scrollbar. egui's default is "floating" — thin
-                // until hovered, which read as the track widening on hover; `floating =
-                // false` plus a fixed `bar_width` (and zero margins) pins it to a steady
-                // strip the width we reserved above.
-                {
-                    let s = &mut ui.style_mut().spacing.scroll;
-                    s.floating = false;
-                    s.bar_width = SCROLLBAR_WIDTH;
-                    s.bar_inner_margin = 0.0;
-                    s.bar_outer_margin = 0.0;
-                }
-                // Suppress the per-widget hover/active visuals egui paints on selectable
-                // labels (they drew a flickering box around the rows near the pointer).
-                {
-                    let w = &mut ui.visuals_mut().widgets;
-                    for s in [
-                        &mut w.hovered,
-                        &mut w.active,
-                        &mut w.inactive,
-                        &mut w.noninteractive,
-                    ] {
-                        s.bg_stroke = egui::Stroke::NONE;
-                        s.weak_bg_fill = egui::Color32::TRANSPARENT;
-                        s.bg_fill = egui::Color32::TRANSPARENT;
-                    }
-                }
-                // The scroll handle is drawn from the *idle* widget visuals (egui maps an
-                // un-hovered scrollbar to `widgets.inactive`), using `bg_fill` when
-                // `scroll_style.foreground_color` is false (the default) or `fg_stroke`
-                // when true. We just cleared those fills for the labels, which is why the
-                // handle vanished. Set `foreground_color = true` and drive the handle via
-                // `fg_stroke.color` on every interaction state — explicit and immune to
-                // the bg_fill clearing above. Hover/drag brighten so it stays visible on
-                // a dark scheme.
-                ui.style_mut().spacing.scroll.foreground_color = true;
-                {
-                    let w = &mut ui.visuals_mut().widgets;
-                    w.inactive.fg_stroke.color = handle;
-                    w.noninteractive.fg_stroke.color = handle;
-                    w.hovered.fg_stroke.color = handle.gamma_multiply(1.2);
-                    w.active.fg_stroke.color = handle.gamma_multiply(1.4);
-                }
-                // Zero the inter-row spacing *here*, before `show_rows`, so the row pitch
-                // it uses to size the virtual content (and thus where `stick_to_bottom`
-                // scrolls) matches what the rows actually render at. Setting it only
-                // inside the closure left `show_rows` reserving `row_h + default_spacing`
-                // per row while rows drew at `row_h`, so the computed bottom overshot the
-                // real last row and the newest data never came into view.
-                ui.spacing_mut().item_spacing.y = 0.0;
-                // Resume's one-shot jump to the newest bytes: force the offset
-                // to the exact virtual content height (rows × row pitch — the
-                // spacing zeroed above is what makes this arithmetic hold;
-                // egui clamps overshoot). With the view at the bottom,
-                // `stick_to_bottom` re-latches and follows new data on its own.
-                let jump_to_bottom = self
-                    .resume_scroll_bottom
-                    .take_if(|channel| *channel == id)
-                    .is_some();
-                let mut scroll = egui::ScrollArea::vertical()
-                    .id_salt("stream")
-                    .stick_to_bottom(true)
-                    .max_height(viewer_height)
-                    .auto_shrink([false, false]);
-                if jump_to_bottom {
-                    scroll = scroll.vertical_scroll_offset(rows.len() as f32 * row_h);
-                }
-                if stream_len == 0 {
-                    // No data yet: still occupy the full viewer height, with a note.
-                    scroll.show(ui, |ui| {
-                        let note = if has_snapshot {
-                            "no data received yet"
-                        } else {
-                            "waiting for data — Start the channel"
-                        };
-                        ui.label(egui::RichText::new(note).weak());
-                    });
-                    return;
-                }
-                // Soft-wrapped AND virtualized: rows are pre-wrapped to `wrap_cols`
-                // (above) so each is one uniform-height visual line, which lets
-                // `show_rows` lay out only the visible rows. This is what keeps the UI
-                // responsive — the earlier "render everything" approaches (N labels or
-                // one giant galley) re-laid-out the whole buffer every frame and made
-                // resizing/the whole UI sluggish. Rows don't wrap again here (they're
-                // already wrapped); they just extend if anything slipped through.
-                scroll.show_rows(ui, row_h, rows.len().max(1), |ui, range| {
-                    for row in &rows[range] {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(row).font(font.clone()).color(fg))
-                                .wrap_mode(egui::TextWrapMode::Extend),
-                        );
-                    }
-                });
-            });
-    }
-
-    /// The view-configuration controls (inside the "View configuration" dropdown):
-    /// View mode + ctrl-chars on one row, font size / colors / mono on the next, then
-    /// the scroll-buffer size readout. Edits the passed-in [`ViewPrefs`] (a clone of
-    /// the selected channel's); the caller persists any change. `stream_len` is the
-    /// channel's current scrollback byte count. Takes `&self` — touches no app state
-    /// beyond rendering.
-    fn show_view_controls(&self, ui: &mut egui::Ui, prefs: &mut ViewPrefs, stream_len: usize) {
-        let base = egui::TextStyle::Body.resolve(ui.style()).size;
-        ui.horizontal(|ui| {
-            ui.label("View")
-                .on_hover_text("How the received bytes are displayed in the viewer.");
-            ui.radio_value(&mut prefs.mode, DisplayMode::Hex, "Hex")
-                .on_hover_text("Each byte as two-digit hex (e.g. 0A 0D 41).");
-            ui.radio_value(&mut prefs.mode, DisplayMode::Rendered, "Rendered")
-                .on_hover_text("As text, where line break bytes (CR and LF) start a new line.");
-            ui.radio_value(&mut prefs.mode, DisplayMode::Raw, "Raw")
-                .on_hover_text(
-                    "As text, but control characters are shown as the marks chosen under \
-                     ctrl-chars instead of moving the text around.",
-                );
-            ui.separator();
-            // Control-character rendering (§46) — enabled only in Raw mode. The
-            // oversized ␊ glyph makes the row taller than the text, so the whole
-            // ctrl-chars cluster is bottom-aligned to sit on the View radios' baseline.
-            ui.add_enabled_ui(prefs.mode == DisplayMode::Raw, |ui| {
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("ctrl-chars");
-                        ui.radio_value(
-                            &mut prefs.chars,
-                            CharacterRendering::Glyph,
-                            egui::RichText::new("␊").size(base * 1.6),
-                        )
-                        .on_hover_text("Control pictures (␊ ␍ ␉ …)");
-                        ui.radio_value(&mut prefs.chars, CharacterRendering::Token, "[LF]")
-                            .on_hover_text("Bracketed names ([LF] [CR] [TAB] …)");
-                        ui.radio_value(&mut prefs.chars, CharacterRendering::HexEscape, "<0A>")
-                            .on_hover_text("Hex escapes (<0A> <0D> <09> …)");
-                    });
-                });
-            });
-        });
-        // Hex grouping (§45) — enabled only in Hex mode, but the setting persists
-        // either way, so switching modes and back does not lose it.
-        ui.add_enabled_ui(prefs.mode == DisplayMode::Hex, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Group").on_hover(&GROUP_HOVER);
-                egui::ComboBox::from_id_salt("hex_bytes_per_group")
-                    .selected_text(format!(
-                        "{} bytes",
-                        prefs.hex_grouping.bytes_per_group.max(1)
-                    ))
-                    .show_ui(ui, |ui| {
-                        for &size in HEX_GROUP_SIZES {
-                            ui.selectable_value(
-                                &mut prefs.hex_grouping.bytes_per_group,
-                                size,
-                                format!("{size} bytes"),
-                            );
-                        }
-                    });
-                ui.label("Line").on_hover(&LINE_HOVER);
-                egui::ComboBox::from_id_salt("hex_groups_per_line")
-                    .selected_text(hex_line_label(prefs.hex_grouping))
-                    .show_ui(ui, |ui| {
-                        for &groups in HEX_LINE_GROUPS {
-                            let candidate = HexGrouping {
-                                groups_per_line: groups,
-                                ..prefs.hex_grouping
-                            };
-                            ui.selectable_value(
-                                &mut prefs.hex_grouping.groups_per_line,
-                                groups,
-                                hex_line_label(candidate),
-                            );
-                        }
-                    });
-            });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Size");
-            // An editable "combo": type any size into the field, or pick a preset from
-            // the ▾ menu; the text is the source of truth while editing.
-            let resp = ui.add(egui::TextEdit::singleline(&mut prefs.font_text).desired_width(40.0));
-            if resp.changed() {
-                if let Ok(v) = prefs.font_text.trim().parse::<f32>() {
-                    prefs.font_size = v.clamp(6.0, 72.0);
-                }
-            }
-            ui.menu_button("\u{25BC}", |ui| {
-                for &size in MSG_FONT_SIZES {
-                    if ui.button(format!("{size:.0}")).clicked() {
-                        prefs.font_size = size;
-                        prefs.font_text = format!("{size:.0}");
-                        ui.close();
-                    }
-                }
-            });
-            ui.separator();
-            ui.label("Colors");
-            egui::ComboBox::from_id_salt("msg_colors")
-                .selected_text(prefs.colors.label())
-                .show_ui(ui, |ui| {
-                    for scheme in [
-                        ColorScheme::BlackOnWhite,
-                        ColorScheme::GreenOnBlack,
-                        ColorScheme::GreenOnBlackDim,
-                        ColorScheme::AmberOnBlack,
-                        ColorScheme::WhiteOnBlack,
-                    ] {
-                        ui.selectable_value(&mut prefs.colors, scheme, scheme.label());
-                    }
-                });
-            ui.separator();
-            ui.label("Mono");
-            egui::ComboBox::from_id_salt("msg_font")
-                .selected_text(prefs.mono.label())
-                .show_ui(ui, |ui| {
-                    for &font in MonoFont::ALL {
-                        ui.selectable_value(&mut prefs.mono, font, font.label());
-                    }
-                });
-        });
-        // Scroll-buffer cap (§87): how far back the viewer scrolls, chosen from presets
-        // (2 … 256 kB) — no free text, so it's always a known value. The current fill is
-        // shown alongside. Persisted via retention (the runtime adopts it next start; the
-        // GUI viewer caps live).
-        ui.horizontal(|ui| {
-            ui.label("Scroll buffer").on_hover(&SCROLL_BUFFER_HOVER);
-            egui::ComboBox::from_id_salt("scroll_buffer")
-                .selected_text(scroll_buffer_label(prefs.scroll_buffer_bytes))
-                // Tall enough for every preset: the default popup max height sat
-                // right at the content height, so its (floating) scrollbar
-                // flashed in and out on hover. With room to spare the popup
-                // never scrolls and no scrollbar can appear.
-                .height(280.0)
-                .show_ui(ui, |ui| {
-                    for &kb in SCROLL_BUFFER_PRESETS_KB {
-                        let bytes =
-                            (kb * 1024).clamp(MIN_SCROLL_BUFFER_BYTES, MAX_SCROLL_BUFFER_BYTES);
-                        ui.selectable_value(
-                            &mut prefs.scroll_buffer_bytes,
-                            bytes,
-                            scroll_buffer_label(bytes),
-                        );
-                    }
-                })
-                .response
-                .on_hover(&SCROLL_BUFFER_HOVER);
-            ui.separator();
-            // The current fill (how much is buffered right now, ≤ the cap).
-            ui.label(
-                egui::RichText::new(format!("now: {}", human_bytes(stream_len as u64))).weak(),
-            )
-            .on_hover_text("The bytes in the scroll buffer right now, never more than its size.");
-        });
-    }
-
-    /// Refresh the incrementally maintained stream-view rows for `id` (see
-    /// [`super::super::StreamRenderCache`]): render only the bytes new since
-    /// the last refresh, rebuilding from scratch only on a settings / marks /
-    /// reset change. No-ops entirely when nothing changed.
-    fn refresh_stream_rows(&mut self, id: ChannelId, renderer: &DisplayView, wrap_cols: usize) {
+        // Resume's one-shot jump to the newest bytes (see `show_stream_rows`).
+        let jump_to_bottom = self
+            .resume_scroll_bottom
+            .take_if(|channel| *channel == id)
+            .is_some();
         let Some(view) = self.state.channel_mut(id) else {
-            self.stream_cache = None;
             return;
         };
         // Make the window contiguous *first*, then take an immutable slice via
@@ -501,20 +158,507 @@ impl ListenerApp {
         view.stream_bytes.make_contiguous();
         let (window, rest) = view.stream_bytes.as_slices();
         debug_assert!(rest.is_empty(), "make_contiguous left a split deque");
-        refresh_rows(
+        let empty_note = if !window.is_empty() {
+            None
+        } else if has_snapshot {
+            Some("no data received yet")
+        } else {
+            Some("waiting for data — Start the channel")
+        };
+        let input = StreamInput {
+            key: id,
+            window,
+            window_start: view.stream_base_offset,
+            cursor: view.stream_cursor,
+            marks: &view.marks,
+            marks_version: view.marks_version,
+            trailing: &[],
+        };
+        show_stream_rows(
+            ui,
+            &prefs,
             &mut self.stream_cache,
-            StreamRefresh {
-                channel: id,
-                window,
-                window_start: view.stream_base_offset,
-                cursor: view.stream_cursor,
-                marks: &view.marks,
-                marks_version: view.marks_version,
-                view: renderer,
-                wrap_cols,
-            },
+            &input,
+            empty_note,
+            jump_to_bottom,
         );
     }
+}
+
+/// Everything the viewer draws from, supplied by the caller so the same viewer
+/// serves a Channel's scrollback and Linemon's display.
+pub(in crate::gui) struct StreamInput<'a> {
+    /// Identity the row cache is keyed on: a cache built for one key is rebuilt
+    /// when handed another.
+    pub key: ChannelId,
+    /// The accumulated byte window, contiguous. Its first byte sits at absolute
+    /// offset `window_start`.
+    pub window: &'a [u8],
+    /// Absolute offset of `window[0]`.
+    pub window_start: u64,
+    /// Absolute offset one past the window's last byte.
+    pub cursor: u64,
+    /// Marks pinned to the window, offset-sorted, with the text each is spliced in as.
+    pub marks: &'a [crate::gui::state::StreamMark],
+    /// Changes whenever `marks` changes (see `StreamRefresh::marks_version`).
+    pub marks_version: u64,
+    /// The marks at or past `cursor`: drawn after the last byte, because the byte
+    /// they precede has not arrived. Empty for a Channel.
+    pub trailing: &'a [crate::gui::state::StreamMark],
+}
+
+/// The rows to draw: the row cache's rows, with the cache's open last row
+/// replaced by `tail` when marks trail the data.
+pub(in crate::gui) struct StreamRows<'a> {
+    head: &'a [String],
+    tail: Vec<String>,
+}
+
+impl StreamRows<'_> {
+    pub(in crate::gui) fn len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
+
+    pub(in crate::gui) fn get(&self, index: usize) -> Option<&String> {
+        match index.checked_sub(self.head.len()) {
+            None => self.head.get(index),
+            Some(i) => self.tail.get(i),
+        }
+    }
+
+    /// Every row joined with `\n`, exactly as drawn.
+    pub(in crate::gui) fn to_text(&self) -> String {
+        let mut text = String::new();
+        for i in 0..self.len() {
+            if i > 0 {
+                text.push('\n');
+            }
+            if let Some(row) = self.get(i) {
+                text.push_str(row);
+            }
+        }
+        text
+    }
+}
+
+/// Refresh `cache` from `input`, then return the rows to draw.
+pub(in crate::gui) fn build_rows<'a>(
+    cache: &'a mut Option<super::super::StreamRenderCache>,
+    input: &StreamInput,
+    view: &DisplayView,
+    wrap_cols: usize,
+) -> StreamRows<'a> {
+    refresh_rows(
+        cache,
+        StreamRefresh {
+            channel: input.key,
+            window: input.window,
+            window_start: input.window_start,
+            cursor: input.cursor,
+            marks: input.marks,
+            marks_version: input.marks_version,
+            view,
+            wrap_cols,
+        },
+    );
+    compose_rows(cache, input.key, input.trailing)
+}
+
+/// The rows of an already-refreshed `cache`, with `trailing` marks drawn after
+/// the last byte. Empty when the cache belongs to another key.
+pub(in crate::gui) fn compose_rows<'a>(
+    cache: &'a Option<super::super::StreamRenderCache>,
+    key: ChannelId,
+    trailing: &[crate::gui::state::StreamMark],
+) -> StreamRows<'a> {
+    let Some(c) = cache.as_ref().filter(|c| c.channel == key) else {
+        return StreamRows {
+            head: &[],
+            tail: Vec::new(),
+        };
+    };
+    if trailing.is_empty() || c.rows.is_empty() {
+        return StreamRows {
+            head: &c.rows,
+            tail: Vec::new(),
+        };
+    }
+    let (head, open) = c.rows.split_at(c.rows.len() - 1);
+    StreamRows {
+        head,
+        tail: tail_rows(c.mode, &open[0], trailing, c.wrap_cols),
+    }
+}
+
+/// The rows that follow the data when marks trail it: the cache's open last row
+/// with each mark spliced on, as the renderer splices them once a byte arrives
+/// after them. Text modes carry their line breaks in the mark text; Hex breaks
+/// the byte row and ends the mark's line itself.
+fn tail_rows(
+    mode: DisplayMode,
+    open_row: &str,
+    trailing: &[crate::gui::state::StreamMark],
+    wrap_cols: usize,
+) -> Vec<String> {
+    let mut text = open_row.to_string();
+    for mark in trailing {
+        if mode == DisplayMode::Hex {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&mark.text);
+            if !mark.text.ends_with(['\r', '\n']) {
+                text.push('\n');
+            }
+        } else {
+            text.push_str(&mark.text);
+        }
+    }
+    split_stream_rows(&text, wrap_cols)
+}
+
+/// The framed, virtualised stream viewer: the row cache refresh and the
+/// scroll-to-bottom row view with its scrollbar styling. It reads nothing but
+/// its arguments, so a Channel and Linemon each draw through it with their own
+/// `cache`.
+///
+/// `empty_note` is `Some` while there is nothing to show; the viewer then
+/// reserves its full height and draws the note. `jump_to_bottom` is a one-shot
+/// jump onto the newest rows.
+pub(in crate::gui) fn show_stream_rows(
+    ui: &mut egui::Ui,
+    prefs: &ViewPrefs,
+    cache: &mut Option<super::super::StreamRenderCache>,
+    input: &StreamInput,
+    empty_note: Option<&str>,
+    jump_to_bottom: bool,
+) {
+    let msg_mode = prefs.mode;
+    let msg_chars = prefs.chars;
+    let font_size = prefs.font_size;
+    let mono_family = prefs.mono.family();
+    let fg = prefs.colors.fg();
+    let bg = prefs.colors.bg();
+
+    // The stream viewer (§41): there is one source — the verbatim byte stream.
+    // Hex line length is filled in below, once the pane's width is known, so
+    // that every Hex byte wrap happens in the renderer — the only place a
+    // cell boundary is known. `split_stream_rows` is still character-based
+    // and still wraps the text modes; a Hex *byte* row never reaches it with
+    // anything left to cut (see `hex_line_bytes`). A Hex *Mark* row can, and
+    // that is deliberate: a Mark wider than the pane is cut as text, which
+    // is the one overrun ADR-042 accepts.
+    let hex_grouping = prefs.hex_grouping;
+    let mut renderer = DisplayView {
+        mode: msg_mode,
+        encoding: DisplayEncoding::Utf8,
+        character_rendering: msg_chars,
+        wrapping: WrappingMode::NoWrap,
+        wrap_width: None,
+        hex_separator: " ".to_string(),
+        hex_bytes_per_group: usize::from(hex_grouping.bytes_per_group.max(1)),
+        hex_bytes_per_line: 0,
+    };
+    // Verbatim received bytes (§17–18, §41): line breaks come only from the
+    // data — Rendered honors real CR/LF (§44), Raw shows control pictures, Hex
+    // is a byte run. Serial and UDP render identically (no reframing).
+    //
+    // Performance (§100): the scrollback can reach the 256 KB scroll cap. The
+    // bytes arrive incrementally (StreamDelta) so the driver never re-ships the
+    // whole buffer; here we (a) memoize the split rows, re-rendering only when
+    // data arrives or the view mode changes — keyed on the stream cursor — and
+    // (b) virtualize the layout with `show_rows`, laying out only visible rows.
+    // Both matter: a non-virtualized selectable Label over the full buffer
+    // stalled the UI.
+    let font = egui::FontId::new(font_size, mono_family.clone());
+    // Monospace metrics: row height and the width of one glyph ('0' as a stand-in),
+    // so we can convert the available pixel width into a column count for wrapping.
+    let (row_h, char_w) =
+        ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0').max(1.0)));
+    // Width of the (non-floating) vertical scrollbar. Used both to size the bar
+    // below and to reserve its space when wrapping, so a full row ends just before
+    // the bar instead of under it. One const so the two uses can't drift apart.
+    const SCROLLBAR_WIDTH: f32 = 12.0;
+    // Pin the viewer to exactly the height left in the pane, so the ScrollArea owns
+    // the scrolling (and `stick_to_bottom` keeps the newest bytes pinned to the
+    // bottom edge) instead of the content overflowing and scrolling the whole pane —
+    // which left the latest data stranded below the window fold ("never reaches the
+    // bottom"). The Frame's 4px inner margin top+bottom is subtracted.
+    let viewer_height = (ui.available_height() - 8.0).max(0.0);
+    egui::Frame::new()
+        .fill(bg)
+        .inner_margin(4.0)
+        .show(ui, |ui| {
+            // Pre-wrap each cached row to the columns that fit the viewer's inner
+            // width (less the scrollbar), so every row is exactly one visual line —
+            // uniform height, which `show_rows` needs to virtualize. Re-wraps only
+            // when the column count changes (the cache key includes it).
+            let avail_w = (ui.available_width() - SCROLLBAR_WIDTH).max(char_w);
+            let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
+            // Resolve Hex line length against the pane now that its width is
+            // known, so the renderer wraps at a whole group and the row
+            // splitter below never has a Hex byte line left to cut. The
+            // column bound that goes with it is attached by `rebuild_rows`,
+            // which receives `wrap_cols` anyway and so cannot be given one
+            // setting without the other.
+            renderer.hex_bytes_per_line = hex_line_bytes(hex_grouping, wrap_cols);
+            let rows = build_rows(cache, input, &renderer, wrap_cols);
+            // The viewer fills its full height whether or not data is flowing — the
+            // ScrollArea (`auto_shrink([false,false])`) reserves the space, so the
+            // window doesn't pop open when a channel starts. Empty state shows a
+            // weak note *inside* the scroll area rather than collapsing the frame.
+            // Text selection across the (non-interactive) row labels.
+            ui.style_mut().interaction.selectable_labels = true;
+            // Give the scrollbar a visible track + handle, distinct from the text
+            // background, so the strip on the right edge reads as the scrollbar (not
+            // mysterious empty space). Both contrast with `bg`, the handle more
+            // strongly (see `scrollbar_colors`). Set before the per-widget overrides.
+            let (track, handle) = scrollbar_colors(bg);
+            ui.visuals_mut().extreme_bg_color = track;
+            // A solid, constant-width scrollbar. egui's default is "floating" — thin
+            // until hovered, which read as the track widening on hover; `floating =
+            // false` plus a fixed `bar_width` (and zero margins) pins it to a steady
+            // strip the width we reserved above.
+            {
+                let s = &mut ui.style_mut().spacing.scroll;
+                s.floating = false;
+                s.bar_width = SCROLLBAR_WIDTH;
+                s.bar_inner_margin = 0.0;
+                s.bar_outer_margin = 0.0;
+            }
+            // Suppress the per-widget hover/active visuals egui paints on selectable
+            // labels (they drew a flickering box around the rows near the pointer).
+            {
+                let w = &mut ui.visuals_mut().widgets;
+                for s in [
+                    &mut w.hovered,
+                    &mut w.active,
+                    &mut w.inactive,
+                    &mut w.noninteractive,
+                ] {
+                    s.bg_stroke = egui::Stroke::NONE;
+                    s.weak_bg_fill = egui::Color32::TRANSPARENT;
+                    s.bg_fill = egui::Color32::TRANSPARENT;
+                }
+            }
+            // The scroll handle is drawn from the *idle* widget visuals (egui maps an
+            // un-hovered scrollbar to `widgets.inactive`), using `bg_fill` when
+            // `scroll_style.foreground_color` is false (the default) or `fg_stroke`
+            // when true. We just cleared those fills for the labels, which is why the
+            // handle vanished. Set `foreground_color = true` and drive the handle via
+            // `fg_stroke.color` on every interaction state — explicit and immune to
+            // the bg_fill clearing above. Hover/drag brighten so it stays visible on
+            // a dark scheme.
+            ui.style_mut().spacing.scroll.foreground_color = true;
+            {
+                let w = &mut ui.visuals_mut().widgets;
+                w.inactive.fg_stroke.color = handle;
+                w.noninteractive.fg_stroke.color = handle;
+                w.hovered.fg_stroke.color = handle.gamma_multiply(1.2);
+                w.active.fg_stroke.color = handle.gamma_multiply(1.4);
+            }
+            // Zero the inter-row spacing *here*, before `show_rows`, so the row pitch
+            // it uses to size the virtual content (and thus where `stick_to_bottom`
+            // scrolls) matches what the rows actually render at. Setting it only
+            // inside the closure left `show_rows` reserving `row_h + default_spacing`
+            // per row while rows drew at `row_h`, so the computed bottom overshot the
+            // real last row and the newest data never came into view.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            // Resume's one-shot jump to the newest bytes: force the offset
+            // to the exact virtual content height (rows × row pitch — the
+            // spacing zeroed above is what makes this arithmetic hold;
+            // egui clamps overshoot). With the view at the bottom,
+            // `stick_to_bottom` re-latches and follows new data on its own.
+            let mut scroll = egui::ScrollArea::vertical()
+                .id_salt("stream")
+                .stick_to_bottom(true)
+                .max_height(viewer_height)
+                .auto_shrink([false, false]);
+            if jump_to_bottom {
+                scroll = scroll.vertical_scroll_offset(rows.len() as f32 * row_h);
+            }
+            if let Some(note) = empty_note {
+                // No data yet: still occupy the full viewer height, with a note.
+                scroll.show(ui, |ui| {
+                    ui.label(egui::RichText::new(note).weak());
+                });
+                return;
+            }
+            // Soft-wrapped AND virtualized: rows are pre-wrapped to `wrap_cols`
+            // (above) so each is one uniform-height visual line, which lets
+            // `show_rows` lay out only the visible rows. This is what keeps the UI
+            // responsive — the earlier "render everything" approaches (N labels or
+            // one giant galley) re-laid-out the whole buffer every frame and made
+            // resizing/the whole UI sluggish. Rows don't wrap again here (they're
+            // already wrapped); they just extend if anything slipped through.
+            scroll.show_rows(ui, row_h, rows.len().max(1), |ui, range| {
+                for row in range.filter_map(|i| rows.get(i)) {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(row).font(font.clone()).color(fg))
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                }
+            });
+        });
+}
+
+/// The view-configuration controls (inside the "View configuration" dropdown):
+/// View mode + ctrl-chars on one row, font size / colors / mono on the next, then
+/// the scroll-buffer size readout. Edits the passed-in [`ViewPrefs`] (a clone of
+/// the selected channel's); the caller persists any change. `stream_len` is the
+/// channel's current scrollback byte count. Touches no app state beyond
+/// rendering.
+pub(in crate::gui) fn show_view_controls(
+    ui: &mut egui::Ui,
+    prefs: &mut ViewPrefs,
+    stream_len: usize,
+) {
+    let base = egui::TextStyle::Body.resolve(ui.style()).size;
+    ui.horizontal(|ui| {
+        ui.label("View")
+            .on_hover_text("How the received bytes are displayed in the viewer.");
+        ui.radio_value(&mut prefs.mode, DisplayMode::Hex, "Hex")
+            .on_hover_text("Each byte as two-digit hex (e.g. 0A 0D 41).");
+        ui.radio_value(&mut prefs.mode, DisplayMode::Rendered, "Rendered")
+            .on_hover_text("As text, where line break bytes (CR and LF) start a new line.");
+        ui.radio_value(&mut prefs.mode, DisplayMode::Raw, "Raw")
+            .on_hover_text(
+                "As text, but control characters are shown as the marks chosen under \
+                 ctrl-chars instead of moving the text around.",
+            );
+        ui.separator();
+        // Control-character rendering (§46) — enabled only in Raw mode. The
+        // oversized ␊ glyph makes the row taller than the text, so the whole
+        // ctrl-chars cluster is bottom-aligned to sit on the View radios' baseline.
+        ui.add_enabled_ui(prefs.mode == DisplayMode::Raw, |ui| {
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("ctrl-chars");
+                    ui.radio_value(
+                        &mut prefs.chars,
+                        CharacterRendering::Glyph,
+                        egui::RichText::new("␊").size(base * 1.6),
+                    )
+                    .on_hover_text("Control pictures (␊ ␍ ␉ …)");
+                    ui.radio_value(&mut prefs.chars, CharacterRendering::Token, "[LF]")
+                        .on_hover_text("Bracketed names ([LF] [CR] [TAB] …)");
+                    ui.radio_value(&mut prefs.chars, CharacterRendering::HexEscape, "<0A>")
+                        .on_hover_text("Hex escapes (<0A> <0D> <09> …)");
+                });
+            });
+        });
+    });
+    // Hex grouping (§45) — enabled only in Hex mode, but the setting persists
+    // either way, so switching modes and back does not lose it.
+    ui.add_enabled_ui(prefs.mode == DisplayMode::Hex, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Group").on_hover(&GROUP_HOVER);
+            egui::ComboBox::from_id_salt("hex_bytes_per_group")
+                .selected_text(format!(
+                    "{} bytes",
+                    prefs.hex_grouping.bytes_per_group.max(1)
+                ))
+                .show_ui(ui, |ui| {
+                    for &size in HEX_GROUP_SIZES {
+                        ui.selectable_value(
+                            &mut prefs.hex_grouping.bytes_per_group,
+                            size,
+                            format!("{size} bytes"),
+                        );
+                    }
+                });
+            ui.label("Line").on_hover(&LINE_HOVER);
+            egui::ComboBox::from_id_salt("hex_groups_per_line")
+                .selected_text(hex_line_label(prefs.hex_grouping))
+                .show_ui(ui, |ui| {
+                    for &groups in HEX_LINE_GROUPS {
+                        let candidate = HexGrouping {
+                            groups_per_line: groups,
+                            ..prefs.hex_grouping
+                        };
+                        ui.selectable_value(
+                            &mut prefs.hex_grouping.groups_per_line,
+                            groups,
+                            hex_line_label(candidate),
+                        );
+                    }
+                });
+        });
+    });
+    ui.horizontal(|ui| {
+        ui.label("Size");
+        // An editable "combo": type any size into the field, or pick a preset from
+        // the ▾ menu; the text is the source of truth while editing.
+        let resp = ui.add(egui::TextEdit::singleline(&mut prefs.font_text).desired_width(40.0));
+        if resp.changed() {
+            if let Ok(v) = prefs.font_text.trim().parse::<f32>() {
+                prefs.font_size = v.clamp(6.0, 72.0);
+            }
+        }
+        ui.menu_button("\u{25BC}", |ui| {
+            for &size in MSG_FONT_SIZES {
+                if ui.button(format!("{size:.0}")).clicked() {
+                    prefs.font_size = size;
+                    prefs.font_text = format!("{size:.0}");
+                    ui.close();
+                }
+            }
+        });
+        ui.separator();
+        ui.label("Colors");
+        egui::ComboBox::from_id_salt("msg_colors")
+            .selected_text(prefs.colors.label())
+            .show_ui(ui, |ui| {
+                for scheme in [
+                    ColorScheme::BlackOnWhite,
+                    ColorScheme::GreenOnBlack,
+                    ColorScheme::GreenOnBlackDim,
+                    ColorScheme::AmberOnBlack,
+                    ColorScheme::WhiteOnBlack,
+                ] {
+                    ui.selectable_value(&mut prefs.colors, scheme, scheme.label());
+                }
+            });
+        ui.separator();
+        ui.label("Mono");
+        egui::ComboBox::from_id_salt("msg_font")
+            .selected_text(prefs.mono.label())
+            .show_ui(ui, |ui| {
+                for &font in MonoFont::ALL {
+                    ui.selectable_value(&mut prefs.mono, font, font.label());
+                }
+            });
+    });
+    // Scroll-buffer cap (§87): how far back the viewer scrolls, chosen from presets
+    // (2 … 256 kB) — no free text, so it's always a known value. The current fill is
+    // shown alongside. Persisted via retention (the runtime adopts it next start; the
+    // GUI viewer caps live).
+    ui.horizontal(|ui| {
+        ui.label("Scroll buffer").on_hover(&SCROLL_BUFFER_HOVER);
+        egui::ComboBox::from_id_salt("scroll_buffer")
+            .selected_text(scroll_buffer_label(prefs.scroll_buffer_bytes))
+            // Tall enough for every preset: the default popup max height sat
+            // right at the content height, so its (floating) scrollbar
+            // flashed in and out on hover. With room to spare the popup
+            // never scrolls and no scrollbar can appear.
+            .height(280.0)
+            .show_ui(ui, |ui| {
+                for &kb in SCROLL_BUFFER_PRESETS_KB {
+                    let bytes = (kb * 1024).clamp(MIN_SCROLL_BUFFER_BYTES, MAX_SCROLL_BUFFER_BYTES);
+                    ui.selectable_value(
+                        &mut prefs.scroll_buffer_bytes,
+                        bytes,
+                        scroll_buffer_label(bytes),
+                    );
+                }
+            })
+            .response
+            .on_hover(&SCROLL_BUFFER_HOVER);
+        ui.separator();
+        // The current fill (how much is buffered right now, ≤ the cap).
+        ui.label(egui::RichText::new(format!("now: {}", human_bytes(stream_len as u64))).weak())
+            .on_hover_text("The bytes in the scroll buffer right now, never more than its size.");
+    });
 }
 
 /// Narrowest row width the viewer will lay out to, in monospace columns.

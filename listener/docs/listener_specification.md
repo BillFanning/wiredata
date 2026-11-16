@@ -1,14 +1,19 @@
-# Listener Specification v2.5.0
+# Listener Specification v2.5.1
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-15) — Linemon:
+Revision note (2026-11-15) — Linemon, as built:
 
-- **§50.3 (ADR-070).** New: Linemon, a window for looking at one stream.
-- **Appendix A.** Lists what Linemon leaves for later.
+- **§50.3 (ADR-070).** Adds Start, Stop and Reopen port on start, and says
+  that a typed value takes effect when its field is left. Names the buttons
+  as they appear: Previous, Next and Copy scroll buffer. A port held by
+  Linemon or by a channel is refused the same way in both directions, and a
+  refused port waits for Start.
+- **§91, §113.** Quoted on-screen messages write "channel" in lower case, as
+  the screen does.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -984,28 +989,50 @@ Rules are part of `ChannelConfig` (§72) as `match_rules: Vec<MatchRule>`.
 
 Linemon is a window for looking at one stream (ADR-070). It opens from one
 button in the main window, and it works while Channels are running and
-recording.
+recording, and while the main window is minimized.
 
 - **Source.** Linemon reads one serial port or one UDP port. Only that port is
   open. Closing the window closes the port.
-- **Choosing a port.** A drop-down lists the ports. Step-up and step-down
-  buttons move to the next serial port or the next UDP port number.
+- **Start and Stop.** Start opens the port shown in the bar. Stop closes it and
+  leaves the display as it is.
+- **Reopen port on start.** With this ticked, opening the window opens the port
+  Linemon last had. With it unticked, Linemon waits for Start. It starts
+  ticked.
+- **Choosing a port.** A drop-down lists the serial ports. Previous and Next
+  move through that list, wrapping at its ends, or move the UDP port number one
+  down or up.
 - **Settings.** The bar holds the baud rate, data bits, parity, stop bits and
   flow control for a serial port, and the port number for UDP. A More button
-  holds the multicast group, the network interface and port sharing. There is
-  no Apply button: every change takes effect at once.
-- **A port a Channel is using.** Linemon does not open it. It says which
-  Channel has it.
+  holds the mode, the binding address, the multicast group and port sharing.
+  There is no Apply button: while Linemon is started, every change takes effect
+  at once. A value typed into a field takes effect when the field is left or
+  Enter is pressed, so a half-typed value never opens a port. While Linemon is
+  stopped, a change takes effect at the next Start.
+- **A port a Channel is using.** Linemon does not open it, and says which
+  Channel has it. Linemon stays started, so choosing a free port opens that
+  port. The refused port does not open on its own when the Channel lets it go:
+  Linemon says it is free and waits for Start.
+- **A port Linemon is using.** The same holds the other way: a Channel started,
+  or started with Start all, on the port Linemon has does not start, and its
+  error says Linemon has the port. An automatic reconnect (§9.1) on that port
+  does not run either; it counts as a failed attempt, so the backoff and the
+  attempt limit carry on, and the error says Linemon has the port. Both windows
+  show the message in the same way.
 - **Display.** Linemon shows the stream in Raw, Rendered or Hex (§42–§47), with
   the view controls a Channel's display has. The data stays on screen when the
   port or a setting changes, and a marker line records each change, naming the
   port and its settings. **Clear** empties the display. With **Clear on port
   change** ticked, choosing another port empties it too; it starts unticked.
-- **Pause and Copy.** Pause stops the display, not reception. Copy puts the
-  selection, or the whole display, on the clipboard.
-- **What it keeps.** Linemon remembers its last port, settings and view between
-  launches, with the window's own saved settings. It is not a Channel: it is
-  not in the Channel list, a profile, a recording or a run summary.
+- **Pause.** Pause stops the display, not reception. Bytes that arrive while
+  the display is paused are not shown.
+- **Copy.** Copy scroll buffer puts the whole scroll buffer on the clipboard, as
+  it is displayed, marker lines included. Selecting text and pressing Ctrl+C
+  copies part of it.
+- **What it keeps.** Between launches, Linemon remembers whether it reads serial
+  or UDP, each kind's settings, its view and both checkboxes, with the window's
+  own saved settings. Whether the port was open is not kept: Reopen port on
+  start decides that. Linemon is not a Channel: it is not in the Channel list,
+  a profile, a recording or a run summary.
 - **Limit.** The display holds at most the scroll-buffer size (§87) and drops
   the oldest data past that.
 
@@ -1897,7 +1924,7 @@ this request, the Channel's last answer with its age, or an earlier run's
 figures when the Channel has not answered in this run or its latest run ended
 without a final answer. When the figures are not
 from the latest request, the diagnostics card says so in a sentence, such as
-"These figures were measured 12.0 s ago. The Channel is not answering status
+"These figures were measured 12.0 s ago. The channel is not answering status
 requests." The figures are shown as measured, not adjusted for their age. A
 stopped or faulted Channel's timing window is called its final ten seconds only
 when the figures are its exact final ones.
@@ -2344,7 +2371,7 @@ a final snapshot exists. Finalization is complete only when the Channel confirme
 its close, or never had a pipeline to close; a pipeline that failed first counts
 as incomplete. The copied report has the key `finalization_complete`,
 and the GUI's last-run summary says "The end of the recordings may be missing,
-because the Channel did not finish closing them in time." when it did not.
+because the channel did not finish closing them in time." when it did not.
 
 ---
 

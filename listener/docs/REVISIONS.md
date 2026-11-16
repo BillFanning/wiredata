@@ -12,6 +12,11 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-15) — Linemon:
+
+- **§50.3 (ADR-070).** New: Linemon, a window for looking at one stream.
+- **Appendix A.** Lists what Linemon leaves for later.
+
 Revision note (2026-11-15) — fixes from the follow-up code review:
 
 - **§71 (ADR-064, ADR-065).** A rule may have at most 16 actions and a Mark
