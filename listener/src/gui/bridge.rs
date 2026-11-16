@@ -2064,7 +2064,7 @@ mod tests {
     /// A Channel that is both selected and popped out is polled once: its bytes
     /// reach the GUI exactly once.
     #[tokio::test]
-    async fn a_selected_and_popped_out_channel_is_streamed_once() {
+    async fn a_selected_and_popped_out_channel_gets_each_byte_once() {
         let (cmd_tx, mut upd_rx, id, port, handle) = popout_driver().await;
         cmd_tx.send(UiCommand::Select(Some(id))).await.unwrap();
         cmd_tx.send(UiCommand::SetPopouts(vec![id])).await.unwrap();
@@ -3048,6 +3048,7 @@ mod tests {
                 error_count: 0,
                 raw_recording: None,
                 display_recording: None,
+                display_paused: false,
                 match_boundary_saves: 0,
                 ingest_delay: DurationHistogram::default(),
                 recent_ingest_delay: DurationHistogram::default(),

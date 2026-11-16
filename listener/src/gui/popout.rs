@@ -13,7 +13,7 @@
 use crate::core::ChannelId;
 
 use super::detail::stream_view::{show_stream_rows, StreamInput};
-use super::state::ChannelView;
+use super::state::{AppState, ChannelView};
 use super::view_prefs::ViewPrefs;
 use super::{ListenerApp, StreamRenderCache};
 use wiredata_ui::hover::{Hover, ShowHover};
@@ -27,12 +27,14 @@ pub(super) const POP_OUT_HOVER: Hover = Hover::new(
     "Opens this channel's display in a window of its own.\n\n\
      The window shows the received bytes only, without timestamps or other \
      insertions. You can pause it, clear it, and change its font and view without \
-     changing this display or the channel.",
+     changing this display or the channel.\n\n\
+     Pausing this display pauses the window too, because both show the same bytes.",
 );
 
 const PAUSE_HOVER: Hover = Hover::new(
     "Stops this window's display so you can read it.\n\n\
-     The channel keeps receiving and recording, and its own display keeps moving.",
+     The channel keeps receiving, any recording carries on, and its own display \
+     keeps moving.",
 );
 
 const RESUME_HOVER: Hover = Hover::new(
@@ -40,6 +42,11 @@ const RESUME_HOVER: Hover = Hover::new(
      What arrived while it was paused is shown too, as far back as the channel's \
      display still holds it.",
 );
+
+/// Said while the channel's own display is paused: it and the pop-out show the
+/// same bytes, so nothing new reaches the pop-out either.
+const HELD_TEXT: &str = "This channel's display is paused in the main window, so nothing \
+     new appears here until it is resumed there.";
 
 const CLEAR_HOVER: Hover = Hover::new(
     "Empties this window.\n\n\
@@ -180,9 +187,14 @@ impl Popout {
         let cursor = view.stream_cursor;
 
         let was_paused = self.is_paused();
-        let action = egui::Panel::top("popout_controls")
+        let held = view.display_paused;
+        // An id of this window's own: egui keeps a panel's height under its id
+        // for every window, so two pop-outs sharing one would cut each other off.
+        let action = egui::Panel::top(ui.id().with("popout_controls"))
             .resizable(false)
-            .show_inside(ui, |ui| show_controls(ui, &mut self.prefs, was_paused))
+            .show_inside(ui, |ui| {
+                show_controls(ui, &mut self.prefs, was_paused, held)
+            })
             .inner;
         match action {
             Some(Action::Pause) => self.pause(live, base),
@@ -195,6 +207,8 @@ impl Popout {
         let (bytes, start) = window_of(self.frozen.as_ref(), self.clear_at, live, base);
         let note = bytes.is_empty().then_some(if paused {
             "This window is paused and has nothing to show."
+        } else if held {
+            HELD_TEXT
         } else {
             "Nothing to show yet. Bytes the channel receives will appear here."
         });
@@ -228,8 +242,14 @@ fn window_of<'a>(
 
 /// The pop-out's controls: Pause (Resume) and Clear, then the channel display's
 /// view controls (view, control characters, hex grouping, font size, colours and
-/// font). Returns what was pressed.
-fn show_controls(ui: &mut egui::Ui, prefs: &mut ViewPrefs, paused: bool) -> Option<Action> {
+/// font). `held` says the channel's own display is paused in the main window.
+/// Returns what was pressed.
+fn show_controls(
+    ui: &mut egui::Ui,
+    prefs: &mut ViewPrefs,
+    paused: bool,
+    held: bool,
+) -> Option<Action> {
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
         if paused {
@@ -243,13 +263,30 @@ fn show_controls(ui: &mut egui::Ui, prefs: &mut ViewPrefs, paused: bool) -> Opti
             action = Some(Action::Clear);
         }
         if paused {
-            ui.label("This window is paused. The channel keeps receiving and recording.");
+            ui.label(
+                "This window is paused. The channel keeps receiving, and any recording carries on.",
+            );
+        } else if held {
+            ui.label(HELD_TEXT);
         }
     });
     // The channel display's own controls, without the scroll-buffer row: the
     // pop-out shows the channel's buffer, so its size is not the pop-out's to set.
     super::detail::stream_view::show_view_controls(ui, prefs, None);
     action
+}
+
+/// Drop the pop-outs whose channel has been removed.
+fn drop_removed(popouts: &mut Vec<Popout>, state: &AppState) {
+    popouts.retain(|popout| state.channel(popout.channel()).is_some());
+}
+
+/// The channels that have a pop-out, in a stable order, when they differ from
+/// `sent`, the set the driver was last told; `None` when they are the same.
+fn changed_set(popouts: &[Popout], sent: &[ChannelId]) -> Option<Vec<ChannelId>> {
+    let mut channels: Vec<ChannelId> = popouts.iter().map(Popout::channel).collect();
+    channels.sort_by_key(|id| format!("{id:?}"));
+    (channels != sent).then_some(channels)
 }
 
 /// The id of a channel's pop-out viewport: one per channel.
@@ -278,13 +315,12 @@ impl ListenerApp {
     /// window being minimized. A pop-out whose window was closed, or whose
     /// channel was removed, is dropped.
     pub(super) fn show_popouts(&mut self, ctx: &egui::Context) {
+        drop_removed(&mut self.popouts, &self.state);
         let mut open = std::mem::take(&mut self.popouts);
         open.retain_mut(|popout| self.show_popout(ctx, popout));
         self.popouts = open;
 
-        let mut channels: Vec<ChannelId> = self.popouts.iter().map(Popout::channel).collect();
-        channels.sort_by_key(|id| format!("{id:?}"));
-        if channels != self.last_popouts_sent {
+        if let Some(channels) = changed_set(&self.popouts, &self.last_popouts_sent) {
             self.last_popouts_sent = channels.clone();
             self.send(super::bridge::UiCommand::SetPopouts(channels));
         }
@@ -322,6 +358,44 @@ mod tests {
 
     fn popout() -> Popout {
         Popout::new(ChannelId::new(), ViewPrefs::default(), Some(1))
+    }
+
+    fn state_with(channels: &[ChannelId]) -> AppState {
+        let mut state = AppState::default();
+        for &id in channels {
+            state.apply(crate::gui::bridge::UiUpdate::ChannelAdded(
+                id,
+                "c".into(),
+                String::new(),
+                Box::new(crate::config::templates::udp_template()),
+            ));
+        }
+        state
+    }
+
+    #[test]
+    fn a_removed_channels_pop_out_is_dropped_and_the_driver_is_told() {
+        let (a, b) = (ChannelId::new(), ChannelId::new());
+        let mut popouts = vec![
+            Popout::new(a, ViewPrefs::default(), None),
+            Popout::new(b, ViewPrefs::default(), None),
+        ];
+        let sent = changed_set(&popouts, &[]).expect("the first set is sent");
+        assert_eq!(sent.len(), 2);
+        assert_eq!(changed_set(&popouts, &sent), None, "nothing changed");
+
+        // b is removed from the main window.
+        drop_removed(&mut popouts, &state_with(&[a]));
+        assert_eq!(popouts.len(), 1);
+        assert_eq!(popouts[0].channel(), a);
+        assert_eq!(changed_set(&popouts, &sent), Some(vec![a]));
+    }
+
+    #[test]
+    fn closing_the_last_pop_out_tells_the_driver_the_set_is_empty() {
+        let a = ChannelId::new();
+        let sent = vec![a];
+        assert_eq!(changed_set(&[], &sent), Some(vec![]));
     }
 
     fn view(mode: DisplayMode) -> DisplayView {

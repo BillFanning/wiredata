@@ -2114,6 +2114,7 @@ impl ChannelPipeline {
             display_recording: self.display_recording_state(),
             raw_recording_status: self.recording_status(RecordingTap::Raw),
             display_recording_status: self.recording_status(RecordingTap::Display),
+            display_paused: self.display_pause.is_paused(),
             match_boundary_saves: self.match_rules.boundary_saves(),
             ingest_delay: self.ingest_delay,
             recent_ingest_delay: self.recent_ingest_delay.snapshot_at(now),

@@ -1,19 +1,15 @@
-# Listener Specification v2.6.0
+# Listener Specification v2.6.1
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-15) — Linemon on its own, and the pop-out display:
+Revision note (2026-11-16) — the pop-out and the Channel's display pause:
 
-- **§50.3 (ADR-070).** Linemon is a program of its own, not a window of
-  Listener. It no longer names a channel that holds a port, and a channel no
-  longer names Linemon.
-- **§50.4 (ADR-071).** New: a channel's display can be popped out into a
-  window of its own.
-- **Appendix A.** What Linemon leaves for later is a record button, time
-  stamps on each line, finding the baud rate, TCP and find.
+- **§50.4 (ADR-071).** Pausing the Channel's display pauses its pop-out too,
+  and the pop-out says so. Resume shows what arrived while the pop-out was
+  paused, and removing the Channel closes its pop-out.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -1051,11 +1047,20 @@ made as large as wanted or moved to another monitor.
   clearing it does not pause or clear the Channel's display, and its view
   settings do not change the Channel's. They are not kept: each pop-out starts
   with the Channel's own display settings, and closing it forgets any change.
+- **Resume.** Resume shows live data again, from the newest bytes, and what
+  arrived while the pop-out was paused, as far back as the Channel's display
+  still holds it.
 - **Paused through a restart.** A paused pop-out keeps its picture when the
   Channel restarts, and shows the new run when Resume is pressed.
+- **The Channel's display paused.** The pop-out shows the bytes the Channel's
+  display holds, and a paused display (§50) takes in no new ones. So pausing the
+  Channel's display pauses its pop-out too, and the pop-out says so; the bytes
+  that arrive meanwhile appear in neither.
 - **What it does not do.** The pop-out does not change the Channel's settings,
   start or stop it, or record. A display recording (§54) follows the Channel's
   own view, never a pop-out's.
+- **Closing.** Closing the pop-out's window closes it. Removing the Channel
+  closes its pop-out.
 
 ---
 

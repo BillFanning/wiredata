@@ -212,6 +212,10 @@ pub struct ChannelStats {
     pub raw_recording_status: Option<RecordingStatus>,
     /// The Display sibling of `raw_recording_status`.
     pub display_recording_status: Option<RecordingStatus>,
+    /// Whether the Channel's display is paused (§50). While it is, received
+    /// bytes do not enter the scrollback, so a pop-out (§50.4) shows nothing
+    /// new either; this lets one say so for a Channel that is not selected.
+    pub display_paused: bool,
     /// How many `BytePattern` matches were recovered only because a pattern spanned
     /// a read-chunk boundary (§50.2) — the cross-chunk-carry measurement. A nonzero,
     /// rising count tells an operator that read boundaries are routinely splitting

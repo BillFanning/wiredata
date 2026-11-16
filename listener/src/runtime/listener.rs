@@ -205,6 +205,7 @@ fn retained_stats(channel: &ManagedChannel) -> ChannelStats {
         error_count: errors,
         raw_recording: None,
         display_recording: None,
+        display_paused: false,
         match_boundary_saves: kept.boundary_saves,
         ingest_delay: kept.ingest_delay,
         recent_ingest_delay: kept.recent_ingest_delay,

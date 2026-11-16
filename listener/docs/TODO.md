@@ -18,7 +18,7 @@ again. Remove an item when it is done: the commit says what changed.
   and Next wrap at the ends of the list; the refresh button lists a port
   plugged in or removed; unplugging the adapter shows the fault and Start
   reopens it.
-- [ ] **Linemon's buttons stay on their rows (§50.3).** In `Linemon::draw` the
+- [ ] **Linemon's buttons stay on their rows (§50.3).** In `Linemon::buttons` the
   button row wraps, so buttons move from row to row as the window is resized.
   Give the buttons fixed rows, so each stays where the hand expects it.
 - [ ] **Disk guard in the GUI (§56.2).** Neither recording editor,

@@ -59,6 +59,8 @@ const DEFAULT_WINDOW_SIZE: [f32; 2] = [1100.0, 740.0];
 /// Smallest size the window can be dragged to (a usability floor).
 const MIN_WINDOW_SIZE: [f32; 2] = [640.0, 480.0];
 
+pub use linemon_app::run as run_linemon;
+
 /// Launch the graphical interface (§3). Owns the eframe event loop on the calling
 /// (main) thread; the runtime bridge runs on its own Tokio thread (ADR-008).
 ///
@@ -68,8 +70,6 @@ const MIN_WINDOW_SIZE: [f32; 2] = [640.0, 480.0];
 /// `listener.exe`'s bare-launch / `--gui` path. Put ALL GUI startup (console detach,
 /// logging, window options) in this function so the two binaries stay identical —
 /// never in either `main`.
-pub use linemon_app::run as run_linemon;
-
 pub fn run() -> anyhow::Result<()> {
     detach_console(); // drop the double-click console before the window opens
                       // §114, §118; non-fatal (§117). Held until the window closes, so the event

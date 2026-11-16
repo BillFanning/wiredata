@@ -12,6 +12,16 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-15) — Linemon on its own, and the pop-out display:
+
+- **§50.3 (ADR-070).** Linemon is a program of its own, not a window of
+  Listener. It no longer names a channel that holds a port, and a channel no
+  longer names Linemon.
+- **§50.4 (ADR-071).** New: a channel's display can be popped out into a
+  window of its own.
+- **Appendix A.** What Linemon leaves for later is a record button, time
+  stamps on each line, finding the baud rate, TCP and find.
+
 Revision note (2026-11-15) — Linemon, as built:
 
 - **§50.3 (ADR-070).** Adds Start, Stop and Reopen port on start, and says

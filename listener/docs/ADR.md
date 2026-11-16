@@ -2471,11 +2471,13 @@ Channel are unchanged; the program around it holds only that window. What
 looking at a running Channel's stream needed moves into Listener instead, as
 the pop-out display (ADR-071).
 
-Two parts of the decision above end with the move. The two programs cannot see
-each other's ports, so Linemon no longer names a Channel that holds a port, a
-Channel no longer names Linemon, and each shows the system's reason when a port
-is taken. And Linemon is drawn as its program's own window, so the reason for
-drawing it every frame no longer applies. Linemon keeps its own saved settings
+Three parts of the decision above end with the move. The two programs cannot
+see each other's ports, so Linemon no longer names a Channel that holds a port,
+a Channel no longer names Linemon, and each shows the system's reason when a
+port is taken. For the same reason the consequence above that a logging run is
+never disturbed no longer holds: Linemon can take a port that a Channel in
+Listener is waiting to reconnect to. And Linemon is drawn as its program's own
+window, so the reason for drawing it every frame no longer applies. Linemon keeps its own saved settings
 and writes no event log. Its deferred list shrinks to a record button, time
 stamps on each line, finding the baud rate, TCP and find.
 
@@ -2501,6 +2503,10 @@ display, larger, with nothing that could change the Channel.
   after it closes. A paused pop-out keeps its picture through a restart until
   Resume.
 - It never changes the Channel's settings, starts or stops it, or records.
+- It shows what the Channel's display holds, so pausing that display pauses
+  the pop-out too, and the pop-out says so. The Channel's paused state rides in
+  the status poll every Channel gets, so a pop-out of a Channel that is not
+  selected knows it.
 
 The GUI streams bytes only for the selected Channel today, so each popped-out
 Channel gets its stream too. A pop-out reads the Channel's bytes as the GUI

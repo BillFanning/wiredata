@@ -208,7 +208,7 @@ impl LinemonStream {
 
     /// Draw the buffer through the shared stream viewer, with `cache` as its
     /// row cache. The caller owns the cache, so this does not disturb the row
-    /// cache of the Channel the main window draws.
+    /// cache of the channel display the main window draws.
     pub(super) fn show(
         &mut self,
         ui: &mut egui::Ui,

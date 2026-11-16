@@ -518,6 +518,19 @@ impl Linemon {
             self.settings.reopen_on_start && port_key(&self.settings.interface()).is_some();
     }
 
+    /// The last request did not reach the runtime, which is busy or has
+    /// stopped. Said as the port's open error, so Start is offered again and
+    /// sends it again.
+    pub fn request_not_delivered(&mut self) {
+        if self.sent.is_some() {
+            self.open_error = Some(
+                "the request did not reach Linemon's runtime, which is busy or has stopped. \
+                 Press Start to try again."
+                    .to_owned(),
+            );
+        }
+    }
+
     /// Fold an update about the hidden Channel. Stream bytes that arrive while
     /// the display is paused are not shown.
     pub fn handle(&mut self, update: LinemonUpdate) {
@@ -1142,8 +1155,6 @@ mod tests {
         assert!(is_port_change(&PortKey::Udp(5005), &com4));
     }
 
-    // ---- in use ----
-
     // ---- stepping ----
 
     fn ports(names: &[&str]) -> Vec<String> {
@@ -1502,6 +1513,30 @@ mod tests {
             l.start_up();
             assert_eq!(l.started, expect, "reopen {reopen}, port {port:?}");
         }
+    }
+
+    #[test]
+    fn a_request_that_did_not_reach_the_runtime_is_said_and_start_is_offered() {
+        let mut l = started_on("COM4");
+        let mut out = Vec::new();
+        l.sync(&mut out);
+        assert!(!l.can_start(), "open and waiting");
+        l.request_not_delivered();
+        assert!(l.can_start(), "Start sends it again");
+        let interface = l.settings.interface();
+        let line = status_line(&StatusFacts {
+            interface: &interface,
+            started: true,
+            paused: false,
+            open_error: l.open_error.as_deref(),
+            run: None,
+        });
+        assert!(line.problem);
+        assert!(
+            line.text.ends_with("Press Start to try again."),
+            "{}",
+            line.text
+        );
     }
 
     #[test]

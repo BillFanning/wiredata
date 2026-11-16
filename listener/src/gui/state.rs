@@ -108,6 +108,9 @@ pub struct ChannelView {
     /// Display-recording state from the latest snapshot/stats (§54) — the Record
     /// Display block's indicator. `None` when it isn't attached.
     pub display_recording: Option<RecordingState>,
+    /// Whether the channel's display is paused, from the latest snapshot or
+    /// stats (§50). A pop-out says so, since it shows the same bytes (§50.4).
+    pub display_paused: bool,
     /// Bounded-queue occupancy from the latest snapshot/stats (§99) — for stress
     /// testing / backpressure diagnosis. Shown in the detail pane.
     /// Where the timing and throughput figures below came from: measured for
@@ -184,6 +187,7 @@ impl ChannelView {
             control_lines: None,
             recording: None,
             display_recording: None,
+            display_paused: false,
             figures: crate::runtime::Provenance::Fresh,
             ingest_delay: crate::runtime::DurationHistogram::default(),
             recent_ingest_delay: crate::runtime::DurationHistogram::default(),
@@ -530,6 +534,7 @@ impl AppState {
             UiUpdate::Event(event) => self.apply_event(event),
             UiUpdate::Snapshot(id, snapshot) => {
                 if let Some(view) = self.views.get_mut(&id) {
+                    view.display_paused = snapshot.display_paused.unwrap_or(false);
                     reconcile_status(view, snapshot.state, snapshot.reconnect_pending);
                     view.bytes_total = snapshot.activity.total_bytes;
                     view.bytes_per_sec = snapshot.activity.bytes_per_sec;
@@ -562,6 +567,7 @@ impl AppState {
             // Cheap per-tab health for non-selected channels (no scrollback bytes).
             UiUpdate::Stats(id, stats) => {
                 if let Some(view) = self.views.get_mut(&id) {
+                    view.display_paused = stats.display_paused;
                     reconcile_status(view, stats.state, stats.reconnect_pending);
                     view.bytes_total = stats.activity.total_bytes;
                     view.bytes_per_sec = stats.activity.bytes_per_sec;
@@ -1119,6 +1125,7 @@ mod tests {
                 error_count: 0,
                 raw_recording: None,
                 display_recording: None,
+                display_paused: false,
                 match_boundary_saves: 0,
                 ingest_delay: crate::runtime::DurationHistogram::default(),
                 recent_ingest_delay: crate::runtime::DurationHistogram::default(),
@@ -1132,6 +1139,24 @@ mod tests {
                 display_recording_status: None,
             }),
         )
+    }
+
+    #[test]
+    fn the_display_pause_is_folded_from_stats() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "GPS", "udp"));
+        let paused = |on: bool| {
+            let mut update = stats_with_state(id, ChannelState::Running, false);
+            if let UiUpdate::Stats(_, stats) = &mut update {
+                stats.display_paused = on;
+            }
+            update
+        };
+        state.apply(paused(true));
+        assert!(state.channel(id).unwrap().display_paused);
+        state.apply(paused(false));
+        assert!(!state.channel(id).unwrap().display_paused);
     }
 
     #[test]

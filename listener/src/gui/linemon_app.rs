@@ -75,12 +75,11 @@ impl LinemonApp {
     }
 
     /// Send a command to the driver. Non-blocking: a full command channel drops
-    /// it rather than stalling the window. Linemon sends again whenever what
-    /// it wants differs from what it last asked for, so a dropped open or close
-    /// is not lost for good, but it is logged.
+    /// it rather than stalling the window. A dropped request is not sent again
+    /// on its own; the status line says so, and Start sends it again.
     fn send(&mut self, command: UiCommand) {
-        if let Err(e) = self.bridge.commands.try_send(command) {
-            tracing::warn!("Linemon command dropped ({e}): the runtime is busy or stopped");
+        if self.bridge.commands.try_send(command).is_err() {
+            self.linemon.request_not_delivered();
         }
     }
 
