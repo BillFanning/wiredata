@@ -11,7 +11,7 @@
 //! coupling to the UI is an opaque `repaint` callback the driver invokes after
 //! pushing an update (the App passes `egui::Context::request_repaint`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -129,6 +129,11 @@ pub enum UiCommand {
     /// channel gets a snapshot + incremental stream delta polled; the rest get cheap
     /// stats (ADR-006).
     Select(Option<ChannelId>),
+    /// Tell the driver which channels have a pop-out window open (spec §50.4).
+    /// Each of them gets the same incremental stream delta the selected channel
+    /// gets, whether or not it is selected. The list replaces the previous one;
+    /// ids of channels that do not exist are ignored.
+    SetPopouts(Vec<ChannelId>),
     /// Save the current workspace (every registered channel's config) to a TOML
     /// profile at `path` (§67–§71). The driver replies with `ProfileSaved` or, on an
     /// I/O/serialization error, `ProfileError`.
@@ -745,6 +750,9 @@ pub struct Driver {
     /// The channel currently on screen; only this one gets a snapshot + stream delta
     /// polled (the rest get cheap stats).
     selected: Option<ChannelId>,
+    /// Channels with a pop-out window open (spec §50.4). Like the selected
+    /// channel they get a stream delta each poll, and they keep the cheap stats.
+    popouts: HashSet<ChannelId>,
     /// Per-channel live stream cursors (§87, ADR-009). Preserving these across
     /// selection changes avoids re-shipping the retained window whenever the user
     /// revisits a tab. Generation changes still force a reliable run reset.
@@ -790,6 +798,7 @@ impl Driver {
             repaint,
             channels: Vec::new(),
             selected: None,
+            popouts: HashSet::new(),
             stream_cursors: HashMap::new(),
             steps: HashMap::new(),
             workspace: VecDeque::new(),
@@ -908,26 +917,6 @@ impl Driver {
                 None => break,
             }
         }
-    }
-
-    /// The interface of the port Linemon has open or is opening: its window
-    /// wants it open, no newer request waits, and its hidden Channel is
-    /// running or starting.
-    fn linemon_port(&self) -> Option<InterfaceConfig> {
-        let linemon = self.linemon.as_ref()?;
-        if !linemon.open || linemon.waiting.is_some() {
-            return None;
-        }
-        let live = matches!(
-            self.listener.state(linemon.id),
-            Some(ChannelState::Running | ChannelState::Starting)
-        );
-        if !live {
-            return None;
-        }
-        self.listener
-            .config(linemon.id)
-            .map(|config| config.interface.clone())
     }
 
     fn is_linemon(&self, id: ChannelId) -> bool {
@@ -1051,6 +1040,7 @@ impl Driver {
                 let _ = self.listener.remove_channel(id).await;
                 self.channels.retain(|c| *c != id);
                 self.stream_cursors.remove(&id);
+                self.popouts.remove(&id);
                 self.push(UiUpdate::ChannelRemoved(id));
             }
             Step::Reconnected(attempt) => {
@@ -1197,15 +1187,10 @@ impl Driver {
 
     /// Queue the reconnect attempts now due (§9.1): each a stop and a start,
     /// off the loop like any other (ADR-052). A Channel mid-step waits.
-    ///
-    /// An attempt on the port Linemon has does not run: it counts as a failed
-    /// attempt, so the backoff and the attempt limit carry on, and the
-    /// Channel's error names Linemon, as a Start in the main window does.
     fn queue_reconnects(&mut self) {
         // Linemon's hidden Channel is never reconnected: the window opens it
         // again when it wants it.
         let linemon = self.linemon.as_ref().map(|linemon| linemon.id);
-        let linemon_port = self.linemon_port();
         let attempts = self
             .listener
             .reconnects_due(std::time::Instant::now(), |id| {
@@ -1213,16 +1198,6 @@ impl Driver {
             });
         for attempt in attempts {
             let id = attempt.id();
-            let refusal = linemon_port.as_ref().and_then(|held| {
-                let wanted = &self.listener.config(id)?.interface;
-                super::linemon_window::reconnect_refusal(held, wanted)
-            });
-            if let Some(reason) = refusal {
-                self.listener
-                    .finish_reconnect(attempt, false, std::time::Instant::now());
-                self.push_channel_error(id, reason);
-                continue;
-            }
             self.queue(
                 id,
                 [
@@ -1238,6 +1213,7 @@ impl Driver {
         match change {
             WorkspaceStep::Clear => {
                 self.selected = None;
+                self.popouts.clear();
                 self.stream_cursors.clear();
             }
             WorkspaceStep::Load {
@@ -1422,6 +1398,12 @@ impl Driver {
                 // bytes that arrived while it was off-screen.
                 self.selected = id;
             }
+            UiCommand::SetPopouts(ids) => {
+                self.popouts = ids
+                    .into_iter()
+                    .filter(|id| self.channels.contains(id))
+                    .collect();
+            }
             // Profile file work runs off the loop, one piece at a time (see
             // `ProfileWork`).
             UiCommand::SaveProfile(path) => self.save_profile(path),
@@ -1525,9 +1507,10 @@ impl Driver {
         added
     }
 
-    /// Poll channels for the UI's pull surface. Every channel gets cheap **stats**
-    /// (per-tab health); the **selected** channel additionally gets a snapshot (its
-    /// bounded diagnostic/match detail) and an incremental **stream delta** (only the
+    /// Poll channels for the UI's pull surface. Every unselected channel gets cheap
+    /// **stats** (per-tab health); the **selected** channel gets a snapshot (its
+    /// bounded diagnostic/match detail) instead. The selected channel and every
+    /// channel with a pop-out open also get an incremental **stream delta** (only the
     /// scrollback bytes new since our cursor — never the whole buffer, §87/ADR-009).
     /// Stopped/unknown channels yield `None`.
     ///
@@ -1582,50 +1565,57 @@ impl Driver {
         }
     }
 
-    /// One Channel's share of a poll round.
+    /// One Channel's share of a poll round: stats for every unselected Channel, a
+    /// snapshot for the selected one, and the stream's new bytes for the selected
+    /// Channel and for each Channel with a pop-out open. A Channel that is both
+    /// is polled once.
     async fn poll_channel(&mut self, id: ChannelId) {
-        if Some(id) == self.selected {
+        let selected = Some(id) == self.selected;
+        if selected {
             // Two requests to the pipeline per poll, the snapshot and the
             // stream delta, where one would do. Not worth changing on its
             // own: fold them together when `PipelineRequest` next changes.
             if let Some(snap) = self.listener.snapshot(id).await {
                 self.push(UiUpdate::Snapshot(id, Box::new(snap)));
             }
-            // Incremental live stream (§87, ADR-009): fetch only the bytes new
-            // since our cursor, so we never re-ship the whole scrollback. A
-            // "caught up" empty delta is a no-op (just advance past it). For a
-            // non-empty delta, advance the cursor ONLY if the push was accepted —
-            // if the bounded update channel was full and dropped it, keep the
-            // cursor so the next poll re-fetches those bytes instead of skipping
-            // them. (Previously the cursor advanced unconditionally, so a dropped
-            // delta was lost forever and the view froze while bytes kept counting.)
-            let cursor = self.stream_cursors.get(&id).copied().unwrap_or_default();
-            if let Some(delta) = self.listener.stream_delta(id, cursor.offset).await {
-                let end = delta.end_offset;
-                let generation = delta.generation;
-                // Empty caught-up deltas normally stay off the UI channel. A new
-                // generation is different: forward even an empty window so a
-                // restart clears stale bytes when no new data has arrived yet.
-                let needs_update = Some(generation) != cursor.generation || !delta.bytes.is_empty();
-                let advance =
-                    !needs_update || self.push(UiUpdate::StreamDelta(id, Box::new(delta)));
-                if advance {
-                    self.stream_cursors.insert(
-                        id,
-                        StreamPollCursor {
-                            generation: Some(generation),
-                            offset: end,
-                        },
-                    );
-                }
-            }
         } else if let Some(stats) = self.listener.channel_stats(id).await {
             self.push(UiUpdate::Stats(id, Box::new(stats)));
+        }
+        if selected || self.popouts.contains(&id) {
+            self.poll_stream(id).await;
         }
         // Live serial control/status lines (§161); `None` for non-serial or
         // stopped channels.
         if let Some(lines) = self.listener.serial_control_lines(id) {
             self.push(UiUpdate::ControlLines(id, lines));
+        }
+    }
+
+    /// Incremental live stream (§87, ADR-009): fetch only the bytes new since
+    /// the Channel's cursor, so we never re-ship the whole scrollback. A
+    /// "caught up" empty delta is a no-op (just advance past it). For a
+    /// non-empty delta, advance the cursor ONLY if the push was accepted — if
+    /// the bounded update channel was full and dropped it, keep the cursor so
+    /// the next poll re-fetches those bytes instead of skipping them.
+    async fn poll_stream(&mut self, id: ChannelId) {
+        let cursor = self.stream_cursors.get(&id).copied().unwrap_or_default();
+        if let Some(delta) = self.listener.stream_delta(id, cursor.offset).await {
+            let end = delta.end_offset;
+            let generation = delta.generation;
+            // Empty caught-up deltas normally stay off the UI channel. A new
+            // generation is different: forward even an empty window so a
+            // restart clears stale bytes when no new data has arrived yet.
+            let needs_update = Some(generation) != cursor.generation || !delta.bytes.is_empty();
+            let advance = !needs_update || self.push(UiUpdate::StreamDelta(id, Box::new(delta)));
+            if advance {
+                self.stream_cursors.insert(
+                    id,
+                    StreamPollCursor {
+                        generation: Some(generation),
+                        offset: end,
+                    },
+                );
+            }
         }
     }
 
@@ -1964,6 +1954,167 @@ mod tests {
         }
         cmd_tx.send(UiCommand::Shutdown).await.unwrap();
         handle.await.unwrap();
+    }
+
+    /// A running driver with one UDP Channel added: the command sender, the
+    /// update receiver, the Channel's id and port, and the driver task.
+    async fn popout_driver() -> (
+        Sender<UiCommand>,
+        UpdateReceiver,
+        ChannelId,
+        u16,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = update_lanes(256);
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let handle =
+            tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
+        let port = free_udp_port();
+        cmd_tx
+            .send(UiCommand::AddChannel(Box::new(udp_config(port))))
+            .await
+            .unwrap();
+        let id = loop {
+            let update = tokio::time::timeout(Duration::from_secs(5), upd_rx.recv())
+                .await
+                .expect("driver update timed out")
+                .expect("update stream closed");
+            if let UiUpdate::ChannelAdded(id, ..) = update {
+                break id;
+            }
+        };
+        (cmd_tx, upd_rx, id, port, handle)
+    }
+
+    /// Wait until the Channel's start is reported.
+    async fn wait_started(rx: &mut UpdateReceiver, id: ChannelId) {
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("driver update timed out")
+                .expect("update stream closed");
+            if matches!(update, UiUpdate::Event(RuntimeEvent::ChannelStarted(c)) if c == id) {
+                return;
+            }
+        }
+    }
+
+    /// Spec §50.4: a Channel with a pop-out open gets its stream whether or not
+    /// it is selected, and stops getting it once it leaves the set.
+    #[tokio::test]
+    async fn a_popped_out_unselected_channel_streams_until_removed_from_the_set() {
+        let (cmd_tx, mut upd_rx, id, port, handle) = popout_driver().await;
+        cmd_tx.send(UiCommand::SetPopouts(vec![id])).await.unwrap();
+        cmd_tx.send(UiCommand::Start(id)).await.unwrap();
+        wait_started(&mut upd_rx, id).await;
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut got_stream = false;
+        while !got_stream {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no stream delta arrived for the popped-out channel"
+            );
+            let _ = client.send_to(b"hello", ("127.0.0.1", port)).await;
+            match tokio::time::timeout(Duration::from_millis(250), upd_rx.recv()).await {
+                Ok(Some(UiUpdate::StreamDelta(sid, delta))) if sid == id => {
+                    got_stream = !delta.bytes.is_empty();
+                }
+                Ok(Some(UiUpdate::Snapshot(sid, _))) if sid == id => {
+                    panic!("an unselected channel got a snapshot")
+                }
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => panic!("update stream closed early"),
+            }
+        }
+
+        // Out of the set: let anything already queued land, then no new bytes
+        // may arrive however much the channel receives.
+        cmd_tx
+            .send(UiCommand::SetPopouts(Vec::new()))
+            .await
+            .unwrap();
+        let settle = tokio::time::Instant::now() + Duration::from_millis(700);
+        while tokio::time::Instant::now() < settle {
+            let _ = tokio::time::timeout(Duration::from_millis(50), upd_rx.recv()).await;
+        }
+        let quiet = tokio::time::Instant::now() + Duration::from_millis(900);
+        while tokio::time::Instant::now() < quiet {
+            let _ = client.send_to(b"more", ("127.0.0.1", port)).await;
+            if let Ok(Some(UiUpdate::StreamDelta(sid, delta))) =
+                tokio::time::timeout(Duration::from_millis(50), upd_rx.recv()).await
+            {
+                assert!(
+                    sid != id || delta.bytes.is_empty(),
+                    "a stream delta arrived after the pop-out left the set"
+                );
+            }
+        }
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("driver did not shut down")
+            .unwrap();
+    }
+
+    /// A Channel that is both selected and popped out is polled once: its bytes
+    /// reach the GUI exactly once.
+    #[tokio::test]
+    async fn a_selected_and_popped_out_channel_is_streamed_once() {
+        let (cmd_tx, mut upd_rx, id, port, handle) = popout_driver().await;
+        cmd_tx.send(UiCommand::Select(Some(id))).await.unwrap();
+        cmd_tx.send(UiCommand::SetPopouts(vec![id])).await.unwrap();
+        cmd_tx.send(UiCommand::Start(id)).await.unwrap();
+        wait_started(&mut upd_rx, id).await;
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(b"0123456789", ("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut received: Vec<u8> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(UiUpdate::StreamDelta(sid, delta))) =
+                tokio::time::timeout(Duration::from_millis(100), upd_rx.recv()).await
+            {
+                if sid == id {
+                    received.extend_from_slice(&delta.bytes);
+                }
+            }
+        }
+        assert_eq!(received, b"0123456789");
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    /// The set holds only Channels that exist, and a removed Channel leaves it.
+    #[tokio::test]
+    async fn the_popout_set_drops_unknown_and_removed_channels() {
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(4);
+        let (upd_tx, _upd_rx) = update_lanes(64);
+        let mut driver = Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {}));
+        driver
+            .handle(UiCommand::AddChannel(Box::new(udp_config(free_udp_port()))))
+            .await;
+        let id = driver.channels[0];
+        let unknown = ChannelId::new();
+        driver
+            .handle(UiCommand::SetPopouts(vec![id, unknown]))
+            .await;
+        assert_eq!(driver.popouts, HashSet::from([id]));
+        driver.handle(UiCommand::RemoveChannel(id)).await;
+        driver.pump().await;
+        assert!(driver.popouts.is_empty());
+        driver.handle(UiCommand::SetPopouts(vec![id])).await;
+        assert!(driver.popouts.is_empty());
     }
 
     /// The driver translates commands into runtime calls, forwards lifecycle events,
@@ -3064,70 +3215,6 @@ mod tests {
             .handle(UiCommand::LinemonOpen(Box::new(udp_config(port))))
             .await;
         driver.pump().await;
-    }
-
-    /// A reconnect due on the port Linemon has does not run: no steps are
-    /// queued, the attempt counts as failed, and the Channel's error names
-    /// Linemon.
-    #[tokio::test]
-    async fn a_reconnect_on_linemons_port_does_not_run_and_names_linemon() {
-        let mut listener = Listener::with_default_capacities();
-        let events = listener.take_events().unwrap();
-        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
-        let (upd_tx, mut upd_rx) = update_lanes(256);
-        let mut driver = Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {}));
-
-        let port = free_udp_port();
-        open_linemon(&mut driver, port).await;
-        land_one_step(&mut driver).await;
-        assert_eq!(
-            driver.linemon_port().map(|i| udp_port_of_interface(&i)),
-            Some(port)
-        );
-
-        // A user Channel on the same port, faulted, with reconnect on.
-        let mut config = udp_config(port);
-        if let InterfaceConfig::Udp(udp) = &mut config.interface {
-            udp.bind_address = "not-an-ip-address".to_string();
-        }
-        config.reconnect = crate::config::ReconnectPolicy {
-            enabled: true,
-            initial_backoff_ms: 1,
-            max_backoff_ms: 1,
-            multiplier: 1.0,
-            max_attempts: None,
-        };
-        let id = driver.listener.add_channel(config);
-        driver.channels.push(id);
-        assert!(driver.listener.start(id).await.is_err());
-
-        driver.queue_reconnects(); // arms the backoff
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        driver.queue_reconnects(); // the attempt is due
-        assert!(!driver.steps.contains_key(&id), "nothing is opened");
-
-        let mut errors = Vec::new();
-        while let Ok(update) = upd_rx.try_recv() {
-            if let UiUpdate::ChannelError(cid, text) = update {
-                if cid == id {
-                    errors.push(text);
-                }
-            }
-        }
-        assert_eq!(
-            errors,
-            vec![format!(
-                "UDP port {port} is in use by Linemon, so this channel could not reconnect. \
-                 Stop Linemon to let it reconnect."
-            )]
-        );
-    }
-
-    fn udp_port_of_interface(interface: &InterfaceConfig) -> u16 {
-        match interface {
-            InterfaceConfig::Udp(udp) => udp.port,
-            InterfaceConfig::Serial(_) => unreachable!("this test uses UDP"),
-        }
     }
 
     /// Three opens while the first is in flight leave one waiting request, the

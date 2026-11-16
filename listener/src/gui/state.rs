@@ -343,6 +343,12 @@ impl ChannelView {
         );
     }
 
+    /// The pipeline run the held bytes belong to, `None` until the first delta of
+    /// a run arrives. It changes when the channel restarts.
+    pub(crate) fn stream_generation(&self) -> Option<u64> {
+        self.stream_generation
+    }
+
     /// The accumulated stream bytes as a contiguous slice for rendering.
     pub fn stream_contiguous(&mut self) -> &[u8] {
         self.stream_bytes.make_contiguous()

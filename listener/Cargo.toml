@@ -19,6 +19,12 @@ path = "src/main.rs"
 name = "listener-gui"
 path = "src/bin/listener-gui.rs"
 
+# Linemon, the program for looking at one stream (spec §50.3, ADR-070). Also a
+# "windows" subsystem app; it shares the runtime and its window with this crate.
+[[bin]]
+name = "linemon"
+path = "src/bin/linemon.rs"
+
 [dependencies]
 
 # Shared GUI chrome: fonts, palette, base style (ADR-019)

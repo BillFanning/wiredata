@@ -2464,6 +2464,58 @@ While the window is open it costs one more Channel's memory, within the same
 limits (ADR-048); closed, it costs nothing. A logging run is not disturbed by
 it, since it never opens a port a Channel holds.
 
+**Added decision (2026-11-15), Linemon on its own:** Opened from Listener,
+Linemon was clutter in the logging tool, so it becomes a program of its own,
+`linemon`, built from this crate. The window, its behaviour and its hidden
+Channel are unchanged; the program around it holds only that window. What
+looking at a running Channel's stream needed moves into Listener instead, as
+the pop-out display (ADR-071).
+
+Two parts of the decision above end with the move. The two programs cannot see
+each other's ports, so Linemon no longer names a Channel that holds a port, a
+Channel no longer names Linemon, and each shows the system's reason when a port
+is taken. And Linemon is drawn as its program's own window, so the reason for
+drawing it every frame no longer applies. Linemon keeps its own saved settings
+and writes no event log. Its deferred list shrinks to a record button, time
+stamps on each line, finding the baud rate, TCP and find.
+
+## ADR-071 — A Channel's display pops out into a window of its own
+
+**Status:** Accepted 2026-11-15.
+
+**Context:** Looking closely at one stream also happens with a Channel that is
+already running, and Listener's display sits in the main window at the size
+the rest of the window leaves it. Linemon looked at such a stream from inside
+Listener, which was clutter (ADR-070). What was wanted was the Channel's own
+display, larger, with nothing that could change the Channel.
+
+**Decision:** A Pop out button opens a Channel's display in a window of its own
+(§50.4).
+
+- One pop-out per Channel; several Channels can each have one open. The main
+  window keeps its display.
+- It shows the Channel's received bytes with no insertions: no Mark timestamps
+  and no other spliced text. It clears when the Channel restarts.
+- It has Pause, Clear and the view controls of the Channel's display, apart
+  from the scroll-buffer size, each acting on the pop-out alone, and none kept
+  after it closes. A paused pop-out keeps its picture through a restart until
+  Resume.
+- It never changes the Channel's settings, starts or stops it, or records.
+
+The GUI streams bytes only for the selected Channel today, so each popped-out
+Channel gets its stream too. A pop-out reads the Channel's bytes as the GUI
+already holds them and keeps only its own pause point, clear point, view
+settings and rendering.
+
+**Boundary:** A pop-out is a second rendering of the same bytes on screen, not
+a second Display View: the Channel still has one view (ADR-023 stands), and its
+display recording follows that view. The pop-out keeps nothing across
+launches and is in no profile.
+
+**Consequences:** A running Channel's stream can be read at any size, on any
+monitor, without risk to the Channel or its recordings. Each pop-out costs one
+more stream to the GUI and its own rendering while it is open.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

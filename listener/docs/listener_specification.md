@@ -1,19 +1,19 @@
-# Listener Specification v2.5.1
+# Listener Specification v2.6.0
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-15) — Linemon, as built:
+Revision note (2026-11-15) — Linemon on its own, and the pop-out display:
 
-- **§50.3 (ADR-070).** Adds Start, Stop and Reopen port on start, and says
-  that a typed value takes effect when its field is left. Names the buttons
-  as they appear: Previous, Next and Copy scroll buffer. A port held by
-  Linemon or by a channel is refused the same way in both directions, and a
-  refused port waits for Start.
-- **§91, §113.** Quoted on-screen messages write "channel" in lower case, as
-  the screen does.
+- **§50.3 (ADR-070).** Linemon is a program of its own, not a window of
+  Listener. It no longer names a channel that holds a port, and a channel no
+  longer names Linemon.
+- **§50.4 (ADR-071).** New: a channel's display can be popped out into a
+  window of its own.
+- **Appendix A.** What Linemon leaves for later is a record button, time
+  stamps on each line, finding the baud rate, TCP and find.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -987,16 +987,16 @@ Rules are part of `ChannelConfig` (§72) as `match_rules: Vec<MatchRule>`.
 
 ## 50.3 Linemon
 
-Linemon is a window for looking at one stream (ADR-070). It opens from one
-button in the main window, and it works while Channels are running and
-recording, and while the main window is minimized.
+Linemon is a program for looking at one stream (ADR-070). It is built from this
+crate as `linemon`, beside `listener` and `listener-gui`, and runs on its own:
+it is not opened from Listener, and Listener need not be running.
 
 - **Source.** Linemon reads one serial port or one UDP port. Only that port is
-  open. Closing the window closes the port.
+  open. Closing Linemon closes the port.
 - **Start and Stop.** Start opens the port shown in the bar. Stop closes it and
   leaves the display as it is.
-- **Reopen port on start.** With this ticked, opening the window opens the port
-  Linemon last had. With it unticked, Linemon waits for Start. It starts
+- **Reopen port on start.** With this ticked, Linemon opens the port it last
+  had when it starts. With it unticked, Linemon waits for Start. It starts
   ticked.
 - **Choosing a port.** A drop-down lists the serial ports. Previous and Next
   move through that list, wrapping at its ends, or move the UDP port number one
@@ -1008,16 +1008,9 @@ recording, and while the main window is minimized.
   at once. A value typed into a field takes effect when the field is left or
   Enter is pressed, so a half-typed value never opens a port. While Linemon is
   stopped, a change takes effect at the next Start.
-- **A port a Channel is using.** Linemon does not open it, and says which
-  Channel has it. Linemon stays started, so choosing a free port opens that
-  port. The refused port does not open on its own when the Channel lets it go:
-  Linemon says it is free and waits for Start.
-- **A port Linemon is using.** The same holds the other way: a Channel started,
-  or started with Start all, on the port Linemon has does not start, and its
-  error says Linemon has the port. An automatic reconnect (§9.1) on that port
-  does not run either; it counts as a failed attempt, so the backoff and the
-  attempt limit carry on, and the error says Linemon has the port. Both windows
-  show the message in the same way.
+- **A port another program has.** Linemon cannot see which program holds a
+  port, Listener included. Opening it fails with the system's reason, which the
+  status line shows.
 - **Display.** Linemon shows the stream in Raw, Rendered or Hex (§42–§47), with
   the view controls a Channel's display has. The data stays on screen when the
   port or a setting changes, and a marker line records each change, naming the
@@ -1029,14 +1022,40 @@ recording, and while the main window is minimized.
   it is displayed, marker lines included. Selecting text and pressing Ctrl+C
   copies part of it.
 - **What it keeps.** Between launches, Linemon remembers whether it reads serial
-  or UDP, each kind's settings, its view and both checkboxes, with the window's
-  own saved settings. Whether the port was open is not kept: Reopen port on
-  start decides that. Linemon is not a Channel: it is not in the Channel list,
-  a profile, a recording or a run summary.
+  or UDP, each kind's settings, its view and both checkboxes, in its own saved
+  settings, apart from Listener's. Whether the port was open is not kept:
+  Reopen port on start decides that. Linemon has no Channels, profiles,
+  recordings, run summaries or event log.
 - **Limit.** The display holds at most the scroll-buffer size (§87) and drops
   the oldest data past that.
 
 Linemon does no decoding (ADR-010). What it leaves for later is in Appendix A.
+
+## 50.4 Pop-out display
+
+A Channel's display can be popped out into a window of its own (ADR-071), to be
+made as large as wanted or moved to another monitor.
+
+- **Opening.** A Pop out button on the Channel's display opens it. Each Channel
+  has at most one pop-out, and several Channels can each have one open at once.
+  The main window keeps showing the Channel's display as well.
+- **Data.** The pop-out shows the Channel's received bytes, the same as its
+  display. It shows no insertions: no Mark timestamps (§50.2) and no other text
+  spliced into the main display. When the Channel restarts, the pop-out clears,
+  as the display does.
+- **Controls.** The pop-out has Pause and Clear, and the view controls of the
+  Channel's display: Hex, Rendered or Raw, the control-character marks for Raw,
+  the hex grouping and line length, the font size, the colours and the font.
+  The scroll-buffer size is not among them, since the pop-out shows the
+  Channel's own buffer. Each control acts on the pop-out alone: pausing or
+  clearing it does not pause or clear the Channel's display, and its view
+  settings do not change the Channel's. They are not kept: each pop-out starts
+  with the Channel's own display settings, and closing it forgets any change.
+- **Paused through a restart.** A paused pop-out keeps its picture when the
+  Channel restarts, and shows the new run when Resume is pressed.
+- **What it does not do.** The pop-out does not change the Channel's settings,
+  start or stop it, or record. A display recording (§54) follows the Channel's
+  own view, never a pop-out's.
 
 ---
 
@@ -3260,8 +3279,6 @@ Deferred (ADR-023/ADR-024/ADR-047):
 
 Deferred from Linemon (§50.3, ADR-070):
 
-- Viewing a running Channel's stream in Linemon, including the Channel that
-  holds the port Linemon was asked for
 - A record button
 - Time stamps at the start of each line
 - Finding the baud rate automatically

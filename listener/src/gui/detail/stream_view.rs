@@ -11,6 +11,7 @@ use crate::display::{
 };
 
 use super::super::bridge::UiCommand;
+use super::super::popout::POP_OUT_HOVER;
 use super::super::view_prefs::{
     hex_line_label, scroll_buffer_label, ViewPrefs, HEX_GROUP_SIZES, HEX_LINE_GROUPS,
     MAX_SCROLL_BUFFER_BYTES, MIN_SCROLL_BUFFER_BYTES, SCROLL_BUFFER_PRESETS_KB,
@@ -109,9 +110,13 @@ impl ListenerApp {
                     self.send(UiCommand::PauseDisplay(id));
                 }
             }
+            if ui.button("Pop out").on_hover(&POP_OUT_HOVER).clicked() {
+                let ctx = ui.ctx().clone();
+                self.pop_out(&ctx, id);
+            }
         })
         .body(|ui| {
-            show_view_controls(ui, &mut prefs, stream_len);
+            show_view_controls(ui, &mut prefs, Some(stream_len));
             // Inline Mark timestamps (§50.2) live here — they shape what the view
             // (and `.disp`) show. They edit the draft config; committing goes
             // through Apply & Restart (config_needs_restart counts match_rules).
@@ -503,15 +508,16 @@ pub(in crate::gui) fn show_stream_rows(
 }
 
 /// The view-configuration controls (inside the "View configuration" dropdown):
-/// View mode + ctrl-chars on one row, font size / colors / mono on the next, then
-/// the scroll-buffer size readout. Edits the passed-in [`ViewPrefs`] (a clone of
-/// the selected channel's); the caller persists any change. `stream_len` is the
-/// channel's current scrollback byte count. Touches no app state beyond
-/// rendering.
+/// View mode + ctrl-chars on one row, the hex grouping, font size / colors / mono
+/// on the next, then the scroll-buffer size readout. Edits the passed-in
+/// [`ViewPrefs`] (a clone of the caller's); the caller persists any change.
+/// `stream_len` is the current scrollback byte count, or `None` to leave out the
+/// scroll-buffer row: a pop-out shows the channel's own buffer, so a size chosen
+/// there would change nothing. Touches no app state beyond rendering.
 pub(in crate::gui) fn show_view_controls(
     ui: &mut egui::Ui,
     prefs: &mut ViewPrefs,
-    stream_len: usize,
+    stream_len: Option<usize>,
 ) {
     let base = egui::TextStyle::Body.resolve(ui.style()).size;
     ui.horizontal(|ui| {
@@ -633,6 +639,9 @@ pub(in crate::gui) fn show_view_controls(
     // (2 … 256 kB) — no free text, so it's always a known value. The current fill is
     // shown alongside. Persisted via retention (the runtime adopts it next start; the
     // GUI viewer caps live).
+    let Some(stream_len) = stream_len else {
+        return;
+    };
     ui.horizontal(|ui| {
         ui.label("Scroll buffer").on_hover(&SCROLL_BUFFER_HOVER);
         egui::ComboBox::from_id_salt("scroll_buffer")

@@ -1,5 +1,5 @@
 //! Linemon's window (listener ADR-070, spec §50.3): one serial or UDP port at a
-//! time, shown in a window of its own.
+//! time. The `linemon` program draws it as its own window.
 //!
 //! The window never owns a port. It asks the runtime's hidden Channel to open
 //! one ([`UiCommand::LinemonOpen`]) and keeps what that Channel sends in a
@@ -9,7 +9,7 @@
 //!
 //! The decisions that can be made without egui are plain functions at the top
 //! of the file: the settings and their stored form, the marker line, the port
-//! description, the status sentence, the in-use check, and Previous/Next.
+//! description, the status sentence, and Previous/Next.
 
 use serde::{Deserialize, Serialize};
 use wiredata_ui::diagnostics::{tone_marker, SignalTone};
@@ -27,7 +27,6 @@ use crate::transport::udp::UdpMode;
 use super::bind_scope::LocalAddresses;
 use super::bridge::{LinemonUpdate, UiCommand};
 use super::linemon::LinemonStream;
-use super::state::{AppState, ChannelStatus};
 use super::view_prefs::ViewPrefs;
 use super::widgets::{
     list_serial_ports, template_for, udp_bind_row, udp_group_row, udp_mode_row, udp_shared_row,
@@ -35,21 +34,14 @@ use super::widgets::{
 };
 use super::StreamRenderCache;
 
-/// eframe storage key for Linemon's remembered settings.
-pub(super) const LINEMON_KEY: &str = "listener.linemon";
+/// eframe storage key for Linemon's remembered settings, in the `linemon`
+/// program's own storage.
+pub(super) const LINEMON_KEY: &str = "linemon.settings";
 
-/// The window's title.
-const WINDOW_TITLE: &str = "Linemon";
 /// The size the window opens at.
-const DEFAULT_SIZE: [f32; 2] = [960.0, 640.0];
+pub(super) const DEFAULT_SIZE: [f32; 2] = [960.0, 640.0];
 /// The smallest size it can be dragged to.
-const MIN_SIZE: [f32; 2] = [480.0, 320.0];
-
-pub(super) const LINEMON_HOVER: Hover = Hover::new(
-    "Opens a window for looking at one stream.\n\n\
-     Linemon reads one serial or UDP port at a time, without setting up a channel. \
-     It works while channels are running and recording.",
-);
+pub(super) const MIN_SIZE: [f32; 2] = [480.0, 320.0];
 const START_HOVER: Hover = Hover::new(
     "Opens the port shown above.\n\n\
      While Linemon is started, choosing another port or changing a setting takes \
@@ -231,38 +223,6 @@ fn describe_port(key: &PortKey) -> String {
     }
 }
 
-/// Why a Channel on `interface` is not started while Linemon has its port, as
-/// the main window says it: the counterpart of Linemon's own sentence when a
-/// Channel has the port Linemon was asked for.
-fn held_by_linemon_text(key: &PortKey) -> String {
-    format!(
-        "{} is in use by Linemon, so this channel did not start. Stop Linemon, then \
-         press Start to start the channel.",
-        describe_port(key)
-    )
-}
-
-/// Why a Channel's automatic reconnect did not run while Linemon has its port.
-fn reconnect_held_by_linemon_text(key: &PortKey) -> String {
-    format!(
-        "{} is in use by Linemon, so this channel could not reconnect. Stop Linemon to \
-         let it reconnect.",
-        describe_port(key)
-    )
-}
-
-/// Why a Channel on `wanted` may not reconnect while Linemon has `held` open,
-/// or `None` when they are different ports. The driver asks this before a
-/// reconnect, which does not pass through the main window.
-pub(super) fn reconnect_refusal(
-    held: &InterfaceConfig,
-    wanted: &InterfaceConfig,
-) -> Option<String> {
-    let held = port_key(held)?;
-    let wanted = port_key(wanted)?;
-    (!is_port_change(&held, &wanted)).then(|| reconnect_held_by_linemon_text(&wanted))
-}
-
 /// A serial line in the conventional compact form: `9600 8N1`. Flow control is
 /// not part of it.
 fn serial_line_text(serial: &SerialConfig) -> String {
@@ -330,37 +290,6 @@ fn marker_text(interface: &InterfaceConfig) -> String {
     format!("\u{2014} {text} \u{2014}")
 }
 
-/// A Channel as the in-use check sees it.
-pub(super) struct ChannelUse<'a> {
-    pub name: &'a str,
-    pub status: ChannelStatus,
-    pub interface: &'a InterfaceConfig,
-}
-
-/// The name of a Running or Reconnecting Channel that has `key`: the same serial
-/// port (names compared ignoring ASCII case) or the same UDP port number.
-fn in_use_by<'a>(
-    key: &PortKey,
-    channels: impl IntoIterator<Item = ChannelUse<'a>>,
-) -> Option<&'a str> {
-    channels
-        .into_iter()
-        .filter(|c| {
-            matches!(
-                c.status,
-                ChannelStatus::Running | ChannelStatus::Reconnecting
-            )
-        })
-        .find(|c| match (key, c.interface) {
-            (PortKey::Serial(name), InterfaceConfig::Serial(serial)) => {
-                serial.port.trim().eq_ignore_ascii_case(name)
-            }
-            (PortKey::Udp(port), InterfaceConfig::Udp(udp)) => udp.port == *port,
-            _ => false,
-        })
-        .map(|c| c.name)
-}
-
 /// The serial port `step` places from `current` in `ports`, wrapping round at
 /// the ends. A current port that is not in the list steps to the first port
 /// going forward and the last going back. `None` when the list is empty.
@@ -423,11 +352,6 @@ pub(super) struct StatusFacts<'a> {
     pub interface: &'a InterfaceConfig,
     pub started: bool,
     pub paused: bool,
-    /// The Channel that has the port, when the check refused it.
-    pub in_use_by: Option<&'a str>,
-    /// The Channel that had the port when Linemon refused it, once that Channel
-    /// has let it go. Linemon still waits for Start.
-    pub freed_by: Option<&'a str>,
     /// Why the hidden Channel could not open the port.
     pub open_error: Option<&'a str>,
     pub run: Option<&'a RunFacts>,
@@ -475,17 +399,6 @@ fn status_line(facts: &StatusFacts) -> StatusLine {
     if !facts.started {
         return ok(format!("Stopped. Press Start to open {port}."));
     }
-    if let Some(channel) = facts.in_use_by {
-        return problem(format!(
-            "{port} is in use by channel \u{201C}{channel}\u{201D}, so Linemon did not open it. \
-             Stop that channel, then press Start to look at the port here."
-        ));
-    }
-    if let Some(channel) = facts.freed_by {
-        return ok(format!(
-            "Channel \u{201C}{channel}\u{201D} no longer has {port}. Press Start to open it here."
-        ));
-    }
     if let Some(reason) = facts.open_error {
         return problem(format!("{port} could not be opened: {reason}"));
     }
@@ -529,23 +442,15 @@ fn status_line(facts: &StatusFacts) -> StatusLine {
 // The window
 // ---------------------------------------------------------------------------
 
-/// A port Linemon did not open because a Channel had it.
-struct Refusal {
-    interface: InterfaceConfig,
-    channel: String,
-}
-
 /// Linemon: the window's state, its display, and what it has asked the runtime
 /// for.
 pub(super) struct Linemon {
-    open: bool,
     settings: LinemonSettings,
     prefs: ViewPrefs,
     stream: LinemonStream,
     cache: Option<StreamRenderCache>,
-    /// The user has pressed Start (or the window opened with Reopen port on
-    /// start) and has not pressed Stop. The port opens whenever one is chosen
-    /// and free.
+    /// The user has pressed Start (or Linemon started with Reopen port on
+    /// start) and has not pressed Stop. The port opens whenever one is chosen.
     started: bool,
     paused: bool,
     /// The interface the runtime's hidden Channel was last asked to open and
@@ -553,12 +458,6 @@ pub(super) struct Linemon {
     sent: Option<InterfaceConfig>,
     /// The port last opened, for Clear on port change. Kept through Stop.
     last_port: Option<PortKey>,
-    /// The Channel that has the port wanted now.
-    in_use_by: Option<String>,
-    /// The port Linemon did not open because a Channel had it, and that
-    /// Channel. Linemon does not open it on its own when the Channel lets it
-    /// go: only Start, or choosing another port, ends the refusal.
-    refused: Option<Refusal>,
     open_error: Option<String>,
     run: Option<RunFacts>,
     serial_ports: Vec<String>,
@@ -576,12 +475,12 @@ pub(super) struct Linemon {
 
 impl Linemon {
     /// Linemon with `stored` as its remembered settings (`None`, or text that
-    /// cannot be read, gives the defaults). The window starts closed.
+    /// cannot be read, gives the defaults). It starts stopped; see
+    /// [`start_up`](Self::start_up).
     pub fn new(stored: Option<&str>) -> Self {
         let settings = LinemonSettings::from_stored(stored);
         let prefs = settings.prefs();
         Self {
-            open: false,
             stream: LinemonStream::new(prefs.scroll_buffer_bytes),
             settings,
             prefs,
@@ -590,8 +489,6 @@ impl Linemon {
             paused: false,
             sent: None,
             last_port: None,
-            in_use_by: None,
-            refused: None,
             open_error: None,
             run: None,
             serial_ports: Vec::new(),
@@ -611,37 +508,14 @@ impl Linemon {
         settings.to_stored()
     }
 
-    fn viewport_id() -> egui::ViewportId {
-        egui::ViewportId::from_hash_of("linemon")
-    }
-
-    /// The Linemon button: open the window, or bring it to the front when it is
-    /// already open.
-    pub fn open_or_focus(&mut self, ctx: &egui::Context) {
-        if self.open {
-            ctx.send_viewport_cmd_to(Self::viewport_id(), egui::ViewportCommand::Focus);
-            return;
-        }
-        self.open = true;
+    /// Get ready as the program starts: list the serial ports, and open the
+    /// port Linemon last had when Reopen port on start is ticked and a port is
+    /// chosen.
+    pub fn start_up(&mut self) {
         self.serial_ports = list_serial_ports();
-        self.paused = false;
         self.jump_to_bottom = true;
         self.started =
             self.settings.reopen_on_start && port_key(&self.settings.interface()).is_some();
-    }
-
-    /// Close the port and hide the window. The display keeps its contents.
-    fn close_window(&mut self, out: &mut Vec<UiCommand>) {
-        self.open = false;
-        self.started = false;
-        self.paused = false;
-        self.in_use_by = None;
-        self.refused = None;
-        self.open_error = None;
-        self.run = None;
-        if self.sent.take().is_some() {
-            out.push(UiCommand::LinemonClose);
-        }
     }
 
     /// Fold an update about the hidden Channel. Stream bytes that arrive while
@@ -668,17 +542,15 @@ impl Linemon {
 
     /// Ask the runtime for what the window wants now. Called every frame.
     ///
-    /// Started with a port chosen: open it, unless a Channel has it, and open
-    /// it again whenever the interface differs from the last one asked for.
+    /// Started with a port chosen: open it, and open it again whenever the
+    /// interface differs from the last one asked for.
     /// Anything else: close what is open. An open marks the display, and
     /// empties it first when the port changed and Clear on port change is
     /// ticked.
-    fn sync(&mut self, state: &AppState, out: &mut Vec<UiCommand>) {
+    fn sync(&mut self, out: &mut Vec<UiCommand>) {
         let interface = self.settings.interface();
         let key = port_key(&interface).filter(|_| self.started);
         let Some(key) = key else {
-            self.in_use_by = None;
-            self.refused = None;
             if self.sent.take().is_some() {
                 out.push(UiCommand::LinemonClose);
             }
@@ -694,35 +566,6 @@ impl Linemon {
         if self.editing_text {
             return;
         }
-        let channels = state.channels().map(|v| ChannelUse {
-            name: &v.name,
-            status: v.status,
-            interface: &v.config.interface,
-        });
-        let holder = in_use_by(&key, channels).map(str::to_owned);
-        // A refused port stays refused until Start or another port: Linemon
-        // never opens a port on its own because a Channel let it go.
-        if self
-            .refused
-            .as_ref()
-            .is_some_and(|r| r.interface == interface)
-        {
-            self.in_use_by = holder;
-            return;
-        }
-        self.refused = None;
-        if let Some(name) = holder {
-            if self.sent.take().is_some() {
-                out.push(UiCommand::LinemonClose);
-            }
-            self.refused = Some(Refusal {
-                interface,
-                channel: name.clone(),
-            });
-            self.in_use_by = Some(name);
-            return;
-        }
-        self.in_use_by = None;
         self.open_error = None;
         self.run = None;
         let changed = self
@@ -741,58 +584,21 @@ impl Linemon {
         self.sent = Some(interface);
     }
 
-    /// The port Linemon has open or is opening: asked for, and neither refused
-    /// by the runtime nor stopped by a fault.
-    fn port_held(&self) -> Option<PortKey> {
-        let faulted = self
-            .run
-            .as_ref()
-            .is_some_and(|r| r.state == ChannelState::Faulted);
-        if self.open_error.is_some() || faulted {
-            return None;
-        }
-        self.sent.as_ref().and_then(port_key)
-    }
-
-    /// Why a Channel on `interface` must not start now, or `None` when it may:
-    /// Linemon has that port. The main window shows the reason as the
-    /// Channel's error, as Linemon shows the Channel that has a port it wants.
-    pub fn refuse_channel(&self, interface: &InterfaceConfig) -> Option<String> {
-        let held = self.port_held()?;
-        let wanted = port_key(interface)?;
-        (!is_port_change(&held, &wanted)).then(|| held_by_linemon_text(&wanted))
-    }
-
-    /// Draw the window while it is open, and queue the commands it wants sent.
-    pub fn show(&mut self, ctx: &egui::Context, state: &AppState, out: &mut Vec<UiCommand>) {
-        if !self.open {
-            return;
-        }
-        let builder = egui::ViewportBuilder::default()
-            .with_title(WINDOW_TITLE)
-            .with_inner_size(DEFAULT_SIZE)
-            .with_min_inner_size(MIN_SIZE)
-            .with_resizable(true);
-        let mut close = false;
-        ctx.show_viewport_immediate(Self::viewport_id(), builder, |ui, _class| {
-            if ui.input(|i| i.viewport().close_requested()) {
-                close = true;
-            }
-            self.draw(ui, state, out);
-        });
-        if close {
-            self.close_window(out);
-        }
-    }
-
-    fn draw(&mut self, ui: &mut egui::Ui, state: &AppState, out: &mut Vec<UiCommand>) {
+    /// Draw Linemon into `ui`, the program's whole window, and queue the
+    /// commands it wants sent. `local_addresses` feeds the UDP binding choice.
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        local_addresses: &LocalAddresses,
+        out: &mut Vec<UiCommand>,
+    ) {
         egui::Panel::top("linemon_bar")
             .resizable(false)
             .show_inside(ui, |ui| {
-                self.show_bar(ui, state, out);
+                self.show_bar(ui, local_addresses, out);
             });
         self.editing_text = ui.ctx().text_edit_focused();
-        self.sync(state, out);
+        self.sync(out);
         self.stream.set_cap(self.prefs.scroll_buffer_bytes);
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let jump = std::mem::take(&mut self.jump_to_bottom);
@@ -804,7 +610,12 @@ impl Linemon {
         });
     }
 
-    fn show_bar(&mut self, ui: &mut egui::Ui, state: &AppState, out: &mut Vec<UiCommand>) {
+    fn show_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        local_addresses: &LocalAddresses,
+        out: &mut Vec<UiCommand>,
+    ) {
         let mut refresh = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Source");
@@ -817,7 +628,7 @@ impl Linemon {
             }
         });
         if self.settings.kind == SourceKind::Udp && self.show_more {
-            self.udp_more(ui, state.local_addresses(), &mut refresh);
+            self.udp_more(ui, local_addresses, &mut refresh);
         }
         match refresh {
             Some(Refresh::SerialPorts) => self.serial_ports = list_serial_ports(),
@@ -833,7 +644,7 @@ impl Linemon {
                 super::detail::stream_view::show_view_controls(
                     ui,
                     &mut self.prefs,
-                    self.stream.len(),
+                    Some(self.stream.len()),
                 );
             });
     }
@@ -1021,13 +832,11 @@ impl Linemon {
         !(self.started && self.sent.is_some() && self.open_error.is_none() && !faulted)
     }
 
-    /// Start: open the port in the bar. It also ends a refusal, so a port a
-    /// Channel has let go opens now.
+    /// Start: open the port in the bar.
     fn press_start(&mut self) {
         self.started = true;
         self.open_error = None;
         self.run = None;
-        self.refused = None;
         // Ask again even when the interface is the one last opened.
         self.sent = None;
     }
@@ -1075,29 +884,19 @@ impl Linemon {
             .on_hover(&REOPEN_HOVER);
     }
 
-    /// The Channel that had the refused port, once it has let it go.
-    fn freed_by(&self) -> Option<&str> {
-        match (&self.refused, &self.in_use_by) {
-            (Some(refusal), None) => Some(refusal.channel.as_str()),
-            _ => None,
-        }
-    }
-
     fn show_status(&self, ui: &mut egui::Ui) {
         let interface = self.settings.interface();
         let line = status_line(&StatusFacts {
             interface: &interface,
             started: self.started,
             paused: self.paused,
-            in_use_by: self.in_use_by.as_deref(),
-            freed_by: self.freed_by(),
             open_error: self.open_error.as_deref(),
             run: self.run.as_ref(),
         });
         let mut text = egui::RichText::new(line.text);
         if line.problem {
-            // The colour the main window draws a Channel's error in, so the
-            // same kind of message looks the same in both windows.
+            // The colour Listener draws a channel's error in, so the same kind
+            // of message looks the same in both programs.
             text = text.color(wiredata_ui::palette::active(ui).fault);
         }
         ui.label(text);
@@ -1129,8 +928,6 @@ fn option_combo<T: PartialEq + Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ChannelId;
-    use crate::gui::bridge::UiUpdate;
     use crate::runtime::StreamDelta;
 
     fn serial(port: &str) -> SerialConfig {
@@ -1347,51 +1144,6 @@ mod tests {
 
     // ---- in use ----
 
-    fn using<'a>(
-        name: &'a str,
-        status: ChannelStatus,
-        interface: &'a InterfaceConfig,
-    ) -> ChannelUse<'a> {
-        ChannelUse {
-            name,
-            status,
-            interface,
-        }
-    }
-
-    #[test]
-    fn a_running_or_reconnecting_channel_has_its_port() {
-        let key = PortKey::Serial("COM4".into());
-        let gps = ser("com4");
-        for status in [ChannelStatus::Running, ChannelStatus::Reconnecting] {
-            assert_eq!(in_use_by(&key, [using("GPS", status, &gps)]), Some("GPS"));
-        }
-        for status in [ChannelStatus::Stopped, ChannelStatus::Faulted] {
-            assert_eq!(in_use_by(&key, [using("GPS", status, &gps)]), None);
-        }
-    }
-
-    #[test]
-    fn the_in_use_check_matches_serial_names_and_udp_numbers_only() {
-        let com5 = ser("COM5");
-        let udp5005 = net(5005);
-        let running = ChannelStatus::Running;
-        let both = || [using("A", running, &com5), using("B", running, &udp5005)];
-        assert_eq!(in_use_by(&PortKey::Serial("COM4".into()), both()), None);
-        assert_eq!(
-            in_use_by(&PortKey::Serial("Com5".into()), both()),
-            Some("A")
-        );
-        assert_eq!(in_use_by(&PortKey::Udp(5005), both()), Some("B"));
-        assert_eq!(in_use_by(&PortKey::Udp(5006), both()), None);
-        // A serial port named like a number is not a UDP port.
-        let odd = ser("5005");
-        assert_eq!(
-            in_use_by(&PortKey::Udp(5005), [using("C", running, &odd)]),
-            None
-        );
-    }
-
     // ---- stepping ----
 
     fn ports(names: &[&str]) -> Vec<String> {
@@ -1442,8 +1194,6 @@ mod tests {
             interface,
             started: true,
             paused: false,
-            in_use_by: None,
-            freed_by: None,
             open_error: None,
             run: None,
         }
@@ -1515,18 +1265,6 @@ mod tests {
         assert!(!glyph.is_empty());
 
         let mut f = facts(&com4);
-        f.in_use_by = Some("GPS");
-        let line = status_line(&f);
-        assert!(line.problem);
-        assert_eq!(
-            line.text,
-            format!(
-                "{glyph}COM4 is in use by channel \u{201C}GPS\u{201D}, so Linemon did not open \
-                 it. Stop that channel, then press Start to look at the port here."
-            )
-        );
-
-        let mut f = facts(&com4);
         f.open_error = Some("Access is denied.");
         let line = status_line(&f);
         assert!(line.problem);
@@ -1552,7 +1290,6 @@ mod tests {
         let com4 = ser("COM4");
         let mut f = facts(&com4);
         f.started = false;
-        f.in_use_by = Some("GPS");
         f.open_error = Some("x");
         assert_eq!(text(&f), "Stopped. Press Start to open COM4.");
     }
@@ -1581,51 +1318,26 @@ mod tests {
             .count()
     }
 
-    fn state_with_running(name: &str, config: ChannelConfig) -> AppState {
-        let mut state = AppState::default();
-        let id = ChannelId::new();
-        state.apply(UiUpdate::ChannelAdded(
-            id,
-            name.into(),
-            String::new(),
-            Box::new(config),
-        ));
-        state.apply(UiUpdate::Event(crate::core::RuntimeEvent::ChannelStarted(
-            id,
-        )));
-        state
-    }
-
-    fn gps_on(port: &str) -> ChannelConfig {
-        let mut c = templates::serial_template();
-        if let InterfaceConfig::Serial(s) = &mut c.interface {
-            s.port = port.into();
-        }
-        c
-    }
-
     #[test]
     fn started_with_a_port_opens_it_once_and_marks_the_display() {
-        let state = AppState::default();
         let mut l = started_on("COM4");
         let mut out = Vec::new();
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(opened(&out).len(), 1);
         assert_eq!(l.stream.marks().len(), 1);
         assert_eq!(l.stream.marks()[0].text, "\u{2014} COM4, 9600 8N1 \u{2014}");
         // Nothing changed, so nothing more is sent.
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(opened(&out).len(), 1);
         assert_eq!(l.stream.marks().len(), 1);
     }
 
     #[test]
     fn a_changed_setting_reopens_at_once_and_does_not_clear() {
-        let state = AppState::default();
         let mut l = started_on("COM4");
         l.settings.clear_on_port_change = true;
         let mut out = Vec::new();
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         l.stream.append(&StreamDelta {
             generation: 1,
             base_offset: 0,
@@ -1633,7 +1345,7 @@ mod tests {
             end_offset: 3,
         });
         l.settings.serial.baud_rate = 115_200;
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(opened(&out).len(), 2);
         assert_eq!(l.stream.len(), 3, "a baud change never clears");
         assert_eq!(l.stream.marks().len(), 2);
@@ -1641,21 +1353,20 @@ mod tests {
 
     #[test]
     fn a_value_still_being_typed_does_not_reopen_the_port() {
-        let state = AppState::default();
         let mut l = Linemon::new(None);
         l.settings.kind = SourceKind::Udp;
         l.settings.udp.port = 5005;
         l.settings.udp.mode = UdpMode::Multicast;
         l.started = true;
         let mut out = Vec::new();
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(opened(&out).len(), 1);
 
         // A group typed one keystroke at a time, with its field focused.
         l.editing_text = true;
         for typed in ["2", "23", "239", "239.", "239.0.0.1"] {
             l.settings.udp.multicast_group = Some(typed.into());
-            l.sync(&state, &mut out);
+            l.sync(&mut out);
         }
         assert_eq!(opened(&out).len(), 1, "nothing opens while it is typed");
         assert_eq!(l.stream.marks().len(), 1, "and no marker line is added");
@@ -1663,14 +1374,14 @@ mod tests {
 
         // Leaving the field lets the finished value through, once.
         l.editing_text = false;
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(opened(&out).len(), 2);
         assert_eq!(l.stream.marks().len(), 2);
         assert_eq!(
             l.stream.marks()[1].text,
             "\u{2014} UDP port 5005, multicast group 239.0.0.1 \u{2014}"
         );
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(opened(&out).len(), 2, "nothing more is sent");
     }
 
@@ -1679,25 +1390,23 @@ mod tests {
         // Start while a field has the keyboard: pressing Start moves focus away
         // in practice, but the first open is the same request as any other
         // change and waits only while the field is being edited.
-        let state = AppState::default();
         let mut l = started_on("COM4");
         l.editing_text = true;
         let mut out = Vec::new();
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert!(opened(&out).is_empty());
         l.editing_text = false;
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(opened(&out).len(), 1);
     }
 
     #[test]
     fn a_changed_port_clears_only_when_the_checkbox_is_ticked() {
         for clear in [false, true] {
-            let state = AppState::default();
             let mut l = started_on("COM4");
             l.settings.clear_on_port_change = clear;
             let mut out = Vec::new();
-            l.sync(&state, &mut out);
+            l.sync(&mut out);
             l.stream.append(&StreamDelta {
                 generation: 1,
                 base_offset: 0,
@@ -1705,7 +1414,7 @@ mod tests {
                 end_offset: 3,
             });
             l.settings.serial.port = "COM5".into();
-            l.sync(&state, &mut out);
+            l.sync(&mut out);
             assert_eq!(l.stream.len(), if clear { 0 } else { 3 });
             assert_eq!(l.stream.marks().len(), if clear { 1 } else { 2 });
         }
@@ -1713,7 +1422,6 @@ mod tests {
 
     #[test]
     fn the_first_open_never_clears() {
-        let state = AppState::default();
         let mut l = started_on("COM4");
         l.settings.clear_on_port_change = true;
         l.stream.append(&StreamDelta {
@@ -1723,167 +1431,41 @@ mod tests {
             end_offset: 3,
         });
         let mut out = Vec::new();
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(l.stream.len(), 3);
     }
 
     #[test]
     fn stopping_closes_and_pressing_start_again_reopens_the_same_port() {
-        let state = AppState::default();
         let mut l = started_on("COM4");
         let mut out = Vec::new();
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         l.started = false;
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(closes(&out), 1);
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(closes(&out), 1, "closed once");
         // Changes while stopped send nothing.
         l.settings.serial.baud_rate = 4800;
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(opened(&out).len(), 1);
         // Start uses the settings as they are then.
         l.started = true;
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(opened(&out).len(), 2);
         assert_eq!(opened(&out)[1].interface, l.settings.interface());
     }
 
     #[test]
-    fn a_port_a_channel_runs_is_not_opened_and_the_previous_one_is_released() {
-        let mut l = started_on("COM4");
-        let mut out = Vec::new();
-        l.sync(&AppState::default(), &mut out);
-        assert_eq!(opened(&out).len(), 1);
-
-        let state = state_with_running("GPS", gps_on("com5"));
-        l.settings.serial.port = "COM5".into();
-        l.sync(&state, &mut out);
-        assert_eq!(closes(&out), 1, "COM4 is released");
-        assert_eq!(opened(&out).len(), 1, "COM5 is not opened");
-        assert_eq!(l.in_use_by.as_deref(), Some("GPS"));
-        assert!(l.started, "Linemon stays started");
-
-        // Stepping to a free port opens it without pressing Start.
-        l.settings.serial.port = "COM6".into();
-        l.sync(&state, &mut out);
-        assert_eq!(opened(&out).len(), 2);
-        assert_eq!(l.in_use_by, None);
-    }
-
-    #[test]
-    fn a_channel_is_refused_the_port_linemon_has() {
-        let mut l = started_on("COM4");
-        let mut out = Vec::new();
-        l.sync(&AppState::default(), &mut out);
-        // Matched ignoring case, and named as the Channel spells it, since the
-        // sentence appears on that Channel's line.
-        assert_eq!(
-            l.refuse_channel(&gps_on("com4").interface).as_deref(),
-            Some(
-                "com4 is in use by Linemon, so this channel did not start. Stop Linemon, \
-                 then press Start to start the channel."
-            )
-        );
-        assert_eq!(l.refuse_channel(&gps_on("COM5").interface), None);
-    }
-
-    #[test]
-    fn a_reconnect_is_refused_the_port_linemon_has() {
-        let com4 = gps_on("COM4").interface;
-        assert_eq!(
-            reconnect_refusal(&com4, &gps_on("com4").interface).as_deref(),
-            Some(
-                "com4 is in use by Linemon, so this channel could not reconnect. Stop \
-                 Linemon to let it reconnect."
-            )
-        );
-        assert_eq!(reconnect_refusal(&com4, &gps_on("COM5").interface), None);
-    }
-
-    #[test]
-    fn a_channel_may_start_on_a_port_linemon_does_not_hold() {
-        let mut out = Vec::new();
-        // Stopped.
-        let mut l = started_on("COM4");
-        l.sync(&AppState::default(), &mut out);
-        l.started = false;
-        l.sync(&AppState::default(), &mut out);
-        assert_eq!(l.refuse_channel(&gps_on("COM4").interface), None);
-        // The open failed.
-        let mut l = started_on("COM4");
-        l.sync(&AppState::default(), &mut out);
-        l.handle(LinemonUpdate::Error("access is denied".into()));
-        assert_eq!(l.refuse_channel(&gps_on("COM4").interface), None);
-        // Refused itself, because a Channel had it.
-        let mut l = started_on("COM4");
-        l.sync(&state_with_running("GPS", gps_on("COM4")), &mut out);
-        assert_eq!(l.refuse_channel(&gps_on("COM4").interface), None);
-    }
-
-    #[test]
-    fn a_refused_port_stays_closed_when_its_channel_lets_it_go() {
-        let mut l = started_on("COM5");
-        let mut out = Vec::new();
-        let held = state_with_running("GPS", gps_on("COM5"));
-        l.sync(&held, &mut out);
-        assert!(opened(&out).is_empty(), "refused while GPS has it");
-        assert_eq!(l.in_use_by.as_deref(), Some("GPS"));
-
-        // GPS stops: COM5 is free, and Linemon still does not open it.
-        let free = AppState::default();
-        for _ in 0..3 {
-            l.sync(&free, &mut out);
-        }
-        assert!(opened(&out).is_empty(), "not opened on its own");
-        assert_eq!(l.in_use_by, None);
-        assert_eq!(l.freed_by(), Some("GPS"));
-        assert!(l.can_start(), "Start is offered");
-
-        // Start opens it.
-        l.press_start();
-        l.sync(&free, &mut out);
-        assert_eq!(opened(&out).len(), 1);
-        assert_eq!(l.freed_by(), None);
-    }
-
-    #[test]
-    fn a_refused_port_taken_again_is_reported_in_use_again() {
-        let mut l = started_on("COM5");
-        let mut out = Vec::new();
-        l.sync(&state_with_running("GPS", gps_on("COM5")), &mut out);
-        l.sync(&AppState::default(), &mut out);
-        assert_eq!(l.freed_by(), Some("GPS"));
-        l.sync(&state_with_running("Logger", gps_on("COM5")), &mut out);
-        assert_eq!(l.in_use_by.as_deref(), Some("Logger"));
-        assert_eq!(l.freed_by(), None);
-        assert!(opened(&out).is_empty());
-    }
-
-    #[test]
-    fn the_status_says_when_a_refused_port_is_free_and_waits_for_start() {
-        let com5 = ser("COM5");
-        let mut f = facts(&com5);
-        f.freed_by = Some("GPS");
-        let line = status_line(&f);
-        assert!(!line.problem);
-        assert_eq!(
-            line.text,
-            "Channel \u{201C}GPS\u{201D} no longer has COM5. Press Start to open it here."
-        );
-    }
-
-    #[test]
     fn no_port_closes_what_is_open_and_choosing_one_opens_it() {
-        let state = AppState::default();
         let mut l = started_on("COM4");
         let mut out = Vec::new();
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         l.settings.serial.port.clear();
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(closes(&out), 1);
         l.settings.serial.port = "COM5".into();
-        l.sync(&state, &mut out);
+        l.sync(&mut out);
         assert_eq!(opened(&out).len(), 2);
     }
 
@@ -1908,27 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_window_closes_the_port_and_keeps_the_display() {
-        let state = AppState::default();
-        let mut l = started_on("COM4");
-        l.open = true;
-        let mut out = Vec::new();
-        l.sync(&state, &mut out);
-        l.stream.append(&StreamDelta {
-            generation: 1,
-            base_offset: 0,
-            bytes: b"abc".to_vec().into(),
-            end_offset: 3,
-        });
-        l.close_window(&mut out);
-        assert_eq!(closes(&out), 1);
-        assert!(!l.open && !l.started);
-        assert_eq!(l.stream.len(), 3);
-    }
-
-    #[test]
-    fn reopening_the_window_starts_only_when_the_checkbox_is_ticked_and_a_port_is_chosen() {
-        let ctx = egui::Context::default();
+    fn starting_up_opens_only_when_the_checkbox_is_ticked_and_a_port_is_chosen() {
         for (reopen, port, expect) in [
             (true, "COM4", true),
             (false, "COM4", false),
@@ -1937,8 +1499,7 @@ mod tests {
             let mut l = Linemon::new(None);
             l.settings.reopen_on_start = reopen;
             l.settings.serial.port = port.into();
-            l.open_or_focus(&ctx);
-            assert!(l.open);
+            l.start_up();
             assert_eq!(l.started, expect, "reopen {reopen}, port {port:?}");
         }
     }
@@ -1952,13 +1513,12 @@ mod tests {
 
     #[test]
     fn start_is_off_with_no_port_and_while_the_port_is_open() {
-        let state = AppState::default();
         let mut l = Linemon::new(None);
         assert!(!l.can_start());
         l.settings.serial.port = "COM4".into();
         assert!(l.can_start());
         l.started = true;
-        l.sync(&state, &mut Vec::new());
+        l.sync(&mut Vec::new());
         assert!(!l.can_start(), "already open");
         l.open_error = Some("busy".into());
         assert!(l.can_start(), "try again after a failure");

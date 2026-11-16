@@ -6,7 +6,6 @@ use wiredata_ui::hover::{Hover, ShowHover};
 use wiredata_ui::selection;
 
 use super::bridge::UiCommand;
-use super::linemon_window::LINEMON_HOVER;
 use super::state::ChannelStatus;
 use super::widgets::{human_bytes, status_color, status_glyph, AddKind};
 use super::ListenerApp;
@@ -122,10 +121,6 @@ impl ListenerApp {
                 // event channel), leaving some channels stuck Running in the UI. The
                 // driver iterates server-side and skips already-Stopped channels.
                 self.send(UiCommand::StopAll);
-            }
-            if ui.button("Linemon").on_hover(&LINEMON_HOVER).clicked() {
-                let ctx = ui.ctx().clone();
-                self.linemon.open_or_focus(&ctx);
             }
             // "+ Add" rides with the bulk actions rather than the title row, so
             // the header carries only the title, theme toggle and Profile. That

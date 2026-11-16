@@ -12,6 +12,16 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-15) — Linemon, as built:
+
+- **§50.3 (ADR-070).** Adds Start, Stop and Reopen port on start, and says
+  that a typed value takes effect when its field is left. Names the buttons
+  as they appear: Previous, Next and Copy scroll buffer. A port held by
+  Linemon or by a channel is refused the same way in both directions, and a
+  refused port waits for Start.
+- **§91, §113.** Quoted on-screen messages write "channel" in lower case, as
+  the screen does.
+
 Revision note (2026-11-15) — Linemon:
 
 - **§50.3 (ADR-070).** New: Linemon, a window for looking at one stream.
