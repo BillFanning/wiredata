@@ -12,6 +12,12 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-16) — the pop-out and the Channel's display pause:
+
+- **§50.4 (ADR-071).** Pausing the Channel's display pauses its pop-out too,
+  and the pop-out says so. Resume shows what arrived while the pop-out was
+  paused, and removing the Channel closes its pop-out.
+
 Revision note (2026-11-15) — Linemon on its own, and the pop-out display:
 
 - **§50.3 (ADR-070).** Linemon is a program of its own, not a window of

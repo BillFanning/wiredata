@@ -591,6 +591,10 @@ pub(in crate::gui) fn show_view_controls(
                 });
         });
     });
+    // A quarter of a row's height above and below the font row, as between
+    // Linemon's lines.
+    let row_gap = ui.spacing().interact_size.y * 0.25;
+    ui.add_space(row_gap);
     ui.horizontal(|ui| {
         ui.label("Size");
         // An editable "combo": type any size into the field, or pick a preset from
@@ -635,6 +639,7 @@ pub(in crate::gui) fn show_view_controls(
                 }
             });
     });
+    ui.add_space(row_gap);
     // Scroll-buffer cap (§87): how far back the viewer scrolls, chosen from presets
     // (2 … 256 kB) — no free text, so it's always a known value. The current fill is
     // shown alongside. Persisted via retention (the runtime adopts it next start; the

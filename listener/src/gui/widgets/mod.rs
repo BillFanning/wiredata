@@ -219,18 +219,18 @@ fn port_field(ui: &mut egui::Ui, id: &str, port: &mut u16) {
 
 const BROADCAST_HOVER: Hover = Hover::new(
     "Receives datagrams that a sender addresses to the whole subnet.\n\n\
-     Set the Binding address to All interfaces to accept them on any of this \
+     Set the binding address to All interfaces to accept them on any of this \
      computer's network interfaces.",
 );
 const UNICAST_HOVER: Hover = Hover::new(
     "Receives datagrams addressed directly to this computer.\n\n\
-     Set the Binding address to All interfaces to listen on every network \
+     Set the binding address to All interfaces to listen on every network \
      interface, or to one local address to listen on only that one.",
 );
 const MULTICAST_HOVER: Hover = Hover::new(
     "Joins a multicast group and receives the datagrams sent to it.\n\n\
      Enter the group's address in Group. Listener joins the group on this \
-     computer's default network interface; the Binding address does not choose \
+     computer's default network interface; the binding address does not choose \
      which interface joins it.",
 );
 
@@ -315,10 +315,17 @@ pub(super) fn edit_interface(
                 .num_columns(2)
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
-                    udp_mode_row(ui, udp);
-                    udp_bind_row(ui, udp, local_addresses, &mut refresh, true);
-                    udp_group_row(ui, udp);
-                    udp_shared_row(ui, udp);
+                    // The port line, then the mode line (port sharing and the
+                    // multicast group follow the mode on it).
+                    ui.label("Port").on_hover(&UDP_PORT_HOVER);
+                    ui.horizontal(|ui| {
+                        port_field(ui, "udp_port", &mut udp.port);
+                        udp_bind_choice(ui, udp, local_addresses, &mut refresh);
+                    });
+                    ui.end_row();
+                    ui.label("Mode").on_hover(&UDP_MODE_HOVER);
+                    ui.horizontal(|ui| udp_mode_and_sharing(ui, udp));
+                    ui.end_row();
 
                     ui.label("Arrival timing").on_hover_text(
                         "Choose who takes the arrival time of each UDP datagram: Listener \
@@ -440,36 +447,27 @@ pub(super) fn edit_interface(
                 });
         }
     }
-    ui.separator();
     edit_reconnect(ui, &mut config.reconnect);
     refresh
 }
 
-/// The UDP "Mode" row of a two-column grid: Broadcast, Unicast or Multicast.
-pub(super) fn udp_mode_row(ui: &mut egui::Ui, udp: &mut UdpConfig) {
-    ui.label("Mode")
-        .on_hover_text("How this UDP socket receives datagrams.");
-    ui.horizontal(|ui| {
-        ui.radio_value(&mut udp.mode, UdpMode::Broadcast, "Broadcast")
-            .on_hover(&BROADCAST_HOVER);
-        ui.radio_value(&mut udp.mode, UdpMode::Unicast, "Unicast")
-            .on_hover(&UNICAST_HOVER);
-        ui.radio_value(&mut udp.mode, UdpMode::Multicast, "Multicast")
-            .on_hover(&MULTICAST_HOVER);
-    });
-    ui.end_row();
-}
+/// What the "Port" label says on hover, in the channel editor and Linemon.
+pub(super) const UDP_PORT_HOVER: Hover = Hover::new(
+    "The UDP port to listen on.\n\n\
+     It is the port the sending machine sends to.",
+);
 
-/// The UDP "Binding address" row of a two-column grid, with the port field
-/// after it when `with_port` is set. Always directly under Mode, so it never
-/// moves when switching modes. Sets `refresh` when the address list should be
-/// listed again.
-pub(super) fn udp_bind_row(
+/// What the "Mode" label says on hover, in the channel editor and Linemon.
+pub(super) const UDP_MODE_HOVER: Hover = Hover::new("How this UDP socket receives datagrams.");
+
+/// The UDP binding address choice and its refresh button, with no label: it
+/// follows the port number on the port line, in the channel editor and in
+/// Linemon. Sets `refresh` when the address list should be listed again.
+pub(super) fn udp_bind_choice(
     ui: &mut egui::Ui,
     udp: &mut UdpConfig,
     local_addresses: &LocalAddresses,
     refresh: &mut Option<Refresh>,
-    with_port: bool,
 ) {
     // The bind-address tip is mode-aware: All interfaces is the right default
     // in every mode (accept on any local interface), but *why* differs.
@@ -478,118 +476,155 @@ pub(super) fn udp_bind_row(
         UdpMode::Unicast => UNICAST_BIND_HOVER,
         UdpMode::Multicast => MULTICAST_BIND_HOVER,
     };
-    ui.label("Binding address").on_hover(&bind_hint);
-    ui.horizontal(|ui| {
-        // The choices say who can reach the socket (§15, ADR-047). If the OS
-        // cannot list its addresses, the address is typed.
-        if let LocalAddresses::Failed(why) = local_addresses {
-            ui.add(
-                egui::TextEdit::singleline(&mut udp.bind_address)
-                    .id_salt("udp_bind")
-                    .desired_width(130.0)
-                    .hint_text(ALL_INTERFACES_ADDRESS),
-            )
-            .on_hover(&bind_hint.clone().with_paragraph(&format!(
-                "This computer's addresses could not be listed, so type \
-                 the address instead. The system reported: {why}"
-            )));
-        } else {
-            let listed = local_addresses.listed();
-            let combo = egui::ComboBox::from_id_salt("udp_bind")
-                .selected_text(bind_choice_label(&udp.bind_address, listed))
-                .width(280.0)
-                .show_ui(ui, |ui| {
-                    for (address, label) in bind_choices(&udp.bind_address, listed) {
-                        ui.selectable_value(&mut udp.bind_address, address, label);
-                    }
-                });
-            // Listed again as the choice opens, as the serial port list is: an
-            // adapter may have come or gone.
-            if combo.response.on_hover(&bind_hint).clicked() {
-                *refresh = Some(Refresh::LocalAddresses);
-            }
-        }
-        if ui
-            .small_button("\u{2B6E}")
-            .on_hover_text("Refresh this computer's addresses")
-            .clicked()
-        {
+    // Two spaces' width between the port number and the binding address, so
+    // the two read as separate settings.
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let two_spaces = ui
+        .painter()
+        .layout_no_wrap("  ".to_owned(), font, egui::Color32::PLACEHOLDER)
+        .size()
+        .x;
+    ui.add_space(two_spaces);
+    // The choices say who can reach the socket (§15, ADR-047). If the OS
+    // cannot list its addresses, the address is typed.
+    if let LocalAddresses::Failed(why) = local_addresses {
+        ui.add(
+            egui::TextEdit::singleline(&mut udp.bind_address)
+                .id_salt("udp_bind")
+                .desired_width(130.0)
+                .hint_text(ALL_INTERFACES_ADDRESS),
+        )
+        .on_hover(&bind_hint.clone().with_paragraph(&format!(
+            "This computer's addresses could not be listed, so type \
+             the address instead. The system reported: {why}"
+        )));
+    } else {
+        let listed = local_addresses.listed();
+        let combo = egui::ComboBox::from_id_salt("udp_bind")
+            .selected_text(bind_choice_label(&udp.bind_address, listed))
+            .width(280.0)
+            .show_ui(ui, |ui| {
+                for (address, label) in bind_choices(&udp.bind_address, listed) {
+                    ui.selectable_value(&mut udp.bind_address, address, label);
+                }
+            });
+        // Listed again as the choice opens, as the serial port list is: an
+        // adapter may have come or gone.
+        if combo.response.on_hover(&bind_hint).clicked() {
             *refresh = Some(Refresh::LocalAddresses);
         }
-        if with_port {
-            ui.label("port").on_hover_text(
-                "The UDP port to listen on \u{2014} i.e. the destination port the \
-                 sending machine sends to.",
-            );
-            port_field(ui, "udp_port", &mut udp.port);
-        }
-    });
-    ui.end_row();
-}
-
-/// The multicast "Group" row of a two-column grid; nothing for other modes.
-pub(super) fn udp_group_row(ui: &mut egui::Ui, udp: &mut UdpConfig) {
-    if udp.mode != UdpMode::Multicast {
-        return;
     }
-    ui.label("Group").on_hover(&GROUP_HINT);
-    let mut group = udp.multicast_group.clone().unwrap_or_default();
     if ui
-        .add(
-            egui::TextEdit::singleline(&mut group)
-                .id_salt("udp_group")
-                .desired_width(130.0)
-                .hint_text("239.0.0.1"),
-        )
-        .on_hover(&GROUP_HINT)
-        .changed()
+        .small_button("\u{2B6E}")
+        .on_hover_text("Refresh this computer's addresses")
+        .clicked()
     {
-        let g = group.trim();
-        udp.multicast_group = (!g.is_empty()).then(|| g.to_string());
+        *refresh = Some(Refresh::LocalAddresses);
     }
-    ui.end_row();
 }
 
-/// The "Port sharing" row of a two-column grid. Not offered for unicast (§15,
-/// ADR-047), so switching to it clears the request rather than leaving a
-/// profile that fails validation.
-pub(super) fn udp_shared_row(ui: &mut egui::Ui, udp: &mut UdpConfig) {
-    if udp.mode == UdpMode::Unicast {
+/// The UDP mode radios, then port sharing and, for multicast, the group, all
+/// on one line with no labels but the caller's "Mode": the mode line in the
+/// channel editor and in Linemon.
+///
+/// Port sharing is always shown, so it does not come and go as the mode
+/// changes. It is not offered for unicast (§15, ADR-047): there the box is
+/// disabled and unticked, and words say so, so the grey is not the only sign.
+/// Switching to unicast clears the request rather than leaving a profile that
+/// fails validation.
+pub(super) fn udp_mode_and_sharing(ui: &mut egui::Ui, udp: &mut UdpConfig) {
+    ui.radio_value(&mut udp.mode, UdpMode::Broadcast, "Broadcast")
+        .on_hover(&BROADCAST_HOVER);
+    ui.radio_value(&mut udp.mode, UdpMode::Unicast, "Unicast")
+        .on_hover(&UNICAST_HOVER);
+    ui.radio_value(&mut udp.mode, UdpMode::Multicast, "Multicast")
+        .on_hover(&MULTICAST_HOVER);
+    ui.separator();
+    let unicast = udp.mode == UdpMode::Unicast;
+    if unicast {
         udp.shared_port = false;
-        return;
     }
-    ui.label("Port sharing").on_hover(&SHARED_HINT);
-    ui.checkbox(&mut udp.shared_port, "Request shared port")
-        .on_hover(&SHARED_HINT);
-    ui.end_row();
+    ui.add_enabled(
+        !unicast,
+        egui::Checkbox::new(&mut udp.shared_port, "Request shared port"),
+    )
+    .on_hover(&SHARED_HINT);
+    if unicast {
+        ui.weak("Only for Broadcast and Multicast.");
+    }
+    // The group is laid out in every mode and shown only in Multicast: its
+    // text box is taller than the checkbox, so leaving it out would make the
+    // line grow, and move, when Multicast is chosen.
+    let multicast = udp.mode == UdpMode::Multicast;
+    let group_ui = if multicast {
+        egui::UiBuilder::new()
+    } else {
+        egui::UiBuilder::new().invisible()
+    };
+    ui.scope_builder(group_ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.separator();
+            ui.label("Group").on_hover(&GROUP_HINT);
+            let mut group = udp.multicast_group.clone().unwrap_or_default();
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut group)
+                        .id_salt("udp_group")
+                        .desired_width(130.0)
+                        .hint_text("239.0.0.1"),
+                )
+                .on_hover(&GROUP_HINT)
+                .changed()
+            {
+                let g = group.trim();
+                udp.multicast_group = (!g.is_empty()).then(|| g.to_string());
+            }
+        });
+    });
 }
 
 /// The "Reconnect automatically" choice (§9.1, ADR-045), with what it does in
 /// words. Applied live; it needs no restart.
 pub(super) fn edit_reconnect(ui: &mut egui::Ui, policy: &mut crate::config::ReconnectPolicy) {
-    ui.checkbox(&mut policy.enabled, "Reconnect automatically");
-    ui.label(egui::RichText::new(reconnect_behaviour(policy)).weak());
+    let hover = reconnect_hover(policy);
+    ui.checkbox(&mut policy.enabled, "Reconnect automatically")
+        .on_hover(&hover);
 }
 
-/// What a reconnect policy does, in words (§9.1). Pure, unit-tested.
-pub(super) fn reconnect_behaviour(policy: &crate::config::ReconnectPolicy) -> String {
-    if !policy.enabled {
-        return "If the port or device fails, the channel stays down until you start it \
-                again."
-            .to_owned();
-    }
+/// The "Reconnect automatically" hover. It reads the same ticked or not, and
+/// says what each state does, with the retry timing taken from `policy`.
+fn reconnect_hover(policy: &crate::config::ReconnectPolicy) -> Hover {
+    Hover::from_paragraphs([
+        "Reopens the channel by itself when its port or device fails.".to_owned(),
+        format!("When this is ticked, {}", reconnect_retries(policy)),
+        "When it is not ticked, the channel stays down until you start it again.".to_owned(),
+    ])
+}
+
+/// How reconnecting retries under `policy`, as the end of a sentence that
+/// starts "When this is ticked, ". Whether reconnecting is on is not part of it.
+fn reconnect_retries(policy: &crate::config::ReconnectPolicy) -> String {
     let wait = |ms: u64| wiredata_ui::format::wait(std::time::Duration::from_millis(ms));
-    let until = match policy.max_attempts {
-        None => "until it works".to_owned(),
-        Some(1) => "once, then gives up".to_owned(),
-        Some(n) => format!("up to {n} times, then gives up"),
-    };
-    format!(
-        "If the port or device fails, the channel tries again after {}, waiting longer \
-         each time up to {}, {until}.",
-        wait(policy.initial_backoff_ms),
-        wait(policy.max_backoff_ms)
-    )
+    let first = wait(policy.initial_backoff_ms);
+    let longest = wait(policy.max_backoff_ms);
+    // The wait grows by the multiplier until it reaches the longest wait, and
+    // stays there: retrying goes on at that wait unless there is a limit.
+    let grows = policy.max_backoff_ms > policy.initial_backoff_ms;
+    match (policy.max_attempts, grows) {
+        (Some(1), _) => format!("the channel tries again once, after {first}, then gives up."),
+        (None, true) => format!(
+            "the channel tries again after {first}, then waits longer between tries until \
+             the wait reaches {longest}, and keeps trying every {longest} until it works."
+        ),
+        (None, false) => format!("the channel tries again every {first} until it works."),
+        (Some(n), true) => format!(
+            "the channel tries again after {first}, then waits longer between tries, up to \
+             {longest} at most, and gives up after {n} tries."
+        ),
+        (Some(n), false) => {
+            format!("the channel tries again every {first}, and gives up after {n} tries.")
+        }
+    }
 }
 
 /// The available serial port names, sorted (§14.4). Empty if enumeration fails.
@@ -787,24 +822,28 @@ mod tests {
     }
 
     #[test]
-    fn the_reconnect_choice_says_what_it_does() {
+    fn the_reconnect_hover_describes_both_states_whether_ticked_or_not() {
         let mut policy = templates::udp_template().reconnect;
-        policy.enabled = false;
-        assert_eq!(
-            reconnect_behaviour(&policy),
-            "If the port or device fails, the channel stays down until you start it again."
-        );
-        policy.enabled = true;
         policy.initial_backoff_ms = 1_000;
         policy.max_backoff_ms = 30_000;
         policy.max_attempts = None;
+        policy.enabled = false;
+        let unticked = reconnect_hover(&policy);
+        policy.enabled = true;
+        let ticked = reconnect_hover(&policy);
+        assert_eq!(ticked.text(), unticked.text(), "the same words either way");
         assert_eq!(
-            reconnect_behaviour(&policy),
-            "If the port or device fails, the channel tries again after 1 s, waiting longer \
-             each time up to 30 s, until it works."
+            ticked.text(),
+            "Reopens the channel by itself when its port or device fails.\n\n\
+             When this is ticked, the channel tries again after 1 s, then waits longer \
+             between tries until the wait reaches 30 s, and keeps trying every 30 s until \
+             it works.\n\n\
+             When it is not ticked, the channel stays down until you start it again."
         );
         policy.max_attempts = Some(10);
-        assert!(reconnect_behaviour(&policy).ends_with("up to 10 times, then gives up."));
+        assert!(reconnect_hover(&policy)
+            .text()
+            .contains("up to 30 s at most, and gives up after 10 tries."));
     }
 
     #[test]

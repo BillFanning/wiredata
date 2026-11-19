@@ -20,6 +20,9 @@ use wiredata_ui::hover::{Hover, ShowHover};
 
 /// Where a pop-out window opens, before the person resizes it.
 const DEFAULT_SIZE: [f32; 2] = [900.0, 600.0];
+/// The size of Pause and Clear: the size of Linemon's buttons and of
+/// Listener's channel Start and Stop.
+const BUTTON_SIZE: egui::Vec2 = egui::vec2(96.0, 32.0);
 /// The smallest a pop-out window can be made.
 const MIN_SIZE: [f32; 2] = [420.0, 240.0];
 
@@ -251,15 +254,20 @@ fn show_controls(
     held: bool,
 ) -> Option<Action> {
     let mut action = None;
+    // Linemon's look: a quarter of a row's height above the buttons and below
+    // them, and buttons the size of Linemon's and of Listener's channel buttons.
+    let row_gap = ui.spacing().interact_size.y * 0.25;
+    let button = |text: &str| egui::Button::new(text).min_size(BUTTON_SIZE);
+    ui.add_space(row_gap);
     ui.horizontal_wrapped(|ui| {
         if paused {
-            if ui.button("Resume").on_hover(&RESUME_HOVER).clicked() {
+            if ui.add(button("Resume")).on_hover(&RESUME_HOVER).clicked() {
                 action = Some(Action::Resume);
             }
-        } else if ui.button("Pause").on_hover(&PAUSE_HOVER).clicked() {
+        } else if ui.add(button("Pause")).on_hover(&PAUSE_HOVER).clicked() {
             action = Some(Action::Pause);
         }
-        if ui.button("Clear").on_hover(&CLEAR_HOVER).clicked() {
+        if ui.add(button("Clear")).on_hover(&CLEAR_HOVER).clicked() {
             action = Some(Action::Clear);
         }
         if paused {
@@ -270,6 +278,7 @@ fn show_controls(
             ui.label(HELD_TEXT);
         }
     });
+    ui.add_space(row_gap);
     // The channel display's own controls, without the scroll-buffer row: the
     // pop-out shows the channel's buffer, so its size is not the pop-out's to set.
     super::detail::stream_view::show_view_controls(ui, prefs, None);
@@ -333,7 +342,10 @@ impl ListenerApp {
         };
         popout.sync(view.stream_generation());
         let builder = egui::ViewportBuilder::default()
-            .with_title(format!("{} — Listener", view.name))
+            .with_title(format!(
+                "Listener pop-out display for channel {}",
+                view.name
+            ))
             .with_inner_size(DEFAULT_SIZE)
             .with_min_inner_size(MIN_SIZE)
             .with_resizable(true);

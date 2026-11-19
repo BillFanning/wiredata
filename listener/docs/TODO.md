@@ -14,13 +14,13 @@ again. Remove an item when it is done: the commit says what changed.
 
 - [ ] **Check Linemon's serial bar by hand (§50.3).** Its UDP side was checked
   by hand; the serial side waits for a USB serial adapter. Open a port; change
-  the baud and the other settings while started; type a custom baud; Previous
-  and Next wrap at the ends of the list; the refresh button lists a port
-  plugged in or removed; unplugging the adapter shows the fault and Start
-  reopens it.
-- [ ] **Linemon's buttons stay on their rows (§50.3).** In `Linemon::buttons` the
-  button row wraps, so buttons move from row to row as the window is resized.
-  Give the buttons fixed rows, so each stays where the hand expects it.
+  the baud and the other settings while started; type a custom baud; the
+  refresh button lists a port plugged in or removed; unplugging the adapter
+  shows the fault and Start reopens it. The control lines (§161): RTS and DTR
+  change when clicked, and with RTS looped to CTS and DTR to DSR the circles
+  follow. With Flow set to RTS/CTS the driver may hold RTS itself, so a click
+  may not change it; Listener's channel view behaves the same. Decide whether
+  that wants a word on screen.
 - [ ] **Disk guard in the GUI (§56.2).** Neither recording editor,
   `edit_raw_recording` nor `edit_display_recording`, sets `disk_guard`, so a
   guard comes only from a profile.
@@ -30,12 +30,6 @@ again. Remove an item when it is done: the commit says what changed.
 - [ ] **A glyph for a bare `Mark` (optional).** A `Mark` with no timestamp writes
   its `‹MARK …›` line into the `.disp`, but the live view draws nothing for it.
   Low priority: kept simple on purpose.
-- [ ] **Grey out Port sharing in unicast instead of hiding it (§15).**
-  `edit_interface` drops the Port sharing row when Mode is Unicast, so the row
-  comes and goes as Mode changes. Keep it in place, disabled and unticked, and
-  say in words that sharing is for broadcast and multicast only, so the grey
-  is not the only sign. Switching to unicast still clears `shared_port`, so
-  the profile stays valid.
 - [ ] **RS-422 and RS-485 (§14.5).** They follow RS-232; nothing is specific to
   them yet beyond the RTS line of §14.3.
 

@@ -164,6 +164,10 @@ pub enum UiCommand {
     LinemonOpen(Box<ChannelConfig>),
     /// Close Linemon's port. The hidden Channel stops; nothing else is touched.
     LinemonClose,
+    /// Set RTS on Linemon's open serial port (§161). Ignored when no port is open.
+    LinemonSetRts(bool),
+    /// Set DTR on Linemon's open serial port (§161). Ignored when no port is open.
+    LinemonSetDtr(bool),
     /// Stop all channels and end the driver (the App is closing).
     Shutdown,
 }
@@ -233,6 +237,8 @@ pub enum LinemonUpdate {
     Snapshot(Box<ChannelSnapshot>),
     /// Opening or re-opening failed; the reason, as a sentence for the window.
     Error(String),
+    /// The open serial port's live control lines (§161).
+    ControlLines(SerialControlLines),
 }
 
 impl UiUpdate {
@@ -256,7 +262,11 @@ impl UiUpdate {
             | Self::Stats(..)
             | Self::ControlLines(..)
             | Self::StreamDelta(..)
-            | Self::Linemon(LinemonUpdate::Stream(_) | LinemonUpdate::Snapshot(_))
+            | Self::Linemon(
+                LinemonUpdate::Stream(_)
+                | LinemonUpdate::Snapshot(_)
+                | LinemonUpdate::ControlLines(_),
+            )
             | Self::Event(_) => true,
             Self::ChannelAdded(..)
             | Self::ChannelReconfigured(..)
@@ -1421,6 +1431,8 @@ impl Driver {
                 self.linemon_request(LinemonRequest::Open(Box::new(linemon_config(*config))));
             }
             UiCommand::LinemonClose => self.linemon_request(LinemonRequest::Close),
+            UiCommand::LinemonSetRts(on) => self.linemon_set_line(true, on).await,
+            UiCommand::LinemonSetDtr(on) => self.linemon_set_line(false, on).await,
             UiCommand::Shutdown => return false,
         }
         true
@@ -1533,6 +1545,26 @@ impl Driver {
         }
     }
 
+    /// Set RTS (`rts`) or DTR on Linemon's hidden Channel, while the window
+    /// has its port open and no newer request waits (§161). A line its serial
+    /// reader did not take in time is not reported: the window shows the lines
+    /// as the next poll reads them, so it shows what the port did.
+    async fn linemon_set_line(&mut self, rts: bool, on: bool) {
+        let Some(id) = self
+            .linemon
+            .as_ref()
+            .filter(|l| l.open && l.waiting.is_none())
+            .map(|l| l.id)
+        else {
+            return;
+        };
+        let _ = if rts {
+            self.listener.set_rts(id, on).await
+        } else {
+            self.listener.set_dtr(id, on).await
+        };
+    }
+
     /// Linemon's share of a poll round: a snapshot and the stream's new bytes,
     /// with the cursor rules of [`poll_channel`](Self::poll_channel). Nothing is
     /// sent once the window has closed the port, or while a newer request waits
@@ -1547,6 +1579,10 @@ impl Driver {
         let (id, cursor) = (linemon.id, linemon.cursor);
         if let Some(snap) = self.listener.snapshot(id).await {
             self.push(UiUpdate::Linemon(LinemonUpdate::Snapshot(Box::new(snap))));
+        }
+        // `None` for UDP, or a serial port not open yet.
+        if let Some(lines) = self.listener.serial_control_lines(id) {
+            self.push(UiUpdate::Linemon(LinemonUpdate::ControlLines(lines)));
         }
         if let Some(delta) = self.listener.stream_delta(id, cursor.offset).await {
             let end = delta.end_offset;

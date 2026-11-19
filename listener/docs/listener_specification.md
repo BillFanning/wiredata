@@ -1,15 +1,18 @@
-# Listener Specification v2.6.1
+# Listener Specification v2.6.2
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-16) — the pop-out and the Channel's display pause:
+Revision note (2026-11-19) — Linemon's controls:
 
-- **§50.4 (ADR-071).** Pausing the Channel's display pauses its pop-out too,
-  and the pop-out says so. Resume shows what arrived while the pop-out was
-  paused, and removing the Channel closes its pop-out.
+- **§50.3 (ADR-070).** The UDP port number has − and + beside it; serial
+  ports are chosen from the drop-down only. A custom baud rate is typed at
+  the bottom of the baud list. A change that leaves no port chosen marks the
+  display. The checkbox is named Clear display on port change. The UDP
+  settings are two lines, as in a channel's editor, with no More button.
+- **§15.** Port sharing stays in place for unicast, disabled, and says why.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -617,7 +620,9 @@ from the network)"; the Channel header shows the scope.
 port, off by default, so another program can bind the same port. Listener sets
 the platform's address-reuse option before binding and status reports whether
 the OS applied it. Sharing is not offered for unicast, where the OS delivers
-each datagram to only one of the sharing sockets.
+each datagram to only one of the sharing sockets: the choice stays in place,
+disabled and unticked, and says in words that it is for broadcast and
+multicast only.
 
 UDP arrival wall time defaults to the portable post-read capture (§26). When the
 additive `kernel_timestamps` option is enabled, Linux requests a per-datagram software
@@ -994,12 +999,16 @@ it is not opened from Listener, and Listener need not be running.
 - **Reopen port on start.** With this ticked, Linemon opens the port it last
   had when it starts. With it unticked, Linemon waits for Start. It starts
   ticked.
-- **Choosing a port.** A drop-down lists the serial ports. Previous and Next
-  move through that list, wrapping at its ends, or move the UDP port number one
-  down or up.
-- **Settings.** The bar holds the baud rate, data bits, parity, stop bits and
-  flow control for a serial port, and the port number for UDP. A More button
-  holds the mode, the binding address, the multicast group and port sharing.
+- **Choosing a port.** A drop-down lists the serial ports. For UDP, − and +
+  beside the port number move it one down or up.
+- **Settings.** For a serial port the bar has two lines: the port with its
+  baud rate, data bits, parity and stop bits, then flow control with the
+  control lines (§161). RTS and DTR are buttons that set them; CTS, DSR, DCD and
+  RI are circles, filled when high. The lines are live while the port is open
+  and greyed out otherwise. The baud list ends with a box for any other
+  rate. For UDP the bar has two lines, as a channel's editor has: the port
+  number with the binding address after it, then the mode with port sharing
+  and, for multicast, the group after it.
   There is no Apply button: while Linemon is started, every change takes effect
   at once. A value typed into a field takes effect when the field is left or
   Enter is pressed, so a half-typed value never opens a port. While Linemon is
@@ -1010,8 +1019,10 @@ it is not opened from Listener, and Listener need not be running.
 - **Display.** Linemon shows the stream in Raw, Rendered or Hex (§42–§47), with
   the view controls a Channel's display has. The data stays on screen when the
   port or a setting changes, and a marker line records each change, naming the
-  port and its settings. **Clear** empties the display. With **Clear on port
-  change** ticked, choosing another port empties it too; it starts unticked.
+  port and its settings. A change that leaves no port chosen while started,
+  such as choosing Serial before a serial port, closes the port and is marked
+  too. **Clear** empties the display. With **Clear display on port change**
+  ticked, choosing another port empties it too; it starts unticked.
 - **Pause.** Pause stops the display, not reception. Bytes that arrive while
   the display is paused are not shown.
 - **Copy.** Copy scroll buffer puts the whole scroll buffer on the clipboard, as

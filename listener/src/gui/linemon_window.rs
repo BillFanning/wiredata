@@ -9,7 +9,7 @@
 //!
 //! The decisions that can be made without egui are plain functions at the top
 //! of the file: the settings and their stored form, the marker line, the port
-//! description, the status sentence, and Previous/Next.
+//! description, the status sentence, and stepping the UDP port number.
 
 use serde::{Deserialize, Serialize};
 use wiredata_ui::diagnostics::{tone_marker, SignalTone};
@@ -28,11 +28,13 @@ use super::bind_scope::LocalAddresses;
 use super::bridge::{LinemonUpdate, UiCommand};
 use super::linemon::LinemonStream;
 use super::view_prefs::ViewPrefs;
+use super::widgets::line_indicator;
 use super::widgets::{
-    list_serial_ports, template_for, udp_bind_row, udp_group_row, udp_mode_row, udp_shared_row,
-    AddKind, Refresh, BAUD_RATES, DATA_BITS, FLOW_CONTROL, PARITY, STOP_BITS,
+    list_serial_ports, template_for, udp_bind_choice, udp_mode_and_sharing, AddKind, Refresh,
+    BAUD_RATES, DATA_BITS, FLOW_CONTROL, PARITY, STOP_BITS, UDP_MODE_HOVER, UDP_PORT_HOVER,
 };
 use super::StreamRenderCache;
+use crate::transport::SerialControlLines;
 
 /// eframe storage key for Linemon's remembered settings, in the `linemon`
 /// program's own storage.
@@ -40,8 +42,12 @@ pub(super) const LINEMON_KEY: &str = "linemon.settings";
 
 /// The size the window opens at.
 pub(super) const DEFAULT_SIZE: [f32; 2] = [960.0, 640.0];
-/// The smallest size it can be dragged to.
-pub(super) const MIN_SIZE: [f32; 2] = [480.0, 320.0];
+/// The smallest size it can be dragged to: wide enough for the row of five
+/// buttons at [`BUTTON_SIZE`].
+pub(super) const MIN_SIZE: [f32; 2] = [600.0, 360.0];
+/// The size of Start, Stop, Pause, Clear and Copy scroll buffer: the size of
+/// Listener's channel Start and Stop buttons.
+const BUTTON_SIZE: egui::Vec2 = egui::vec2(96.0, 32.0);
 const START_HOVER: Hover = Hover::new(
     "Opens the port shown above.\n\n\
      While Linemon is started, choosing another port or changing a setting takes \
@@ -71,8 +77,6 @@ const REOPEN_HOVER: Hover = Hover::new(
     "Opens the port Linemon last had as soon as its window opens.\n\n\
      With this off, Linemon waits for you to press Start.",
 );
-const SERIAL_PREVIOUS_HOVER: Hover = Hover::new("Moves to the previous port in the list.");
-const SERIAL_NEXT_HOVER: Hover = Hover::new("Moves to the next port in the list.");
 const UDP_PREVIOUS_HOVER: Hover = Hover::new("Moves to the port number one lower.");
 const UDP_NEXT_HOVER: Hover = Hover::new("Moves to the port number one higher.");
 
@@ -256,6 +260,16 @@ fn flow_control_text(flow: FlowControl) -> Option<&'static str> {
     }
 }
 
+/// The line that marks a change that left no port chosen: `— Serial, no port
+/// chosen —` or `— UDP, no port chosen —`.
+fn no_port_text(interface: &InterfaceConfig) -> String {
+    let kind = match interface {
+        InterfaceConfig::Serial(_) => "Serial",
+        InterfaceConfig::Udp(_) => "UDP",
+    };
+    format!("\u{2014} {kind}, no port chosen \u{2014}")
+}
+
 /// The line that marks an open on the display: `— COM4, 9600 8N1 —` or
 /// `— UDP port 5005 —`, with flow control, broadcast or the multicast group
 /// added when they apply.
@@ -288,25 +302,6 @@ fn marker_text(interface: &InterfaceConfig) -> String {
         },
     }
     format!("\u{2014} {text} \u{2014}")
-}
-
-/// The serial port `step` places from `current` in `ports`, wrapping round at
-/// the ends. A current port that is not in the list steps to the first port
-/// going forward and the last going back. `None` when the list is empty.
-fn step_serial_port(ports: &[String], current: &str, step: i32) -> Option<String> {
-    if ports.is_empty() {
-        return None;
-    }
-    let len = ports.len() as i32;
-    let index = match ports
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case(current.trim()))
-    {
-        Some(at) => (at as i32 + step).rem_euclid(len),
-        None if step >= 0 => 0,
-        None => len - 1,
-    };
-    ports.get(index as usize).cloned()
 }
 
 /// The UDP port number one lower or higher, staying within 1 to 65535. A port
@@ -428,7 +423,7 @@ fn status_line(facts: &StatusFacts) -> StatusLine {
                 plural_bytes(run.bytes_total)
             );
             if facts.paused {
-                text.push_str(" The display is paused, so bytes arriving now are not shown.");
+                text.push_str(" The display is paused, so arriving bytes are not shown.");
             }
             ok(text)
         }
@@ -456,12 +451,17 @@ pub(super) struct Linemon {
     /// The interface the runtime's hidden Channel was last asked to open and
     /// has not been asked to close since.
     sent: Option<InterfaceConfig>,
-    /// The port last opened, for Clear on port change. Kept through Stop.
+    /// The port last opened, for Clear display on port change. Kept through Stop.
     last_port: Option<PortKey>,
+    /// The display was marked "no port chosen" while started. The next port
+    /// opened is then a change of port, whatever port was open before.
+    marked_no_port: bool,
     open_error: Option<String>,
     run: Option<RunFacts>,
+    /// The open serial port's control lines, as last read. `None` while no
+    /// serial port is open.
+    control_lines: Option<SerialControlLines>,
     serial_ports: Vec<String>,
-    show_more: bool,
     /// Text typed into the custom baud and UDP port fields.
     baud_text: String,
     udp_port_text: String,
@@ -471,6 +471,9 @@ pub(super) struct Linemon {
     /// such as a multicast group, is not complete until the field is left, so
     /// `sync` holds back a changed interface meanwhile.
     editing_text: bool,
+    /// The window's minimum width: [`MIN_SIZE`] at first, raised to fit the
+    /// port settings line once it has been drawn, so its items never wrap.
+    min_width: f32,
 }
 
 impl Linemon {
@@ -489,15 +492,17 @@ impl Linemon {
             paused: false,
             sent: None,
             last_port: None,
+            marked_no_port: false,
+            control_lines: None,
             open_error: None,
             run: None,
             serial_ports: Vec::new(),
-            show_more: false,
             baud_text: String::new(),
             udp_port_text: String::new(),
             jump_to_bottom: false,
             copy_all: false,
             editing_text: false,
+            min_width: MIN_SIZE[0],
         }
     }
 
@@ -550,6 +555,11 @@ impl Linemon {
                     self.open_error = Some(reason);
                 }
             }
+            LinemonUpdate::ControlLines(lines) => {
+                if matches!(self.sent, Some(InterfaceConfig::Serial(_))) {
+                    self.control_lines = Some(lines);
+                }
+            }
         }
     }
 
@@ -558,14 +568,25 @@ impl Linemon {
     /// Started with a port chosen: open it, and open it again whenever the
     /// interface differs from the last one asked for.
     /// Anything else: close what is open. An open marks the display, and
-    /// empties it first when the port changed and Clear on port change is
-    /// ticked.
+    /// empties it first when the port changed and Clear display on port change is
+    /// ticked. A change that leaves no port chosen while started, such as
+    /// switching to Serial before choosing a serial port, marks the display
+    /// too, so the switch shows.
     fn sync(&mut self, out: &mut Vec<UiCommand>) {
         let interface = self.settings.interface();
         let key = port_key(&interface).filter(|_| self.started);
         let Some(key) = key else {
             if self.sent.take().is_some() {
                 out.push(UiCommand::LinemonClose);
+                self.control_lines = None;
+                if self.started {
+                    if self.settings.clear_on_port_change && self.last_port.is_some() {
+                        self.stream.clear();
+                    }
+                    self.stream.mark_change(&no_port_text(&interface));
+                    self.last_port = None;
+                    self.marked_no_port = true;
+                }
             }
             return;
         };
@@ -581,10 +602,12 @@ impl Linemon {
         }
         self.open_error = None;
         self.run = None;
-        let changed = self
-            .last_port
-            .as_ref()
-            .is_some_and(|last| is_port_change(last, &key));
+        self.control_lines = None;
+        let changed = std::mem::take(&mut self.marked_no_port)
+            || self
+                .last_port
+                .as_ref()
+                .is_some_and(|last| is_port_change(last, &key));
         if changed && self.settings.clear_on_port_change {
             self.stream.clear();
         }
@@ -605,8 +628,11 @@ impl Linemon {
         local_addresses: &LocalAddresses,
         out: &mut Vec<UiCommand>,
     ) {
+        // No line under the panel: the status box ends it, and the display
+        // starts right below.
         egui::Panel::top("linemon_bar")
             .resizable(false)
+            .show_separator_line(false)
             .show_inside(ui, |ui| {
                 self.show_bar(ui, local_addresses, out);
             });
@@ -630,18 +656,52 @@ impl Linemon {
         out: &mut Vec<UiCommand>,
     ) {
         let mut refresh = None;
-        ui.horizontal_wrapped(|ui| {
+        // The same quarter of a row's height above the top line as below it.
+        let row_gap = ui.spacing().interact_size.y * 0.25;
+        ui.add_space(row_gap);
+        ui.horizontal(|ui| {
             ui.label("Source");
             ui.radio_value(&mut self.settings.kind, SourceKind::Serial, "Serial");
             ui.radio_value(&mut self.settings.kind, SourceKind::Udp, "UDP");
             ui.separator();
-            match self.settings.kind {
-                SourceKind::Serial => self.serial_controls(ui, &mut refresh),
-                SourceKind::Udp => self.udp_controls(ui),
-            }
+            self.options(ui);
         });
-        if self.settings.kind == SourceKind::Udp && self.show_more {
-            self.udp_more(ui, local_addresses, &mut refresh);
+        // A quarter of a row's height more between the source line and the
+        // port settings, so the two read as separate lines.
+        ui.add_space(row_gap);
+        // One line that never wraps. Its drawn width sets the window's minimum
+        // width, measured rather than guessed, so it fits whatever the font
+        // size and screen scaling.
+        match self.settings.kind {
+            SourceKind::Serial => {
+                // Two lines, as UDP has: the port and its line settings, then
+                // flow control and the control lines.
+                let line = ui
+                    .horizontal(|ui| self.serial_controls(ui, &mut refresh))
+                    .response
+                    .rect;
+                self.fit_min_width(ui, line);
+                ui.add_space(row_gap);
+                let line = ui.horizontal(|ui| self.serial_lines(ui, out)).response.rect;
+                self.fit_min_width(ui, line);
+            }
+            SourceKind::Udp => {
+                // The same two lines as the channel editor in Listener.
+                let line = ui
+                    .horizontal(|ui| self.udp_controls(ui, local_addresses, &mut refresh))
+                    .response
+                    .rect;
+                self.fit_min_width(ui, line);
+                ui.add_space(row_gap);
+                let line = ui
+                    .horizontal(|ui| {
+                        ui.label("Mode").on_hover(&UDP_MODE_HOVER);
+                        udp_mode_and_sharing(ui, &mut self.settings.udp);
+                    })
+                    .response
+                    .rect;
+                self.fit_min_width(ui, line);
+            }
         }
         match refresh {
             Some(Refresh::SerialPorts) => self.serial_ports = list_serial_ports(),
@@ -649,7 +709,13 @@ impl Linemon {
             None => {}
         }
 
-        ui.horizontal_wrapped(|ui| self.buttons(ui));
+        // The buttons, then the status, sit near the display, where the
+        // eye is. The buttons are one fixed row, not one that wraps, so each
+        // stays where the hand expects it whatever the window's width; the row
+        // fits at MIN_SIZE.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| self.buttons(ui));
+        ui.add_space(4.0);
         self.show_status(ui);
         egui::CollapsingHeader::new("Configure display")
             .default_open(false)
@@ -672,9 +738,13 @@ impl Linemon {
         } else {
             format!("{current} (not found)")
         };
+        let width = combo_width(
+            ui,
+            std::iter::once(label.as_str()).chain(self.serial_ports.iter().map(String::as_str)),
+        );
         let combo = egui::ComboBox::from_id_salt("linemon_serial_port")
-            .selected_text(label)
-            .width(150.0)
+            .selected_text(label.as_str())
+            .width(width)
             .show_ui(ui, |ui| {
                 if !current.is_empty() {
                     ui.selectable_value(
@@ -694,25 +764,6 @@ impl Linemon {
         if combo.response.clicked() {
             *refresh = Some(Refresh::SerialPorts);
         }
-        let any = !self.serial_ports.is_empty();
-        if ui
-            .add_enabled(any, egui::Button::new("Previous"))
-            .on_hover(&SERIAL_PREVIOUS_HOVER)
-            .clicked()
-        {
-            if let Some(port) = step_serial_port(&self.serial_ports, &current, -1) {
-                self.settings.serial.port = port;
-            }
-        }
-        if ui
-            .add_enabled(any, egui::Button::new("Next"))
-            .on_hover(&SERIAL_NEXT_HOVER)
-            .clicked()
-        {
-            if let Some(port) = step_serial_port(&self.serial_ports, &current, 1) {
-                self.settings.serial.port = port;
-            }
-        }
         if ui
             .small_button("\u{2B6E}")
             .on_hover_text("Refresh port list")
@@ -723,35 +774,56 @@ impl Linemon {
 
         ui.label("Baud");
         let baud = self.settings.serial.baud_rate;
+        let rates: Vec<String> = BAUD_RATES
+            .iter()
+            .chain(std::iter::once(&baud))
+            .map(u32::to_string)
+            .collect();
+        let width = combo_width(ui, rates.iter().map(String::as_str));
+        // The standard rates, then a box for any other rate at the bottom of
+        // the same list. The list stays open while the box is clicked into and
+        // typed in, so it closes itself after a choice. A custom rate is applied
+        // when a valid number is entered and the box is left or Enter is
+        // pressed, never on a half-typed value.
+        let width = width.max(combo_width(ui, ["custom"]));
         egui::ComboBox::from_id_salt("linemon_baud")
             .selected_text(baud.to_string())
+            .width(width)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show_ui(ui, |ui| {
                 for &rate in BAUD_RATES {
-                    ui.selectable_value(
-                        &mut self.settings.serial.baud_rate,
-                        rate,
-                        rate.to_string(),
-                    );
+                    let chosen = ui
+                        .selectable_value(
+                            &mut self.settings.serial.baud_rate,
+                            rate,
+                            rate.to_string(),
+                        )
+                        .clicked();
+                    if chosen {
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                let custom = ui.add(
+                    egui::TextEdit::singleline(&mut self.baud_text)
+                        .id_salt("linemon_baud_custom")
+                        .desired_width(ui.available_width())
+                        .hint_text("custom"),
+                );
+                if custom.lost_focus() {
+                    if let Ok(rate) = self.baud_text.trim().parse::<u32>() {
+                        if rate > 0 {
+                            self.settings.serial.baud_rate = rate;
+                        }
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        ui.close();
+                    }
+                }
+                if !custom.has_focus() {
+                    self.baud_text.clear();
                 }
             });
-        // A custom rate is applied when a valid number is entered and the field
-        // is left or Enter is pressed, never on a half-typed value.
-        let custom = ui.add(
-            egui::TextEdit::singleline(&mut self.baud_text)
-                .id_salt("linemon_baud_custom")
-                .desired_width(70.0)
-                .hint_text("custom"),
-        );
-        if custom.lost_focus() {
-            if let Ok(rate) = self.baud_text.trim().parse::<u32>() {
-                if rate > 0 {
-                    self.settings.serial.baud_rate = rate;
-                }
-            }
-        }
-        if !custom.has_focus() {
-            self.baud_text.clear();
-        }
 
         let serial = &mut self.settings.serial;
         option_combo(
@@ -769,24 +841,75 @@ impl Linemon {
             &mut serial.stop_bits,
             STOP_BITS,
         );
+    }
+
+    /// The serial port's second line: flow control, then the control lines
+    /// (§161). RTS and DTR are outputs this computer sets: a click sets the
+    /// line the other way. CTS, DSR, DCD and RI are inputs it reads, filled when
+    /// high. The lines are live only while the port is open, and greyed out
+    /// otherwise. What they show is what the port last reported, not what was
+    /// asked for.
+    fn serial_lines(&mut self, ui: &mut egui::Ui, out: &mut Vec<UiCommand>) {
         option_combo(
             ui,
             "linemon_flow",
             "Flow",
-            &mut serial.flow_control,
+            &mut self.settings.serial.flow_control,
             FLOW_CONTROL,
         );
+        ui.separator();
+        let live = self.control_lines;
+        let lines = live.unwrap_or_default();
+        ui.add_enabled_ui(live.is_some(), |ui| {
+            if ui
+                .radio(lines.rts, "RTS")
+                .on_hover(&output_line_hover("RTS (Request To Send)", lines.rts))
+                .clicked()
+            {
+                out.push(UiCommand::LinemonSetRts(!lines.rts));
+            }
+            if ui
+                .radio(lines.dtr, "DTR")
+                .on_hover(&output_line_hover("DTR (Data Terminal Ready)", lines.dtr))
+                .clicked()
+            {
+                out.push(UiCommand::LinemonSetDtr(!lines.dtr));
+            }
+            ui.separator();
+            for (name, high) in [
+                ("CTS", lines.cts),
+                ("DSR", lines.dsr),
+                ("DCD", lines.dcd),
+                ("RI", lines.ri),
+            ] {
+                line_indicator(ui, name, high);
+            }
+        });
     }
 
-    fn udp_controls(&mut self, ui: &mut egui::Ui) {
-        ui.label("Port");
+    fn udp_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        local_addresses: &LocalAddresses,
+        refresh: &mut Option<Refresh>,
+    ) {
+        ui.label("Port").on_hover(&UDP_PORT_HOVER);
+        // − and + beside the number, as in the channel editor's port field. A
+        // typed number is applied when it is valid and the field is left or
+        // Enter is pressed. Otherwise the field shows the port in use.
+        let port = self.settings.udp.port;
+        if ui
+            .small_button("\u{2212}")
+            .on_hover(&UDP_PREVIOUS_HOVER)
+            .clicked()
+        {
+            self.settings.udp.port = step_udp_port(port, -1);
+        }
         let field = ui.add(
             egui::TextEdit::singleline(&mut self.udp_port_text)
                 .id_salt("linemon_udp_port")
-                .desired_width(64.0),
+                .desired_width(56.0),
         );
-        // Applied when a valid port is entered and the field is left or Enter
-        // is pressed. Otherwise the field shows the port in use.
         if field.lost_focus() {
             if let Ok(port) = self.udp_port_text.trim().parse::<u16>() {
                 if port != 0 {
@@ -794,15 +917,7 @@ impl Linemon {
                 }
             }
         }
-        let port = self.settings.udp.port;
-        if ui
-            .button("Previous")
-            .on_hover(&UDP_PREVIOUS_HOVER)
-            .clicked()
-        {
-            self.settings.udp.port = step_udp_port(port, -1);
-        }
-        if ui.button("Next").on_hover(&UDP_NEXT_HOVER).clicked() {
+        if ui.small_button("+").on_hover(&UDP_NEXT_HOVER).clicked() {
             self.settings.udp.port = step_udp_port(port, 1);
         }
         if !field.has_focus() {
@@ -811,25 +926,7 @@ impl Linemon {
                 port => port.to_string(),
             };
         }
-        ui.toggle_value(&mut self.show_more, "More");
-    }
-
-    fn udp_more(
-        &mut self,
-        ui: &mut egui::Ui,
-        local_addresses: &LocalAddresses,
-        refresh: &mut Option<Refresh>,
-    ) {
-        let udp = &mut self.settings.udp;
-        egui::Grid::new("linemon_udp_more")
-            .num_columns(2)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                udp_mode_row(ui, udp);
-                udp_bind_row(ui, udp, local_addresses, refresh, false);
-                udp_group_row(ui, udp);
-                udp_shared_row(ui, udp);
-            });
+        udp_bind_choice(ui, &mut self.settings.udp, local_addresses, refresh);
     }
 
     /// Whether Start would do anything now: a port is chosen, and the port is
@@ -850,47 +947,72 @@ impl Linemon {
         self.started = true;
         self.open_error = None;
         self.run = None;
+        self.control_lines = None;
         // Ask again even when the interface is the one last opened.
         self.sent = None;
     }
 
     fn buttons(&mut self, ui: &mut egui::Ui) {
+        let button = |text: &str| egui::Button::new(text).min_size(BUTTON_SIZE);
         if ui
-            .add_enabled(self.can_start(), egui::Button::new("Start"))
+            .add_enabled(self.can_start(), button("Start"))
             .on_hover(&START_HOVER)
             .clicked()
         {
             self.press_start();
         }
         if ui
-            .add_enabled(self.started, egui::Button::new("Stop"))
+            .add_enabled(self.started, button("Stop"))
             .on_hover(&STOP_HOVER)
             .clicked()
         {
             self.started = false;
             self.open_error = None;
             self.run = None;
+            self.control_lines = None;
+            self.control_lines = None;
         }
         let pause_label = if self.paused { "Resume" } else { "Pause" };
-        if ui.button(pause_label).on_hover(&PAUSE_HOVER).clicked() {
+        if ui.add(button(pause_label)).on_hover(&PAUSE_HOVER).clicked() {
             self.paused = !self.paused;
             if !self.paused {
                 self.jump_to_bottom = true;
             }
         }
-        if ui.button("Clear").on_hover(&CLEAR_HOVER).clicked() {
+        if ui.add(button("Clear")).on_hover(&CLEAR_HOVER).clicked() {
             self.stream.clear();
         }
         if ui
-            .button("Copy scroll buffer")
+            .add(button("Copy scroll buffer"))
             .on_hover(&COPY_ALL_HOVER)
             .clicked()
         {
             self.copy_all = true;
         }
+    }
+
+    /// Raise the window's minimum width to fit `line`, the port settings line
+    /// as drawn, with the panel's margins either side. Only ever raised, so
+    /// switching between Serial and UDP leaves room for the wider of the two.
+    fn fit_min_width(&mut self, ui: &egui::Ui, line: egui::Rect) {
+        let window = ui.ctx().content_rect();
+        let margins = (line.left() - window.left()) * 2.0;
+        let needed = (line.width() + margins).ceil();
+        if needed > self.min_width {
+            self.min_width = needed;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                    needed,
+                    MIN_SIZE[1],
+                )));
+        }
+    }
+
+    /// The two checkboxes, on the top row after the source choice.
+    fn options(&mut self, ui: &mut egui::Ui) {
         ui.checkbox(
             &mut self.settings.clear_on_port_change,
-            "Clear on port change",
+            "Clear display on port change",
         )
         .on_hover(&CLEAR_ON_CHANGE_HOVER);
         ui.checkbox(&mut self.settings.reopen_on_start, "Reopen port on start")
@@ -909,14 +1031,59 @@ impl Linemon {
         let mut text = egui::RichText::new(line.text);
         if line.problem {
             // The colour Listener draws a channel's error in, so the same kind
-            // of message looks the same in both programs.
+            // of message looks the same in both programs. The ⚠ it leads with
+            // says so without the colour.
             text = text.color(wiredata_ui::palette::active(ui).fault);
         }
-        ui.label(text);
+        // A framed box the full width of the window, so the line that says what
+        // Linemon is doing is easy to find.
+        let visuals = ui.visuals();
+        egui::Frame::new()
+            .fill(visuals.faint_bg_color)
+            .stroke(visuals.widgets.noninteractive.bg_stroke)
+            .corner_radius(4.0)
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(text);
+            });
     }
 }
 
-/// A label and a drop-down over a table of (value, text) options.
+/// The width of a drop-down whose widest choice is one of `texts`: the text,
+/// the arrow, and the button's padding. Keeps the serial row short, where
+/// egui's default width is far wider than "8" or "1.5" needs.
+fn combo_width<'a>(ui: &egui::Ui, texts: impl IntoIterator<Item = &'a str>) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let widest = texts
+        .into_iter()
+        .map(|text| {
+            ui.painter()
+                .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    let spacing = ui.spacing();
+    widest + spacing.icon_width + spacing.icon_spacing + spacing.button_padding.x * 2.0
+}
+
+/// A label and a drop-down over a table of (value, text) options, as wide as
+/// its longest option.
+/// The hover of an output line's button: what the line is, its level now, and
+/// what a click does.
+fn output_line_hover(name: &str, high: bool) -> Hover {
+    let (now, then) = if high {
+        ("high", "low")
+    } else {
+        ("low", "high")
+    };
+    Hover::from_paragraphs([
+        format!("{name} is an output this computer sets."),
+        format!("It is {now} now. Click to set it {then}."),
+    ])
+}
+
 fn option_combo<T: PartialEq + Copy>(
     ui: &mut egui::Ui,
     salt: &str,
@@ -929,8 +1096,10 @@ fn option_combo<T: PartialEq + Copy>(
         .iter()
         .find(|(v, _)| v == value)
         .map_or("", |(_, text)| *text);
+    let width = combo_width(ui, options.iter().map(|(_, text)| *text));
     egui::ComboBox::from_id_salt(salt)
         .selected_text(shown)
+        .width(width)
         .show_ui(ui, |ui| {
             for (v, text) in options {
                 ui.selectable_value(value, *v, *text);
@@ -1157,28 +1326,6 @@ mod tests {
 
     // ---- stepping ----
 
-    fn ports(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| (*s).to_owned()).collect()
-    }
-
-    #[test]
-    fn stepping_through_serial_ports_wraps_round() {
-        let list = ports(&["COM3", "COM4", "COM9"]);
-        assert_eq!(step_serial_port(&list, "COM3", 1).as_deref(), Some("COM4"));
-        assert_eq!(step_serial_port(&list, "COM9", 1).as_deref(), Some("COM3"));
-        assert_eq!(step_serial_port(&list, "COM3", -1).as_deref(), Some("COM9"));
-        assert_eq!(step_serial_port(&list, "com4", -1).as_deref(), Some("COM3"));
-    }
-
-    #[test]
-    fn stepping_from_a_port_not_listed_starts_at_an_end() {
-        let list = ports(&["COM3", "COM4"]);
-        assert_eq!(step_serial_port(&list, "", 1).as_deref(), Some("COM3"));
-        assert_eq!(step_serial_port(&list, "COM8", 1).as_deref(), Some("COM3"));
-        assert_eq!(step_serial_port(&list, "COM8", -1).as_deref(), Some("COM4"));
-        assert_eq!(step_serial_port(&[], "COM3", 1), None);
-    }
-
     #[test]
     fn stepping_a_udp_port_stays_within_1_and_65535() {
         assert_eq!(step_udp_port(5005, 1), 5006);
@@ -1265,7 +1412,7 @@ mod tests {
         assert_eq!(
             text(&f),
             "COM4 is open at 9600 8N1. 1 byte received, 0 bytes per second. \
-             The display is paused, so bytes arriving now are not shown."
+             The display is paused, so arriving bytes are not shown."
         );
     }
 
@@ -1537,6 +1684,99 @@ mod tests {
             "{}",
             line.text
         );
+    }
+
+    #[test]
+    fn switching_to_a_kind_with_no_port_marks_the_display() {
+        let mut l = Linemon::new(None);
+        l.settings.kind = SourceKind::Udp;
+        l.settings.udp.port = 5005;
+        l.settings.serial.port.clear();
+        l.started = true;
+        let mut out = Vec::new();
+        l.sync(&mut out);
+        assert_eq!(opened(&out).len(), 1);
+
+        l.settings.kind = SourceKind::Serial;
+        l.sync(&mut out);
+        assert_eq!(closes(&out), 1, "the UDP port is closed");
+        let marks = l.stream.marks();
+        assert_eq!(
+            marks.last().map(|m| m.text.as_str()),
+            Some("\u{2014} Serial, no port chosen \u{2014}")
+        );
+        // Nothing more on the next frames.
+        let count = l.stream.marks().len();
+        l.sync(&mut out);
+        assert_eq!(l.stream.marks().len(), count);
+    }
+
+    #[test]
+    fn opening_a_port_after_no_port_was_chosen_clears_the_display() {
+        let mut l = Linemon::new(None);
+        l.settings.kind = SourceKind::Udp;
+        l.settings.udp.port = 5005;
+        l.settings.serial.port.clear();
+        l.settings.clear_on_port_change = true;
+        l.started = true;
+        let mut out = Vec::new();
+        l.sync(&mut out);
+        l.settings.kind = SourceKind::Serial;
+        l.sync(&mut out);
+        let before = l.stream.marks().len();
+        assert!(before > 0, "the no-port marker is shown");
+
+        l.settings.kind = SourceKind::Udp;
+        l.sync(&mut out);
+        let marks = l.stream.marks();
+        assert_eq!(marks.len(), 1, "only the new port's marker is left");
+
+        // Without the box ticked, nothing is cleared.
+        let mut l = Linemon::new(None);
+        l.settings.kind = SourceKind::Udp;
+        l.settings.udp.port = 5005;
+        l.settings.serial.port.clear();
+        l.settings.clear_on_port_change = false;
+        l.started = true;
+        l.sync(&mut out);
+        l.settings.kind = SourceKind::Serial;
+        l.sync(&mut out);
+        l.settings.kind = SourceKind::Udp;
+        l.sync(&mut out);
+        assert_eq!(l.stream.marks().len(), 3);
+    }
+
+    #[test]
+    fn control_lines_show_only_while_a_serial_port_is_open() {
+        let mut l = started_on("COM4");
+        let mut out = Vec::new();
+        l.sync(&mut out);
+        let high = SerialControlLines {
+            cts: true,
+            ..SerialControlLines::default()
+        };
+        l.handle(LinemonUpdate::ControlLines(high));
+        assert_eq!(l.control_lines, Some(high));
+
+        // Stop forgets them: a closed port has no lines to show.
+        l.started = false;
+        l.sync(&mut out);
+        assert_eq!(l.control_lines, None);
+        // And a late reading after the close is not taken.
+        l.handle(LinemonUpdate::ControlLines(high));
+        assert_eq!(l.control_lines, None);
+    }
+
+    #[test]
+    fn stopping_adds_no_marker() {
+        let mut l = started_on("COM4");
+        let mut out = Vec::new();
+        l.sync(&mut out);
+        let count = l.stream.marks().len();
+        l.started = false;
+        l.sync(&mut out);
+        assert_eq!(closes(&out), 1);
+        assert_eq!(l.stream.marks().len(), count);
     }
 
     #[test]
