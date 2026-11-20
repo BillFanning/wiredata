@@ -305,7 +305,6 @@ pub fn validate_channel(
         .limit_errors()
         .into_iter()
         .chain(limits::match_rule_errors(&channel.match_rules))
-        .chain(channel.reconnect.limit_errors())
         .chain(limits::size_cap_error(
             "raw",
             channel.raw_recording.size_cap,
@@ -1075,7 +1074,6 @@ actions = [{ kind = "PauseDisplay", view = 1 }, { kind = "Notify", severity = "E
     fn a_setting_past_its_limit_is_rejected_with_the_limit() {
         let mut channel = templates::udp_template();
         channel.retention.byte_limit = Some(limits::MAX_SCROLLBACK_BYTES + 1);
-        channel.reconnect.multiplier = 20.0;
         channel.raw_recording.size_cap = Some(1024);
         channel.match_rules = vec![MatchRule {
             name: "long".to_owned(),
@@ -1102,18 +1100,14 @@ actions = [{ kind = "PauseDisplay", view = 1 }, { kind = "Notify", severity = "E
             "{errors:?}"
         );
         assert!(
-            matches!(limits[2], LimitError::BackoffMultiplier { .. }),
+            matches!(limits[2], LimitError::SizeCap { .. }),
             "{errors:?}"
         );
-        assert!(
-            matches!(limits[3], LimitError::SizeCap { .. }),
-            "{errors:?}"
-        );
-        assert_eq!(limits.len(), 4, "{errors:?}");
+        assert_eq!(limits.len(), 3, "{errors:?}");
         // The message is the limit's own: it says what to change.
         assert_eq!(
-            ChannelConfigError::Limit(limits[2].clone()).to_string(),
-            "reconnect multiplier 20 is outside 1.0–10"
+            ChannelConfigError::Limit(limits[0].clone()).to_string(),
+            limits[0].to_string()
         );
     }
 
@@ -1144,14 +1138,15 @@ actions = [{ kind = "PauseDisplay", view = 1 }, { kind = "Notify", severity = "E
     fn channel_errors_read_as_their_messages() {
         let errors = vec![
             ChannelConfigError::DuplicateChannelName,
-            ChannelConfigError::Limit(LimitError::BackoffMultiplier {
-                found: "20".to_owned(),
+            ChannelConfigError::Limit(LimitError::Diagnostics {
+                severity: "event",
+                found: 2_001,
             }),
         ];
         assert_eq!(
             describe_channel_errors(&errors),
             "another channel has this name; names must be unique; \
-             reconnect multiplier 20 is outside 1.0–10"
+             event retention of 2001 is over the limit of 2000"
         );
     }
 

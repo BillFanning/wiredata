@@ -6,6 +6,7 @@ pub mod display;
 pub mod gui;
 pub mod record;
 pub mod retention;
+pub mod retry;
 pub mod runtime;
 pub mod transport;
 

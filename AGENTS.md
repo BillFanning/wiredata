@@ -203,8 +203,8 @@ Ten crates in a Cargo workspace:
   timer policy, chunk-shape telemetry, retention, and presentation stay in their apps.
 - **`wiredata-log/`** — internal (`publish = false`) shared bounded log-file worker
   (talker ADR-061). It owns the worker thread behind a bounded, non-blocking handoff,
-  loss counting and gap lines, visible open/write failure, daily rotation, and
-  deletion of log files past a caller-given age. What is logged, levels, formatting,
+  loss counting and gap lines, visible open/write failure, and daily rotation.
+  It never deletes a log file (talker ADR-069). What is logged, levels, formatting,
   the folder and prefix, and presentation stay in their apps.
 - **`wiredata-stop/`** — internal (`publish = false`) OS stop requests for both CLIs
   (listener ADR-049). It catches Windows logoff and shutdown through a hidden
@@ -271,7 +271,7 @@ I/O shape (see talker ADR-002 vs listener ADR-001):
   recent-window engine. Application measurement boundaries, aggregate telemetry
   types, and runtime/configuration policy remain in `talker` and `listener`.
 - `wiredata-log` owns only the log-file mechanism. It must never depend on `talker`,
-  `listener` or GUI crates, and it deletes only log files, never recordings.
+  `listener` or GUI crates, and it deletes no files at all.
 - `wiredata-stop` owns only receiving OS stop requests. It depends on
   `windows-sys` on Windows and on Tokio only behind its `tokio` feature, never on
   `talker`, `listener` or GUI crates.

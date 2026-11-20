@@ -6,8 +6,8 @@
 //! scrollback and about 2 MiB of diagnostics (ADR-048).
 
 use super::{
-    DiskGuard, DiskThreshold, MatchAction, MatchCondition, MatchRule, ReconnectPolicy,
-    RecordControl, RecordTarget, RetentionConfig, MIN_SIZE_CAP,
+    DiskGuard, DiskThreshold, MatchAction, MatchCondition, MatchRule, RecordControl, RecordTarget,
+    RetentionConfig, MIN_SIZE_CAP,
 };
 
 /// Stream scrollback per Channel (§71, §88).
@@ -23,8 +23,6 @@ pub const MAX_MATCH_RULES: usize = 64;
 pub const MAX_MATCH_ACTIONS: usize = 16;
 /// The text a timestamped Mark adds after its timestamp (§71).
 pub const MAX_MARK_SEPARATOR_BYTES: usize = 256;
-/// The reconnect backoff multiplier's range (§71).
-pub const RECONNECT_MULTIPLIER: std::ops::RangeInclusive<f64> = 1.0..=10.0;
 /// The receive queue, in chunks of up to 64 KiB: 16 MiB at most (ADR-048).
 pub const MAX_INGEST_CHUNKS: usize = 256;
 /// Each recording's queue, in bytes (ADR-043, ADR-048).
@@ -65,11 +63,6 @@ pub enum LimitError {
          data arrived. Change one of the two patterns so that they cannot overlap that way."
     )]
     TriggerOverlap { stop: String, begin: String },
-    #[error("reconnect initial backoff of {initial} ms is longer than its maximum of {max} ms")]
-    BackoffOrder { initial: u64, max: u64 },
-    /// The multiplier as written, since a float has no `Eq`.
-    #[error("reconnect multiplier {found} is outside 1.0–10")]
-    BackoffMultiplier { found: String },
     #[error(
         "{recording} recording size cap of {found} bytes is under the minimum of 64 MiB \
          ({MIN_SIZE_CAP} bytes)"
@@ -108,26 +101,6 @@ impl RetentionConfig {
             if let Some(found) = limit.filter(|&n| n > MAX_DIAGNOSTICS_PER_SEVERITY) {
                 errors.push(LimitError::Diagnostics { severity, found });
             }
-        }
-        errors
-    }
-}
-
-impl ReconnectPolicy {
-    /// The limits this policy breaks (§71).
-    pub fn limit_errors(&self) -> Vec<LimitError> {
-        let mut errors = Vec::new();
-        if self.initial_backoff_ms > self.max_backoff_ms {
-            errors.push(LimitError::BackoffOrder {
-                initial: self.initial_backoff_ms,
-                max: self.max_backoff_ms,
-            });
-        }
-        // `contains` is false for NaN, so it is refused too.
-        if !RECONNECT_MULTIPLIER.contains(&self.multiplier) {
-            errors.push(LimitError::BackoffMultiplier {
-                found: self.multiplier.to_string(),
-            });
         }
         errors
     }
@@ -306,42 +279,6 @@ mod tests {
             over.limit_errors()[1].to_string(),
             "event retention of 2001 is over the limit of 2000"
         );
-    }
-
-    #[test]
-    fn reconnect_backoff_is_ordered_and_its_multiplier_bounded() {
-        let mut policy = ReconnectPolicy::default();
-        assert_eq!(policy.limit_errors(), []);
-        for fine in [1.0, 10.0] {
-            policy.multiplier = fine;
-            assert_eq!(policy.limit_errors(), [], "{fine}");
-        }
-
-        policy.initial_backoff_ms = 5_000;
-        policy.max_backoff_ms = 1_000;
-        policy.multiplier = 0.5;
-        assert_eq!(
-            policy.limit_errors(),
-            [
-                LimitError::BackoffOrder {
-                    initial: 5_000,
-                    max: 1_000
-                },
-                LimitError::BackoffMultiplier {
-                    found: "0.5".to_owned()
-                },
-            ]
-        );
-        for bad in [10.5, f64::NAN, f64::INFINITY] {
-            policy.multiplier = bad;
-            assert!(
-                policy
-                    .limit_errors()
-                    .iter()
-                    .any(|e| matches!(e, LimitError::BackoffMultiplier { .. })),
-                "{bad}"
-            );
-        }
     }
 
     #[test]

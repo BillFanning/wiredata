@@ -41,9 +41,6 @@ const POLL_ROUND_LIMIT: Duration = crate::runtime::channel::POLL_ROUND_LIMIT;
 /// How often the driver polls running Channels for a fresh snapshot (the pull
 /// surface, ADR-006). 5 Hz is responsive without busy-polling.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
-/// Auto-reconnect cadence (§162): the orchestrator has no background loop, so the
-/// driver ticks it, exactly as the CLI does.
-const RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Default)]
 struct StreamPollCursor {
@@ -564,7 +561,6 @@ fn event_channel(event: &RuntimeEvent) -> ChannelId {
         | RuntimeEvent::ControlLinesChanged(id)
         | RuntimeEvent::ChannelReconnecting(id, _)
         | RuntimeEvent::ChannelReconnected(id)
-        | RuntimeEvent::ChannelReconnectGaveUp(id)
         | RuntimeEvent::DiskSpaceLow(id)
         | RuntimeEvent::RecordingStoppedLowDisk(id)
         | RuntimeEvent::MatchTriggered(id, _) => *id,
@@ -839,7 +835,7 @@ impl Driver {
     pub async fn run(mut self) {
         let mut snapshot_tick = tokio::time::interval(SNAPSHOT_INTERVAL);
         snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut reconnect_tick = tokio::time::interval(RECONNECT_INTERVAL);
+        let mut reconnect_tick = tokio::time::interval(crate::retry::RECONNECT_CHECK_EVERY);
         reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut events_open = true;
 
@@ -1393,9 +1389,7 @@ impl Driver {
                 self.listener.set_display_recording_config(id, *display);
             }
             UiCommand::SetReconnect(id, policy) => {
-                if let Err(err) = self.listener.set_reconnect_policy(id, policy) {
-                    self.push_channel_error(id, err);
-                }
+                self.listener.set_reconnect_policy(id, policy);
             }
             UiCommand::SetViewConfig(id, display, retention) => {
                 // View settings render GUI-side and the scroll buffer is capped GUI-side
@@ -3132,7 +3126,6 @@ mod tests {
             RuntimeEvent::RecordingStarted(id, crate::core::RecordingTap::Raw),
             RuntimeEvent::ChannelReconnecting(id, 1),
             RuntimeEvent::ChannelReconnected(id),
-            RuntimeEvent::ChannelReconnectGaveUp(id),
             RuntimeEvent::DiskSpaceLow(id),
         ];
         for event in events {

@@ -1493,7 +1493,8 @@ records between them.
 
 ## ADR-044 — Diagnostics also go to a persistent daily event log
 
-**Status:** Accepted 2026-09-30. Amends §118.
+**Status:** Accepted 2026-09-30. Amends §118. Amended 2026-11-19: log files are
+kept, not deleted after 30 days (talker ADR-069).
 
 **Context:** Diagnostics live only in memory: bounded, per Channel, and gone when
 the process exits or retention evicts them. `init_logging` writes to stdout, and
@@ -1514,8 +1515,7 @@ failure (talker ADR-006).
 - Listener turns a failed log back on about once a minute. The worker reports a
   failure and stops; trying again is the application's choice, so talker, whose
   file log has a person at the GUI, is unchanged.
-- Log files older than 30 days are deleted at start and at each day's rollover.
-  Only log files are deleted, never recordings (ADR-043).
+- Log files are kept. They were deleted after 30 days until talker ADR-069.
 - The CLI and the GUI both write it. The CLI prints the log folder at start.
 
 **Boundary:** The event log holds diagnostics, never stream bytes, and is not a
@@ -1530,11 +1530,13 @@ recording (§114). There is no log shipping and no configurable folder yet.
   files merged by hand.
 
 **Consequences:** §118 stops being optional, and persistent log rotation leaves
-Appendix A. Disk use is bounded by the 30-day retention.
+Appendix A. The log folder grows by one file a day until an operator removes
+old files (talker ADR-069).
 
 ## ADR-045 — Unattended GUI: reconnect is an explicit choice, and resume is registered once
 
 **Status:** Accepted 2026-09-30. Amends §9.1 presentation, §70 and §159.
+Amended 2026-11-19: nothing gives up, so the "Gave up" status is gone (ADR-072).
 
 **Context:** Auto-reconnect is opt-in (§9.1) and the GUI offers no control for
 it, so a recording Channel stops for good at its first unplug. Separately, the
@@ -1691,7 +1693,7 @@ surface the runtime does not have.
   | Diagnostics | ≤ 2,000 per severity |
   | Match pattern | ≤ 256 bytes |
   | Rules | ≤ 64 per Channel |
-  | Reconnect backoff | initial ≤ max, multiplier 1.0–10 |
+  | Reconnect backoff | initial ≤ max, multiplier 1.0–10 (removed with the settings, ADR-072) |
   | Queue capacities | non-zero, with an upper bound |
   | Segment size cap | ≥ 64 MiB (ADR-043) |
 
@@ -2061,7 +2063,8 @@ multicast join interface is a separate, open question.
 
 ## ADR-058 — A reconnect sequence ends only after 60 s up
 
-**Status:** Accepted 2026-11-13.
+**Status:** Accepted 2026-11-13. Amended 2026-11-19: there is no attempt limit
+any more (ADR-072); the 60 s rule is unchanged.
 
 **Context:** A faulted Channel reconnects under its `ReconnectPolicy` (§9.1):
 attempts with a growing backoff, up to `max_attempts`. A successful attempt
@@ -2525,3 +2528,47 @@ more stream to the GUI and its own rendering while it is open.
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_
+
+## ADR-072 — Reconnect is on or off, at one fixed pace
+
+**Status:** Accepted 2026-11-19. Amends ADR-045, ADR-048 and ADR-058.
+
+**Context:** `ReconnectPolicy` held five values: `enabled`, a first and a
+longest wait, a multiplier, and an optional attempt limit. The GUI sets only
+`enabled` (ADR-045), so the other four could be changed only by editing a
+profile. Their limits (ADR-048) accepted a first wait of 0 ms, which with a
+multiplier of 1 retried every 1 ms for ever. The pace they defaulted to, 1 s
+doubling to 30 s, was also written out separately for a recording's reopen
+(§55). Neither primary use needs to tune it: someone troubleshooting presses
+Start, and a weeks-long log wants patient retrying that never stops.
+
+**Decision:**
+
+- `ReconnectPolicy` holds only `enabled`.
+- Reconnecting waits 1 s, doubling to 30 s, and goes on until the Channel
+  starts. The pace lives in the `retry` module (`RETRY_FIRST`, `RETRY_MAX`),
+  which a recording's reopen uses too, so the two cannot drift. Tests shorten
+  it through `Backoff`.
+- Nothing gives up: the attempt limit, the give-up event and the "gave up
+  after N attempts" status are removed.
+- The 500 ms at which both front ends look for a due reconnect is one
+  constant, `RECONNECT_CHECK_EVERY`.
+
+**Boundary:** ADR-058's 60 s rule stands: a fault within 60 s of reconnecting
+carries the attempt count and the wait forward. Talker's retries keep their
+own constants. A profile that still carries the removed keys is refused, as
+any unknown key is; no profiles are in use, and both schemas return to 1 at
+release.
+
+**Alternatives considered:**
+
+- **Bound the four values instead:** Rejected. It keeps settings no screen
+  shows, to serve a need nobody has raised.
+- **Put the four values in the channel editor:** Rejected. Four number fields
+  for a pace nobody needs to change.
+- **Keep only the attempt limit:** Deferred. It is the one value with a clear
+  use, and one key can be added back if someone needs it.
+
+**Consequences:** Every Channel with reconnect on retries the same way, and
+its hover states the pace. A Channel never stops retrying by itself; Stop
+ends it.

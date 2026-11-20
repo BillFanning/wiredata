@@ -31,7 +31,7 @@ sudo systemctl enable --now listener
   files, prints "stopped" and a summary, and exits.
 - **Output:** `journalctl -u listener`.
 - **Event log:** `/var/lib/listener/.local/share/listener/logs`, one file per
-  day, kept 30 days.
+  day. Old files are kept; remove them when they are no longer wanted.
 - **Removable drive:** uncomment `RequiresMountsFor=` in the unit, so the
   service waits for the drive.
 
@@ -71,7 +71,7 @@ manages. Leave them in place.
 | 0 | Healthy, or every outage recovered |
 | 1 | Internal error |
 | 2 | Invalid profile, nothing could start, or `--require-all` failed |
-| 3 | Degraded: a channel never started, ran out of retries, or was down at the stop |
+| 3 | Degraded: a channel never started, or was down at the stop |
 | 4 | A recording could not finish its files at the stop |
 
 Codes 3 and 4 appear when the run is stopped. The summary printed just before

@@ -55,8 +55,6 @@ struct Watched<K> {
     down_since: Option<Instant>,
     /// The latest reason it is down.
     reason: String,
-    /// Its retries ran out.
-    gave_up: bool,
     /// Outages it recovered from, and their total length.
     recovered: u32,
     recovered_for: Duration,
@@ -95,7 +93,6 @@ impl<K: Copy + PartialEq> HealthWatch<K> {
             ever_up: false,
             down_since: None,
             reason: String::new(),
-            gave_up: false,
             recovered: 0,
             recovered_for: Duration::ZERO,
         });
@@ -156,19 +153,6 @@ impl<K: Copy + PartialEq> HealthWatch<K> {
         ))
     }
 
-    /// The channel's retries ran out. Returns the warning, once.
-    pub fn gave_up(&mut self, id: K) -> Option<String> {
-        let channel = self.get(id)?;
-        if channel.gave_up {
-            return None;
-        }
-        channel.gave_up = true;
-        Some(format!(
-            "WARNING: [{}] ran out of retries and stays down: {}",
-            channel.name, channel.reason
-        ))
-    }
-
     /// Whether a reminder is due: some channel is down, and five minutes have
     /// passed since the last reminder or, before the first, since the earliest
     /// outage began.
@@ -210,12 +194,12 @@ impl<K: Copy + PartialEq> HealthWatch<K> {
             .all(|c| c.down_since.is_some() && !c.retries)
     }
 
-    /// Whether the run is degraded (exit code 3): a channel never started, its
-    /// retries ran out, or it is down now.
+    /// Whether the run is degraded (exit code 3): a channel never started, or
+    /// it is down now.
     pub fn degraded(&self) -> bool {
         self.channels
             .iter()
-            .any(|c| !c.ever_up || c.gave_up || c.down_since.is_some())
+            .any(|c| !c.ever_up || c.down_since.is_some())
     }
 
     /// The final summary, one line per channel in the order added, with its id
@@ -226,9 +210,6 @@ impl<K: Copy + PartialEq> HealthWatch<K> {
             .map(|c| {
                 let line = match (c.down_since, c.ever_up) {
                     (Some(_), false) => format!("[{}] never started: {}", c.name, c.reason),
-                    (Some(_), true) if c.gave_up => {
-                        format!("[{}] ran out of retries: {}", c.name, c.reason)
-                    }
                     (Some(since), true) => format!(
                         "[{}] down at the stop, for {}: {}",
                         c.name,
@@ -379,23 +360,6 @@ mod tests {
         assert_eq!(watch.reminders(t0 + 10 * MIN).len(), 1);
         watch.up(id, t0 + 11 * MIN);
         assert!(watch.reminders(t0 + 20 * MIN).is_empty(), "nothing is down");
-    }
-
-    #[test]
-    fn running_out_of_retries_is_reported_once_and_degrades_the_run() {
-        let (mut watch, id, t0) = watch_one(true);
-        watch.up(id, t0);
-        watch.down(id, "device removed", "retrying", t0);
-        assert_eq!(
-            watch.gave_up(id).as_deref(),
-            Some("WARNING: [GPS] ran out of retries and stays down: device removed")
-        );
-        assert_eq!(watch.gave_up(id), None);
-        assert!(watch.degraded());
-        assert_eq!(
-            lines(watch.summary(t0)),
-            ["[GPS] ran out of retries: device removed"]
-        );
     }
 
     #[test]

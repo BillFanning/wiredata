@@ -1,12 +1,14 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.31
-**Date:** 2026-11-15
+**Version:** 1.32
+**Date:** 2026-11-19
 **Status:** Accepted
 
-Revision note (2026-11-15) — button names in lower case:
+Revision note (2026-11-19) — log files are kept:
 
-- **ADR-060** — quotes the button as it now reads, Retry channel.
+- **ADR-069** — `wiredata-log` no longer deletes old log files, so listener's
+  event log is kept, as talker's always was.
+- **ADR-061** — amended to match.
 
 ---
 
@@ -2421,7 +2423,8 @@ while it is down. Scripts and service managers can act on the exit code.
 
 ## ADR-061 — One bounded log-file worker, shared as `wiredata-log`
 
-**Status:** Accepted 2026-09-30.
+**Status:** Accepted 2026-09-30. Amended 2026-11-19: the crate no longer deletes
+old log files (ADR-069).
 
 **Context:** Listener needs a persistent event log (listener ADR-044) with the
 same properties talker's GUI log file already has (ADR-006): a dedicated worker
@@ -2434,12 +2437,12 @@ exactly the details that make it trustworthy.
 (`publish = false`), which both apps use.
 
 - It owns the file worker thread, the bounded handoff, loss accounting, gap
-  lines, failure reporting, daily rotation by local date, deletion of log files
-  older than a caller-given age, and flush and close.
+  lines, failure reporting, daily rotation by local date, and flush and close.
+  It deleted log files past a caller-given age until ADR-069 removed that.
 - Callers own everything else: the `tracing` layers and formatting, the level
   policy, what is logged, the folder and file prefix, and presentation.
 - Talker keeps its current behaviour, including deleting no old files. Listener
-  keeps 30 days.
+  kept 30 days until ADR-069.
 
 **Boundary:** Like `wiredata-timing` and `wiredata-telemetry`, the crate stays
 narrow. No logging policy moves into it.
@@ -2706,6 +2709,36 @@ settings shown as applied never change on a failed update.
 
 **Consequences:** A channel never sends with settings other than the ones shown
 as applied.
+
+## ADR-069 — Log files are kept; nothing deletes them
+
+**Status:** Accepted 2026-11-19. Amends ADR-061 and listener ADR-044.
+
+**Context:** `wiredata-log` deleted a caller's log files past a given age, when
+the file opened and hourly after that. Only listener used it, keeping its event
+log 30 days; talker kept every file. Deleting files is the one thing the crate
+did that can lose information nobody chose to lose, and a survey of the
+workspace's retry and timed behaviour on 2026-11-19 raised it.
+
+**Decision:** The deletion is removed. `wiredata-log` writes, rotates and
+closes log files and never deletes one. Listener's event log is kept, one file
+per local day, as talker's logs already were.
+
+**Boundary:** This does not decide a retention policy. If bounded log disk use
+is wanted later, it is chosen as its own decision: who deletes (the app, the
+operator or the OS), what limit, and how a failed cleanup is reported. Talker's
+TODO tracks that.
+
+**Alternatives considered:**
+
+- **Keep 30 days for listener:** Rejected by the user. Old logs are cheap to
+  keep and impossible to get back.
+- **Keep the mechanism, unused:** Rejected. Code nobody calls still has to be
+  read, tested and kept in step.
+
+**Consequences:** Listener's event log folder grows by one file a day until an
+operator removes old files. An event log is diagnostics only, so a day's file
+is small next to a recording. The deploy notes say the files are kept.
 
 ---
 

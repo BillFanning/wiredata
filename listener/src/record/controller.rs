@@ -170,9 +170,8 @@ pub enum RecorderReport {
 /// How the controller paces retries and flushes. Tests shorten them.
 #[derive(Clone, Copy, Debug)]
 pub struct Timings {
-    /// The first wait after a fault; it doubles up to `max_retry`.
-    pub first_retry: Duration,
-    pub max_retry: Duration,
+    /// The wait after a fault, doubling to its longest (`crate::retry`).
+    pub retry: crate::retry::Backoff,
     /// Faults within this window count toward instability.
     pub unstable_window: Duration,
     /// This many faults within the window mark the recording unstable.
@@ -186,8 +185,7 @@ pub struct Timings {
 impl Default for Timings {
     fn default() -> Self {
         Self {
-            first_retry: Duration::from_secs(1),
-            max_retry: Duration::from_secs(30),
+            retry: crate::retry::Backoff::default(),
             unstable_window: Duration::from_secs(10 * 60),
             unstable_after: 3,
             unstable_retry: Duration::from_secs(5 * 60),
@@ -482,7 +480,7 @@ where
         closing_gap: false,
         ever_opened: false,
         low_disk: false,
-        backoff: timings.first_retry,
+        backoff: timings.retry.first,
         retry_at: Some(Instant::now()),
         faults: VecDeque::new(),
         unflushed_since: None,
@@ -615,7 +613,7 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
                 self.segment = Some(segment);
                 self.period = period.or(self.period.take());
                 self.ever_opened = true;
-                self.backoff = self.timings.first_retry;
+                self.backoff = self.timings.retry.first;
                 self.shared.report(RecorderReport::SegmentOpened {
                     path: path.clone(),
                     kind,
@@ -913,7 +911,7 @@ impl<I: RecordItem, S: SegmentSource<I>> Controller<I, S> {
             self.timings.unstable_retry
         } else {
             let delay = self.backoff;
-            self.backoff = (self.backoff * 2).min(self.timings.max_retry);
+            self.backoff = self.timings.retry.after(self.backoff);
             delay
         };
         self.retry_at = Some(now + delay);
@@ -1002,8 +1000,10 @@ mod tests {
 
     fn fast() -> Timings {
         Timings {
-            first_retry: Duration::from_millis(10),
-            max_retry: Duration::from_millis(40),
+            retry: crate::retry::Backoff {
+                first: Duration::from_millis(10),
+                max: Duration::from_millis(40),
+            },
             unstable_window: Duration::from_secs(60),
             unstable_after: 3,
             unstable_retry: Duration::from_secs(3600),
@@ -1655,7 +1655,7 @@ mod tests {
             closing_gap: false,
             ever_opened: false,
             low_disk: false,
-            backoff: fast().first_retry,
+            backoff: fast().retry.first,
             retry_at: Some(Instant::now()),
             faults: VecDeque::new(),
             unflushed_since: None,

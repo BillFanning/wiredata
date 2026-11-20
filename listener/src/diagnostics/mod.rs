@@ -212,9 +212,6 @@ pub(crate) fn emit_to_event_log(name: &str, id: ChannelId, diagnostic: &Diagnost
     }
 }
 
-/// How long event log files are kept (§118).
-const EVENT_LOG_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-
 /// The event log's file name prefix; daily files are `listener.log.<date>`.
 const EVENT_LOG_PREFIX: &str = "listener.log";
 
@@ -405,8 +402,9 @@ impl EventLog {
     }
 }
 
-/// A `tracing` layer that writes INFO and above to daily files in `folder`,
-/// kept 30 days, through the bounded `wiredata-log` worker (§118, ADR-044).
+/// A `tracing` layer that writes INFO and above to daily files in `folder`
+/// through the bounded `wiredata-log` worker (§118, ADR-044). Old files are
+/// kept (talker ADR-069).
 fn event_log_layer<S>(folder: &Path) -> anyhow::Result<(impl Layer<S> + Send + Sync, EventLog)>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -416,7 +414,6 @@ where
         directory: folder.to_path_buf(),
         prefix: EVENT_LOG_PREFIX.to_owned(),
         rotation: Rotation::DailyLocal,
-        max_age: Some(EVENT_LOG_MAX_AGE),
     };
     sink.toggle.enable(config.clone())?;
     let layer = tracing_subscriber::fmt::layer()

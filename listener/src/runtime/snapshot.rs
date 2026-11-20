@@ -109,14 +109,11 @@ pub struct QueueDepth {
 }
 
 /// Where an automatic reconnect stands (§9.1, ADR-045), so status can say it
-/// in words: "Reconnecting — attempt 3, next try in 8 s", "Gave up after 10
-/// attempts".
+/// in words: "Reconnecting — attempt 3, next try in 8 s".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconnectProgress {
     /// Waiting to make attempt number `attempt`, due in `next_try_in`.
     Retrying { attempt: u32, next_try_in: Duration },
-    /// The policy's `max_attempts` ran out after `attempts` attempts.
-    GaveUp { attempts: u32 },
 }
 
 /// What status shows about one running recording (§56.2): where it is writing,
@@ -190,8 +187,8 @@ pub struct ChannelStats {
     /// state forever; the poll re-derives it.
     pub state: ChannelState,
     /// Whether an auto-reconnect is armed or in progress for a `Faulted` channel
-    /// (§9.1, §162) — pending reads as "Reconnecting" in a UI. `false` once the
-    /// backoff gives up (that is a plain `Faulted`). Orchestrator-stamped, like
+    /// (§9.1, §162) — pending reads as "Reconnecting" in a UI. `false` when
+    /// reconnect is off (that is a plain `Faulted`). Orchestrator-stamped, like
     /// `state`.
     pub reconnect_pending: bool,
     /// Where an automatic reconnect stands, for status in words (§9.1);

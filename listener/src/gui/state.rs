@@ -739,7 +739,6 @@ impl AppState {
                     view.transport_health = crate::runtime::TransportHealth::default();
                 }
             }
-            RuntimeEvent::ChannelReconnectGaveUp(id) => self.set_status(id, ChannelStatus::Faulted),
             // A recording fault (e.g. a begin that couldn't open the file — Refuse over
             // an existing file) surfaces inline so "Record now" gives feedback instead
             // of silently doing nothing. The specific reason is in the diagnostics log.
@@ -792,7 +791,7 @@ impl AppState {
 ///
 /// `Faulted` splits on `reconnect_pending`: a fault the runtime is still retrying
 /// reads as Reconnecting (matching the `ChannelReconnecting` event), a fault it
-/// gave up on (or never retries) reads as Faulted — so neither direction depends
+/// never retries reads as Faulted — so neither direction depends
 /// on the corresponding event having arrived. The transitional states are left
 /// alone: they resolve within the runtime's own command call, and the event (or
 /// the next poll) settles the row without flapping it through an intermediate.
@@ -985,8 +984,6 @@ mod tests {
         );
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelReconnected(id)));
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
-        state.apply(UiUpdate::Event(RuntimeEvent::ChannelReconnectGaveUp(id)));
-        assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Faulted);
     }
 
     #[test]
@@ -1201,7 +1198,7 @@ mod tests {
     fn polled_fault_with_reconnect_pending_reads_reconnecting() {
         // While the runtime is still retrying, the effective state is Faulted but
         // reconnect_pending distinguishes it — the row reads Reconnecting without
-        // needing the ChannelReconnecting event; once the backoff gives up,
+        // needing the ChannelReconnecting event; once reconnect is turned off,
         // pending drops and the same polled state reads Faulted.
         let mut state = AppState::default();
         let id = ChannelId::new();

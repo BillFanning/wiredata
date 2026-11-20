@@ -69,8 +69,6 @@ pub enum RuntimeEvent {
     ChannelReconnecting(ChannelId, u32),
     /// Auto-reconnect succeeded — the Channel is Running again.
     ChannelReconnected(ChannelId),
-    /// Auto-reconnect gave up after `max_attempts`; the Channel stays Faulted.
-    ChannelReconnectGaveUp(ChannelId),
     /// Free disk space for a Channel's recording fell below its guard threshold
     /// (§56.2, §168). Recording may continue (Warn) or stop (see below).
     DiskSpaceLow(ChannelId),

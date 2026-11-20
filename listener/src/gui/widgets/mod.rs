@@ -586,45 +586,26 @@ pub(super) fn udp_mode_and_sharing(ui: &mut egui::Ui, udp: &mut UdpConfig) {
 /// The "Reconnect automatically" choice (§9.1, ADR-045), with what it does in
 /// words. Applied live; it needs no restart.
 pub(super) fn edit_reconnect(ui: &mut egui::Ui, policy: &mut crate::config::ReconnectPolicy) {
-    let hover = reconnect_hover(policy);
+    let hover = reconnect_hover();
     ui.checkbox(&mut policy.enabled, "Reconnect automatically")
         .on_hover(&hover);
 }
 
 /// The "Reconnect automatically" hover. It reads the same ticked or not, and
-/// says what each state does, with the retry timing taken from `policy`.
-fn reconnect_hover(policy: &crate::config::ReconnectPolicy) -> Hover {
+/// says what each state does, with the pace from `crate::retry`.
+fn reconnect_hover() -> Hover {
+    let wait = |d: std::time::Duration| wiredata_ui::format::wait(d);
+    let longest = wait(crate::retry::RETRY_MAX);
     Hover::from_paragraphs([
         "Reopens the channel by itself when its port or device fails.".to_owned(),
-        format!("When this is ticked, {}", reconnect_retries(policy)),
+        format!(
+            "When this is ticked, the channel tries again after {}, then waits longer \
+             between tries until the wait reaches {longest}, and keeps trying every \
+             {longest} until it works.",
+            wait(crate::retry::RETRY_FIRST)
+        ),
         "When it is not ticked, the channel stays down until you start it again.".to_owned(),
     ])
-}
-
-/// How reconnecting retries under `policy`, as the end of a sentence that
-/// starts "When this is ticked, ". Whether reconnecting is on is not part of it.
-fn reconnect_retries(policy: &crate::config::ReconnectPolicy) -> String {
-    let wait = |ms: u64| wiredata_ui::format::wait(std::time::Duration::from_millis(ms));
-    let first = wait(policy.initial_backoff_ms);
-    let longest = wait(policy.max_backoff_ms);
-    // The wait grows by the multiplier until it reaches the longest wait, and
-    // stays there: retrying goes on at that wait unless there is a limit.
-    let grows = policy.max_backoff_ms > policy.initial_backoff_ms;
-    match (policy.max_attempts, grows) {
-        (Some(1), _) => format!("the channel tries again once, after {first}, then gives up."),
-        (None, true) => format!(
-            "the channel tries again after {first}, then waits longer between tries until \
-             the wait reaches {longest}, and keeps trying every {longest} until it works."
-        ),
-        (None, false) => format!("the channel tries again every {first} until it works."),
-        (Some(n), true) => format!(
-            "the channel tries again after {first}, then waits longer between tries, up to \
-             {longest} at most, and gives up after {n} tries."
-        ),
-        (Some(n), false) => {
-            format!("the channel tries again every {first}, and gives up after {n} tries.")
-        }
-    }
 }
 
 /// The available serial port names, sorted (§14.4). Empty if enumeration fails.
@@ -799,8 +780,8 @@ mod tests {
 
     #[test]
     fn reconnect_status_is_stated_in_words() {
-        // ADR-045: "Reconnecting — attempt 3, next try in 8 s", "Gave up after
-        // N attempts" — never colour alone.
+        // ADR-045: "Reconnecting — attempt 3, next try in 8 s" — never colour
+        // alone.
         use crate::runtime::ReconnectProgress;
         use std::time::Duration;
         let retrying = ReconnectProgress::Retrying {
@@ -811,39 +792,19 @@ mod tests {
             status_words(ChannelStatus::Reconnecting, Some(retrying)),
             "Reconnecting — attempt 3, next try in 8 s"
         );
-        assert_eq!(
-            status_words(
-                ChannelStatus::Faulted,
-                Some(ReconnectProgress::GaveUp { attempts: 10 })
-            ),
-            "Faulted — gave up after 10 attempts"
-        );
         assert_eq!(status_words(ChannelStatus::Running, None), "running");
     }
 
     #[test]
-    fn the_reconnect_hover_describes_both_states_whether_ticked_or_not() {
-        let mut policy = templates::udp_template().reconnect;
-        policy.initial_backoff_ms = 1_000;
-        policy.max_backoff_ms = 30_000;
-        policy.max_attempts = None;
-        policy.enabled = false;
-        let unticked = reconnect_hover(&policy);
-        policy.enabled = true;
-        let ticked = reconnect_hover(&policy);
-        assert_eq!(ticked.text(), unticked.text(), "the same words either way");
+    fn the_reconnect_hover_describes_both_states() {
         assert_eq!(
-            ticked.text(),
+            reconnect_hover().text(),
             "Reopens the channel by itself when its port or device fails.\n\n\
              When this is ticked, the channel tries again after 1 s, then waits longer \
              between tries until the wait reaches 30 s, and keeps trying every 30 s until \
              it works.\n\n\
              When it is not ticked, the channel stays down until you start it again."
         );
-        policy.max_attempts = Some(10);
-        assert!(reconnect_hover(&policy)
-            .text()
-            .contains("up to 30 s at most, and gives up after 10 tries."));
     }
 
     #[test]

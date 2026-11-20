@@ -7,9 +7,9 @@
 //! ahead of the loss have drained. A failed open or write is published as a
 //! state the application shows; it never stops the application.
 //!
-//! The crate owns only that mechanism, plus daily rotation and age-based
-//! deletion of old log files. What is logged, its level and format, the folder
-//! and file prefix, and how any of it is presented stay in the applications.
+//! The crate owns only that mechanism, plus rotation. It never deletes a log
+//! file (talker ADR-069). What is logged, its level and format, the folder and
+//! file prefix, and how any of it is presented stay in the applications.
 
 use std::{
     io::{self, Write},
@@ -19,7 +19,7 @@ use std::{
         Arc, Mutex, RwLock,
     },
     thread::JoinHandle,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 use anyhow::Context;
@@ -27,35 +27,26 @@ use tracing_subscriber::fmt::MakeWriter;
 
 const FILE_EVENT_QUEUE_CAP: usize = 4_096;
 
-/// How often a long-running log file checks for old files to delete. Daily
-/// rotation makes one hour ample: a file is deleted within an hour of passing
-/// its age limit.
-const PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
 type FileWriter = Box<dyn Write + Send>;
 type OpenFileFn = Box<dyn Fn(&LogFileConfig) -> anyhow::Result<FileWriter> + Send>;
 type Notify = Arc<dyn Fn() + Send + Sync>;
 
-/// Where a log file goes and how long old files are kept.
+/// Where a log file goes and how it rotates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogFileConfig {
     pub directory: PathBuf,
     /// File name prefix; rotated files are named `<prefix>.<date>`.
     pub prefix: String,
     pub rotation: Rotation,
-    /// Log files with this prefix older than this are deleted when the file
-    /// opens and hourly after that. `None` keeps every file.
-    pub max_age: Option<Duration>,
 }
 
 impl LogFileConfig {
-    /// Daily rotation, keeping every file.
+    /// Daily rotation.
     pub fn new(directory: impl Into<PathBuf>, prefix: impl Into<String>) -> Self {
         Self {
             directory: directory.into(),
             prefix: prefix.into(),
             rotation: Rotation::Daily,
-            max_age: None,
         }
     }
 }
@@ -73,20 +64,8 @@ pub enum Rotation {
     DailyLocal,
 }
 
-/// Open a rotating log file, first deleting files older than `max_age`.
-///
-/// The returned writer keeps deleting old files, at most hourly, while it is
-/// written to. Deletion is best-effort: a file that cannot be deleted is left
-/// and tried again at the next check.
+/// Open a rotating log file.
 pub fn open_rolling_file(config: &LogFileConfig) -> anyhow::Result<RollingLogFile> {
-    if let Some(max_age) = config.max_age {
-        prune_old_files(
-            &config.directory,
-            &config.prefix,
-            max_age,
-            SystemTime::now(),
-        );
-    }
     let context = || {
         format!(
             "opening file log {:?} in {:?}",
@@ -112,22 +91,12 @@ pub fn open_rolling_file(config: &LogFileConfig) -> anyhow::Result<RollingLogFil
                 .with_context(context)?,
         ),
     };
-    Ok(RollingLogFile {
-        inner,
-        directory: config.directory.clone(),
-        prefix: config.prefix.clone(),
-        max_age: config.max_age,
-        next_prune: Instant::now() + PRUNE_INTERVAL,
-    })
+    Ok(RollingLogFile { inner })
 }
 
-/// A rotating log file that also deletes its own old files.
+/// A rotating log file.
 pub struct RollingLogFile {
     inner: RollingInner,
-    directory: PathBuf,
-    prefix: String,
-    max_age: Option<Duration>,
-    next_prune: Instant,
 }
 
 enum RollingInner {
@@ -137,13 +106,6 @@ enum RollingInner {
 
 impl Write for RollingLogFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(max_age) = self.max_age {
-            let now = Instant::now();
-            if now >= self.next_prune {
-                self.next_prune = now + PRUNE_INTERVAL;
-                prune_old_files(&self.directory, &self.prefix, max_age, SystemTime::now());
-            }
-        }
         match &mut self.inner {
             RollingInner::Utc(appender) => appender.write(buf),
             RollingInner::Local(file) => file.write(buf),
@@ -221,38 +183,6 @@ fn next_local_midnight(now: chrono::DateTime<chrono::Local>) -> chrono::DateTime
         .filter_map(|hour| tomorrow.and_hms_opt(hour, 0, 0))
         .find_map(|start| chrono::Local.from_local_datetime(&start).earliest())
         .unwrap_or(fallback)
-}
-
-/// Delete the log files in `directory` with this prefix that were last written
-/// more than `max_age` before `now`. Returns how many were deleted.
-///
-/// Only `<prefix>` itself and `<prefix>.<anything>` are candidates, so other
-/// files in the folder are never touched.
-fn prune_old_files(directory: &Path, prefix: &str, max_age: Duration, now: SystemTime) -> usize {
-    let Some(cutoff) = now.checked_sub(max_age) else {
-        return 0;
-    };
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return 0;
-    };
-    let dotted = format!("{prefix}.");
-    entries
-        .flatten()
-        .filter(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name == prefix || name.starts_with(&dotted)
-        })
-        .filter(|entry| {
-            entry
-                .metadata()
-                .ok()
-                .filter(std::fs::Metadata::is_file)
-                .and_then(|meta| meta.modified().ok())
-                .is_some_and(|modified| modified < cutoff)
-        })
-        .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
-        .count()
 }
 
 /// Runtime state of an optional file destination.
@@ -1025,52 +955,6 @@ mod tests {
         dir
     }
 
-    fn file_last_written(path: &Path, when: SystemTime) {
-        std::fs::write(path, b"x").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(when)
-            .unwrap();
-    }
-
-    #[test]
-    fn only_this_prefix_older_than_the_limit_is_deleted() {
-        let dir = temp_folder("prune");
-        let now = SystemTime::now();
-        let old = now - Duration::from_secs(40 * 24 * 60 * 60);
-        let recent = now - Duration::from_secs(2 * 24 * 60 * 60);
-        file_last_written(&dir.join("listener.log.2026-08-01"), old);
-        file_last_written(&dir.join("listener.log.2026-09-28"), recent);
-        file_last_written(&dir.join("listener.logbook"), old); // not this prefix
-        file_last_written(&dir.join("other.log.2026-08-01"), old);
-
-        let deleted = prune_old_files(
-            &dir,
-            "listener.log",
-            Duration::from_secs(30 * 24 * 60 * 60),
-            now,
-        );
-
-        let mut left: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        assert_eq!(deleted, 1);
-        assert_eq!(
-            left,
-            [
-                "listener.log.2026-09-28",
-                "listener.logbook",
-                "other.log.2026-08-01"
-            ]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn a_local_day_file_is_named_for_the_local_date_and_rolls_at_local_midnight() {
         use chrono::{Datelike as _, TimeZone as _, Timelike as _};
@@ -1110,26 +994,6 @@ mod tests {
         let text = std::fs::read_to_string(dir.join(today)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(text, "first run\nsecond run\n");
-    }
-
-    #[test]
-    fn opening_deletes_old_files_first_and_keeping_all_deletes_none() {
-        let dir = temp_folder("open_prune");
-        let old = SystemTime::now() - Duration::from_secs(40 * 24 * 60 * 60);
-        let stale = dir.join("app.log.2026-08-01");
-
-        file_last_written(&stale, old);
-        let keep_all = LogFileConfig::new(&dir, "app.log");
-        drop(open_rolling_file(&keep_all).unwrap());
-        assert!(stale.exists(), "max_age None keeps every file");
-
-        let thirty_days = LogFileConfig {
-            max_age: Some(Duration::from_secs(30 * 24 * 60 * 60)),
-            ..keep_all
-        };
-        drop(open_rolling_file(&thirty_days).unwrap());
-        assert!(!stale.exists(), "opening deletes files past the limit");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn wait_for_state(

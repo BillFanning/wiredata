@@ -23,7 +23,14 @@ again. Remove an item when it is done: the commit says what changed.
   that wants a word on screen.
 - [ ] **Disk guard in the GUI (§56.2).** Neither recording editor,
   `edit_raw_recording` nor `edit_display_recording`, sets `disk_guard`, so a
-  guard comes only from a profile.
+  guard comes only from a profile. With log files kept (talker ADR-069) and
+  recordings unbounded, a full drive is the main risk of a weeks-long run, so
+  this is the disk work to do first.
+- [ ] **Decide the wider disk work (needs a spec amendment).** Whether a new
+  recording gets a disk guard by default; whether the event log folder
+  (`event_log_folder`) is watched too; and how a low drive is shown when no
+  recording has a guard. Talker's logs have the same question; see talker's
+  File-log retention item.
 - [ ] **A general match-rule editor (§50.2).** `edit_mark_rules` edits only a
   `BytePattern` rule with a `Mark` action (ADR-016). `Idle` conditions and the
   `Record`, `Notify` and `PauseDisplay` actions arrive only through profiles.
@@ -32,6 +39,15 @@ again. Remove an item when it is done: the commit says what changed.
   Low priority: kept simple on purpose.
 - [ ] **RS-422 and RS-485 (§14.5).** They follow RS-232; nothing is specific to
   them yet beyond the RTS line of §14.3.
+
+## Reconnect
+
+- [ ] **A give-up limit, only if asked for (ADR-072).** Reconnecting never
+  stops by itself now. If someone needs a Channel to give up, add one key to
+  `ReconnectPolicy` and one field to the editor.
+
+The retry questions shared with talker are in
+[`talker/docs/TODO.md`](../../talker/docs/TODO.md), under Retry and backoff.
 
 ## Specification
 

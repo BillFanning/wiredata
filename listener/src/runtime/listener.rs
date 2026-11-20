@@ -252,19 +252,17 @@ struct DataSpawnContext {
 struct ReconnectState {
     /// Reconnect attempts made so far (each a Stop+Start cycle).
     attempts: u32,
-    /// The current backoff delay (grows by `multiplier`, capped at `max_backoff`).
+    /// The current wait, doubling to its longest (`crate::retry`).
     backoff: Duration,
     /// When the next attempt is due.
     next_attempt_at: Instant,
-    /// Whether `max_attempts` was exhausted (stop retrying, stay Faulted).
-    gave_up: bool,
 }
 
 /// How long a reconnected Channel must stay up before its attempt count and
 /// backoff start over (§9.1). A device that connects and drops again within this
 /// window is still misbehaving: restarting at attempt 1 and the shortest delay
-/// would retry it at the fastest rate for ever and `max_attempts` would never
-/// apply. Only this much uptime counts as recovery.
+/// would retry it at the fastest rate for ever. Only this much uptime counts as
+/// recovery.
 const RECONNECT_STABLE_AFTER: Duration = Duration::from_secs(60);
 
 /// Where a reconnect sequence stood when an attempt succeeded, kept for
@@ -573,24 +571,18 @@ impl ManagedChannel {
 
     /// Whether an auto-reconnect is armed or in progress (§9.1) — the poll-lane
     /// counterpart of the `ChannelReconnecting` event, so a UI can distinguish
-    /// "Faulted, retrying" from "Faulted, given up / not retrying" without
-    /// depending on the advisory event stream.
+    /// "Faulted, retrying" from "Faulted, not retrying" without depending on the
+    /// advisory event stream.
     fn reconnect_pending(&self) -> bool {
-        self.reconnect_state.as_ref().is_some_and(|r| !r.gave_up)
+        self.reconnect_state.is_some()
     }
 
     /// Where an automatic reconnect stands at `now`, for status (§9.1).
     fn reconnect_progress(&self, now: Instant) -> Option<ReconnectProgress> {
         let state = self.reconnect_state.as_ref()?;
-        Some(if state.gave_up {
-            ReconnectProgress::GaveUp {
-                attempts: state.attempts,
-            }
-        } else {
-            ReconnectProgress::Retrying {
-                attempt: state.attempts + 1,
-                next_try_in: state.next_attempt_at.saturating_duration_since(now),
-            }
+        Some(ReconnectProgress::Retrying {
+            attempt: state.attempts + 1,
+            next_try_in: state.next_attempt_at.saturating_duration_since(now),
         })
     }
 }
@@ -633,6 +625,8 @@ pub struct Listener {
     events_tx: mpsc::Sender<RuntimeEvent>,
     events_rx: Option<mpsc::Receiver<RuntimeEvent>>,
     caps: PipelineCapacities,
+    /// The reconnect pace (§9.1). Always `crate::retry`'s, but tests shorten it.
+    reconnect_backoff: crate::retry::Backoff,
     /// Tests stand in for an interface that is slow to open, such as a
     /// Bluetooth serial port whose device is off.
     #[cfg(test)]
@@ -648,6 +642,7 @@ impl Listener {
             events_tx,
             events_rx: Some(events_rx),
             caps,
+            reconnect_backoff: crate::retry::Backoff::default(),
             #[cfg(test)]
             open_delay: None,
         }
@@ -705,15 +700,7 @@ impl Listener {
     /// ADR-045): only [`reconnect_tick`](Self::reconnect_tick) reads it.
     /// Turning it off ends a retry in progress, so the Channel reads Faulted
     /// rather than Reconnecting. Unknown id is ignored.
-    /// A policy outside its limits (ADR-048) is refused and the old one kept.
-    pub fn set_reconnect_policy(
-        &mut self,
-        id: ChannelId,
-        policy: crate::config::ReconnectPolicy,
-    ) -> Result<(), OrchestratorError> {
-        if let Some(error) = policy.limit_errors().into_iter().next() {
-            return Err(error.into());
-        }
+    pub fn set_reconnect_policy(&mut self, id: ChannelId, policy: crate::config::ReconnectPolicy) {
         if let Some(channel) = self.channels.get_mut(&id) {
             if !policy.enabled {
                 channel.reconnect_state = None;
@@ -721,15 +708,6 @@ impl Listener {
             }
             channel.config.reconnect = policy;
         }
-        Ok(())
-    }
-
-    /// Whether `id`'s reconnect retries ran out (§9.1).
-    pub fn reconnect_exhausted(&self, id: ChannelId) -> bool {
-        self.channels
-            .get(&id)
-            .and_then(|c| c.reconnect_state.as_ref())
-            .is_some_and(|s| s.gave_up)
     }
 
     pub fn config(&self, id: ChannelId) -> Option<&ChannelConfig> {
@@ -1569,9 +1547,8 @@ impl Listener {
     /// the orchestrator has no background loop (ADR-006). For each Channel that is
     /// effectively Faulted with reconnect enabled, the first call arms a backoff
     /// timer; once the backoff elapses, this performs a Stop+Start reconnect
-    /// (emitting `ChannelReconnecting`/`ChannelReconnected`), backing off
-    /// exponentially on failure and giving up (`ChannelReconnectGaveUp`) after
-    /// `max_attempts`. Stop+Start reuses the tested lifecycle (Faulted → Stopped →
+    /// (emitting `ChannelReconnecting`/`ChannelReconnected`), backing off on
+    /// failure at the pace in `crate::retry` until it works. Stop+Start reuses the tested lifecycle (Faulted → Stopped →
     /// Starting → Running), so the events also include the intermediate
     /// `ChannelStopped`/`ChannelStarted`.
     pub async fn reconnect_tick(&mut self) {
@@ -1584,8 +1561,8 @@ impl Listener {
 
     /// The reconnect bookkeeping of [`reconnect_tick`](Self::reconnect_tick)
     /// without the stop and start, for a caller that runs those off its loop
-    /// (ADR-052). Arms backoff on a newly faulted Channel, gives up after
-    /// `max_attempts`, and returns the attempts now due, each announced with
+    /// (ADR-052). Arms backoff on a newly faulted Channel and returns the
+    /// attempts now due, each announced with
     /// `ChannelReconnecting`. A Channel `busy` says is mid-operation is left
     /// for a later tick.
     pub fn reconnects_due(
@@ -1606,9 +1583,6 @@ impl Listener {
         let mut due = Vec::new();
 
         for id in candidates {
-            let Some(policy) = self.channels.get(&id).map(|c| c.config.reconnect) else {
-                continue;
-            };
             let state = self
                 .channels
                 .get(&id)
@@ -1627,42 +1601,20 @@ impl Listener {
                         });
                     let (attempts, backoff) = match carry {
                         Some(c) => (c.attempts, c.backoff),
-                        None => (0, Duration::from_millis(policy.initial_backoff_ms)),
+                        None => (0, self.reconnect_backoff.first),
                     };
-                    let gave_up = policy.max_attempts.is_some_and(|max| attempts >= max);
-                    if gave_up {
-                        let _ = self
-                            .events_tx
-                            .try_send(RuntimeEvent::ChannelReconnectGaveUp(id));
-                    }
                     self.set_reconnect_state(
                         id,
                         ReconnectState {
                             attempts,
                             backoff,
                             next_attempt_at: now + backoff,
-                            gave_up,
                         },
                     );
                 }
-                // Given up, or not due yet.
-                Some(s) if s.gave_up || now < s.next_attempt_at => {}
+                // Not due yet.
+                Some(s) if now < s.next_attempt_at => {}
                 Some(s) => {
-                    // A failed last attempt gives up in `finish_reconnect`;
-                    // this catches a limit lowered while a retry was waiting.
-                    if policy.max_attempts.is_some_and(|max| s.attempts >= max) {
-                        let _ = self
-                            .events_tx
-                            .try_send(RuntimeEvent::ChannelReconnectGaveUp(id));
-                        if let Some(rs) = self
-                            .channels
-                            .get_mut(&id)
-                            .and_then(|c| c.reconnect_state.as_mut())
-                        {
-                            rs.gave_up = true;
-                        }
-                        continue;
-                    }
                     let attempt = s.attempts + 1;
                     let _ = self
                         .events_tx
@@ -1679,8 +1631,7 @@ impl Listener {
     }
 
     /// Record how a reconnect attempt's stop and start went (§9.1): announce
-    /// the reconnect, back off for the next attempt, or give up when this was
-    /// the last one `max_attempts` allows. Stopping cleared the reconnect
+    /// the reconnect, or back off for the next attempt. Stopping cleared the reconnect
     /// state, so a failure re-establishes it. `now` is the caller's clock
     /// reading as the start landed: a Channel is stable from then, not from
     /// when the attempt was issued.
@@ -1690,11 +1641,10 @@ impl Listener {
             attempt,
             previous,
         } = attempt;
-        let Some(policy) = self.channels.get(&id).map(|c| c.config.reconnect) else {
+        if !self.channels.contains_key(&id) {
             return;
-        };
-        let next_ms = (previous.backoff.as_millis() as f64 * policy.multiplier) as u64;
-        let backoff = Duration::from_millis(next_ms.min(policy.max_backoff_ms).max(1));
+        }
+        let backoff = self.reconnect_backoff.after(previous.backoff);
         if started {
             let _ = self
                 .events_tx
@@ -1710,21 +1660,12 @@ impl Listener {
             }
             return;
         }
-        // Decided here, not when the next backoff ends: status must not count
-        // down to an attempt that will not be made.
-        let gave_up = policy.max_attempts.is_some_and(|max| attempt >= max);
-        if gave_up {
-            let _ = self
-                .events_tx
-                .try_send(RuntimeEvent::ChannelReconnectGaveUp(id));
-        }
         self.set_reconnect_state(
             id,
             ReconnectState {
                 attempts: attempt,
                 backoff,
                 next_attempt_at: Instant::now() + backoff,
-                gave_up,
             },
         );
     }
@@ -1754,12 +1695,11 @@ impl Listener {
     }
 
     /// Refuse to build a Channel whose settings break a limit the runtime
-    /// cannot otherwise hold to (ADR-048, §71): match rules and the reconnect
-    /// policy. Capacities are checked as they are made.
+    /// cannot otherwise hold to (ADR-048, §71): match rules. Capacities are
+    /// checked as they are made.
     fn check_limits(config: &ChannelConfig) -> Result<(), OrchestratorError> {
         let first = crate::config::limits::match_rule_errors(&config.match_rules)
             .into_iter()
-            .chain(config.reconnect.limit_errors())
             .next();
         match first {
             Some(error) => Err(error.into()),
@@ -2574,27 +2514,6 @@ mod tests {
             ),
             "{err}"
         );
-
-        let mut config = udp_channel();
-        config.reconnect.initial_backoff_ms = 10_000;
-        config.reconnect.max_backoff_ms = 1_000;
-        let id = listener.add_channel(config);
-        assert!(matches!(
-            listener.start(id).await,
-            Err(OrchestratorError::Limit(
-                crate::config::LimitError::BackoffOrder { .. }
-            ))
-        ));
-
-        // A live change is held to the same limits, and the old policy kept.
-        let id = listener.add_channel(udp_channel());
-        let mut policy = crate::config::ReconnectPolicy {
-            enabled: true,
-            ..crate::config::ReconnectPolicy::default()
-        };
-        policy.multiplier = 0.0;
-        assert!(listener.set_reconnect_policy(id, policy).is_err());
-        assert!(!listener.config(id).unwrap().reconnect.enabled);
     }
 
     #[test]
@@ -3037,14 +2956,12 @@ mod tests {
         use crate::config::ReconnectPolicy;
         let mut listener = Listener::with_default_capacities();
         let mut events = listener.take_events().unwrap();
-        let mut config = udp_channel();
-        config.reconnect = ReconnectPolicy {
-            enabled: true,
-            initial_backoff_ms: 1,
-            max_backoff_ms: 10,
-            multiplier: 2.0,
-            max_attempts: None,
+        listener.reconnect_backoff = crate::retry::Backoff {
+            first: Duration::from_millis(1),
+            max: Duration::from_millis(10),
         };
+        let mut config = udp_channel();
+        config.reconnect = ReconnectPolicy { enabled: true };
         let id = listener.add_channel(config);
         listener.start(id).await.unwrap();
 
@@ -3072,108 +2989,6 @@ mod tests {
         assert!(reconnected, "expected a ChannelReconnected event");
 
         listener.stop(id).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn auto_reconnect_gives_up_after_max_attempts() {
-        // §162: a channel that cannot start (bad config) gives up after the
-        // configured number of attempts and stays faulted.
-        use crate::config::ReconnectPolicy;
-        let mut listener = Listener::with_default_capacities();
-        let mut events = listener.take_events().unwrap();
-        let mut config = udp_channel();
-        if let InterfaceConfig::Udp(udp) = &mut config.interface {
-            udp.bind_address = "not-an-ip-address".to_string(); // start always fails
-        }
-        config.reconnect = ReconnectPolicy {
-            enabled: true,
-            initial_backoff_ms: 1,
-            max_backoff_ms: 5,
-            multiplier: 1.0,
-            max_attempts: Some(1),
-        };
-        let id = listener.add_channel(config);
-
-        // The initial start fails → Faulted; reconnect then retries and gives up.
-        assert!(listener.start(id).await.is_err());
-        for _ in 0..6 {
-            listener.reconnect_tick().await;
-            tokio::time::sleep(Duration::from_millis(3)).await;
-        }
-
-        let mut gave_up = false;
-        while let Ok(ev) = events.try_recv() {
-            if matches!(ev, RuntimeEvent::ChannelReconnectGaveUp(_)) {
-                gave_up = true;
-            }
-        }
-        assert!(gave_up, "expected a ChannelReconnectGaveUp event");
-        assert_eq!(listener.state(id), Some(ChannelState::Faulted));
-        assert!(listener.reconnect_exhausted(id));
-        assert_eq!(
-            listener.channel_stats(id).await.unwrap().reconnect,
-            Some(ReconnectProgress::GaveUp { attempts: 1 })
-        );
-    }
-
-    #[tokio::test]
-    async fn the_last_allowed_attempt_gives_up_as_soon_as_it_fails() {
-        // Status must not count down to an attempt the policy does not allow,
-        // and the give-up notice must not wait out one more backoff.
-        use crate::config::ReconnectPolicy;
-        let mut listener = Listener::with_default_capacities();
-        let mut events = listener.take_events().unwrap();
-        let mut config = udp_channel();
-        if let InterfaceConfig::Udp(udp) = &mut config.interface {
-            udp.bind_address = "not-an-ip-address".to_string(); // start always fails
-        }
-        config.reconnect = ReconnectPolicy {
-            enabled: true,
-            initial_backoff_ms: 1_000,
-            max_backoff_ms: 60_000,
-            multiplier: 2.0,
-            max_attempts: Some(2),
-        };
-        let id = listener.add_channel(config);
-        assert!(listener.start(id).await.is_err());
-
-        // The steps a driver takes, with the clock supplied: no waiting.
-        let later = |secs| Instant::now() + Duration::from_secs(secs);
-        assert!(
-            listener.reconnects_due(later(0), |_| false).is_empty(),
-            "the first look only arms the backoff"
-        );
-        for attempt in 1..=2 {
-            let due = listener
-                .reconnects_due(later(3_600), |_| false)
-                .pop()
-                .unwrap_or_else(|| panic!("attempt {attempt} is due"));
-            let _ = listener.stop(id).await;
-            let started = listener.start(id).await.is_ok();
-            listener.finish_reconnect(due, started, Instant::now());
-            if attempt == 1 {
-                assert!(!listener.reconnect_exhausted(id));
-                assert!(matches!(
-                    listener.channel_stats(id).await.unwrap().reconnect,
-                    Some(ReconnectProgress::Retrying { attempt: 2, .. })
-                ));
-            }
-        }
-
-        assert!(listener.reconnect_exhausted(id));
-        assert_eq!(
-            listener.channel_stats(id).await.unwrap().reconnect,
-            Some(ReconnectProgress::GaveUp { attempts: 2 })
-        );
-        // A later look finds nothing to do and does not announce it again.
-        assert!(listener.reconnects_due(later(7_200), |_| false).is_empty());
-        let mut gave_up = 0;
-        while let Ok(event) = events.try_recv() {
-            if event == RuntimeEvent::ChannelReconnectGaveUp(id) {
-                gave_up += 1;
-            }
-        }
-        assert_eq!(gave_up, 1, "one give-up notice");
     }
 
     /// Report a reconnect's outcome as of the clock reading `landed`.
@@ -3212,14 +3027,9 @@ mod tests {
         attempt
     }
 
-    fn quick_policy(max_attempts: Option<u32>) -> crate::config::ReconnectPolicy {
-        crate::config::ReconnectPolicy {
-            enabled: true,
-            initial_backoff_ms: 1_000,
-            max_backoff_ms: 60_000,
-            multiplier: 2.0,
-            max_attempts,
-        }
+    /// Reconnect on, at the pace in `crate::retry`: 1 s, doubling.
+    fn reconnect_on() -> crate::config::ReconnectPolicy {
+        crate::config::ReconnectPolicy { enabled: true }
     }
 
     #[tokio::test]
@@ -3230,7 +3040,7 @@ mod tests {
         let mut listener = Listener::with_default_capacities();
         let _events = listener.take_events();
         let mut config = udp_channel();
-        config.reconnect = quick_policy(None);
+        config.reconnect = reconnect_on();
         let id = listener.add_channel(config);
         listener.start(id).await.unwrap();
         let t0 = Instant::now();
@@ -3265,7 +3075,7 @@ mod tests {
         let mut listener = Listener::with_default_capacities();
         let _events = listener.take_events();
         let mut config = udp_channel();
-        config.reconnect = quick_policy(None);
+        config.reconnect = reconnect_on();
         let id = listener.add_channel(config);
         listener.start(id).await.unwrap();
         let t0 = Instant::now();
@@ -3306,7 +3116,7 @@ mod tests {
         let mut listener = Listener::with_default_capacities();
         let _events = listener.take_events();
         let mut config = udp_channel();
-        config.reconnect = quick_policy(None);
+        config.reconnect = reconnect_on();
         let id = listener.add_channel(config);
         listener.start(id).await.unwrap();
         let t0 = Instant::now();
@@ -3330,11 +3140,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_device_that_keeps_dropping_quickly_reaches_max_attempts() {
+    async fn a_device_that_keeps_dropping_quickly_is_retried_at_a_growing_wait() {
         let mut listener = Listener::with_default_capacities();
-        let mut events = listener.take_events().unwrap();
+        let _events = listener.take_events();
         let mut config = udp_channel();
-        config.reconnect = quick_policy(Some(2));
+        config.reconnect = reconnect_on();
         let id = listener.add_channel(config);
         listener.start(id).await.unwrap();
         let t0 = Instant::now();
@@ -3348,7 +3158,8 @@ mod tests {
             drop_and_reconnect(&mut listener, id, at(20), at(30)).await,
             2
         );
-        // The third drop, 10 s after the second reconnect: no attempt 3.
+        // The third drop, 10 s after the second reconnect: attempt 3, after a
+        // wait of 4 s. Nothing gives up.
         listener
             .channels
             .get(&id)
@@ -3356,19 +3167,9 @@ mod tests {
             .faulted
             .store(true, Ordering::Relaxed);
         assert!(listener.reconnects_due(at(40), |_| false).is_empty());
-        assert!(listener.reconnect_exhausted(id));
-        assert_eq!(
-            listener.channel_stats(id).await.unwrap().reconnect,
-            Some(ReconnectProgress::GaveUp { attempts: 2 })
-        );
-        assert!(listener.reconnects_due(at(4_000), |_| false).is_empty());
-        let mut gave_up = 0;
-        while let Ok(event) = events.try_recv() {
-            if event == RuntimeEvent::ChannelReconnectGaveUp(id) {
-                gave_up += 1;
-            }
-        }
-        assert_eq!(gave_up, 1, "one give-up notice");
+        assert!(listener.reconnects_due(at(43), |_| false).is_empty());
+        let due = listener.reconnects_due(at(44), |_| false).pop().unwrap();
+        assert_eq!(due.attempt, 3);
         let _ = listener.stop(id).await;
     }
 
@@ -3377,7 +3178,7 @@ mod tests {
         let mut listener = Listener::with_default_capacities();
         let _events = listener.take_events();
         let mut config = udp_channel();
-        config.reconnect = quick_policy(None);
+        config.reconnect = reconnect_on();
         let id = listener.add_channel(config);
         listener.start(id).await.unwrap();
         let t0 = Instant::now();
@@ -3408,14 +3209,11 @@ mod tests {
         if let InterfaceConfig::Udp(udp) = &mut config.interface {
             udp.bind_address = "not-an-ip-address".to_string(); // start always fails
         }
-        let policy = ReconnectPolicy {
-            enabled: true,
-            initial_backoff_ms: 60_000,
-            max_backoff_ms: 60_000,
-            multiplier: 1.0,
-            max_attempts: None,
+        listener.reconnect_backoff = crate::retry::Backoff {
+            first: Duration::from_secs(60),
+            max: Duration::from_secs(60),
         };
-        config.reconnect = policy;
+        config.reconnect = ReconnectPolicy { enabled: true };
         let id = listener.add_channel(config);
         assert!(listener.start(id).await.is_err());
         listener.reconnect_tick().await; // arms the first retry
@@ -3430,15 +3228,7 @@ mod tests {
             other => panic!("expected a retry, got {other:?}"),
         }
 
-        listener
-            .set_reconnect_policy(
-                id,
-                ReconnectPolicy {
-                    enabled: false,
-                    ..policy
-                },
-            )
-            .unwrap();
+        listener.set_reconnect_policy(id, ReconnectPolicy { enabled: false });
         let stats = listener.channel_stats(id).await.unwrap();
         assert_eq!(stats.reconnect, None, "turning it off ends the retry");
         assert!(!stats.reconnect_pending);
@@ -3460,13 +3250,11 @@ mod tests {
             udp.bind_address = "127.0.0.1".to_string();
             udp.port = port;
         }
-        config.reconnect = ReconnectPolicy {
-            enabled: true,
-            initial_backoff_ms: 1,
-            max_backoff_ms: 5,
-            multiplier: 1.0,
-            max_attempts: None,
+        listener.reconnect_backoff = crate::retry::Backoff {
+            first: Duration::from_millis(1),
+            max: Duration::from_millis(5),
         };
+        config.reconnect = ReconnectPolicy { enabled: true };
         let id = listener.add_channel(config);
         assert!(listener.start(id).await.is_err(), "the port is taken");
         assert_eq!(listener.state(id), Some(ChannelState::Faulted));
@@ -3487,7 +3275,6 @@ mod tests {
             listener.reconnect_tick().await;
             tokio::time::sleep(Duration::from_millis(3)).await;
         }
-        assert!(!listener.reconnect_exhausted(id));
         listener.stop(id).await.unwrap();
     }
 

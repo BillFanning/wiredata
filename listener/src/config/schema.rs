@@ -47,50 +47,21 @@ pub struct ChannelConfig {
     pub match_rules: Vec<MatchRule>,
 }
 
-/// Opt-in auto-reconnect policy (§9.1, §162). When `enabled`, a Channel that
-/// faults while it was meant to be Running is automatically re-Started with
-/// exponential backoff. Applies to Serial and UDP Channels.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Opt-in auto-reconnect (§9.1, §162). When `enabled`, a Channel that faults
+/// while it was meant to be Running is started again, at the pace in
+/// `crate::retry`, until it runs. Applies to Serial and UDP Channels. The pace
+/// is not a profile setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReconnectPolicy {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_initial_backoff_ms")]
-    pub initial_backoff_ms: u64,
-    #[serde(default = "default_max_backoff_ms")]
-    pub max_backoff_ms: u64,
-    #[serde(default = "default_backoff_multiplier")]
-    pub multiplier: f64,
-    /// `None` = retry indefinitely.
-    #[serde(default)]
-    pub max_attempts: Option<u32>,
 }
 
-fn default_initial_backoff_ms() -> u64 {
-    1_000
-}
-fn default_max_backoff_ms() -> u64 {
-    30_000
-}
-fn default_backoff_multiplier() -> f64 {
-    2.0
-}
 /// Serde default for opt-out booleans (e.g. a Match Rule is enabled unless the
 /// profile says otherwise, §50.2).
 fn default_true() -> bool {
     true
-}
-
-impl Default for ReconnectPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            initial_backoff_ms: default_initial_backoff_ms(),
-            max_backoff_ms: default_max_backoff_ms(),
-            multiplier: default_backoff_multiplier(),
-            max_attempts: None,
-        }
-    }
 }
 
 /// Interface configuration (§73).

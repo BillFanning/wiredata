@@ -488,6 +488,10 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 
 ## Architecture Decision Record
 
+Revision note (2026-11-15) — button names in lower case:
+
+- **ADR-060** — quotes the button as it now reads, Retry channel.
+
 Revision note (2026-11-14) — fixes from the November code review:
 
 - **ADR-068** — a settings change on a live serial port or UDP socket never

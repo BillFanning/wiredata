@@ -292,7 +292,7 @@ async fn run_cli(
     // Drive auto-reconnect (§162): the orchestrator has no background loop, so the
     // app ticks it. Channels without reconnect enabled are unaffected. The same
     // tick checks the event log, so a failure that starts mid-run is reported.
-    let mut reconnect = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut reconnect = tokio::time::interval(crate::retry::RECONNECT_CHECK_EVERY);
     let mut stop_reason = "the event stream closed".to_owned();
     loop {
         tokio::select! {
@@ -470,12 +470,7 @@ async fn observe_health(
             Some(ChannelState::Running) => health.up(id, now),
             Some(ChannelState::Faulted) => {
                 let reason = latest_error(listener, id, &names[&id]).await;
-                let down = health.down(id, &reason, RETRYING, now);
-                if down.is_some() || !listener.reconnect_exhausted(id) {
-                    down
-                } else {
-                    health.gave_up(id)
-                }
+                health.down(id, &reason, RETRYING, now)
             }
             // Starting and Stopping are passing through.
             _ => None,
@@ -558,8 +553,7 @@ fn format_event(event: &RuntimeEvent, names: &HashMap<ChannelId, String>) -> Opt
         | RuntimeEvent::ChannelStopped(_)
         | RuntimeEvent::ChannelFaulted(_)
         | RuntimeEvent::ChannelReconnecting(..)
-        | RuntimeEvent::ChannelReconnected(_)
-        | RuntimeEvent::ChannelReconnectGaveUp(_) => return None,
+        | RuntimeEvent::ChannelReconnected(_) => return None,
         RuntimeEvent::RecordingFaulted(id, tap) => {
             format!("[{}] {} recording faulted", label(id), tap.label())
         }
@@ -879,7 +873,6 @@ mod tests {
             RuntimeEvent::ChannelFaulted(id),
             RuntimeEvent::ChannelReconnecting(id, 3),
             RuntimeEvent::ChannelReconnected(id),
-            RuntimeEvent::ChannelReconnectGaveUp(id),
         ] {
             assert_eq!(format_event(&event, &names), None, "{event:?}");
         }

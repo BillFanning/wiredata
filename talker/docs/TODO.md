@@ -18,11 +18,42 @@ found again. Remove an item when it is done: the commit says what changed.
   override, such as a `--profile-dir` flag, a `TALKER_PROFILE_DIR` variable or a
   GUI setting, so users can point talker elsewhere. That also allows a portable
   "profiles beside the .exe" layout without making it the default.
-- [ ] **File-log retention.** Talker keeps every log file (ADR-061): GUI logs
-  rotate daily, and a CLI profile chooses never, hourly or daily (`FileLogConfig`).
-  Choose an age, count or size limit, and how a failed cleanup is reported, before
-  describing file logging as bounded. `wiredata-log` already deletes files past a
-  caller-given age.
+- [ ] **File-log retention (workspace).** Neither app deletes a log file
+  (ADR-069): talker's GUI logs rotate daily, a CLI profile chooses never, hourly
+  or daily (`FileLogConfig`), and listener's event log rotates daily. If bounded
+  log disk use is wanted, decide who deletes, what limit, and how a failed
+  cleanup is reported, before describing file logging as bounded.
+
+## Retry and backoff (workspace)
+
+Found by a survey of every retry in the workspace on 2026-11-19.
+
+- [ ] **Talker's GUI never retries a failed open.** The supervisor calls
+  `open_and_run`, which reports the failure once; the CLI calls
+  `open_retrying_and_run` (1 s doubling to 30 s, ADR-060). Listener's GUI
+  retries when a channel's reconnect is on. Decide whether talker's GUI should
+  retry too. Once a channel is open, both talker front ends already recover.
+- [ ] **The two CLIs disagree on retrying a failed start (ADR-060).** Talker's
+  retries every channel and cannot be turned off (`--require-all` stops the run
+  instead). Listener's retries only a channel whose `ReconnectPolicy` is
+  enabled, which is off by default, and warns only for recording channels.
+  Decide whether the one contract should make them agree.
+- [ ] **One answer for a device that keeps dropping.** There are three now:
+  listener's reconnect carries the count and wait forward within
+  `RECONNECT_STABLE_AFTER` (ADR-058) and never gives up; listener's
+  recorder slows to `unstable_retry` after `unstable_after` faults within
+  `unstable_window` and never gives up; talker resets to
+  `RETRY_BACKOFF_INITIAL` after every successful send, so it probes at the
+  fastest rate on each drop. Pick one, or record in an ADR why each differs.
+- [ ] **The specs repeat retry numbers, and nothing checks them.** The docs test
+  catches a renamed identifier, not a changed value: if `RETRY_MAX` changes,
+  listener's §9.1 and §55 still say 30 s and no test fails. For a value a user
+  relies on, the spec could name the constant instead of repeating the number,
+  or a test could compare the two. Decide with the next spec change.
+- [ ] **Say why talker's two retry paces differ.** Send failures retry from
+  `RETRY_BACKOFF_INITIAL` to `RETRY_BACKOFF_MAX` (250 ms to 5 s), a failed open
+  from `OPEN_RETRY_FIRST` to `OPEN_RETRY_MAX` (1 s to 30 s). The fast pace suits
+  a scheduled send stream, but no document sets the two side by side.
 
 ## Checks by hand
 

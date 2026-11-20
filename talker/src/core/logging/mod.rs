@@ -111,7 +111,6 @@ impl From<FileLogConfig> for wiredata_log::LogFileConfig {
                 Rotation::Hourly => wiredata_log::Rotation::Hourly,
                 Rotation::Daily => wiredata_log::Rotation::Daily,
             },
-            max_age: None,
         }
     }
 }

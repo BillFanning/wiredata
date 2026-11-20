@@ -1,18 +1,17 @@
-# Listener Specification v2.6.2
+# Listener Specification v2.6.4
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-19) — Linemon's controls:
+Revision note (2026-11-19) — reconnect is on or off, at a fixed pace:
 
-- **§50.3 (ADR-070).** The UDP port number has − and + beside it; serial
-  ports are chosen from the drop-down only. A custom baud rate is typed at
-  the bottom of the baud list. A change that leaves no port chosen marks the
-  display. The checkbox is named Clear display on port change. The UDP
-  settings are two lines, as in a channel's editor, with no More button.
-- **§15.** Port sharing stays in place for unicast, disabled, and says why.
+- **§9.1, §80.1, §162 (ADR-072).** A Channel's `ReconnectPolicy` holds only
+  `enabled`. Reconnecting waits 1 s, doubling to 30 s, and goes on until the
+  Channel starts, the pace a recording's reopen uses. Nothing gives up, so
+  the give-up event and status are gone.
+- **§71.** The reconnect limits are gone with the settings they checked.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -402,20 +401,21 @@ auto-reconnect is enabled:
 Faulted → Starting   (auto-reconnect only, after a backoff delay)
 ```
 
-Auto-reconnect is configured per Channel (`ReconnectPolicy`, §80.1) and is
-**disabled by default**, preserving the manual-recovery semantics above. It
-applies to Serial (covering USB hot-plug, §14.4) and UDP Channels. Each attempt emits a reconnect event (§137); after
-`max_attempts` (if set) the Channel remains Faulted.
+Auto-reconnect is turned on or off per Channel (`ReconnectPolicy`, §80.1) and
+is **disabled by default**, preserving the manual-recovery semantics above. It
+applies to Serial (covering USB hot-plug, §14.4) and UDP Channels. Each attempt
+emits a reconnect event (§137). The first attempt waits 1 s; each failure
+doubles the wait up to 30 s, and attempts go on every 30 s until the Channel
+starts. Nothing gives up (ADR-072). The pace is the one a recording's reopen
+uses (§55), and is not a profile setting.
 
 A successful reconnect does not end the sequence until the Channel has stayed
 up for 60 s (ADR-058). A fault within 60 s of a successful reconnect continues
-it: the next attempt number and the next backoff step, counted towards
-`max_attempts`. The 60 s run from the moment the reconnect's start succeeds,
+it: the next attempt number and the next backoff step. The 60 s run from the moment the reconnect's start succeeds,
 not from when the attempt began, so a slow reopen followed by an immediate fault
 continues the attempt count and the backoff. Only 60 s of staying up, or a
 manual stop, starts the count and the backoff over. A device that connects and drops repeatedly is therefore
-retried at a growing interval and gives up at `max_attempts`, instead of being
-retried at the shortest delay for ever.
+retried at a growing interval, instead of at the shortest delay for ever.
 
 **In the GUI, reconnect is a visible, confirmed choice** (ADR-045):
 
@@ -425,7 +425,7 @@ retried at the shortest delay for ever.
   choice appears, pre-selected to on, and the user confirms either way. A saved
   profile never changes without the user choosing it.
 - Status states the attempt in words — "Reconnecting — attempt 3, next try in
-  8 s", "Gave up after 10 attempts" — never by colour alone.
+  8 s" — never by colour alone.
 
 ## 10. Start and Stop
 
@@ -1016,6 +1016,9 @@ it is not opened from Listener, and Listener need not be running.
 - **A port another program has.** Linemon cannot see which program holds a
   port, Listener included. Opening it fails with the system's reason, which the
   status line shows.
+- **A port that fails.** Linemon never retries or reopens a port by itself, as a
+  Channel with reconnect on does (§9.1). When the port fails, for example when
+  an adapter is unplugged, the status line says why, and Start opens it again.
 - **Display.** Linemon shows the stream in Raw, Rendered or Hex (§42–§47), with
   the view controls a Channel's display has. The data stays on screen when the
   port or a setting changes, and a marker line records each change, naming the
@@ -1507,7 +1510,6 @@ the runtime's constructors shall enforce the same limits:
 | Match rules | ≤ 64 per Channel |
 | Actions on one match rule | ≤ 16 |
 | Mark `separator` | ≤ 256 bytes |
-| `ReconnectPolicy` | initial backoff ≤ max backoff; multiplier 1.0–10 |
 | Recording `size_cap` | ≥ 64 MiB (§59) |
 
 Validation shall reject Record triggers that would record different bytes
@@ -1793,12 +1795,8 @@ pub struct TimestampConfig { pub include_date: bool, pub include_millis: bool, p
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MatchRuleId(uuid::Uuid); // §50.2
 
-pub struct ReconnectPolicy {        // §9.1; enabled defaults false
+pub struct ReconnectPolicy {        // §9.1; enabled defaults false; the pace is fixed (ADR-072)
     pub enabled: bool,
-    pub initial_backoff: std::time::Duration,
-    pub max_backoff: std::time::Duration,
-    pub multiplier: f64,
-    pub max_attempts: Option<u32>,  // None = unlimited
 }
 
 pub enum DiskThreshold { Bytes(u64), Percent(u8) } // §56.2
@@ -2466,8 +2464,8 @@ by both the CLI and the GUI:
   once a minute until that succeeds. The fault is reported once, not at each
   attempt; the recovery is reported once, and a line in the recovered log says
   how long entries are missing.
-- Log files older than 30 days are deleted at start and at each day's rollover.
-  Only log files are deleted, never recordings (§59).
+- Log files are kept: Listener never deletes one. Old files stay until an
+  operator removes them (talker ADR-069).
 - The log is flushed at shutdown. The CLI waits for that at most 2 s (talker
   ADR-061). A worker stuck on a drive or share that stopped answering is left
   behind, and a closing WARNING says the last lines of the log may be missing,
@@ -2864,7 +2862,6 @@ pub enum RuntimeEvent {
     MatchTriggered(ChannelId, MatchRuleId),   // §50.2: a rule fired (Notify/Mark observable here)
     ChannelReconnecting(ChannelId, u32 /*attempt*/), // §9.1
     ChannelReconnected(ChannelId),
-    ChannelReconnectGaveUp(ChannelId),
     DiskSpaceLow(ChannelId),                  // §56.2
     RecordingStoppedLowDisk(ChannelId),
 }
@@ -3225,8 +3222,8 @@ affect reception or Recording (§14.2–§14.3).
 ## 162. Auto-Reconnect
 
 With auto-reconnect enabled on a Serial or UDP Channel, a transport fault shall
-trigger automatic re-Start with backoff (`Faulted → Starting`, §9.1), bounded by
-`max_attempts`. With it disabled (the default), a Faulted Channel stays Faulted.
+trigger automatic re-Start with backoff (`Faulted → Starting`, §9.1) until the
+Channel starts. With it disabled (the default), a Faulted Channel stays Faulted.
 The GUI shall show the choice
 and the attempt in words (§9.1).
 

@@ -492,8 +492,10 @@ mod tests {
 
     fn fast() -> Timings {
         Timings {
-            first_retry: Duration::from_millis(10),
-            max_retry: Duration::from_millis(40),
+            retry: crate::retry::Backoff {
+                first: Duration::from_millis(10),
+                max: Duration::from_millis(40),
+            },
             flush: Duration::from_secs(3600),
             ..Timings::default()
         }

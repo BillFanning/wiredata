@@ -12,6 +12,22 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-19) — event log files are kept:
+
+- **§118 (talker ADR-069).** Event log files are no longer deleted after 30
+  days. They are kept until an operator removes them.
+- **§50.3.** Linemon never retries or reopens a failed port by itself; Start
+  opens it again.
+
+Revision note (2026-11-19) — Linemon's controls:
+
+- **§50.3 (ADR-070).** The UDP port number has − and + beside it; serial
+  ports are chosen from the drop-down only. A custom baud rate is typed at
+  the bottom of the baud list. A change that leaves no port chosen marks the
+  display. The checkbox is named Clear display on port change. The UDP
+  settings are two lines, as in a channel's editor, with no More button.
+- **§15.** Port sharing stays in place for unicast, disabled, and says why.
+
 Revision note (2026-11-16) — the pop-out and the Channel's display pause:
 
 - **§50.4 (ADR-071).** Pausing the Channel's display pauses its pop-out too,

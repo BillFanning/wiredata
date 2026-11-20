@@ -132,10 +132,6 @@ pub(crate) fn status_words(
                 wiredata_ui::format::wait(std::time::Duration::from_secs(secs))
             )
         }
-        (ChannelStatus::Faulted, Some(ReconnectProgress::GaveUp { attempts })) => format!(
-            "Faulted — gave up after {attempts} attempt{}",
-            if attempts == 1 { "" } else { "s" }
-        ),
         _ => status_label(status).to_owned(),
     }
 }
