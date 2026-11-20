@@ -40,6 +40,28 @@ again. Remove an item when it is done: the commit says what changed.
 - [ ] **RS-422 and RS-485 (§14.5).** They follow RS-232; nothing is specific to
   them yet beyond the RTS line of §14.3.
 
+## UDP modes
+
+- [ ] **Simplify the UDP receive modes (§15, ADR-047).** On receive, Broadcast
+  and Unicast differ only in the socket's broadcast option and in whether Request
+  shared port is offered (`udp_mode_and_sharing`). A test on 2026-11-19 found a
+  socket in Unicast mode bound to All interfaces receives both kinds of broadcast;
+  one bound to a single address missed 255.255.255.255, but the sender was the
+  same computer, so check with a second device. Options: merge the two and keep
+  Multicast; or one mode with an optional Group. Do it in Linemon and the channel
+  editor together, not Linemon alone: they share the widget, and Linemon is where
+  a shared port is most used. Port sharing is the catch. A unicast datagram
+  reaches only one of the programs sharing a port, so a merged mode either drops
+  sharing or needs a warning when unicast arrives on a shared port, which means
+  reading each datagram's destination address (`IP_PKTINFO`, `WSARecvMsg`, or
+  `IP_RECVDSTADDR` on macOS).
+- [ ] **Check whether a shared port can take another program's datagrams on
+  Windows.** I believe a socket that sets address reuse can bind a port that
+  another socket holds without it, unless that socket set exclusive use. If so,
+  Linemon in Broadcast with sharing ticked could take unicast datagrams from a
+  Listener channel on the same port, and Listener should set exclusive use on
+  sockets that do not share. Test before the item above.
+
 ## Reconnect
 
 - [ ] **A give-up limit, only if asked for (ADR-072).** Reconnecting never
