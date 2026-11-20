@@ -67,9 +67,10 @@ impl fmt::Display for StopRequest {
 
 /// How long a held Windows stop waits for [`StopHold::finish`]. Windows may end
 /// the process sooner; this only keeps a stop that never finishes from holding
-/// a thread forever.
+/// a thread, and the session, for long. It covers both applications' own stop
+/// limits: talker's is about 6 s and listener's 3 s, each plus 2 s for its log.
 #[cfg(windows)]
-const HOLD_LIMIT: Duration = Duration::from_secs(30);
+const HOLD_LIMIT: Duration = Duration::from_secs(10);
 
 /// A function told about each stop request, on whatever thread received it.
 #[cfg(windows)]

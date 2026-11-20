@@ -1726,7 +1726,7 @@ memory in one Channel. One read now fires at most 4,096 matches (ADR-065).
 ## ADR-049 — OS stop requests come from one shared crate, `wiredata-stop`
 
 **Status:** Accepted 2026-09-30. Implements the stop signals of §3.1 and talker
-ADR-060.
+ADR-060. Amended 2026-11-19: a held stop waits at most 10 s, not 30 s.
 
 **Context:** §3.1 requires Ctrl-C, SIGTERM on Linux, and console close, logoff
 and shutdown on Windows to perform the graceful stop of §113. On Windows,
@@ -1746,7 +1746,8 @@ every OS stop request into one stream for both CLIs.
   `WM_QUERYENDSESSION` and `WM_ENDSESSION`. Message-only windows do not receive
   those broadcasts. On `WM_ENDSESSION` it sends Logoff or Shutdown and holds
   the session until the application says its graceful stop has finished, up to
-  30 s; Windows may end the process sooner.
+  10 s, which covers both applications' own stop limits; Windows may end the
+  process sooner.
 - Every listener is registered before `listen` returns, and one that cannot be
   registered is reported to the application, which decides how to say so.
 - The application owns the meaning: its graceful stop, its time limits and its
