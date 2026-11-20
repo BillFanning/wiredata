@@ -6,18 +6,22 @@
 //! down gracefully on every OS stop request. It contains no business logic —
 //! channel construction lives in `runtime`/`config` (§3, §128).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::config::{describe_channel_errors, templates, ChannelConfig, InterfaceConfig, Profile};
 use crate::core::{ChannelId, ChannelState, RuntimeEvent};
 use crate::diagnostics::{Console, EventLogChange, EventLogStatus};
-use crate::runtime::{Listener, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT};
+use crate::runtime::{
+    Listener, OpenedStart, ReconnectAttempt, ShutdownOutcome, RUNTIME_SHUTDOWN_LIMIT,
+};
 use crate::transport::STALL_WARNING;
 use wiredata_cli::{exit_status, HealthWatch, EXIT_CANNOT_START};
 use wiredata_stop::StopRequests;
@@ -242,11 +246,27 @@ impl RunEnd {
     }
 }
 
+/// Where a run's stop requests come from: the operating system's
+/// ([`StopRequests`]), or a test's.
+trait StopSource {
+    /// The next request, in words; `None` once nothing can send one.
+    async fn next_stop(&mut self) -> Option<String>;
+}
+
+impl StopSource for StopRequests {
+    async fn next_stop(&mut self) -> Option<String> {
+        self.recv().await.map(|request| request.to_string())
+    }
+}
+
+/// The stop reason when every stop listener has ended.
+const STOP_LISTENERS_ENDED: &str = "the stop listeners ended";
+
 async fn run_cli(
     cli: Cli,
     event_log: EventLogStatus,
     console: &Console,
-    stop_requests: &mut StopRequests,
+    stop_requests: &mut impl StopSource,
 ) -> Result<RunEnd> {
     let configs = match build_channel_configs(&cli, console) {
         Ok(configs) if configs.is_empty() => {
@@ -261,83 +281,60 @@ async fn run_cli(
     };
 
     let mut listener = Listener::with_default_capacities();
-    let mut events = listener
+    let events = listener
         .take_events()
         .expect("the event stream is available exactly once");
 
     let mut health = health_watch();
-    let mut recording_faults: HashMap<ChannelId, [u32; 2]> = HashMap::new();
-    let (run, stop_early) = start_channels(
+    let (run, start_end) = start_channels(
         &mut listener,
         configs,
         cli.require_all,
         &mut health,
         console,
+        stop_requests,
     )
     .await;
-    if let Some(why) = stop_early {
-        console.err(format_args!("ERROR: {why} — stopping"));
-        listener.shutdown().await;
-        return Ok(RunEnd::cannot_start());
-    }
     let StartedRun {
         names,
         ids,
         running,
     } = run;
-    console.out(format_args!(
-        "listening on {running} of {} channel(s) — press Ctrl-C to stop",
-        ids.len()
-    ));
-    // Drive auto-reconnect (§162): the orchestrator has no background loop, so the
-    // app ticks it. Channels without reconnect enabled are unaffected. The same
-    // tick checks the event log, so a failure that starts mid-run is reported.
-    let mut reconnect = tokio::time::interval(crate::retry::RECONNECT_CHECK_EVERY);
-    let mut stop_reason = "the event stream closed".to_owned();
-    loop {
-        tokio::select! {
-            request = stop_requests.recv() => {
-                stop_reason = request
-                    .map_or_else(|| "the stop listeners ended".to_owned(), |r| r.to_string());
-                break;
-            }
-            _ = reconnect.tick() => {
-                listener.reconnect_tick().await;
-                observe_health(&listener, &mut health, &ids, &names, console).await;
-                match event_log.tend(Instant::now()) {
-                    Some(EventLogChange::StartedFailing(problem)) => {
-                        console.err(format_args!(
-                            "WARNING: the event log is not being saved: {problem}"
-                        ));
-                    }
-                    Some(EventLogChange::Recovered { after }) => {
-                        console.err(format_args!(
-                            "the event log is being saved again after {}",
-                            wiredata_cli::describe(after)
-                        ));
-                    }
-                    None => {}
-                }
-            }
-            maybe = events.recv() => match maybe {
-                Some(event) => {
-                    if let RuntimeEvent::RecordingFaulted(id, tap) = event {
-                        let slot = match tap {
-                            crate::core::RecordingTap::Raw => 0,
-                            crate::core::RecordingTap::Display => 1,
-                        };
-                        recording_faults.entry(id).or_default()[slot] += 1;
-                    }
-                    if let Some(line) = format_event(&event, &names) {
-                        console.out(line);
-                    }
-                }
-                None => break,
-            },
+    let mut serving = Serving {
+        listener,
+        events,
+        health,
+        names,
+        ids,
+        recording_faults: HashMap::new(),
+    };
+    let stop_reason = match start_end {
+        StartEnd::CannotStart(why) => {
+            console.err(format_args!("ERROR: {why} — stopping"));
+            serving.listener.shutdown().await;
+            return Ok(RunEnd::cannot_start());
         }
-    }
+        StartEnd::Stopped(reason) => reason,
+        StartEnd::Go => {
+            console.out(format_args!(
+                "listening on {running} of {} channel(s) — press Ctrl-C to stop",
+                serving.ids.len()
+            ));
+            serving
+                .until_stopped(console, &event_log, stop_requests)
+                .await
+        }
+    };
+    let Serving {
+        mut listener,
+        health,
+        recording_faults,
+        ..
+    } = serving;
 
     console.out(format_args!("stopping ({stop_reason})…"));
+    // A start still opening when the stop came is left behind: an open cannot
+    // be cancelled, and its Channel is still Starting, which the shutdown skips.
     let outcome = listener.shutdown().await;
     let mut closing = Vec::new();
     if !outcome.is_complete() {
@@ -379,17 +376,33 @@ struct StartedRun {
     running: usize,
 }
 
+/// How the first starts of a run ended.
+#[derive(Debug, PartialEq, Eq)]
+enum StartEnd {
+    /// Serve the run.
+    Go,
+    /// The run cannot go on (exit code 2), for this reason.
+    CannotStart(&'static str),
+    /// A stop request came while a port was still opening, for this reason.
+    Stopped(String),
+}
+
 /// Start what can start (§3.1): a Channel that fails to start is reported and
-/// left to its reconnect policy while the others run. Also returns why the run
+/// left to its reconnect policy while the others run. Also says why the run
 /// cannot go on, when it cannot: `--require-all` with a Channel down, or
 /// nothing running and nothing that will retry (exit code 2).
+///
+/// A stop request is read while each port opens, since an open can take
+/// seconds (ADR-052). The open is then left behind, and the Channels not yet
+/// reached are not started.
 async fn start_channels(
     listener: &mut Listener,
     configs: Vec<ChannelConfig>,
     require_all: bool,
     health: &mut HealthWatch<ChannelId>,
     console: &Console,
-) -> (StartedRun, Option<&'static str>) {
+    stop: &mut impl StopSource,
+) -> (StartedRun, StartEnd) {
     let mut run = StartedRun {
         names: HashMap::new(),
         ids: Vec::new(),
@@ -405,7 +418,21 @@ async fn start_channels(
         run.names.insert(id, name.clone());
         run.ids.push(id);
         health.add(id, &name, retries);
-        match listener.start(id).await {
+        let started = match listener.begin_start(id) {
+            Ok(ticket) => tokio::select! {
+                opened = ticket.open() => listener.finish_start(opened),
+                request = stop.next_stop() => {
+                    let reason = request.unwrap_or_else(|| STOP_LISTENERS_ENDED.to_owned());
+                    let why = "the run was stopped while its port was opening";
+                    if let Some(line) = health.down(id, why, RETRYING, Instant::now()) {
+                        console.err(line);
+                    }
+                    return (run, StartEnd::Stopped(reason));
+                }
+            },
+            Err(err) => Err(err),
+        };
+        match started {
             Ok(()) => {
                 console.out(format_args!("started \"{name}\""));
                 health.up(id, Instant::now());
@@ -418,14 +445,127 @@ async fn start_channels(
             }
         }
     }
-    let stop = if require_all && run.running < run.ids.len() {
-        Some("not every channel started, and --require-all is set")
+    let end = if require_all && run.running < run.ids.len() {
+        StartEnd::CannotStart("not every channel started, and --require-all is set")
     } else if health.nothing_can_run() {
-        Some("no channel started, and none will retry")
+        StartEnd::CannotStart("no channel started, and none will retry")
     } else {
-        None
+        StartEnd::Go
     };
-    (run, stop)
+    (run, end)
+}
+
+/// A run being served, from its first starts until a stop request.
+struct Serving {
+    listener: Listener,
+    events: mpsc::Receiver<RuntimeEvent>,
+    health: HealthWatch<ChannelId>,
+    names: HashMap<ChannelId, String>,
+    /// In start order, for the health lines and the summary.
+    ids: Vec<ChannelId>,
+    /// Recording faults per Channel, raw then display, for the summary.
+    recording_faults: HashMap<ChannelId, [u32; 2]>,
+}
+
+/// A reconnect attempt's open, run off the loop, and the attempt it belongs to.
+type Opening = (ReconnectAttempt, OpenedStart);
+
+impl Serving {
+    /// Serve the run until a stop request, or until the event stream closes,
+    /// and return the reason in words.
+    ///
+    /// Auto-reconnect (§162) is driven here, since the runtime has no loop of
+    /// its own. Each attempt's stop runs on this loop, bounded by the stop
+    /// grace, but its open runs as a task: an open can take seconds
+    /// (ADR-052), and a stop request must not wait for it. The same tick
+    /// checks the event log, so a failure that starts mid-run is reported.
+    async fn until_stopped(
+        &mut self,
+        console: &Console,
+        event_log: &EventLogStatus,
+        stop: &mut impl StopSource,
+    ) -> String {
+        let mut reconnect = tokio::time::interval(crate::retry::RECONNECT_CHECK_EVERY);
+        let mut opening: JoinSet<Opening> = JoinSet::new();
+        let mut opening_ids: HashSet<ChannelId> = HashSet::new();
+        loop {
+            tokio::select! {
+                request = stop.next_stop() => {
+                    // Opens still in flight are dropped with `opening`; their
+                    // Channels are still Starting, which the shutdown skips.
+                    return request.unwrap_or_else(|| STOP_LISTENERS_ENDED.to_owned());
+                }
+                _ = reconnect.tick() => {
+                    self.begin_reconnects(&mut opening, &mut opening_ids).await;
+                    observe_health(&self.listener, &mut self.health, &self.ids, &self.names, console)
+                        .await;
+                    match event_log.tend(Instant::now()) {
+                        Some(EventLogChange::StartedFailing(problem)) => {
+                            console.err(format_args!(
+                                "WARNING: the event log is not being saved: {problem}"
+                            ));
+                        }
+                        Some(EventLogChange::Recovered { after }) => {
+                            console.err(format_args!(
+                                "the event log is being saved again after {}",
+                                wiredata_cli::describe(after)
+                            ));
+                        }
+                        None => {}
+                    }
+                }
+                Some(landed) = opening.join_next(), if !opening.is_empty() => {
+                    // An open that panicked would otherwise leave its Channel
+                    // Starting for good; it ends the run as a panic here would.
+                    let (attempt, opened) = landed.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+                    opening_ids.remove(&attempt.id());
+                    let started = self.listener.finish_start(opened).is_ok();
+                    self.listener.finish_reconnect(attempt, started, Instant::now());
+                }
+                maybe = self.events.recv() => match maybe {
+                    Some(event) => {
+                        if let RuntimeEvent::RecordingFaulted(id, tap) = event {
+                            let slot = match tap {
+                                crate::core::RecordingTap::Raw => 0,
+                                crate::core::RecordingTap::Display => 1,
+                            };
+                            self.recording_faults.entry(id).or_default()[slot] += 1;
+                        }
+                        if let Some(line) = format_event(&event, &self.names) {
+                            console.out(line);
+                        }
+                    }
+                    None => return "the event stream closed".to_owned(),
+                },
+            }
+        }
+    }
+
+    /// Begin the reconnect attempts now due (§9.1): stop each Channel here,
+    /// then hand its open to `opening`. A Channel with an open in flight is not
+    /// due again until that open lands.
+    async fn begin_reconnects(
+        &mut self,
+        opening: &mut JoinSet<Opening>,
+        opening_ids: &mut HashSet<ChannelId>,
+    ) {
+        let due = self
+            .listener
+            .reconnects_due(Instant::now(), |id| opening_ids.contains(&id));
+        for attempt in due {
+            let id = attempt.id();
+            let _ = self.listener.stop(id).await;
+            match self.listener.begin_start(id) {
+                Ok(ticket) => {
+                    opening_ids.insert(id);
+                    opening.spawn(async move { (attempt, ticket.open().await) });
+                }
+                Err(_) => self
+                    .listener
+                    .finish_reconnect(attempt, false, Instant::now()),
+            }
+        }
+    }
 }
 
 /// The warning for a recording Channel whose reconnect is off (§3.1): if its
@@ -585,6 +725,22 @@ fn format_event(event: &RuntimeEvent, names: &HashMap<ChannelId, String>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// A test's stop requests: each string sent is one request.
+    impl StopSource for mpsc::UnboundedReceiver<String> {
+        async fn next_stop(&mut self) -> Option<String> {
+            self.recv().await
+        }
+    }
+
+    /// A stop source that never sends, for a start that must run to the end.
+    fn no_stops() -> (
+        mpsc::UnboundedSender<String>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        mpsc::unbounded_channel()
+    }
 
     fn base_cli() -> Cli {
         Cli {
@@ -631,15 +787,17 @@ mod tests {
         let _events = listener.take_events();
         let (late, _blocker) = blocked_udp_channel("GPS", true);
         let mut health = health_watch();
-        let (run, stop) = start_channels(
+        let (_tx, mut stops) = no_stops();
+        let (run, end) = start_channels(
             &mut listener,
             vec![late, free_udp_channel("AIS")],
             false,
             &mut health,
             &Console::discard(),
+            &mut stops,
         )
         .await;
-        assert_eq!(stop, None);
+        assert_eq!(end, StartEnd::Go);
         assert_eq!(run.running, 1);
         assert!(health.degraded(), "until GPS starts");
         listener.shutdown().await;
@@ -651,15 +809,20 @@ mod tests {
         let _events = listener.take_events();
         let (down, _blocker) = blocked_udp_channel("GPS", false);
         let mut health = health_watch();
-        let (_, stop) = start_channels(
+        let (_tx, mut stops) = no_stops();
+        let (_, end) = start_channels(
             &mut listener,
             vec![down],
             false,
             &mut health,
             &Console::discard(),
+            &mut stops,
         )
         .await;
-        assert_eq!(stop, Some("no channel started, and none will retry"));
+        assert_eq!(
+            end,
+            StartEnd::CannotStart("no channel started, and none will retry")
+        );
         listener.shutdown().await;
     }
 
@@ -669,19 +832,124 @@ mod tests {
         let _events = listener.take_events();
         let (late, _blocker) = blocked_udp_channel("GPS", true);
         let mut health = health_watch();
-        let (_, stop) = start_channels(
+        let (_tx, mut stops) = no_stops();
+        let (_, end) = start_channels(
             &mut listener,
             vec![late, free_udp_channel("AIS")],
             true,
             &mut health,
             &Console::discard(),
+            &mut stops,
         )
         .await;
         assert_eq!(
-            stop,
-            Some("not every channel started, and --require-all is set")
+            end,
+            StartEnd::CannotStart("not every channel started, and --require-all is set")
         );
         listener.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_a_slow_first_open_ends_the_start() {
+        // A port can take 10 s to open (ADR-052). A stop request that arrives
+        // meanwhile ends the start at once instead of waiting for the open,
+        // and the Channels not yet reached are not started.
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        listener.delay_opens_for_test(Duration::from_secs(10));
+        let mut health = health_watch();
+        let (tx, mut stops) = no_stops();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send("the test's stop".to_owned());
+        });
+        let asked = Instant::now();
+        let (run, end) = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_channels(
+                &mut listener,
+                vec![free_udp_channel("GPS"), free_udp_channel("AIS")],
+                false,
+                &mut health,
+                &Console::discard(),
+                &mut stops,
+            ),
+        )
+        .await
+        .expect("the start waited for the open");
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert_eq!(end, StartEnd::Stopped("the test's stop".to_owned()));
+        assert_eq!(run.ids.len(), 1, "AIS was not reached");
+        assert_eq!(listener.state(run.ids[0]), Some(ChannelState::Starting));
+        let outcome = listener.shutdown().await;
+        assert!(outcome.is_complete(), "the open left behind is skipped");
+    }
+
+    #[tokio::test]
+    async fn a_stop_is_read_while_a_reconnect_is_still_opening() {
+        // A Channel reconnecting to a port that is slow to open must not hold
+        // up a stop request: the other Channels' recordings have to finish
+        // within the time the operating system gives a logoff or shutdown.
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        listener.set_reconnect_backoff_for_test(crate::retry::Backoff {
+            first: Duration::from_millis(1),
+            max: Duration::from_millis(1),
+        });
+        let (late, _blocker) = blocked_udp_channel("GPS", true);
+        let mut health = health_watch();
+        let (tx, mut stops) = no_stops();
+        let (run, end) = start_channels(
+            &mut listener,
+            vec![late, free_udp_channel("AIS")],
+            false,
+            &mut health,
+            &Console::discard(),
+            &mut stops,
+        )
+        .await;
+        assert_eq!(end, StartEnd::Go);
+        let gps = run.ids[0];
+        // From here every open takes 10 s, so GPS's next attempt is slow.
+        listener.delay_opens_for_test(Duration::from_secs(10));
+        let mut serving = Serving {
+            listener,
+            events,
+            health,
+            names: run.names,
+            ids: run.ids,
+            recording_faults: HashMap::new(),
+        };
+        // The first reconnect check arms GPS's retry, the next one 500 ms later
+        // makes the attempt; the stop comes while its open is outstanding.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            let _ = tx.send("the test's stop".to_owned());
+        });
+        let reason = tokio::time::timeout(
+            Duration::from_secs(5),
+            serving.until_stopped(&Console::discard(), &EventLogStatus::absent(), &mut stops),
+        )
+        .await
+        .expect("the stop waited for the open");
+        assert_eq!(reason, "the test's stop");
+        assert_eq!(
+            serving.listener.state(gps),
+            Some(ChannelState::Starting),
+            "GPS's open was still outstanding"
+        );
+        let asked = Instant::now();
+        let outcome = serving.listener.shutdown().await;
+        assert!(outcome.is_complete());
+        assert!(
+            asked.elapsed() < Listener::STOP_GRACE,
+            "{:?}",
+            asked.elapsed()
+        );
     }
 
     #[test]

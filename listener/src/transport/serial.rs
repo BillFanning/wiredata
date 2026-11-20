@@ -236,8 +236,10 @@ impl SerialTransport {
     }
 
     /// The control lines as this transport leaves them at open: the outputs it
-    /// sets, and everything else not asserted. A line left at the OS default
-    /// cannot be read back, so it is shown as not asserted.
+    /// sets, and everything else not asserted. An output cannot be read back,
+    /// so one left at the OS default is reported as not asserted, which may be
+    /// untrue. Listener's build sets both at open (ADR-073) except RTS under
+    /// RTS/CTS flow control, which the GUI shows as set by flow control.
     fn opened_lines(&self) -> SerialControlLines {
         SerialControlLines {
             rts: self.rts.unwrap_or(false),

@@ -1541,8 +1541,9 @@ impl Driver {
 
     /// Set RTS (`rts`) or DTR on Linemon's hidden Channel, while the window
     /// has its port open and no newer request waits (§161). A line its serial
-    /// reader did not take in time is not reported: the window shows the lines
-    /// as the next poll reads them, so it shows what the port did.
+    /// reader did not take in time is not reported: the shown level changes
+    /// only when the reader sets the line, so the window still shows the level
+    /// last set.
     async fn linemon_set_line(&mut self, rts: bool, on: bool) {
         let Some(id) = self
             .linemon

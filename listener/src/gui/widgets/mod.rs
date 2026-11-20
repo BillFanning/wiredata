@@ -12,7 +12,8 @@ pub(super) use match_rule_editor::edit_mark_rules;
 pub(super) use recording_editor::{edit_display_recording, edit_raw_recording};
 pub(super) use status::{
     line_indicator, line_toggle, paint_glyph, recording_facts, recording_glyph_size,
-    recording_indicator, start_button, status_color, status_glyph, status_words, stop_enabled,
+    recording_indicator, rts_by_flow_control, rts_set_by_flow_control, start_button, status_color,
+    status_glyph, status_words, stop_enabled,
 };
 pub(super) use wiredata_ui::format::human_bytes;
 

@@ -1,5 +1,7 @@
-//! How Listener paces a retry (§9.1, §55). Reconnecting a Channel and reopening
-//! a recording use the same pace, from here, so the two cannot drift apart.
+//! How Listener paces a retry (§9.1, §56). Reconnecting a Channel and reopening
+//! a recording use the same base pace, from here, so the two cannot drift apart.
+//! The recorder alone also slows to one try every 5 minutes after repeated
+//! faults (§56).
 //! Talker paces its open retry the same way with its own constants
 //! (`OPEN_RETRY_FIRST` and `OPEN_RETRY_MAX` in its runner).
 

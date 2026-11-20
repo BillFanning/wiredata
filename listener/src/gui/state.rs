@@ -796,9 +796,10 @@ impl AppState {
 /// alone: they resolve within the runtime's own command call, and the event (or
 /// the next poll) settles the row without flapping it through an intermediate.
 fn reconcile_status(view: &mut ChannelView, state: ChannelState, reconnect_pending: bool) {
-    // A stopped Channel has no live control lines, so a dropped stop event
-    // cannot leave them on screen.
-    if state == ChannelState::Stopped {
+    // Only a running Channel has live control lines: a stopped one has none,
+    // and a faulted one's reader has ended. A dropped event cannot leave them
+    // on screen.
+    if state != ChannelState::Running {
         view.control_lines = None;
     }
     view.status = match state {
@@ -1169,6 +1170,31 @@ mod tests {
         assert!(state.channel(id).unwrap().control_lines.is_some());
         state.apply(stats_with_state(id, ChannelState::Stopped, false));
         assert!(state.channel(id).unwrap().control_lines.is_none());
+    }
+
+    #[test]
+    fn a_poll_showing_a_fault_clears_the_control_lines() {
+        // The reader that kept the lines current ended with the fault, so its
+        // last levels must not stay on screen as if live, retrying or not.
+        for reconnect_pending in [false, true] {
+            let mut state = AppState::default();
+            let id = ChannelId::new();
+            state.apply(added(id, "A", "d"));
+            state.apply(stats_with_state(id, ChannelState::Running, false));
+            state.apply(UiUpdate::ControlLines(
+                id,
+                crate::transport::SerialControlLines::default(),
+            ));
+            state.apply(stats_with_state(
+                id,
+                ChannelState::Faulted,
+                reconnect_pending,
+            ));
+            assert!(
+                state.channel(id).unwrap().control_lines.is_none(),
+                "reconnect pending: {reconnect_pending}"
+            );
+        }
     }
 
     #[test]

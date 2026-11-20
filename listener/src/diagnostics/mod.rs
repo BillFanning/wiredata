@@ -285,6 +285,12 @@ pub struct EventLogStatus {
 }
 
 impl EventLogStatus {
+    /// The status of a run with no event log (tests only).
+    #[cfg(test)]
+    pub(crate) fn absent() -> Self {
+        EventLog::unavailable(None, "this test writes no event log".to_owned()).status
+    }
+
     /// The folder the event log is written to, when there is one.
     pub fn folder(&self) -> Option<&Path> {
         self.folder.as_deref()

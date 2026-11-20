@@ -190,6 +190,25 @@ pub(crate) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Re
         ))
 }
 
+/// Whether RTS is the flow control's to set rather than the user's: under
+/// RTS/CTS flow control (§161, ADR-073). Listener leaves it alone at open
+/// then, so its level is not known and there is no button for it.
+pub(crate) fn rts_set_by_flow_control(interface: &crate::config::InterfaceConfig) -> bool {
+    matches!(
+        interface,
+        crate::config::InterfaceConfig::Serial(serial)
+            if serial.flow_control == crate::config::FlowControl::RtsCts
+    )
+}
+
+/// What stands in for the RTS button under RTS/CTS flow control, in words.
+pub(crate) fn rts_by_flow_control(ui: &mut egui::Ui) {
+    ui.label("RTS set by flow control").on_hover_text(
+        "With RTS/CTS flow control, RTS belongs to the flow control, so it is not set \
+         from here and its level is not shown.",
+    );
+}
+
 /// The color for a status glyph. The distinct glyphs `●`/`■`/`⚠` are the primary
 /// signal and colour reinforces them, which is why this readout survived the
 /// colour-deficiency problem that the control lines above did not.
@@ -242,7 +261,26 @@ pub(crate) use wiredata_ui::glyphs::paint_glyph;
 
 #[cfg(test)]
 mod tests {
-    use super::line_glyph;
+    use super::{line_glyph, rts_set_by_flow_control};
+
+    #[test]
+    fn rts_is_the_flow_controls_only_under_rts_cts() {
+        use crate::config::{templates, FlowControl, InterfaceConfig};
+        let mut serial = templates::serial_template().interface;
+        for (flow, theirs) in [
+            (FlowControl::None, false),
+            (FlowControl::XonXoff, false),
+            (FlowControl::RtsCts, true),
+        ] {
+            if let InterfaceConfig::Serial(config) = &mut serial {
+                config.flow_control = flow;
+            }
+            assert_eq!(rts_set_by_flow_control(&serial), theirs, "{flow:?}");
+        }
+        assert!(!rts_set_by_flow_control(
+            &templates::udp_template().interface
+        ));
+    }
 
     /// The two control-line levels must be distinguishable with the colour
     /// removed — that is the whole point of the glyph, and the defect it fixed.

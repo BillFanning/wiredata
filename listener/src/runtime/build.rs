@@ -107,13 +107,29 @@ pub fn build_serial(
         .with_parity(map_parity(config.parity)?)
         .with_stop_bits(map_stop_bits(config.stop_bits)?)
         .with_flow_control(map_flow_control(config.flow_control));
-    if let Some(rts) = config.rts {
+    let (rts, dtr) = lines_at_open(config);
+    if let Some(rts) = rts {
         transport = transport.with_rts(rts);
     }
-    if let Some(dtr) = config.dtr {
+    if let Some(dtr) = dtr {
         transport = transport.with_dtr(dtr);
     }
     Ok(transport)
+}
+
+/// The RTS and DTR levels to set at open (§14.2, ADR-073), as `(rts, dtr)`.
+///
+/// Listener cannot read an output line back, so what it shows is what it set.
+/// A line the profile leaves unset is therefore set low, which makes the shown
+/// level true whatever the operating system's default. The exception is RTS
+/// under RTS/CTS flow control: that is the driver's to set, so it is left
+/// alone (`None`) and shown as set by flow control.
+fn lines_at_open(config: &SerialConfig) -> (Option<bool>, Option<bool>) {
+    let rts = match config.flow_control {
+        CfgFlowControl::RtsCts => config.rts,
+        CfgFlowControl::None | CfgFlowControl::XonXoff => config.rts.or(Some(false)),
+    };
+    (rts, config.dtr.or(Some(false)))
 }
 
 fn socket_addr(address: &str, port: u16) -> Result<SocketAddr, BuildError> {
@@ -159,6 +175,51 @@ pub fn build_udp(channel_id: ChannelId, config: &UdpConfig) -> Result<UdpTranspo
 mod tests {
     use super::*;
     use crate::core::ChannelId;
+
+    fn serial(flow: CfgFlowControl, rts: Option<bool>, dtr: Option<bool>) -> SerialConfig {
+        let crate::config::InterfaceConfig::Serial(mut config) =
+            crate::config::templates::serial_template().interface
+        else {
+            unreachable!("the serial template is serial");
+        };
+        config.flow_control = flow;
+        config.rts = rts;
+        config.dtr = dtr;
+        config
+    }
+
+    #[test]
+    fn an_output_line_left_unset_is_set_low_at_open() {
+        // Listener cannot read an output line back, so it shows what it set.
+        // Setting both at open makes that true on every operating system.
+        for flow in [CfgFlowControl::None, CfgFlowControl::XonXoff] {
+            assert_eq!(
+                lines_at_open(&serial(flow, None, None)),
+                (Some(false), Some(false)),
+                "{flow:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rts_is_left_to_the_driver_under_rts_cts_flow_control() {
+        assert_eq!(
+            lines_at_open(&serial(CfgFlowControl::RtsCts, None, None)),
+            (None, Some(false))
+        );
+    }
+
+    #[test]
+    fn a_profile_that_sets_a_line_keeps_its_choice() {
+        assert_eq!(
+            lines_at_open(&serial(CfgFlowControl::None, Some(true), Some(true))),
+            (Some(true), Some(true))
+        );
+        assert_eq!(
+            lines_at_open(&serial(CfgFlowControl::RtsCts, Some(true), None)),
+            (Some(true), Some(false))
+        );
+    }
 
     #[test]
     fn unsupported_serial_parameters_are_rejected() {

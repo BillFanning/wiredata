@@ -28,7 +28,7 @@ use super::bind_scope::LocalAddresses;
 use super::bridge::{LinemonUpdate, UiCommand};
 use super::linemon::LinemonStream;
 use super::view_prefs::ViewPrefs;
-use super::widgets::line_indicator;
+use super::widgets::{line_indicator, rts_by_flow_control, rts_set_by_flow_control};
 use super::widgets::{
     list_serial_ports, template_for, udp_bind_choice, udp_mode_and_sharing, AddKind, Refresh,
     BAUD_RATES, DATA_BITS, FLOW_CONTROL, PARITY, STOP_BITS, UDP_MODE_HOVER, UDP_PORT_HOVER,
@@ -314,6 +314,18 @@ fn step_udp_port(port: u16, step: i32) -> u16 {
     next.clamp(1, i32::from(u16::MAX)) as u16
 }
 
+/// The baud rate to apply from the custom box: only when the box has lost the
+/// keyboard, no preset was chosen in the same frame, and the text, ignoring
+/// spaces around it, is a whole number above 0. A clicked preset wins because
+/// egui takes the box's focus away on the click, which is the frame the preset
+/// is set, so the box would otherwise overwrite it with the text typed before.
+fn custom_baud(lost_focus: bool, preset_chosen: bool, text: &str) -> Option<u32> {
+    if !lost_focus || preset_chosen {
+        return None;
+    }
+    text.trim().parse::<u32>().ok().filter(|&rate| rate > 0)
+}
+
 // ---------------------------------------------------------------------------
 // Status line
 // ---------------------------------------------------------------------------
@@ -391,7 +403,13 @@ fn status_line(facts: &StatusFacts) -> StatusLine {
         problem: true,
     };
     let Some(key) = port_key(facts.interface) else {
-        return ok("Choose a port, then press Start.".to_owned());
+        // Started, Start is disabled and a port chosen now opens at once, so
+        // Start is only mentioned while Linemon is stopped.
+        return ok(if facts.started {
+            "Choose a port. Linemon opens it as soon as you choose one.".to_owned()
+        } else {
+            "Choose a port, then press Start.".to_owned()
+        });
     };
     let port = describe_port(&key);
     if !facts.started {
@@ -490,6 +508,9 @@ impl Linemon {
     pub fn new(stored: Option<&str>) -> Self {
         let settings = LinemonSettings::from_stored(stored);
         let prefs = settings.prefs();
+        // The source the window opens on is already drawn, so only a change of
+        // source fades in.
+        let drawn_kind = settings.kind;
         Self {
             stream: LinemonStream::new(prefs.scroll_buffer_bytes),
             settings,
@@ -510,7 +531,7 @@ impl Linemon {
             copy_all: false,
             editing_text: false,
             min_width: MIN_SIZE[0],
-            drawn_kind: SourceKind::default(),
+            drawn_kind,
             kind_changed_at: f64::NEG_INFINITY,
         }
     }
@@ -562,6 +583,10 @@ impl Linemon {
             LinemonUpdate::Error(reason) => {
                 if self.sent.is_some() {
                     self.open_error = Some(reason);
+                    // The port did not open, so nothing of a run is current:
+                    // not a reading that landed late from the previous port.
+                    self.run = None;
+                    self.control_lines = None;
                 }
             }
             LinemonUpdate::ControlLines(lines) => {
@@ -808,6 +833,7 @@ impl Linemon {
             .width(width)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show_ui(ui, |ui| {
+                let mut preset_chosen = false;
                 for &rate in BAUD_RATES {
                     let chosen = ui
                         .selectable_value(
@@ -817,6 +843,7 @@ impl Linemon {
                         )
                         .clicked();
                     if chosen {
+                        preset_chosen = true;
                         ui.close();
                     }
                 }
@@ -827,17 +854,15 @@ impl Linemon {
                         .desired_width(ui.available_width())
                         .hint_text("custom"),
                 );
-                if custom.lost_focus() {
-                    if let Ok(rate) = self.baud_text.trim().parse::<u32>() {
-                        if rate > 0 {
-                            self.settings.serial.baud_rate = rate;
-                        }
-                    }
-                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        ui.close();
-                    }
+                // A preset clicked this frame wins over text typed in the box.
+                if let Some(rate) = custom_baud(custom.lost_focus(), preset_chosen, &self.baud_text)
+                {
+                    self.settings.serial.baud_rate = rate;
                 }
-                if !custom.has_focus() {
+                if custom.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    ui.close();
+                }
+                if preset_chosen || !custom.has_focus() {
                     self.baud_text.clear();
                 }
             });
@@ -862,10 +887,12 @@ impl Linemon {
 
     /// The serial port's second line: flow control, then the control lines
     /// (§161). RTS and DTR are outputs this computer sets: a click sets the
-    /// line the other way. CTS, DSR, DCD and RI are inputs it reads, filled when
-    /// high. The lines are live only while the port is open, and greyed out
-    /// otherwise. What they show is what the port last reported, not what was
-    /// asked for.
+    /// line the other way. An output cannot be read back, so what is shown is
+    /// what was set: low at open (ADR-073), then what a click set. Under RTS/CTS
+    /// flow control RTS is the flow control's, so it has no button. CTS, DSR,
+    /// DCD and RI are inputs read from the port, filled when high. The lines
+    /// are live only while the port is running; otherwise they are greyed out
+    /// and a sentence says why.
     fn serial_lines(&mut self, ui: &mut egui::Ui, out: &mut Vec<UiCommand>) {
         option_combo(
             ui,
@@ -875,10 +902,13 @@ impl Linemon {
             FLOW_CONTROL,
         );
         ui.separator();
-        let live = self.control_lines;
+        let live = self.live_control_lines();
         let lines = live.unwrap_or_default();
+        let rts_by_flow = rts_set_by_flow_control(&self.settings.interface());
         ui.add_enabled_ui(live.is_some(), |ui| {
-            if ui
+            if rts_by_flow {
+                rts_by_flow_control(ui);
+            } else if ui
                 .radio(lines.rts, "RTS")
                 .on_hover(&output_line_hover("RTS (Request To Send)", lines.rts))
                 .clicked()
@@ -902,6 +932,11 @@ impl Linemon {
                 line_indicator(ui, name, high);
             }
         });
+        if live.is_none() {
+            // Greyed out alone would not say why, and disabled widgets show no
+            // hover; hollow circles would otherwise read as lines that are low.
+            ui.weak("The lines show while the port is open.");
+        }
     }
 
     fn udp_controls(
@@ -959,6 +994,17 @@ impl Linemon {
         !(self.started && self.sent.is_some() && self.open_error.is_none() && !faulted)
     }
 
+    /// The control lines to show as live: the last reading, while the hidden
+    /// Channel is known to be running. A faulted port's last reading stays
+    /// behind, but the reader that kept it current has ended.
+    fn live_control_lines(&self) -> Option<SerialControlLines> {
+        let running = self
+            .run
+            .as_ref()
+            .is_some_and(|r| r.state == ChannelState::Running);
+        self.control_lines.filter(|_| running)
+    }
+
     /// Start: open the port in the bar.
     fn press_start(&mut self) {
         self.started = true;
@@ -986,7 +1032,6 @@ impl Linemon {
             self.started = false;
             self.open_error = None;
             self.run = None;
-            self.control_lines = None;
             self.control_lines = None;
         }
         let pause_label = if self.paused { "Resume" } else { "Pause" };
@@ -1130,8 +1175,6 @@ fn combo_width<'a>(ui: &egui::Ui, texts: impl IntoIterator<Item = &'a str>) -> f
     widest + spacing.icon_width + spacing.icon_spacing + spacing.button_padding.x * 2.0
 }
 
-/// A label and a drop-down over a table of (value, text) options, as wide as
-/// its longest option.
 /// The hover of an output line's button: what the line is, its level now, and
 /// what a click does.
 fn output_line_hover(name: &str, high: bool) -> Hover {
@@ -1146,6 +1189,8 @@ fn output_line_hover(name: &str, high: bool) -> Hover {
     ])
 }
 
+/// A label and a drop-down over a table of (value, text) options, as wide as
+/// its longest option.
 fn option_combo<T: PartialEq + Copy>(
     ui: &mut egui::Ui,
     salt: &str,
@@ -1386,6 +1431,45 @@ mod tests {
         assert!(is_port_change(&PortKey::Udp(5005), &com4));
     }
 
+    // ---- custom baud rate ----
+
+    #[test]
+    fn a_chosen_preset_wins_over_text_in_the_custom_box() {
+        assert_eq!(custom_baud(true, true, "23456"), None);
+        assert_eq!(custom_baud(false, true, "23456"), None);
+    }
+
+    #[test]
+    fn a_custom_rate_applies_when_the_box_is_left() {
+        assert_eq!(custom_baud(true, false, "23456"), Some(23_456));
+    }
+
+    #[test]
+    fn a_custom_rate_does_not_apply_while_the_box_has_the_keyboard() {
+        assert_eq!(custom_baud(false, false, "23456"), None);
+    }
+
+    #[test]
+    fn half_typed_or_non_numeric_text_is_not_a_custom_rate() {
+        assert_eq!(custom_baud(true, false, ""), None);
+        assert_eq!(custom_baud(true, false, "   "), None);
+        assert_eq!(custom_baud(true, false, "96x"), None);
+        assert_eq!(custom_baud(true, false, "abc"), None);
+        assert_eq!(custom_baud(true, false, "-9600"), None);
+        assert_eq!(custom_baud(true, false, "99999999999"), None);
+    }
+
+    #[test]
+    fn a_custom_rate_of_zero_is_not_applied() {
+        assert_eq!(custom_baud(true, false, "0"), None);
+        assert_eq!(custom_baud(true, false, " 000 "), None);
+    }
+
+    #[test]
+    fn spaces_around_a_custom_rate_are_ignored() {
+        assert_eq!(custom_baud(true, false, "  57600 "), Some(57_600));
+    }
+
     // ---- stepping ----
 
     #[test]
@@ -1427,7 +1511,20 @@ mod tests {
     fn the_status_says_what_to_do_when_nothing_is_chosen_or_started() {
         let none = ser("");
         let mut f = facts(&none);
+        // Started with no port: Start is disabled and choosing a port opens it,
+        // so the line does not tell the user to press Start.
+        assert_eq!(
+            text(&f),
+            "Choose a port. Linemon opens it as soon as you choose one."
+        );
+        f.started = false;
         assert_eq!(text(&f), "Choose a port, then press Start.");
+        let none_udp = net(0);
+        let mut f = facts(&none_udp);
+        assert_eq!(
+            text(&f),
+            "Choose a port. Linemon opens it as soon as you choose one."
+        );
         f.started = false;
         assert_eq!(text(&f), "Choose a port, then press Start.");
         let com4 = ser("COM4");
@@ -1830,6 +1927,38 @@ mod tests {
     }
 
     #[test]
+    fn control_lines_are_live_only_while_the_port_runs() {
+        // A port that faulted (an adapter unplugged) still has its last
+        // reading, but the reader behind it has ended: the lines are not live.
+        let run = |state| RunFacts {
+            state,
+            bytes_total: 0,
+            bytes_per_sec: 0.0,
+            fault: None,
+        };
+        let mut l = started_on("COM4");
+        let mut out = Vec::new();
+        l.sync(&mut out);
+        let high = SerialControlLines {
+            cts: true,
+            ..SerialControlLines::default()
+        };
+        l.handle(LinemonUpdate::ControlLines(high));
+        assert_eq!(l.live_control_lines(), None, "not known to be running yet");
+        l.run = Some(run(ChannelState::Running));
+        assert_eq!(l.live_control_lines(), Some(high));
+        l.run = Some(run(ChannelState::Faulted));
+        assert_eq!(l.live_control_lines(), None, "faulted");
+
+        // A reading from the previous port can land after a switch. If the new
+        // port then fails to open, nothing of the old run is left showing.
+        l.run = Some(run(ChannelState::Running));
+        l.handle(LinemonUpdate::Error("COM5 is in use".into()));
+        assert_eq!(l.live_control_lines(), None, "the open failed");
+        assert!(l.run.is_none());
+    }
+
+    #[test]
     fn stopping_adds_no_marker() {
         let mut l = started_on("COM4");
         let mut out = Vec::new();
@@ -1846,6 +1975,19 @@ mod tests {
         let mut l = Linemon::new(None);
         l.handle(LinemonUpdate::Error("late".into()));
         assert_eq!(l.open_error, None);
+    }
+
+    #[test]
+    fn only_a_change_of_source_fades_in_not_the_source_a_launch_opens_on() {
+        assert_eq!(Linemon::new(None).drawn_kind, SourceKind::Serial);
+        let stored = LinemonSettings {
+            kind: SourceKind::Udp,
+            ..Default::default()
+        }
+        .to_stored();
+        let l = Linemon::new(Some(&stored));
+        assert_eq!(l.settings.kind, SourceKind::Udp);
+        assert_eq!(l.drawn_kind, SourceKind::Udp);
     }
 
     #[test]

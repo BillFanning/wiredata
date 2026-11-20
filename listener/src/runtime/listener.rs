@@ -492,6 +492,8 @@ struct ManagedChannel {
     /// is still the newest retained entry. Cleared when a run's log replaces
     /// the retained list.
     repeated_start_fault: Option<RepeatedStartFault>,
+    /// The start fault last written to the event log, until a start works.
+    start_fault_log: Option<StartFaultLog>,
     /// The last run's telemetry, retained across Stop like the diagnostics — a
     /// stopped channel keeps reading its exact byte total at rest. Replaced by
     /// each run's final snapshot; the *next start* is what resets the readout.
@@ -506,6 +508,23 @@ struct ManagedChannel {
 struct RepeatedStartFault {
     message: String,
     count: u64,
+}
+
+/// How often a start fault that keeps repeating is written to the event log
+/// again (§118, ADR-072): the first failure at once, then at most one line per
+/// interval, with how many failures it did not write. A reconnect retries every
+/// 30 s for as long as the fault lasts, and the log is never pruned (talker
+/// ADR-069), so a line per failure would grow it by thousands a day.
+const REPEATED_START_FAULT_LOG_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// The last start fault written to the event log, for
+/// [`REPEATED_START_FAULT_LOG_EVERY`].
+struct StartFaultLog {
+    message: String,
+    /// When a line about it was last written.
+    logged_at: Instant,
+    /// Failures since that line that were not written.
+    unlogged: u64,
 }
 
 impl ManagedChannel {
@@ -567,6 +586,48 @@ impl ManagedChannel {
         self.retained_diagnostics_snapshot = Arc::new(DiagnosticsSnapshot::from_diagnostics(
             self.retained_diagnostics.iter().cloned(),
         ));
+    }
+
+    /// The event-log line for a start fault, when one is due (§118): a fault
+    /// different from the last one written goes in at once; the same one again
+    /// is counted, and written once per [`REPEATED_START_FAULT_LOG_EVERY`] with
+    /// the count. The retained diagnostics count every failure regardless.
+    fn start_fault_log_line(
+        &mut self,
+        diagnostic: &crate::diagnostics::Diagnostic,
+        now: Instant,
+    ) -> Option<crate::diagnostics::Diagnostic> {
+        match self.start_fault_log.as_mut() {
+            Some(log) if log.message == diagnostic.message => {
+                log.unlogged += 1;
+                if now.saturating_duration_since(log.logged_at) < REPEATED_START_FAULT_LOG_EVERY {
+                    return None;
+                }
+                let line = crate::diagnostics::Diagnostic::new(
+                    diagnostic.severity,
+                    format!(
+                        "{} (still failing: {} more times since the last line about it)",
+                        diagnostic.message, log.unlogged
+                    ),
+                );
+                log.logged_at = now;
+                log.unlogged = 0;
+                Some(line)
+            }
+            _ => {
+                self.start_fault_log = Some(StartFaultLog {
+                    message: diagnostic.message.clone(),
+                    logged_at: now,
+                    unlogged: 0,
+                });
+                Some(diagnostic.clone())
+            }
+        }
+    }
+
+    /// A start worked, so the next start fault is news and is written at once.
+    fn start_worked(&mut self) {
+        self.start_fault_log = None;
     }
 
     /// Whether an auto-reconnect is armed or in progress (§9.1) — the poll-lane
@@ -654,6 +715,12 @@ impl Listener {
         self.open_delay = Some(delay);
     }
 
+    /// Reconnect at `backoff`'s pace instead of `crate::retry`'s (tests only).
+    #[cfg(test)]
+    pub(crate) fn set_reconnect_backoff_for_test(&mut self, backoff: crate::retry::Backoff) {
+        self.reconnect_backoff = backoff;
+    }
+
     pub fn with_default_capacities() -> Self {
         Self::new(PipelineCapacities::default())
     }
@@ -684,6 +751,7 @@ impl Listener {
                 retained_diagnostics: Vec::new(),
                 retained_diagnostics_snapshot: Arc::new(DiagnosticsSnapshot::default()),
                 repeated_start_fault: None,
+                start_fault_log: None,
                 retained: RetainedTelemetry::default(),
                 active_run: None,
                 last_run_summary: None,
@@ -991,11 +1059,18 @@ impl Listener {
     /// pull side of `ControlLinesChanged`); `None` if it is not a running serial
     /// Channel.
     ///
-    /// `None` means exactly that — not a running serial Channel. A poisoned cell
-    /// recovers its last value (`core::sync`) rather than reporting `None`, which
-    /// the GUI would read as "no serial panel here" and hide the lines entirely.
+    /// `None` means exactly that — not a running serial Channel. A faulted
+    /// Channel keeps its control cell until it is stopped, but the reader that
+    /// kept the cell current has ended, so its last levels are not served. A
+    /// poisoned cell recovers its last value (`core::sync`) rather than
+    /// reporting `None`, which the GUI would read as "no serial panel here" and
+    /// hide the lines entirely.
     pub fn serial_control_lines(&self, id: ChannelId) -> Option<SerialControlLines> {
-        let control = self.channels.get(&id)?.serial_control.as_ref()?;
+        let channel = self.channels.get(&id)?;
+        if channel.effective_state() != ChannelState::Running {
+            return None;
+        }
+        let control = channel.serial_control.as_ref()?;
         Some(*lock_recover(&control.state))
     }
 
@@ -1118,6 +1193,7 @@ impl Listener {
                 let (handle, serial_control) = self.wire(id, &config, interface, caps, faulted);
                 let display_pause = Some(handle.display_pause().clone());
                 if let Some(channel) = self.channels.get_mut(&id) {
+                    channel.start_worked();
                     channel.handle = Some(handle);
                     *lock_recover(&channel.last_good) = LastGood::default();
                     channel.display_pause = display_pause;
@@ -1140,9 +1216,12 @@ impl Listener {
                     let name = channel.config.name.as_str().to_owned();
                     let diagnostic =
                         crate::diagnostics::Diagnostic::error(format!("{name}: {err}"));
-                    // Every failed attempt reaches the event log (§118), even when the
-                    // retained list merges it into one counted entry.
-                    crate::diagnostics::emit_to_event_log(&name, id, &diagnostic);
+                    // The event log gets a new fault at once and the same one
+                    // again at most once per interval, with a count (§118); the
+                    // retained list merges repeats into one counted entry.
+                    if let Some(line) = channel.start_fault_log_line(&diagnostic, Instant::now()) {
+                        crate::diagnostics::emit_to_event_log(&name, id, &line);
+                    }
                     channel.retain_diagnostic(diagnostic, limit);
                 }
                 let _ = self.events_tx.try_send(RuntimeEvent::ChannelFaulted(id));
@@ -1543,14 +1622,19 @@ impl Listener {
         name
     }
 
-    /// Drive auto-reconnect (§9.1, §162). The application calls this periodically;
-    /// the orchestrator has no background loop (ADR-006). For each Channel that is
-    /// effectively Faulted with reconnect enabled, the first call arms a backoff
-    /// timer; once the backoff elapses, this performs a Stop+Start reconnect
+    /// Drive auto-reconnect (§9.1, §162), waiting for each attempt's open. The
+    /// orchestrator has no background loop (ADR-006). The CLI and the GUI's
+    /// driver run the phases themselves instead, through
+    /// [`reconnects_due`](Self::reconnects_due), so that a slow open does not
+    /// hold them up (ADR-052); this serves a caller that can wait.
+    ///
+    /// For each Channel that is effectively Faulted with reconnect enabled, the
+    /// first call arms a backoff timer; once the backoff elapses, this performs
+    /// a Stop+Start reconnect
     /// (emitting `ChannelReconnecting`/`ChannelReconnected`), backing off on
-    /// failure at the pace in `crate::retry` until it works. Stop+Start reuses the tested lifecycle (Faulted → Stopped →
-    /// Starting → Running), so the events also include the intermediate
-    /// `ChannelStopped`/`ChannelStarted`.
+    /// failure at the pace in `crate::retry` until it works. Stop+Start reuses
+    /// the tested lifecycle (Faulted → Stopped → Starting → Running), so the
+    /// events also include the intermediate `ChannelStopped`/`ChannelStarted`.
     pub async fn reconnect_tick(&mut self) {
         for attempt in self.reconnects_due(Instant::now(), |_| false) {
             let _ = self.stop(attempt.id).await;
@@ -1562,9 +1646,8 @@ impl Listener {
     /// The reconnect bookkeeping of [`reconnect_tick`](Self::reconnect_tick)
     /// without the stop and start, for a caller that runs those off its loop
     /// (ADR-052). Arms backoff on a newly faulted Channel and returns the
-    /// attempts now due, each announced with
-    /// `ChannelReconnecting`. A Channel `busy` says is mid-operation is left
-    /// for a later tick.
+    /// attempts now due, each announced with `ChannelReconnecting`. A Channel
+    /// `busy` says is mid-operation is left for a later tick.
     pub fn reconnects_due(
         &mut self,
         now: Instant,
@@ -1631,19 +1714,23 @@ impl Listener {
     }
 
     /// Record how a reconnect attempt's stop and start went (§9.1): announce
-    /// the reconnect, or back off for the next attempt. Stopping cleared the reconnect
-    /// state, so a failure re-establishes it. `now` is the caller's clock
-    /// reading as the start landed: a Channel is stable from then, not from
-    /// when the attempt was issued.
+    /// the reconnect, or back off for the next attempt. Stopping cleared the
+    /// reconnect state, so a failure re-establishes it. `now` is the caller's
+    /// clock reading as the start landed: a Channel is stable from then, not
+    /// from when the attempt was issued.
+    ///
+    /// Reconnect may have been turned off while the attempt was out (the GUI
+    /// runs it off its loop, ADR-052). Then nothing is kept for a next attempt,
+    /// since none would be made.
     pub fn finish_reconnect(&mut self, attempt: ReconnectAttempt, started: bool, now: Instant) {
         let ReconnectAttempt {
             id,
             attempt,
             previous,
         } = attempt;
-        if !self.channels.contains_key(&id) {
+        let Some(enabled) = self.channels.get(&id).map(|c| c.config.reconnect.enabled) else {
             return;
-        }
+        };
         let backoff = self.reconnect_backoff.after(previous.backoff);
         if started {
             let _ = self
@@ -1651,13 +1738,16 @@ impl Listener {
                 .try_send(RuntimeEvent::ChannelReconnected(id));
             // Not yet proven stable: a fault within `RECONNECT_STABLE_AFTER`
             // carries on from the next attempt and the next backoff step.
-            if let Some(channel) = self.channels.get_mut(&id) {
+            if let Some(channel) = self.channels.get_mut(&id).filter(|_| enabled) {
                 channel.reconnect_carry = Some(ReconnectCarry {
                     attempts: attempt,
                     backoff,
                     reconnected_at: now,
                 });
             }
+            return;
+        }
+        if !enabled {
             return;
         }
         self.set_reconnect_state(
@@ -2339,6 +2429,36 @@ mod tests {
         assert!(asked.elapsed() <= super::super::channel::COMMAND_HANDOFF_WAIT);
         // The orchestrator is free afterwards.
         assert!(listener.snapshot(id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_faulted_channel_serves_no_control_lines() {
+        // The reader that kept the lines current has ended, so its last
+        // levels are no longer true. A display shown them would read them as
+        // live; it must read the port as not open instead.
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+        let (commands, _unread) = mpsc::channel(1);
+        listener.channels.get_mut(&id).unwrap().serial_control = Some(SerialControl {
+            commands,
+            state: Arc::new(Mutex::new(SerialControlLines {
+                cts: true,
+                ..Default::default()
+            })),
+        });
+        assert!(listener.serial_control_lines(id).is_some(), "running");
+
+        listener
+            .channels
+            .get(&id)
+            .unwrap()
+            .faulted
+            .store(true, Ordering::Relaxed);
+        assert_eq!(listener.state(id), Some(ChannelState::Faulted));
+        assert_eq!(listener.serial_control_lines(id), None, "faulted");
+        let _ = listener.stop(id).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3233,6 +3353,133 @@ mod tests {
         assert_eq!(stats.reconnect, None, "turning it off ends the retry");
         assert!(!stats.reconnect_pending);
         assert!(!listener.config(id).unwrap().reconnect.enabled);
+    }
+
+    #[tokio::test]
+    async fn a_repeating_start_fault_is_written_to_the_event_log_once_per_interval() {
+        // A reconnect retries every 30 s for as long as the fault lasts. The
+        // event log gets the first failure at once, then one line per interval
+        // with how many failures it did not write; a different fault is
+        // written at once, and a start that works begins afresh.
+        use crate::diagnostics::Diagnostic;
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let busy = Diagnostic::error("GPS: the port is in use");
+        let gone = Diagnostic::error("GPS: the device is gone");
+        let channel = listener.channels.get_mut(&id).unwrap();
+
+        let first = channel.start_fault_log_line(&busy, at(0)).unwrap();
+        assert_eq!(first.message, "GPS: the port is in use");
+        for secs in (30..REPEATED_START_FAULT_LOG_EVERY.as_secs()).step_by(30) {
+            assert!(
+                channel.start_fault_log_line(&busy, at(secs)).is_none(),
+                "{secs}"
+            );
+        }
+        let every = REPEATED_START_FAULT_LOG_EVERY.as_secs();
+        let again = channel.start_fault_log_line(&busy, at(every)).unwrap();
+        assert_eq!(
+            again.message,
+            format!(
+                "GPS: the port is in use (still failing: {} more times since the last \
+                 line about it)",
+                every / 30
+            )
+        );
+        assert!(channel
+            .start_fault_log_line(&busy, at(every + 30))
+            .is_none());
+
+        let other = channel.start_fault_log_line(&gone, at(every + 60)).unwrap();
+        assert_eq!(
+            other.message, "GPS: the device is gone",
+            "a new fault, at once"
+        );
+
+        channel.start_worked();
+        assert!(
+            channel
+                .start_fault_log_line(&gone, at(every + 90))
+                .is_some(),
+            "after a start that worked, the fault is news again"
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_reconnect_off_during_a_failing_attempt_ends_the_retry() {
+        // The GUI runs an attempt off its loop (ADR-052), so the choice can be
+        // turned off between the attempt being taken and its result landing.
+        // The landing must not bring the retry back: nothing would make the
+        // next attempt, and status would count down to it for ever.
+        use crate::config::ReconnectPolicy;
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let mut config = udp_channel();
+        if let InterfaceConfig::Udp(udp) = &mut config.interface {
+            udp.bind_address = "not-an-ip-address".to_string(); // start always fails
+        }
+        config.reconnect = reconnect_on();
+        let id = listener.add_channel(config);
+        assert!(listener.start(id).await.is_err());
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        assert!(listener.reconnects_due(at(0), |_| false).is_empty());
+        let due = listener.reconnects_due(at(10), |_| false).pop().unwrap();
+
+        listener.set_reconnect_policy(id, ReconnectPolicy { enabled: false });
+        let _ = listener.stop(id).await;
+        let started = listener.start(id).await.is_ok();
+        assert!(!started);
+        listener.finish_reconnect(due, started, at(11));
+
+        let stats = listener.channel_stats(id).await.unwrap();
+        assert_eq!(stats.reconnect, None, "no retry is shown");
+        assert!(!stats.reconnect_pending, "the row reads Faulted");
+    }
+
+    #[tokio::test]
+    async fn turning_reconnect_off_during_a_successful_attempt_keeps_no_sequence() {
+        // A success that lands after reconnect was turned off must not leave
+        // the sequence behind: turned on again and faulting at once, the
+        // Channel starts a fresh sequence at attempt 1.
+        use crate::config::ReconnectPolicy;
+        let mut listener = Listener::with_default_capacities();
+        let _events = listener.take_events();
+        let mut config = udp_channel();
+        config.reconnect = reconnect_on();
+        let id = listener.add_channel(config);
+        listener.start(id).await.unwrap();
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        listener
+            .channels
+            .get(&id)
+            .unwrap()
+            .faulted
+            .store(true, Ordering::Relaxed);
+        assert!(listener.reconnects_due(at(0), |_| false).is_empty());
+        let due = listener.reconnects_due(at(10), |_| false).pop().unwrap();
+
+        listener.set_reconnect_policy(id, ReconnectPolicy { enabled: false });
+        let _ = listener.stop(id).await;
+        let started = listener.start(id).await.is_ok();
+        assert!(started);
+        listener.finish_reconnect(due, started, at(10));
+
+        listener.set_reconnect_policy(id, reconnect_on());
+        listener
+            .channels
+            .get(&id)
+            .unwrap()
+            .faulted
+            .store(true, Ordering::Relaxed);
+        assert!(listener.reconnects_due(at(20), |_| false).is_empty());
+        let due = listener.reconnects_due(at(21), |_| false).pop().unwrap();
+        assert_eq!(due.attempt, 1, "a fresh sequence, after the first wait");
+        let _ = listener.stop(id).await;
     }
 
     #[tokio::test]

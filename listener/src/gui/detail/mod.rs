@@ -15,8 +15,8 @@ use super::state::{ChannelStatus, ReconnectPrompt};
 use super::widgets::{
     config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
     line_indicator, line_toggle, paint_glyph, recording_facts, recording_glyph_size,
-    recording_indicator, rename_problem, start_button, status_color, status_glyph, status_words,
-    stop_enabled, Refresh,
+    recording_indicator, rename_problem, rts_by_flow_control, rts_set_by_flow_control,
+    start_button, status_color, status_glyph, status_words, stop_enabled, Refresh,
 };
 use super::ListenerApp;
 use wiredata_ui::fonts::bold;
@@ -255,13 +255,22 @@ impl ListenerApp {
         }
 
         // Live serial control/status lines (§161): green = high, grey = low.
-        if let Some(lines) = self.state.channel(id).and_then(|v| v.control_lines) {
+        if let Some((lines, rts_by_flow)) = self.state.channel(id).and_then(|v| {
+            Some((
+                v.control_lines?,
+                rts_set_by_flow_control(&v.config.interface),
+            ))
+        }) {
             ui.horizontal(|ui| {
-                // Outputs are clickable toggles (§161): clicking sends Set{Rts,Dtr};
-                // the shown state still comes from the live poll, so it reflects what
-                // the port actually did, not just what we asked for.
+                // Outputs are clickable toggles (§161): clicking sends Set{Rts,Dtr}.
+                // An output cannot be read back, so what is shown is what Listener
+                // last set: low at open unless the profile says otherwise
+                // (ADR-073), then what a click set. Under RTS/CTS flow control RTS
+                // is the flow control's, so it has no toggle.
                 ui.label("Out:");
-                if line_toggle(ui, "RTS", lines.rts).clicked() {
+                if rts_by_flow {
+                    rts_by_flow_control(ui);
+                } else if line_toggle(ui, "RTS", lines.rts).clicked() {
                     self.send(UiCommand::SetRts(id, !lines.rts));
                 }
                 if line_toggle(ui, "DTR", lines.dtr).clicked() {
