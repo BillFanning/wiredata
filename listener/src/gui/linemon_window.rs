@@ -45,6 +45,9 @@ pub(super) const DEFAULT_SIZE: [f32; 2] = [960.0, 640.0];
 /// The smallest size it can be dragged to: wide enough for the row of five
 /// buttons at [`BUTTON_SIZE`].
 pub(super) const MIN_SIZE: [f32; 2] = [600.0, 360.0];
+/// How long a new source's settings take to fade in, in seconds.
+const SOURCE_FADE_SECONDS: f64 = 0.15;
+
 /// The size of Start, Stop, Pause, Clear and Copy scroll buffer: the size of
 /// Listener's channel Start and Stop buttons.
 const BUTTON_SIZE: egui::Vec2 = egui::vec2(96.0, 32.0);
@@ -474,6 +477,10 @@ pub(super) struct Linemon {
     /// The window's minimum width: [`MIN_SIZE`] at first, raised to fit the
     /// port settings line once it has been drawn, so its items never wrap.
     min_width: f32,
+    /// The source whose settings were drawn last frame, and when the source
+    /// last changed (egui's clock, in seconds), for the fade.
+    drawn_kind: SourceKind,
+    kind_changed_at: f64,
 }
 
 impl Linemon {
@@ -503,6 +510,8 @@ impl Linemon {
             copy_all: false,
             editing_text: false,
             min_width: MIN_SIZE[0],
+            drawn_kind: SourceKind::default(),
+            kind_changed_at: f64::NEG_INFINITY,
         }
     }
 
@@ -669,40 +678,48 @@ impl Linemon {
         // A quarter of a row's height more between the source line and the
         // port settings, so the two read as separate lines.
         ui.add_space(row_gap);
-        // One line that never wraps. Its drawn width sets the window's minimum
-        // width, measured rather than guessed, so it fits whatever the font
-        // size and screen scaling.
-        match self.settings.kind {
-            SourceKind::Serial => {
-                // Two lines, as UDP has: the port and its line settings, then
-                // flow control and the control lines.
-                let line = ui
-                    .horizontal(|ui| self.serial_controls(ui, &mut refresh))
-                    .response
-                    .rect;
-                self.fit_min_width(ui, line);
-                ui.add_space(row_gap);
-                let line = ui.horizontal(|ui| self.serial_lines(ui, out)).response.rect;
-                self.fit_min_width(ui, line);
-            }
-            SourceKind::Udp => {
-                // The same two lines as the channel editor in Listener.
-                let line = ui
-                    .horizontal(|ui| self.udp_controls(ui, local_addresses, &mut refresh))
-                    .response
-                    .rect;
-                self.fit_min_width(ui, line);
-                ui.add_space(row_gap);
-                let line = ui
-                    .horizontal(|ui| {
-                        ui.label("Mode").on_hover(&UDP_MODE_HOVER);
-                        udp_mode_and_sharing(ui, &mut self.settings.udp);
-                    })
-                    .response
-                    .rect;
-                self.fit_min_width(ui, line);
-            }
+        // Both sources' settings take the same height, so the buttons below
+        // stay where they are when the source changes. The other source's
+        // lines are laid out unseen, out of reach of the pointer, and the
+        // shorter set is padded to the height of the taller.
+        let kind = self.settings.kind;
+        let other = match kind {
+            SourceKind::Serial => SourceKind::Udp,
+            SourceKind::Udp => SourceKind::Serial,
+        };
+        // The new source's lines fade in, so changing source is not an abrupt
+        // swap of every control at once.
+        let now = ui.input(|i| i.time);
+        if kind != self.drawn_kind {
+            self.drawn_kind = kind;
+            self.kind_changed_at = now;
         }
+        let fade = (((now - self.kind_changed_at) / SOURCE_FADE_SECONDS) as f32).clamp(0.0, 1.0);
+        if fade < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        let top = ui.cursor().min;
+        let shown = ui
+            .vertical(|ui| {
+                ui.multiply_opacity(fade);
+                self.settings_lines(ui, kind, local_addresses, &mut refresh, out, row_gap)
+            })
+            .response
+            .rect
+            .height();
+        let mut unseen = ui.new_child(egui::UiBuilder::new().invisible().max_rect(
+            egui::Rect::from_min_size(top, egui::vec2(ui.available_width(), f32::INFINITY)),
+        ));
+        unseen.set_clip_rect(egui::Rect::NOTHING);
+        self.settings_lines(
+            &mut unseen,
+            other,
+            local_addresses,
+            &mut None,
+            &mut Vec::new(),
+            row_gap,
+        );
+        ui.add_space((unseen.min_rect().height() - shown).max(0.0));
         match refresh {
             Some(Refresh::SerialPorts) => self.serial_ports = list_serial_ports(),
             Some(Refresh::LocalAddresses) => out.push(UiCommand::ListLocalAddresses),
@@ -988,6 +1005,51 @@ impl Linemon {
             .clicked()
         {
             self.copy_all = true;
+        }
+    }
+
+    /// The two lines of `kind`'s port settings. Each line never wraps, and its
+    /// drawn width sets the window's minimum width, measured rather than
+    /// guessed, so it fits whatever the font size and screen scaling.
+    fn settings_lines(
+        &mut self,
+        ui: &mut egui::Ui,
+        kind: SourceKind,
+        local_addresses: &LocalAddresses,
+        refresh: &mut Option<Refresh>,
+        out: &mut Vec<UiCommand>,
+        row_gap: f32,
+    ) {
+        match kind {
+            SourceKind::Serial => {
+                // Two lines, as UDP has: the port and its line settings, then
+                // flow control and the control lines.
+                let line = ui
+                    .horizontal(|ui| self.serial_controls(ui, refresh))
+                    .response
+                    .rect;
+                self.fit_min_width(ui, line);
+                ui.add_space(row_gap);
+                let line = ui.horizontal(|ui| self.serial_lines(ui, out)).response.rect;
+                self.fit_min_width(ui, line);
+            }
+            SourceKind::Udp => {
+                // The same two lines as the channel editor in Listener.
+                let line = ui
+                    .horizontal(|ui| self.udp_controls(ui, local_addresses, refresh))
+                    .response
+                    .rect;
+                self.fit_min_width(ui, line);
+                ui.add_space(row_gap);
+                let line = ui
+                    .horizontal(|ui| {
+                        ui.label("Mode").on_hover(&UDP_MODE_HOVER);
+                        udp_mode_and_sharing(ui, &mut self.settings.udp);
+                    })
+                    .response
+                    .rect;
+                self.fit_min_width(ui, line);
+            }
         }
     }
 
