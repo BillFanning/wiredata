@@ -5,7 +5,7 @@
 //! - A WARNING when a channel does not start or goes down, naming it and why.
 //! - A reminder every five minutes while any channel stays down, with how long
 //!   it has been down and the latest reason.
-//! - A line when a channel recovers, and one when its retries run out.
+//! - A line when a channel recovers.
 //! - A summary at the end naming every channel's outcome, which also decides
 //!   whether the run was degraded (exit code 3).
 //!
@@ -18,8 +18,7 @@ use std::time::{Duration, Instant};
 /// Exit code: an invalid profile, nothing could start, or `--require-all`
 /// failed.
 pub const EXIT_CANNOT_START: u8 = 2;
-/// Exit code: a channel never started, its retries ran out, or it was down at
-/// the stop.
+/// Exit code: a channel never started, or it was down at the stop.
 pub const EXIT_DEGRADED: u8 = 3;
 /// Exit code: the stop did not finish within its time limit, so the end of
 /// what the run wrote may be missing.

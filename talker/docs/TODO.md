@@ -47,7 +47,7 @@ Found by a survey of every retry in the workspace on 2026-11-19.
   fastest rate on each drop. Pick one, or record in an ADR why each differs.
 - [ ] **The specs repeat retry numbers, and nothing checks them.** The docs test
   catches a renamed identifier, not a changed value: if `RETRY_MAX` changes,
-  listener's §9.1 and §55 still say 30 s and no test fails. For a value a user
+  listener's §9.1 and §56 still say 30 s and no test fails. For a value a user
   relies on, the spec could name the constant instead of repeating the number,
   or a test could compare the two. Decide with the next spec change.
 - [ ] **Say why talker's two retry paces differ.** Send failures retry from

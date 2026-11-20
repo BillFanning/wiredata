@@ -1,17 +1,19 @@
-# Listener Specification v2.6.4
+# Listener Specification v2.6.5
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-19) — reconnect is on or off, at a fixed pace:
+Revision note (2026-11-20) — serial lines, shutdown and the event log:
 
-- **§9.1, §80.1, §162 (ADR-072).** A Channel's `ReconnectPolicy` holds only
-  `enabled`. Reconnecting waits 1 s, doubling to 30 s, and goes on until the
-  Channel starts, the pace a recording's reopen uses. Nothing gives up, so
-  the give-up event and status are gone.
-- **§71.** The reconnect limits are gone with the settings they checked.
+- **§3.1.** Exit code 3 no longer counts retries running out; nothing gives up.
+- **§14.3, §50.3, §161 (ADR-073).** An output line a profile leaves unset is set
+  low at open, so the level shown is the level set; under RTS/CTS flow control
+  RTS reads "RTS set by flow control". Lines show only while the port is running.
+- **§118.** A start fault that keeps repeating is written once, then at most once
+  every 10 minutes with a count.
+- **§3.1 (ADR-052).** The CLI reads a stop request while a port is still opening.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -99,7 +101,9 @@ ADR-046:
   after the Channels have stopped and is never dropped. The event log (§118)
   is the record.
 - **Stop signals.** Ctrl-C, SIGTERM on Linux, and console close, logoff and
-  shutdown on Windows all perform the graceful stop of §113.
+  shutdown on Windows all perform the graceful stop of §113. A stop request is
+  acted on even while a port is still opening: the open is left behind, and the
+  other Channels stop gracefully (ADR-052).
 - **Exit codes:**
 
   | Code | Meaning |
@@ -107,7 +111,7 @@ ADR-046:
   | 0 | Healthy, or every outage recovered (recording gaps alone do not change this) |
   | 1 | Internal error |
   | 2 | Invalid profile, nothing could start, or `--require-all` failed |
-  | 3 | Degraded: a Channel never started, its retries ran out, or it was down at shutdown |
+  | 3 | Degraded: a Channel never started, or it was down at shutdown |
   | 4 | Finalization incomplete at shutdown (§113) |
 
 The CLI does not install itself as a service. `deploy/` at the workspace root
@@ -407,15 +411,16 @@ applies to Serial (covering USB hot-plug, §14.4) and UDP Channels. Each attempt
 emits a reconnect event (§137). The first attempt waits 1 s; each failure
 doubles the wait up to 30 s, and attempts go on every 30 s until the Channel
 starts. Nothing gives up (ADR-072). The pace is the one a recording's reopen
-uses (§55), and is not a profile setting.
+uses (§56), and is not a profile setting.
 
 A successful reconnect does not end the sequence until the Channel has stayed
 up for 60 s (ADR-058). A fault within 60 s of a successful reconnect continues
-it: the next attempt number and the next backoff step. The 60 s run from the moment the reconnect's start succeeds,
-not from when the attempt began, so a slow reopen followed by an immediate fault
-continues the attempt count and the backoff. Only 60 s of staying up, or a
-manual stop, starts the count and the backoff over. A device that connects and drops repeatedly is therefore
-retried at a growing interval, instead of at the shortest delay for ever.
+it: the next attempt number and the next backoff step. The 60 s run from the
+moment the reconnect's start succeeds, not from when the attempt began, so a
+slow reopen followed by an immediate fault continues the attempt count and the
+backoff. Only 60 s of staying up, or a manual stop, starts the count and the
+backoff over. A device that connects and drops repeatedly is therefore retried
+at a growing interval, instead of at the shortest delay for ever.
 
 **In the GUI, reconnect is a visible, confirmed choice** (ADR-045):
 
@@ -571,6 +576,10 @@ open-time setting. While a Serial Channel is Running:
 
 - **Output lines RTS and DTR** are settable at open (§74 `rts`/`dtr`) **and
   live-toggleable** via runtime commands (`SetRts`/`SetDtr`, §136).
+- **What is shown for an output** is what Listener last set: an output cannot be
+  read back. A line the profile leaves unset is set low at open (ADR-073),
+  except RTS under RTS/CTS flow control, which the driver sets and which is shown
+  as set by flow control, with no control.
 - **Input lines CTS, DSR, DCD, RI** are **live-monitored**; a change is reflected
   in Channel status/snapshot and signalled by `ControlLinesChanged` (§137).
 
@@ -1005,7 +1014,10 @@ it is not opened from Listener, and Listener need not be running.
   baud rate, data bits, parity and stop bits, then flow control with the
   control lines (§161). RTS and DTR are buttons that set them; CTS, DSR, DCD and
   RI are circles, filled when high. The lines are live while the port is open
-  and greyed out otherwise. The baud list ends with a box for any other
+  and greyed out otherwise. RTS and DTR start low at every open (ADR-073); under
+  RTS/CTS flow control RTS reads "RTS set by flow control" and has no button.
+  While the port is not running, a sentence says that the lines show while the
+  port is open. The baud list ends with a box for any other
   rate. For UDP the bar has two lines, as a channel's editor has: the port
   number with the binding address after it, then the mode with port sharing
   and, for multicast, the group after it.
@@ -1024,7 +1036,8 @@ it is not opened from Listener, and Listener need not be running.
   port or a setting changes, and a marker line records each change, naming the
   port and its settings. A change that leaves no port chosen while started,
   such as choosing Serial before a serial port, closes the port and is marked
-  too. **Clear** empties the display. With **Clear display on port change**
+  too. The status line then says to choose a port, which opens as soon as it is
+  chosen. **Clear** empties the display. With **Clear display on port change**
   ticked, choosing another port empties it too; it starts unticked.
 - **Pause.** Pause stops the display, not reception. Bytes that arrive while
   the display is paused are not shown.
@@ -2466,6 +2479,10 @@ by both the CLI and the GUI:
   how long entries are missing.
 - Log files are kept: Listener never deletes one. Old files stay until an
   operator removes them (talker ADR-069).
+- A start fault that keeps repeating, as a reconnect retries it, is written when
+  it first happens and then at most once every 10 minutes, with how many times
+  it failed meanwhile. A different fault is written at once, and a start that
+  works makes the next fault news again.
 - The log is flushed at shutdown. The CLI waits for that at most 2 s (talker
   ADR-061). A worker stuck on a drive or share that stopped answering is left
   behind, and a closing WARNING says the last lines of the log may be missing,
@@ -3217,7 +3234,8 @@ is unverified end-to-end until proven.
 
 A user shall be able to: see CTS/DSR/DCD/RI state live and observe it change; set
 RTS/DTR at open and toggle them live while Running. Control-line activity shall not
-affect reception or Recording (§14.2–§14.3).
+affect reception or Recording (§14.2–§14.3). Under RTS/CTS flow control RTS is not
+set from the GUI and reads "RTS set by flow control" (ADR-073).
 
 ## 162. Auto-Reconnect
 

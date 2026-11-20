@@ -12,6 +12,14 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-19) — reconnect is on or off, at a fixed pace:
+
+- **§9.1, §80.1, §162 (ADR-072).** A Channel's `ReconnectPolicy` holds only
+  `enabled`. Reconnecting waits 1 s, doubling to 30 s, and goes on until the
+  Channel starts, the pace a recording's reopen uses. Nothing gives up, so
+  the give-up event and status are gone.
+- **§71.** The reconnect limits are gone with the settings they checked.
+
 Revision note (2026-11-19) — event log files are kept:
 
 - **§118 (talker ADR-069).** Event log files are no longer deleted after 30

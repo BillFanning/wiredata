@@ -1,14 +1,13 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.32
-**Date:** 2026-11-19
+**Version:** 1.33
+**Date:** 2026-11-20
 **Status:** Accepted
 
-Revision note (2026-11-19) — log files are kept:
+Revision note (2026-11-20) — exit codes and log growth:
 
-- **ADR-069** — `wiredata-log` no longer deletes old log files, so listener's
-  event log is kept, as talker's always was.
-- **ADR-061** — amended to match.
+- **ADR-060** — exit code 3 no longer counts retries running out.
+- **ADR-069** — a repeating start fault is written once per 10 minutes.
 
 ---
 
@@ -2374,6 +2373,8 @@ counts never claim a message was delivered whole when it may not have been.
 ## ADR-060 — Both CLIs run unattended under one contract
 
 **Status:** Accepted 2026-09-30. Workspace-level; listener ADR-046 adopts it.
+Amended 2026-11-20: exit code 3 no longer counts retries running out, since
+nothing gives up (listener ADR-072).
 
 **Context:** Talker's CLI opens every channel or none, so one missing USB adapter
 stops the whole run. Listener's gives up only when nothing starts. Neither
@@ -2399,7 +2400,7 @@ under systemd and Task Scheduler.
   | 0 | Healthy, or every outage recovered (the summary lists them) |
   | 1 | Internal error |
   | 2 | Invalid profile, cannot start, or `--require-all` failed |
-  | 3 | Degraded: a channel never started, its retries ran out, or it was down at shutdown |
+  | 3 | Degraded: a channel never started, or it was down at shutdown |
   | 4 | Finalization incomplete |
 
 - **Stop on every OS stop signal.** Ctrl-C, SIGTERM on Linux, and console close,
@@ -2738,7 +2739,9 @@ TODO tracks that.
 
 **Consequences:** Listener's event log folder grows by one file a day until an
 operator removes old files. An event log is diagnostics only, so a day's file
-is small next to a recording. The deploy notes say the files are kept.
+is small next to a recording. The deploy notes say the files are kept. A listener
+Channel retrying a fault that never clears writes one line per 10 minutes, not
+one per attempt (listener §118).
 
 ---
 

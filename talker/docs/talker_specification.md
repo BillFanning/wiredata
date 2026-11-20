@@ -1,13 +1,12 @@
 # Talker — Program Specification
-**Version:** 2.5.8
+**Version:** 2.5.9
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-15) — button names in lower case:
+Revision note (2026-11-20) — exit code 3:
 
-- **§3.2, §4.2** — the buttons read Start channel, Retry
-  channel and Stop channel. On screen, "channel" is lower case unless it
-  begins a sentence or is part of a channel's name.
+- **§3.1 exit codes** — exit code 3 no longer counts retries running out;
+  nothing in either application gives up retrying.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -226,7 +225,7 @@ nobody watches the terminal:
   | 0 | Healthy, or every outage recovered (the summary lists them) |
   | 1 | Internal error |
   | 2 | Invalid profile, nothing could start, or `--require-all` failed |
-  | 3 | Degraded: a channel never started, its retries ran out, or it was down at shutdown |
+  | 3 | Degraded: a channel never started, or it was down at shutdown |
   | 4 | Shutdown did not finish within its time limit |
 
 The CLI does not install itself as a service; `deploy/` at the workspace root

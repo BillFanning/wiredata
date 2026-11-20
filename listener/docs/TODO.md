@@ -18,9 +18,9 @@ again. Remove an item when it is done: the commit says what changed.
   refresh button lists a port plugged in or removed; unplugging the adapter
   shows the fault and Start reopens it. The control lines (§161): RTS and DTR
   change when clicked, and with RTS looped to CTS and DTR to DSR the circles
-  follow. With Flow set to RTS/CTS the driver may hold RTS itself, so a click
-  may not change it; Listener's channel view behaves the same. Decide whether
-  that wants a word on screen.
+  follow. RTS and DTR start low at open, and under RTS/CTS RTS reads "RTS set
+  by flow control" (ADR-073): check that a device on RTS/CTS still sends.
+  Unplugging the adapter greys the lines out at once.
 - [ ] **Disk guard in the GUI (§56.2).** Neither recording editor,
   `edit_raw_recording` nor `edit_display_recording`, sets `disk_guard`, so a
   guard comes only from a profile. With log files kept (talker ADR-069) and
@@ -56,7 +56,7 @@ again. Remove an item when it is done: the commit says what changed.
   reading each datagram's destination address (`IP_PKTINFO`, `WSARecvMsg`, or
   `IP_RECVDSTADDR` on macOS).
 - [ ] **Check whether a shared port can take another program's datagrams on
-  Windows.** I believe a socket that sets address reuse can bind a port that
+  Windows.** A socket that sets address reuse may be able to bind a port that
   another socket holds without it, unless that socket set exclusive use. If so,
   Linemon in Broadcast with sharing ticked could take unicast datagrams from a
   Listener channel on the same port, and Listener should set exclusive use on

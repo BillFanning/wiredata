@@ -154,7 +154,7 @@ so a dropped lifecycle event did *not* self-correct; the GUI row stayed stale
 `state` (the orchestrator stamps `effective_state()` over the pipeline's
 placeholder — lifecycle belongs to the orchestrator, not the pipeline) plus
 `reconnect_pending` (so a polled `Faulted` distinguishes "still retrying" =
-Reconnecting from "gave up / not retrying" = Faulted without depending on the
+Reconnecting from "not retrying" = Faulted without depending on the
 advisory reconnect events), and `snapshot`/`channel_stats` always serve for a
 known channel — live when running, synthesized from the retained
 diagnostics/activity otherwise. The GUI reducer reconciles its derived status
@@ -1666,7 +1666,9 @@ surface the runtime does not have.
 
 ## ADR-048 — Profiles load strictly and runtime capacities are bounded
 
-**Status:** Accepted 2026-09-30. Amends §71, §72.1, §80 and §88.
+**Status:** Accepted 2026-09-30. Amends §71, §72.1, §80 and §88. Amended
+2026-11-19: the reconnect-backoff limits went with the settings they checked
+(ADR-072).
 
 **Context:**
 
@@ -1726,7 +1728,9 @@ memory in one Channel. One read now fires at most 4,096 matches (ADR-065).
 ## ADR-049 — OS stop requests come from one shared crate, `wiredata-stop`
 
 **Status:** Accepted 2026-09-30. Implements the stop signals of §3.1 and talker
-ADR-060. Amended 2026-11-19: a held stop waits at most 10 s, not 30 s.
+ADR-060. Amended 2026-11-19 and 2026-11-20: the hold was cut to 10 s, then put
+back to 30 s, because a stop that first waits out a slow serial open needs more
+(ADR-052).
 
 **Context:** §3.1 requires Ctrl-C, SIGTERM on Linux, and console close, logoff
 and shutdown on Windows to perform the graceful stop of §113. On Windows,
@@ -1746,8 +1750,7 @@ every OS stop request into one stream for both CLIs.
   `WM_QUERYENDSESSION` and `WM_ENDSESSION`. Message-only windows do not receive
   those broadcasts. On `WM_ENDSESSION` it sends Logoff or Shutdown and holds
   the session until the application says its graceful stop has finished, up to
-  10 s, which covers both applications' own stop limits; Windows may end the
-  process sooner.
+  30 s; Windows may end the process sooner.
 - Every listener is registered before `listen` returns, and one that cannot be
   registered is reported to the application, which decides how to say so.
 - The application owns the meaning: its graceful stop, its time limits and its
@@ -1859,6 +1862,7 @@ are missing, repeated or out of order, and where.
 
 **Status:** Accepted 2026-10-01. Follows from a latency test: the status must keep
 updating at least once a second while one Channel's start blocks for 10 s.
+Amended 2026-11-20: the CLI reads a stop request while a port opens.
 
 **Context:** The GUI's driver awaited every start and stop inside the loop that
 also sends the status. A serial port can take 10 s to open, as a Bluetooth port
@@ -1888,9 +1892,19 @@ during a 10 s start.
 the workspace, so a workspace change does not wait for its steps. A slow serial
 open in Linemon does not hold up a profile load.
 
-**Boundary:** The CLI keeps awaiting. An interface open still cannot be cancelled,
-so a Stop waits for the open to land. At exit the driver lands opens and drains
-in flight, within the stop grace, before stopping what is live.
+**Boundary:** An interface open still cannot be cancelled. In the GUI, a Stop for
+a Channel mid-open waits for the open to land; the CLI leaves an outstanding open
+behind at exit. At exit the driver lands opens and drains in flight, within the
+stop grace, before stopping what is live.
+
+**Added decision (2026-11-20):** The CLI reads stop requests while a port opens.
+Its first starts race each open against a stop request, and a reconnect attempt's
+open runs as a task beside its loop; the attempt's stop still runs on the loop,
+bounded by the stop grace. A stop request that comes while an open is outstanding
+leaves the open behind: its Channel is still Starting, which the shutdown skips,
+so the other Channels' recordings finish within the time a Windows logoff or
+shutdown allows. An outside review found that a 10 s open could otherwise use up
+the whole hold (ADR-049).
 
 **Alternatives considered:**
 
@@ -2485,6 +2499,11 @@ window, so the reason for drawing it every frame no longer applies. Linemon keep
 and writes no event log. Its deferred list shrinks to a record button, time
 stamps on each line, finding the baud rate, TCP and find.
 
+**Added decision (2026-11-19):** The serial port is chosen from the drop-down only;
+the step buttons stay for the UDP port number. The serial settings take two lines,
+and the second holds flow control and the control lines (§161): RTS and DTR as
+buttons, CTS, DSR, DCD and RI as circles. What the outputs show follows ADR-073.
+
 ## ADR-071 — A Channel's display pops out into a window of its own
 
 **Status:** Accepted 2026-11-15.
@@ -2526,10 +2545,6 @@ launches and is in no profile.
 monitor, without risk to the Channel or its recordings. Each pop-out costs one
 more stream to the GUI and its own rendering while it is open.
 
-## Open questions
-
-_None open. (OQ-L1 resolved by ADR-004 above.)_
-
 ## ADR-072 — Reconnect is on or off, at one fixed pace
 
 **Status:** Accepted 2026-11-19. Amends ADR-045, ADR-048 and ADR-058.
@@ -2537,11 +2552,12 @@ _None open. (OQ-L1 resolved by ADR-004 above.)_
 **Context:** `ReconnectPolicy` held five values: `enabled`, a first and a
 longest wait, a multiplier, and an optional attempt limit. The GUI sets only
 `enabled` (ADR-045), so the other four could be changed only by editing a
-profile. Their limits (ADR-048) accepted a first wait of 0 ms, which with a
-multiplier of 1 retried every 1 ms for ever. The pace they defaulted to, 1 s
-doubling to 30 s, was also written out separately for a recording's reopen
-(§55). Neither primary use needs to tune it: someone troubleshooting presses
-Start, and a weeks-long log wants patient retrying that never stops.
+profile. Their limits (ADR-048) accepted a first wait of 0 ms, which made an
+attempt at every reconnect check, twice a second, for ever. The pace they
+defaulted to, 1 s doubling to 30 s, was also written out separately for a
+recording's reopen (§56). Neither primary use needs to tune it: someone
+troubleshooting presses Start, and a weeks-long log wants patient retrying that
+never stops.
 
 **Decision:**
 
@@ -2572,4 +2588,48 @@ release.
 
 **Consequences:** Every Channel with reconnect on retries the same way, and
 its hover states the pace. A Channel never stops retrying by itself; Stop
-ends it.
+ends it. A start fault that keeps repeating is written to the event log once,
+then at most once every 10 minutes with how many times it failed meanwhile, so a
+Channel that can never start does not fill the log (§118).
+
+## ADR-073 — Serial outputs are set at open, so what is shown is true
+
+**Status:** Accepted 2026-11-20. Amends §14.3, §50.3 and §161.
+
+**Context:** Listener cannot read an output line back: what it shows for RTS and
+DTR is what it last set. A line the profile left unset was left at the operating
+system's level and reported as low. On Windows the serial library opens with both
+low, except RTS under RTS/CTS flow control, which it sets high; on Linux the
+system usually raises both at open. So Linemon and a Channel's view could show
+RTS or DTR low while it was high.
+
+**Decision:**
+
+- An output line the profile leaves unset is set low at open, in Linemon and in
+  every Channel alike, so the level shown is the level set. A profile's own `rts`
+  or `dtr` still wins.
+- Under RTS/CTS flow control RTS belongs to the flow control. It is left as the
+  driver sets it, has no button, and reads "RTS set by flow control".
+- The inputs, CTS, DSR, DCD and RI, are read from the port as before.
+- The lines are shown only while the port is running. A faulted port's last
+  reading is not shown as live, and while no port is running a sentence says why
+  the lines are greyed out.
+
+**Boundary:** Nothing changes on Windows, which already opened with both low. On
+Linux and macOS, an unset line now starts low instead of the system's usual high.
+
+**Alternatives considered:**
+
+- **Set both high, as most terminal programs do:** Rejected. A board that resets
+  on DTR would restart at every open, and Linemon reopens at every setting
+  change; some RS-485 adapters stop receiving with RTS high.
+- **Leave them and say "set by the system":** Rejected. It is true but tells the
+  user less than a known level.
+
+**Consequences:** A device that waits for DTR or RTS stays silent until the line
+is clicked high, and the display shows the line low, which says why. A Channel
+that needs a line high from the start sets it in its profile.
+
+## Open questions
+
+_None open. (OQ-L1 resolved by ADR-004 above.)_

@@ -15,6 +15,12 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-15) — button names in lower case:
+
+- **§3.2, §4.2** — the buttons read Start channel, Retry
+  channel and Stop channel. On screen, "channel" is lower case unless it
+  begins a sentence or is part of a channel's name.
+
 Revision note (2026-11-14) — fixes from the November code review:
 
 - **§3.1 CLI** — the CLI checks every message against its channel's
@@ -487,6 +493,12 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-11-19) — log files are kept:
+
+- **ADR-069** — `wiredata-log` no longer deletes old log files, so listener's
+  event log is kept, as talker's always was.
+- **ADR-061** — amended to match.
 
 Revision note (2026-11-15) — button names in lower case:
 
