@@ -79,3 +79,47 @@ jobs:
         with:
           tool: cargo-deny
       - run: cargo deny check
+
+  # Linux release binaries to download from the run's page. Built only once the
+  # tests pass on every OS, so a broken push leaves none. Ubuntu 22.04 rather
+  # than latest: a binary runs only on a glibc at least as new as the one it was
+  # built against, so the older base runs on more distributions. Packed as a
+  # tar.gz because the artifact's zip would drop the execute permission.
+  linux-binaries:
+    name: Linux binaries
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libudev-dev \
+            libxkbcommon-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release -p talker -p listener
+
+      - name: Pack
+        id: pack
+        run: |
+          name="wiredata-linux-x86_64-${GITHUB_SHA::7}"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          mkdir "$name"
+          cp target/release/{talker,talker-gui,listener,listener-gui,linemon} "$name/"
+          tar -czf "$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: ${{ steps.pack.outputs.name }}.tar.gz
+          retention-days: 30
+          if-no-files-found: error
