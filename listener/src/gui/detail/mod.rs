@@ -9,14 +9,15 @@ pub(super) mod stream_view;
 use crate::core::{ChannelId, RecordingState};
 use crate::diagnostics::DiagnosticSeverity;
 use crate::runtime::ListenerRunSummary;
+use crate::transport::serial::open_error_prefix;
 
 use super::bridge::{self, UiCommand};
 use super::state::{ChannelStatus, ReconnectPrompt};
 use super::widgets::{
     config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
-    line_indicator, line_toggle, paint_glyph, recording_facts, recording_glyph_size,
-    recording_indicator, rename_problem, rts_by_flow_control, rts_set_by_flow_control,
-    start_button, status_color, status_glyph, status_words, stop_enabled, Refresh,
+    paint_glyph, recording_facts, recording_glyph_size, recording_indicator, rename_problem,
+    rts_set_by_flow_control, start_button, status_color, status_glyph, status_words, stop_enabled,
+    LineClick, Refresh,
 };
 use super::ListenerApp;
 use wiredata_ui::fonts::bold;
@@ -176,9 +177,6 @@ impl ListenerApp {
                 self.show_recording_block(&mut cols[1], id, status, recording);
             });
         });
-        if let Some(err) = &last_error {
-            ui.colored_label(palette(ui).fault, format!("⚠ {err}"));
-        }
         // Only the UI knows what is currently enumerated, so only the UI can say
         // whether the port the OS called absent is still in the list.
         //
@@ -186,14 +184,28 @@ impl ListenerApp {
         // channel to Faulted and leaves its reason to the runtime's diagnostics
         // headline rather than setting `last_error`, so gating on the error
         // alone hid this hint in exactly the case it was written for.
-        if status == ChannelStatus::Faulted || last_error.is_some() {
-            if let Some(port) = serial_port.filter(|p| !p.is_empty()) {
-                let listed = self.serial_ports.contains(&port);
-                ui.colored_label(
-                    palette(ui).warning,
-                    wiredata_ui::format::serial_port_hint(&port, listed),
-                );
-            }
+        let port = serial_port.filter(|p| !p.is_empty());
+        let hint = port
+            .as_deref()
+            .filter(|_| status == ChannelStatus::Faulted || last_error.is_some())
+            .map(|port| {
+                wiredata_ui::format::serial_port_hint(
+                    port,
+                    self.serial_ports.iter().any(|p| p == port),
+                )
+            });
+        // The error and its hint are one problem, so one paragraph in one colour.
+        let text = match (&last_error, hint) {
+            (Some(err), hint) => Some(format!(
+                "⚠ {}{}",
+                problem_text(err, port.as_deref()),
+                hint.map(|h| format!(" {h}")).unwrap_or_default()
+            )),
+            (None, Some(hint)) => Some(format!("⚠ {hint}")),
+            (None, None) => None,
+        };
+        if let Some(text) = text {
+            ui.add(egui::Label::new(egui::RichText::new(text).color(palette(ui).fault)).wrap());
         }
         if let Some(view) = self.state.channel(id) {
             ui.add_space(6.0);
@@ -218,6 +230,16 @@ impl ListenerApp {
         // (task 1); `None` afterwards so the user can still collapse it.
         let force_open = self.force_config_open.then_some(true);
         let mut refresh = None;
+        let mut click = None;
+        // The serial control lines (§161) are live, not part of the draft: the
+        // running port's last reading, and whether the flow control it was
+        // opened with sets RTS. They are kept only while the port runs.
+        let (lines, rts_by_flow) = self.state.channel(id).map_or((None, false), |v| {
+            (
+                v.control_lines,
+                rts_set_by_flow_control(&v.config.interface),
+            )
+        });
         // Configure is edit-only: there's no Apply button here. Edits commit via the
         // Start / Apply & Restart button at the top, which applies the pending draft.
         if let Some((_, config)) = &mut self.edit_draft {
@@ -233,9 +255,9 @@ impl ListenerApp {
                 .open(force_open)
                 .default_open(true)
                 .show(ui, |ui| {
-                    refresh = ui
+                    (refresh, click) = ui
                         .push_id("edit_iface", |ui| {
-                            edit_interface(ui, id, config, &ports, &addresses)
+                            edit_interface(ui, id, config, &ports, &addresses, lines, rts_by_flow)
                         })
                         .inner;
                     // The reconnect choice inside applies live (§9.1); see
@@ -254,36 +276,10 @@ impl ListenerApp {
             None => {}
         }
 
-        // Live serial control/status lines (§161): green = high, grey = low.
-        if let Some((lines, rts_by_flow)) = self.state.channel(id).and_then(|v| {
-            Some((
-                v.control_lines?,
-                rts_set_by_flow_control(&v.config.interface),
-            ))
-        }) {
-            ui.horizontal(|ui| {
-                // Outputs are clickable toggles (§161): clicking sends Set{Rts,Dtr}.
-                // An output cannot be read back, so what is shown is what Listener
-                // last set: low at open unless the profile says otherwise
-                // (ADR-073), then what a click set. Under RTS/CTS flow control RTS
-                // is the flow control's, so it has no toggle.
-                ui.label("Out:");
-                if rts_by_flow {
-                    rts_by_flow_control(ui);
-                } else if line_toggle(ui, "RTS", lines.rts).clicked() {
-                    self.send(UiCommand::SetRts(id, !lines.rts));
-                }
-                if line_toggle(ui, "DTR", lines.dtr).clicked() {
-                    self.send(UiCommand::SetDtr(id, !lines.dtr));
-                }
-                ui.separator();
-                // Inputs are read-only indicators.
-                ui.label("In:");
-                line_indicator(ui, "CTS", lines.cts);
-                line_indicator(ui, "DSR", lines.dsr);
-                line_indicator(ui, "DCD", lines.dcd);
-                line_indicator(ui, "RI", lines.ri);
-            });
+        match click {
+            Some(LineClick::Rts(on)) => self.send(UiCommand::SetRts(id, on)),
+            Some(LineClick::Dtr(on)) => self.send(UiCommand::SetDtr(id, on)),
+            None => {}
         }
 
         ui.separator();
@@ -531,13 +527,12 @@ impl ListenerApp {
             );
         }
         let reconnect = self.state.channel(id).and_then(|v| v.reconnect);
-        // Wrapped, since the interface details (with the bind scope) are wider
-        // than this column.
-        ui.horizontal_wrapped(|ui| {
-            ui.label(status_words(status, reconnect));
-            ui.label("·");
-            ui.label(egui::RichText::new(details).weak());
-        });
+        // The status on one line and the interface's settings on the next, so a
+        // long status such as a reconnect's countdown never pushes the settings
+        // around. The settings wrap: with the bind scope they are wider than
+        // this column.
+        ui.label(status_words(status, reconnect));
+        ui.add(egui::Label::new(egui::RichText::new(details).weak()).wrap());
         // Byte-based liveness (§18): total received + rolling throughput.
         ui.label(format!(
             "Received: {}    Throughput: {}",
@@ -850,6 +845,18 @@ impl ListenerApp {
 ///
 /// Falls back to the whole (trimmed) message when there is no such boundary; the egui
 /// label still ellipsizes if even the phrase overflows the row.
+/// A channel's error as the detail pane says it. A serial open error reads
+/// `COM3 could not be opened: Access is denied.`, as Linemon says it; any
+/// other error is shown as it is.
+fn problem_text(error: &str, serial_port: Option<&str>) -> String {
+    serial_port
+        .and_then(|port| {
+            let reason = error.strip_prefix(open_error_prefix(port).as_str())?;
+            Some(format!("{port} could not be opened: {reason}"))
+        })
+        .unwrap_or_else(|| error.to_owned())
+}
+
 fn headline_phrase(message: &str) -> String {
     // First, drop a `→ target` tail (recording destinations etc.).
     let head = message.split('→').next().unwrap_or(message).trim();
@@ -967,7 +974,21 @@ fn shorten_path(path: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{headline_phrase, FINAL_SNAPSHOT_TOOLTIP, THROUGHPUT_TOOLTIP};
+    use super::{headline_phrase, problem_text, FINAL_SNAPSHOT_TOOLTIP, THROUGHPUT_TOOLTIP};
+    use crate::transport::serial::open_error_prefix;
+
+    #[test]
+    fn a_serial_open_error_names_the_port_once() {
+        let error = format!("{}Access is denied.", open_error_prefix("COM3"));
+        assert_eq!(
+            problem_text(&error, Some("COM3")),
+            "COM3 could not be opened: Access is denied."
+        );
+        // Another error, or another port's, is shown as it is.
+        assert_eq!(problem_text("read failed", Some("COM3")), "read failed");
+        assert_eq!(problem_text(&error, Some("COM4")), error);
+        assert_eq!(problem_text(&error, None), error);
+    }
 
     #[test]
     fn headline_phrase_cuts_at_natural_boundaries() {

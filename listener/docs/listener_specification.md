@@ -1,19 +1,23 @@
-# Listener Specification v2.6.5
+# Listener Specification v2.6.6
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-20) — serial lines, shutdown and the event log:
+Revision note (2026-11-21) — Linemon's serial markers and RTS under RTS/CTS:
 
-- **§3.1.** Exit code 3 no longer counts retries running out; nothing gives up.
-- **§14.3, §50.3, §161 (ADR-073).** An output line a profile leaves unset is set
-  low at open, so the level shown is the level set; under RTS/CTS flow control
-  RTS reads "RTS set by flow control". Lines show only while the port is running.
-- **§118.** A start fault that keeps repeating is written once, then at most once
-  every 10 minutes with a count.
-- **§3.1 (ADR-052).** The CLI reads a stop request while a port is still opening.
+- **§14.3, §50.3, §161 (ADR-073).** On Windows, RTS under RTS/CTS flow control
+  is known to be high and reads "RTS high, set by flow control"; elsewhere it
+  still reads "RTS set by flow control".
+- **§14.3.** In a Channel's settings, Flow is a drop-down and the control lines
+  follow it on its row, as in Linemon.
+- **§50.3.** A serial marker line gives the whole settings line: port, framing,
+  flow control (none included) and the RTS and DTR levels. A change of RTS or
+  DTR writes one too, once the port reports it.
+- **§50.3.** When the port fails to open or stops, Linemon refreshes the port
+  list and says when the port is no longer in it. A port that opens while
+  unlisted refreshes the list too.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -579,7 +583,11 @@ open-time setting. While a Serial Channel is Running:
 - **What is shown for an output** is what Listener last set: an output cannot be
   read back. A line the profile leaves unset is set low at open (ADR-073),
   except RTS under RTS/CTS flow control, which the driver sets and which is shown
-  as set by flow control, with no control.
+  as set by flow control, with no control. On Windows the driver keeps it high,
+  so it is shown high; elsewhere the driver moves it and its level is not shown.
+- **Where they are shown.** In a Channel's interface settings the lines follow
+  Flow, a drop-down, on its row, drawn as Linemon draws them (§50.3), and
+  greyed out with a sentence saying why while the port is not running.
 - **Input lines CTS, DSR, DCD, RI** are **live-monitored**; a change is reflected
   in Channel status/snapshot and signalled by `ControlLinesChanged` (§137).
 
@@ -1015,7 +1023,8 @@ it is not opened from Listener, and Listener need not be running.
   control lines (§161). RTS and DTR are buttons that set them; CTS, DSR, DCD and
   RI are circles, filled when high. The lines are live while the port is open
   and greyed out otherwise. RTS and DTR start low at every open (ADR-073); under
-  RTS/CTS flow control RTS reads "RTS set by flow control" and has no button.
+  RTS/CTS flow control RTS has no button and reads "RTS high, set by flow
+  control" on Windows, "RTS set by flow control" elsewhere.
   While the port is not running, a sentence says that the lines show while the
   port is open. The baud list ends with a box for any other
   rate. For UDP the bar has two lines, as a channel's editor has: the port
@@ -1031,13 +1040,20 @@ it is not opened from Listener, and Listener need not be running.
 - **A port that fails.** Linemon never retries or reopens a port by itself, as a
   Channel with reconnect on does (§9.1). When the port fails, for example when
   an adapter is unplugged, the status line says why, and Start opens it again.
+  A failure also refreshes the serial port list, so a removed adapter shows as
+  not found and the status line says the port is no longer in the list. A port
+  that opens while not in the list refreshes it too.
 - **Display.** Linemon shows the stream in Raw, Rendered or Hex (§42–§47), with
   the view controls a Channel's display has. The data stays on screen when the
   port or a setting changes, and a marker line records each change, naming the
-  port and its settings. A change that leaves no port chosen while started,
-  such as choosing Serial before a serial port, closes the port and is marked
-  too. The status line then says to choose a port, which opens as soon as it is
-  chosen. **Clear** empties the display. With **Clear display on port change**
+  port and its settings. A serial marker gives the whole settings line: the
+  port, its framing, its flow control (none included) and the RTS and DTR
+  levels the open sets. A change of RTS or DTR writes the same line with the new
+  levels, once the port reports the change, so each marker reads on its own and
+  a reopen that puts the lines back low shows. A change that leaves no port
+  chosen while started, such as choosing Serial before a serial port, closes
+  the port and is marked too. The status line then says to choose a port, which
+  opens as soon as it is chosen. **Clear** empties the display. With **Clear display on port change**
   ticked, choosing another port empties it too; it starts unticked.
 - **Pause.** Pause stops the display, not reception. Bytes that arrive while
   the display is paused are not shown.
@@ -3235,7 +3251,8 @@ is unverified end-to-end until proven.
 A user shall be able to: see CTS/DSR/DCD/RI state live and observe it change; set
 RTS/DTR at open and toggle them live while Running. Control-line activity shall not
 affect reception or Recording (§14.2–§14.3). Under RTS/CTS flow control RTS is not
-set from the GUI and reads "RTS set by flow control" (ADR-073).
+set from the GUI and reads "RTS high, set by flow control" on Windows, "RTS set
+by flow control" elsewhere (ADR-073).
 
 ## 162. Auto-Reconnect
 

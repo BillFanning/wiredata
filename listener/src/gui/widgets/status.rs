@@ -4,6 +4,8 @@
 //! parent's test module); only the line/glyph painters touch egui.
 
 use super::super::state::ChannelStatus;
+use crate::transport::SerialControlLines;
+use wiredata_ui::hover::{Hover, ShowHover};
 use wiredata_ui::palette::Palette;
 
 /// The Start/Apply/Retry button's label and enabled state, from the channel status
@@ -171,28 +173,82 @@ pub(crate) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
         .on_hover_text(if high { "high" } else { "low" });
 }
 
-/// A clickable serial output-line toggle (RTS/DTR, §161): a selectable chip
-/// carrying the same level glyph as [`line_indicator`], highlighted when the
-/// line is asserted. Returns the click response so the caller can send the
-/// matching Set command.
-pub(crate) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Response {
-    let color = if high {
-        wiredata_ui::palette::active(ui).running
+/// A click on an output line's button: the line, and the level asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LineClick {
+    Rts(bool),
+    Dtr(bool),
+}
+
+/// The serial control lines (§161) on one row, as Linemon and a Channel's
+/// settings both show them: RTS and DTR as buttons that set them, then CTS,
+/// DSR, DCD and RI as circles, filled when high. An output cannot be read
+/// back, so its button shows what was set: low at open (ADR-073), then what a
+/// click set. Under RTS/CTS flow control (`rts_by_flow`) RTS is the flow
+/// control's, so it has no button.
+///
+/// `live` is the last reading while the port runs. With `None` the row is
+/// greyed out and a sentence says why: greyed out alone would not, disabled
+/// widgets show no hover, and hollow circles would read as lines that are low.
+/// Returns the button clicked, if any.
+pub(crate) fn serial_lines_row(
+    ui: &mut egui::Ui,
+    live: Option<SerialControlLines>,
+    rts_by_flow: bool,
+) -> Option<LineClick> {
+    let lines = live.unwrap_or_default();
+    let mut click = None;
+    ui.add_enabled_ui(live.is_some(), |ui| {
+        if rts_by_flow {
+            rts_by_flow_control(ui);
+        } else if ui
+            .radio(lines.rts, "RTS")
+            .on_hover(&output_line_hover("RTS (Request To Send)", lines.rts))
+            .clicked()
+        {
+            click = Some(LineClick::Rts(!lines.rts));
+        }
+        if ui
+            .radio(lines.dtr, "DTR")
+            .on_hover(&output_line_hover("DTR (Data Terminal Ready)", lines.dtr))
+            .clicked()
+        {
+            click = Some(LineClick::Dtr(!lines.dtr));
+        }
+        ui.separator();
+        for (name, high) in [
+            ("CTS", lines.cts),
+            ("DSR", lines.dsr),
+            ("DCD", lines.dcd),
+            ("RI", lines.ri),
+        ] {
+            line_indicator(ui, name, high);
+        }
+    });
+    if live.is_none() {
+        ui.weak("The lines show while the port is open.");
+    }
+    click
+}
+
+/// The hover of an output line's button: what the line is, its level now, and
+/// what a click does.
+fn output_line_hover(name: &str, high: bool) -> Hover {
+    let (now, then) = if high {
+        ("high", "low")
     } else {
-        ui.visuals().weak_text_color()
+        ("low", "high")
     };
-    let label = format!("{} {name}", line_glyph(high));
-    ui.selectable_label(high, egui::RichText::new(label).color(color))
-        .on_hover_text(format!(
-            "{name} output is {} — click to set it {}",
-            if high { "high" } else { "low" },
-            if high { "low" } else { "high" },
-        ))
+    Hover::from_paragraphs([
+        format!("{name} is an output this computer sets."),
+        format!("It is {now} now. Click to set it {then}."),
+    ])
 }
 
 /// Whether RTS is the flow control's to set rather than the user's: under
 /// RTS/CTS flow control (§161, ADR-073). Listener leaves it alone at open
-/// then, so its level is not known and there is no button for it.
+/// then, and there is no button for it. Its level is known only where
+/// `RTS_HIGH_UNDER_RTS_CTS` says so.
 pub(crate) fn rts_set_by_flow_control(interface: &crate::config::InterfaceConfig) -> bool {
     matches!(
         interface,
@@ -202,11 +258,27 @@ pub(crate) fn rts_set_by_flow_control(interface: &crate::config::InterfaceConfig
 }
 
 /// What stands in for the RTS button under RTS/CTS flow control, in words.
-pub(crate) fn rts_by_flow_control(ui: &mut egui::Ui) {
-    ui.label("RTS set by flow control").on_hover_text(
-        "With RTS/CTS flow control, RTS belongs to the flow control, so it is not set \
-         from here and its level is not shown.",
-    );
+fn rts_by_flow_control(ui: &mut egui::Ui) {
+    let (label, hover) = rts_by_flow_control_text();
+    ui.label(label).on_hover_text(hover);
+}
+
+/// The words for RTS under RTS/CTS flow control, and their hover: its level
+/// where that is known, and otherwise only who sets it.
+fn rts_by_flow_control_text() -> (&'static str, &'static str) {
+    if crate::transport::serial::RTS_HIGH_UNDER_RTS_CTS {
+        (
+            "RTS high, set by flow control",
+            "With RTS/CTS flow control, the port opens with RTS high and keeps it high, \
+             so it is not set from here.",
+        )
+    } else {
+        (
+            "RTS set by flow control",
+            "With RTS/CTS flow control, the driver raises and lowers RTS to pace the \
+             sender, so it is not set from here and its level is not shown.",
+        )
+    }
 }
 
 /// The color for a status glyph. The distinct glyphs `●`/`■`/`⚠` are the primary

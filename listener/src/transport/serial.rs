@@ -239,10 +239,12 @@ impl SerialTransport {
     /// sets, and everything else not asserted. An output cannot be read back,
     /// so one left at the OS default is reported as not asserted, which may be
     /// untrue. Listener's build sets both at open (ADR-073) except RTS under
-    /// RTS/CTS flow control, which the GUI shows as set by flow control.
+    /// RTS/CTS flow control, which is high where that is known
+    /// ([`RTS_HIGH_UNDER_RTS_CTS`]) and shown as set by flow control.
     fn opened_lines(&self) -> SerialControlLines {
+        let rts_by_flow = RTS_HIGH_UNDER_RTS_CTS && self.flow_control == FlowControl::Hardware;
         SerialControlLines {
-            rts: self.rts.unwrap_or(false),
+            rts: self.rts.unwrap_or(rts_by_flow),
             dtr: self.dtr.unwrap_or(false),
             ..SerialControlLines::default()
         }
@@ -278,7 +280,7 @@ impl SerialTransport {
     fn name_the_port(port: &str, error: serialport::Error) -> serialport::Error {
         serialport::Error::new(
             error.kind(),
-            format!("opening serial port {port:?}: {}", error.description),
+            format!("{}{}", open_error_prefix(port), error.description),
         )
     }
 
@@ -307,6 +309,20 @@ impl SerialTransport {
             stall_state: SerialStallState::default(),
         })
     }
+}
+
+/// Whether RTS is known to be high under RTS/CTS flow control. serialport on
+/// Windows opens such a port with RTS switched on and leaves it on
+/// (`RTS_CONTROL_ENABLE`, not handshaking), so the level is known. On Linux
+/// and macOS the driver lowers and raises RTS to pace the sender, so it is
+/// not.
+pub(crate) const RTS_HIGH_UNDER_RTS_CTS: bool = cfg!(windows);
+
+/// What a failed open's error starts with, before the OS's reason:
+/// `opening serial port "COM3": `. Linemon's status line names the port
+/// itself, so it removes this.
+pub(crate) fn open_error_prefix(port: &str) -> String {
+    format!("opening serial port {port:?}: ")
 }
 
 /// An opened serial port ready to receive. Implements [`DataTransportRunner`].
@@ -970,6 +986,16 @@ mod tests {
         assert!(lines.rts);
         // An unset line keeps the OS default, which cannot be read back.
         assert!(!lines.dtr);
+    }
+
+    #[test]
+    fn rts_under_rts_cts_is_high_where_that_is_known() {
+        let lines = SerialTransport::new(ChannelId::new(), "COM1", 9600)
+            .with_flow_control(FlowControl::Hardware)
+            .opened_lines();
+        assert_eq!(lines.rts, RTS_HIGH_UNDER_RTS_CTS);
+        let lines = SerialTransport::new(ChannelId::new(), "COM1", 9600).opened_lines();
+        assert!(!lines.rts, "no flow control, RTS unset");
     }
 
     #[tokio::test]

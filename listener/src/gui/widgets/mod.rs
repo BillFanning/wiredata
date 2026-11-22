@@ -11,9 +11,9 @@ mod status;
 pub(super) use match_rule_editor::edit_mark_rules;
 pub(super) use recording_editor::{edit_display_recording, edit_raw_recording};
 pub(super) use status::{
-    line_indicator, line_toggle, paint_glyph, recording_facts, recording_glyph_size,
-    recording_indicator, rts_by_flow_control, rts_set_by_flow_control, start_button, status_color,
-    status_glyph, status_words, stop_enabled,
+    paint_glyph, recording_facts, recording_glyph_size, recording_indicator,
+    rts_set_by_flow_control, serial_lines_row, start_button, status_color, status_glyph,
+    status_words, stop_enabled, LineClick,
 };
 pub(super) use wiredata_ui::format::human_bytes;
 
@@ -22,6 +22,7 @@ use crate::config::{
 };
 use crate::core::ChannelId;
 use crate::transport::udp::UdpMode;
+use crate::transport::SerialControlLines;
 use wiredata_ui::hover::{Hover, ShowHover};
 
 use super::bind_scope::{bind_choice_label, bind_choices, LocalAddresses, ALL_INTERFACES_ADDRESS};
@@ -187,6 +188,60 @@ fn radio_row<T: PartialEq + Copy>(
     ui.end_row();
 }
 
+/// The width of a drop-down whose widest choice is one of `texts`: the text,
+/// the arrow, and the button's padding. Keeps the serial row short, where
+/// egui's default width is far wider than "8" or "1.5" needs.
+pub(super) fn combo_width<'a>(ui: &egui::Ui, texts: impl IntoIterator<Item = &'a str>) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let widest = texts
+        .into_iter()
+        .map(|text| {
+            ui.painter()
+                .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    let spacing = ui.spacing();
+    widest + spacing.icon_width + spacing.icon_spacing + spacing.button_padding.x * 2.0
+}
+
+/// A label and a drop-down over a table of (value, text) options, as wide as
+/// its longest option.
+pub(super) fn option_combo<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    salt: &str,
+    label: &str,
+    value: &mut T,
+    options: &[(T, &str)],
+) {
+    ui.label(label);
+    combo(ui, salt, value, options);
+}
+
+/// A drop-down over a table of (value, text) options, as wide as its longest
+/// option, with no label: in a grid, the label is the row's first column.
+pub(super) fn combo<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    salt: &str,
+    value: &mut T,
+    options: &[(T, &str)],
+) {
+    let shown = options
+        .iter()
+        .find(|(v, _)| v == value)
+        .map_or("", |(_, text)| *text);
+    let width = combo_width(ui, options.iter().map(|(_, text)| *text));
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(shown)
+        .width(width)
+        .show_ui(ui, |ui| {
+            for (v, text) in options {
+                ui.selectable_value(value, *v, *text);
+            }
+        });
+}
+
 /// An incrementing port box (talker-style): `[−] [text] [+]`, no drag-to-increment
 /// or resize cursor. The text field parses on change; the buttons step by one. A
 /// port of 0 shows empty (a fresh channel has no port yet, #3).
@@ -294,17 +349,25 @@ pub(super) enum Refresh {
 
 /// Edit a channel's interface config in place, laid out like talker (§74/§75).
 /// Presentation only — applied via a §13 Reconfigure. Returns the list to
-/// refresh, if its ⟳ button was clicked or its choice opened. `channel_id` keys
-/// the per-channel custom-baud text buffer so it survives frames and resets on
-/// switch.
+/// refresh, if its ⟳ button was clicked or its choice opened, and the control
+/// line button clicked, if any. `channel_id` keys the per-channel custom-baud
+/// text buffer so it survives frames and resets on switch.
+///
+/// A serial port's control lines follow Flow on its row, as in Linemon. They
+/// are live, not part of the draft: `lines` is the running port's last reading
+/// (`None` while it is not running), and `rts_by_flow` says whether the open
+/// port's flow control sets RTS.
 pub(super) fn edit_interface(
     ui: &mut egui::Ui,
     channel_id: ChannelId,
     config: &mut ChannelConfig,
     serial_ports: &[String],
     local_addresses: &LocalAddresses,
-) -> Option<Refresh> {
+    lines: Option<SerialControlLines>,
+    rts_by_flow: bool,
+) -> (Option<Refresh>, Option<LineClick>) {
     let mut refresh = None;
+    let mut click = None;
 
     ui.separator();
 
@@ -444,12 +507,18 @@ pub(super) fn edit_interface(
                     radio_row(ui, "Data bits", &mut serial.data_bits, DATA_BITS);
                     radio_row(ui, "Parity", &mut serial.parity, PARITY);
                     radio_row(ui, "Stop bits", &mut serial.stop_bits, STOP_BITS);
-                    radio_row(ui, "Flow", &mut serial.flow_control, FLOW_CONTROL);
+                    ui.label("Flow");
+                    ui.horizontal(|ui| {
+                        combo(ui, "serial_flow", &mut serial.flow_control, FLOW_CONTROL);
+                        ui.separator();
+                        click = serial_lines_row(ui, lines, rts_by_flow);
+                    });
+                    ui.end_row();
                 });
         }
     }
     edit_reconnect(ui, &mut config.reconnect);
-    refresh
+    (refresh, click)
 }
 
 /// What the "Port" label says on hover, in the channel editor and Linemon.

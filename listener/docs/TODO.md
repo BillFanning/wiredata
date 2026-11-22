@@ -12,15 +12,21 @@ again. Remove an item when it is done: the commit says what changed.
 
 ## Features
 
-- [ ] **Check Linemon's serial bar by hand (§50.3).** Its UDP side was checked
-  by hand; the serial side waits for a USB serial adapter. Open a port; change
-  the baud and the other settings while started; type a custom baud; the
-  refresh button lists a port plugged in or removed; unplugging the adapter
-  shows the fault and Start reopens it. The control lines (§161): RTS and DTR
-  change when clicked, and with RTS looped to CTS and DTR to DSR the circles
-  follow. RTS and DTR start low at open, and under RTS/CTS RTS reads "RTS set
-  by flow control" (ADR-073): check that a device on RTS/CTS still sends.
-  Unplugging the adapter greys the lines out at once.
+- [ ] **Finish Linemon's serial checks by hand (§50.3, §161).** Checked on
+  2026-11-21 with one FTDI adapter and no loopback: opening, settings changed
+  while open, unplug and Start, the port list refresh, the markers, and RTS and
+  DTR at open and when clicked, under each flow control. Still to check: type a
+  custom baud; the refresh button lists a port plugged in or removed;
+  unplugging greys the lines out at once. Needs a loopback plug (RTS to CTS,
+  DTR to DSR): the circles follow the buttons. Needs a device on RTS/CTS: it
+  still sends while RTS reads "RTS high, set by flow control".
+- [ ] **Lay out a Channel's Configure interface as Linemon's bar (§14, §50.3).**
+  `edit_interface` gives the serial settings five rows of radio buttons;
+  Linemon puts port, baud and framing on one row of drop-downs, then Flow with
+  the control lines (`serial_lines_row`, shared already). Share the widgets
+  and the layout, for serial and UDP, so the two look the same. Keep what
+  differs on purpose: a Channel's edits wait for Apply & Restart, and it has
+  rows Linemon lacks (kernel timestamps, reconnect).
 - [ ] **Disk guard in the GUI (§56.2).** Neither recording editor,
   `edit_raw_recording` nor `edit_display_recording`, sets `disk_guard`, so a
   guard comes only from a profile. With log files kept (talker ADR-069) and

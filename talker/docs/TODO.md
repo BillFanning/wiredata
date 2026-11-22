@@ -74,7 +74,9 @@ Found by a survey of every retry in the workspace on 2026-11-19.
   confirm the same run resumes. Separately, hold CTS low through a write timeout
   and confirm that flow control causes no port reopen or DTR-reset churn. Watch
   for a possibly partial write while there (§4.4). The automated tests fix the
-  state and accounting contract; this checks real drivers.
+  state and accounting contract; this checks real drivers. One adapter with
+  nothing on its DB9 is enough: under RTS/CTS, CTS is then never raised, so
+  every write waits until it times out. Watch the adapter's DTR light for churn.
 
 ## GUI
 

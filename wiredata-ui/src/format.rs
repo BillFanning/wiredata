@@ -104,18 +104,20 @@ pub fn percent(value: f64) -> String {
 /// driver has started, so a missing or refused driver surfaces as "the device
 /// does not exist". That sends a reader looking for a port sitting right there
 /// in the dropdown. Only the UI knows which ports are currently listed, so only
-/// the UI can separate the two cases.
+/// the UI can separate the two cases. A listed port can also be held by
+/// another program: on Windows that and a missing device are the same error
+/// kind, so the hint names both.
 ///
 /// Lives here, beside the other pure string helpers, so both apps say it the
 /// same way; it takes no egui and decides nothing.
 pub fn serial_port_hint(port: &str, listed: bool) -> String {
     if listed {
         format!(
-            "{port} was listed but could not be opened; the device may have been removed or its \
-             driver may not be running."
+            "{port} is in the port list, so another program may have it open, or its driver \
+             may not be running."
         )
     } else {
-        format!("{port} is no longer listed — the device may have been removed.")
+        format!("{port} is no longer in the port list, so the device may have been removed.")
     }
 }
 

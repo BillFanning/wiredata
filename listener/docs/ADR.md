@@ -2630,6 +2630,14 @@ Linux and macOS, an unset line now starts low instead of the system's usual high
 is clicked high, and the display shows the line low, which says why. A Channel
 that needs a line high from the start sets it in its profile.
 
+**Amendment (2026-11-21):** RTS under RTS/CTS is known on Windows. The serial
+library opens such a port with RTS switched on and left on (`RTS_CONTROL_ENABLE`,
+not handshaking), which an adapter's RTS light confirmed by hand. So on Windows
+it is reported high and reads "RTS high, set by flow control"
+(`RTS_HIGH_UNDER_RTS_CTS`). On Linux and macOS the driver lowers and raises RTS
+to pace the sender, so it still reads "RTS set by flow control" with no level.
+Listener still never sets RTS under RTS/CTS.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

@@ -22,13 +22,16 @@ use crate::config::{
 };
 use crate::core::ChannelState;
 use crate::runtime::ChannelSnapshot;
+use crate::transport::serial::{open_error_prefix, RTS_HIGH_UNDER_RTS_CTS};
 use crate::transport::udp::UdpMode;
 
 use super::bind_scope::LocalAddresses;
 use super::bridge::{LinemonUpdate, UiCommand};
 use super::linemon::LinemonStream;
 use super::view_prefs::ViewPrefs;
-use super::widgets::{line_indicator, rts_by_flow_control, rts_set_by_flow_control};
+use super::widgets::{
+    combo_width, option_combo, rts_set_by_flow_control, serial_lines_row, LineClick,
+};
 use super::widgets::{
     list_serial_ports, template_for, udp_bind_choice, udp_mode_and_sharing, AddKind, Refresh,
     BAUD_RATES, DATA_BITS, FLOW_CONTROL, PARITY, STOP_BITS, UDP_MODE_HOVER, UDP_PORT_HOVER,
@@ -254,12 +257,12 @@ fn serial_line_text(serial: &SerialConfig) -> String {
     format!("{} {data_bits}{parity}{stop_bits}", serial.baud_rate)
 }
 
-/// The words for a flow control that is on, or `None` when it is off.
-fn flow_control_text(flow: FlowControl) -> Option<&'static str> {
+/// The words for a flow control, `none` included, so a marker always says.
+fn flow_control_text(flow: FlowControl) -> &'static str {
     match flow {
-        FlowControl::None => None,
-        FlowControl::RtsCts => Some("RTS/CTS flow control"),
-        FlowControl::XonXoff => Some("XON/XOFF flow control"),
+        FlowControl::None => "flow control: none",
+        FlowControl::RtsCts => "flow control: RTS/CTS",
+        FlowControl::XonXoff => "flow control: XON/XOFF",
     }
 }
 
@@ -273,10 +276,19 @@ fn no_port_text(interface: &InterfaceConfig) -> String {
     format!("\u{2014} {kind}, no port chosen \u{2014}")
 }
 
-/// The line that marks an open on the display: `— COM4, 9600 8N1 —` or
-/// `— UDP port 5005 —`, with flow control, broadcast or the multicast group
-/// added when they apply.
+/// The line that marks an open on the display: `— COM4, 9600 8N1, flow
+/// control: none, RTS low, DTR low —` or `— UDP port 5005 —`, with broadcast
+/// or the multicast group added when they apply. A serial port's outputs are
+/// the levels the open sets.
 fn marker_text(interface: &InterfaceConfig) -> String {
+    marker_text_with(interface, None)
+}
+
+/// The marker line for `interface`, with a serial port's outputs at the
+/// levels in `lines`, or at the levels an open sets when `lines` is `None`.
+/// Every serial marker carries the whole settings line, so each one reads on
+/// its own.
+fn marker_text_with(interface: &InterfaceConfig, lines: Option<SerialControlLines>) -> String {
     let Some(key) = port_key(interface) else {
         return String::new();
     };
@@ -285,10 +297,10 @@ fn marker_text(interface: &InterfaceConfig) -> String {
         InterfaceConfig::Serial(serial) => {
             text.push_str(", ");
             text.push_str(&serial_line_text(serial));
-            if let Some(flow) = flow_control_text(serial.flow_control) {
-                text.push_str(", ");
-                text.push_str(flow);
-            }
+            text.push_str(", ");
+            text.push_str(flow_control_text(serial.flow_control));
+            text.push_str(", ");
+            text.push_str(&outputs_text(serial, lines));
         }
         InterfaceConfig::Udp(udp) => match udp.mode {
             UdpMode::Unicast => {}
@@ -305,6 +317,26 @@ fn marker_text(interface: &InterfaceConfig) -> String {
         },
     }
     format!("\u{2014} {text} \u{2014}")
+}
+
+/// The outputs as a marker gives them: `RTS low, DTR low`, from `lines` or,
+/// when `None`, the levels an open sets (ADR-073). Every open sets them, so a
+/// settings change that reopens the port puts them back, and the marker shows
+/// it. Under RTS/CTS, RTS is given only where its level is known
+/// ([`RTS_HIGH_UNDER_RTS_CTS`]).
+fn outputs_text(serial: &SerialConfig, lines: Option<SerialControlLines>) -> String {
+    let level = |high: bool| if high { "high" } else { "low" };
+    let rts_cts = serial.flow_control == FlowControl::RtsCts;
+    let rts_known = !rts_cts || RTS_HIGH_UNDER_RTS_CTS || serial.rts.is_some();
+    let (rts, dtr) = match lines {
+        Some(lines) => (lines.rts, lines.dtr),
+        None => (serial.rts.unwrap_or(rts_cts), serial.dtr.unwrap_or(false)),
+    };
+    if rts_known {
+        format!("RTS {}, DTR {}", level(rts), level(dtr))
+    } else {
+        format!("DTR {}", level(dtr))
+    }
 }
 
 /// The UDP port number one lower or higher, staying within 1 to 65535. A port
@@ -365,6 +397,9 @@ pub(super) struct StatusFacts<'a> {
     /// Why the hidden Channel could not open the port.
     pub open_error: Option<&'a str>,
     pub run: Option<&'a RunFacts>,
+    /// The serial port is not in the port list as last refreshed. The list
+    /// is refreshed when the port fails, so this says the device has gone.
+    pub port_unlisted: bool,
 }
 
 /// The status line: its text, and whether it reports a problem. A problem leads
@@ -393,6 +428,24 @@ fn with_full_stop(reason: &str) -> String {
     }
 }
 
+/// A serial open error without the transport's `opening serial port "COM3": `,
+/// since the status line names the port already.
+fn without_open_prefix<'a>(reason: &'a str, interface: &InterfaceConfig) -> &'a str {
+    match interface {
+        InterfaceConfig::Serial(serial) => reason
+            .strip_prefix(open_error_prefix(&serial.port).as_str())
+            .unwrap_or(reason),
+        InterfaceConfig::Udp(_) => reason,
+    }
+}
+
+/// Whether an output differs between two readings of the control lines. A
+/// reading follows the reader setting the line, so a marker written for it
+/// records what the port did, not a click.
+fn outputs_changed(before: SerialControlLines, now: SerialControlLines) -> bool {
+    before.rts != now.rts || before.dtr != now.dtr
+}
+
 fn status_line(facts: &StatusFacts) -> StatusLine {
     let ok = |text: String| StatusLine {
         text,
@@ -415,8 +468,17 @@ fn status_line(facts: &StatusFacts) -> StatusLine {
     if !facts.started {
         return ok(format!("Stopped. Press Start to open {port}."));
     }
+    let gone = if facts.port_unlisted {
+        " It is no longer in the port list, so the device may have been removed."
+    } else {
+        ""
+    };
     if let Some(reason) = facts.open_error {
-        return problem(format!("{port} could not be opened: {reason}"));
+        let reason = without_open_prefix(reason, facts.interface);
+        return problem(format!(
+            "{port} could not be opened: {}{gone}",
+            with_full_stop(reason)
+        ));
     }
     let Some(run) = facts.run else {
         return ok(format!("Opening {port}\u{2026}"));
@@ -428,7 +490,7 @@ fn status_line(facts: &StatusFacts) -> StatusLine {
                 .as_deref()
                 .map_or_else(|| "no reason was reported.".to_owned(), with_full_stop);
             problem(format!(
-                "{port} stopped: {reason} Press Start to try again."
+                "{port} stopped: {reason}{gone} Press Start to try again."
             ))
         }
         ChannelState::Running => {
@@ -483,6 +545,9 @@ pub(super) struct Linemon {
     /// serial port is open.
     control_lines: Option<SerialControlLines>,
     serial_ports: Vec<String>,
+    /// The serial port failed, so the port list is refreshed at the next
+    /// frame: a removed adapter then shows as not found.
+    ports_stale: bool,
     /// Text typed into the custom baud and UDP port fields.
     baud_text: String,
     udp_port_text: String,
@@ -525,6 +590,7 @@ impl Linemon {
             open_error: None,
             run: None,
             serial_ports: Vec::new(),
+            ports_stale: false,
             baud_text: String::new(),
             udp_port_text: String::new(),
             jump_to_bottom: false,
@@ -577,11 +643,12 @@ impl Linemon {
             }
             LinemonUpdate::Snapshot(snapshot) => {
                 if self.sent.is_some() {
-                    self.run = Some(RunFacts::from_snapshot(&snapshot));
+                    self.take_run(RunFacts::from_snapshot(&snapshot));
                 }
             }
             LinemonUpdate::Error(reason) => {
                 if self.sent.is_some() {
+                    self.serial_port_failed();
                     self.open_error = Some(reason);
                     // The port did not open, so nothing of a run is current:
                     // not a reading that landed late from the previous port.
@@ -590,10 +657,56 @@ impl Linemon {
                 }
             }
             LinemonUpdate::ControlLines(lines) => {
-                if matches!(self.sent, Some(InterfaceConfig::Serial(_))) {
+                if let Some(open @ InterfaceConfig::Serial(_)) = &self.sent {
+                    // The first reading after an open is the open's own
+                    // levels, which the open's marker covers.
+                    if self
+                        .control_lines
+                        .is_some_and(|before| outputs_changed(before, lines))
+                    {
+                        let text = marker_text_with(open, Some(lines));
+                        self.stream.mark_change(&text);
+                    }
                     self.control_lines = Some(lines);
                 }
             }
+        }
+    }
+
+    /// Take the hidden Channel's latest run facts. The port list is refreshed
+    /// when the port stops, so a removed adapter shows as not found, and when
+    /// it opens while unlisted, since a port that opens is there.
+    fn take_run(&mut self, run: RunFacts) {
+        let was = self.run.as_ref().map(|r| r.state);
+        if run.state == ChannelState::Faulted && was != Some(ChannelState::Faulted) {
+            self.serial_port_failed();
+        }
+        // Once per open: a port that opens but is never listed is not looked
+        // for again at every snapshot.
+        if run.state == ChannelState::Running
+            && was != Some(ChannelState::Running)
+            && self.port_unlisted()
+        {
+            self.ports_stale = true;
+        }
+        self.run = Some(run);
+    }
+
+    /// The serial port in use failed to open or stopped: refresh the port
+    /// list at the next frame, so the status can say whether it has gone.
+    fn serial_port_failed(&mut self) {
+        if matches!(self.sent, Some(InterfaceConfig::Serial(_))) {
+            self.ports_stale = true;
+        }
+    }
+
+    /// Whether the chosen serial port is missing from the port list.
+    fn port_unlisted(&self) -> bool {
+        match &self.settings.interface() {
+            InterfaceConfig::Serial(serial) => {
+                !serial.port.is_empty() && !self.serial_ports.contains(&serial.port)
+            }
+            InterfaceConfig::Udp(_) => false,
         }
     }
 
@@ -745,6 +858,9 @@ impl Linemon {
             row_gap,
         );
         ui.add_space((unseen.min_rect().height() - shown).max(0.0));
+        if std::mem::take(&mut self.ports_stale) {
+            self.serial_ports = list_serial_ports();
+        }
         match refresh {
             Some(Refresh::SerialPorts) => self.serial_ports = list_serial_ports(),
             Some(Refresh::LocalAddresses) => out.push(UiCommand::ListLocalAddresses),
@@ -902,40 +1018,11 @@ impl Linemon {
             FLOW_CONTROL,
         );
         ui.separator();
-        let live = self.live_control_lines();
-        let lines = live.unwrap_or_default();
         let rts_by_flow = rts_set_by_flow_control(&self.settings.interface());
-        ui.add_enabled_ui(live.is_some(), |ui| {
-            if rts_by_flow {
-                rts_by_flow_control(ui);
-            } else if ui
-                .radio(lines.rts, "RTS")
-                .on_hover(&output_line_hover("RTS (Request To Send)", lines.rts))
-                .clicked()
-            {
-                out.push(UiCommand::LinemonSetRts(!lines.rts));
-            }
-            if ui
-                .radio(lines.dtr, "DTR")
-                .on_hover(&output_line_hover("DTR (Data Terminal Ready)", lines.dtr))
-                .clicked()
-            {
-                out.push(UiCommand::LinemonSetDtr(!lines.dtr));
-            }
-            ui.separator();
-            for (name, high) in [
-                ("CTS", lines.cts),
-                ("DSR", lines.dsr),
-                ("DCD", lines.dcd),
-                ("RI", lines.ri),
-            ] {
-                line_indicator(ui, name, high);
-            }
-        });
-        if live.is_none() {
-            // Greyed out alone would not say why, and disabled widgets show no
-            // hover; hollow circles would otherwise read as lines that are low.
-            ui.weak("The lines show while the port is open.");
+        match serial_lines_row(ui, self.live_control_lines(), rts_by_flow) {
+            Some(LineClick::Rts(on)) => out.push(UiCommand::LinemonSetRts(on)),
+            Some(LineClick::Dtr(on)) => out.push(UiCommand::LinemonSetDtr(on)),
+            None => {}
         }
     }
 
@@ -1134,6 +1221,7 @@ impl Linemon {
             paused: self.paused,
             open_error: self.open_error.as_deref(),
             run: self.run.as_ref(),
+            port_unlisted: self.port_unlisted(),
         });
         let mut text = egui::RichText::new(line.text);
         if line.problem {
@@ -1155,63 +1243,6 @@ impl Linemon {
                 ui.label(text);
             });
     }
-}
-
-/// The width of a drop-down whose widest choice is one of `texts`: the text,
-/// the arrow, and the button's padding. Keeps the serial row short, where
-/// egui's default width is far wider than "8" or "1.5" needs.
-fn combo_width<'a>(ui: &egui::Ui, texts: impl IntoIterator<Item = &'a str>) -> f32 {
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let widest = texts
-        .into_iter()
-        .map(|text| {
-            ui.painter()
-                .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
-                .size()
-                .x
-        })
-        .fold(0.0, f32::max);
-    let spacing = ui.spacing();
-    widest + spacing.icon_width + spacing.icon_spacing + spacing.button_padding.x * 2.0
-}
-
-/// The hover of an output line's button: what the line is, its level now, and
-/// what a click does.
-fn output_line_hover(name: &str, high: bool) -> Hover {
-    let (now, then) = if high {
-        ("high", "low")
-    } else {
-        ("low", "high")
-    };
-    Hover::from_paragraphs([
-        format!("{name} is an output this computer sets."),
-        format!("It is {now} now. Click to set it {then}."),
-    ])
-}
-
-/// A label and a drop-down over a table of (value, text) options, as wide as
-/// its longest option.
-fn option_combo<T: PartialEq + Copy>(
-    ui: &mut egui::Ui,
-    salt: &str,
-    label: &str,
-    value: &mut T,
-    options: &[(T, &str)],
-) {
-    ui.label(label);
-    let shown = options
-        .iter()
-        .find(|(v, _)| v == value)
-        .map_or("", |(_, text)| *text);
-    let width = combo_width(ui, options.iter().map(|(_, text)| *text));
-    egui::ComboBox::from_id_salt(salt)
-        .selected_text(shown)
-        .width(width)
-        .show_ui(ui, |ui| {
-            for (v, text) in options {
-                ui.selectable_value(value, *v, *text);
-            }
-        });
 }
 
 #[cfg(test)]
@@ -1324,7 +1355,7 @@ mod tests {
     fn the_serial_marker_gives_port_baud_and_framing() {
         assert_eq!(
             marker_text(&ser("COM4")),
-            "\u{2014} COM4, 9600 8N1 \u{2014}"
+            "\u{2014} COM4, 9600 8N1, flow control: none, RTS low, DTR low \u{2014}"
         );
         let mut s = serial("COM4");
         s.baud_rate = 115_200;
@@ -1333,7 +1364,7 @@ mod tests {
         s.stop_bits = StopBits::Two;
         assert_eq!(
             marker_text(&InterfaceConfig::Serial(s)),
-            "\u{2014} COM4, 115200 7E2 \u{2014}"
+            "\u{2014} COM4, 115200 7E2, flow control: none, RTS low, DTR low \u{2014}"
         );
     }
 
@@ -1365,20 +1396,26 @@ mod tests {
     }
 
     #[test]
-    fn the_serial_marker_names_flow_control_only_when_it_is_on() {
+    fn the_serial_marker_always_names_flow_control() {
         let with = |flow| {
             let mut c = serial("COM4");
             c.flow_control = flow;
             marker_text(&InterfaceConfig::Serial(c))
         };
-        assert_eq!(with(FlowControl::None), "\u{2014} COM4, 9600 8N1 \u{2014}");
         assert_eq!(
-            with(FlowControl::RtsCts),
-            "\u{2014} COM4, 9600 8N1, RTS/CTS flow control \u{2014}"
+            with(FlowControl::None),
+            "\u{2014} COM4, 9600 8N1, flow control: none, RTS low, DTR low \u{2014}"
         );
+        // RTS under RTS/CTS is given only where its level is known.
+        let rts_cts = if RTS_HIGH_UNDER_RTS_CTS {
+            "\u{2014} COM4, 9600 8N1, flow control: RTS/CTS, RTS high, DTR low \u{2014}"
+        } else {
+            "\u{2014} COM4, 9600 8N1, flow control: RTS/CTS, DTR low \u{2014}"
+        };
+        assert_eq!(with(FlowControl::RtsCts), rts_cts);
         assert_eq!(
             with(FlowControl::XonXoff),
-            "\u{2014} COM4, 9600 8N1, XON/XOFF flow control \u{2014}"
+            "\u{2014} COM4, 9600 8N1, flow control: XON/XOFF, RTS low, DTR low \u{2014}"
         );
     }
 
@@ -1500,6 +1537,7 @@ mod tests {
             paused: false,
             open_error: None,
             run: None,
+            port_unlisted: false,
         }
     }
 
@@ -1603,6 +1641,125 @@ mod tests {
     }
 
     #[test]
+    fn an_open_error_names_the_port_once_and_says_when_it_has_gone() {
+        let com3 = ser("COM3");
+        let glyph = tone_marker(SignalTone::Warning);
+        let reason = format!(
+            "{}The system cannot find the file specified.",
+            open_error_prefix("COM3")
+        );
+        let mut f = facts(&com3);
+        f.open_error = Some(&reason);
+        assert_eq!(
+            text(&f),
+            format!("{glyph}COM3 could not be opened: The system cannot find the file specified.")
+        );
+        f.port_unlisted = true;
+        assert_eq!(
+            text(&f),
+            format!(
+                "{glyph}COM3 could not be opened: The system cannot find the file specified. \
+                 It is no longer in the port list, so the device may have been removed."
+            )
+        );
+
+        let mut faulted = run(ChannelState::Faulted, 10, 0.0);
+        faulted.fault = Some("The device was unplugged".into());
+        let mut f = facts(&com3);
+        f.run = Some(&faulted);
+        f.port_unlisted = true;
+        assert_eq!(
+            text(&f),
+            format!(
+                "{glyph}COM3 stopped: The device was unplugged. It is no longer in the port \
+                 list, so the device may have been removed. Press Start to try again."
+            )
+        );
+    }
+
+    #[test]
+    fn a_failed_serial_port_refreshes_the_port_list() {
+        let mut l = started_on("COM3");
+        let mut out = Vec::new();
+        l.sync(&mut out);
+        l.handle(LinemonUpdate::Error("gone".into()));
+        assert!(l.ports_stale, "an open that failed");
+
+        let mut l = started_on("COM3");
+        l.sync(&mut out);
+        let run = |state| RunFacts {
+            state,
+            bytes_total: 0,
+            bytes_per_sec: 0.0,
+            fault: None,
+        };
+        l.serial_ports = vec!["COM3".into()];
+        l.take_run(run(ChannelState::Running));
+        assert!(!l.ports_stale, "open and listed");
+        l.take_run(run(ChannelState::Faulted));
+        assert!(l.ports_stale, "the port stopped");
+
+        // Plugged back in and opened before the list was refreshed: the list
+        // still lacks it, so it is refreshed once, at the open.
+        l.ports_stale = false;
+        l.serial_ports.clear();
+        assert!(l.port_unlisted());
+        l.take_run(run(ChannelState::Running));
+        assert!(l.ports_stale, "it opened, so it is there");
+        l.ports_stale = false;
+        l.take_run(run(ChannelState::Running));
+        assert!(!l.ports_stale, "not again at every snapshot");
+    }
+
+    #[test]
+    fn the_serial_marker_gives_the_levels_the_open_sets() {
+        let mut c = serial("COM4");
+        c.rts = Some(true);
+        assert_eq!(
+            marker_text(&InterfaceConfig::Serial(c)),
+            "\u{2014} COM4, 9600 8N1, flow control: none, RTS high, DTR low \u{2014}"
+        );
+    }
+
+    #[test]
+    fn a_change_of_rts_or_dtr_is_marked_when_the_port_reports_it() {
+        let mut l = started_on("COM4");
+        let mut out = Vec::new();
+        l.sync(&mut out);
+        let opened = l.stream.marks().len();
+        // The first reading is the open's levels: the open's marker covers it.
+        l.handle(LinemonUpdate::ControlLines(SerialControlLines::default()));
+        assert_eq!(l.stream.marks().len(), opened);
+        // An input changing is not marked.
+        let cts = SerialControlLines {
+            cts: true,
+            ..SerialControlLines::default()
+        };
+        l.handle(LinemonUpdate::ControlLines(cts));
+        assert_eq!(l.stream.marks().len(), opened);
+        let rts = SerialControlLines { rts: true, ..cts };
+        let both = SerialControlLines { dtr: true, ..rts };
+        l.handle(LinemonUpdate::ControlLines(rts));
+        l.handle(LinemonUpdate::ControlLines(both));
+        l.handle(LinemonUpdate::ControlLines(both));
+        l.handle(LinemonUpdate::ControlLines(cts));
+        let texts: Vec<&str> = l.stream.marks()[opened..]
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        // Each marker is the whole settings line, one per reading that
+        // changed an output, however many outputs it changed.
+        assert_eq!(
+            texts,
+            [
+                "\u{2014} COM4, 9600 8N1, flow control: none, RTS high, DTR low \u{2014}",
+                "\u{2014} COM4, 9600 8N1, flow control: none, RTS high, DTR high \u{2014}",
+                "\u{2014} COM4, 9600 8N1, flow control: none, RTS low, DTR low \u{2014}",
+            ]
+        );
+    }
+
+    #[test]
     fn a_stopped_linemon_reports_no_problem() {
         let com4 = ser("COM4");
         let mut f = facts(&com4);
@@ -1642,7 +1799,10 @@ mod tests {
         l.sync(&mut out);
         assert_eq!(opened(&out).len(), 1);
         assert_eq!(l.stream.marks().len(), 1);
-        assert_eq!(l.stream.marks()[0].text, "\u{2014} COM4, 9600 8N1 \u{2014}");
+        assert_eq!(
+            l.stream.marks()[0].text,
+            "\u{2014} COM4, 9600 8N1, flow control: none, RTS low, DTR low \u{2014}"
+        );
         // Nothing changed, so nothing more is sent.
         l.sync(&mut out);
         assert_eq!(opened(&out).len(), 1);
@@ -1836,6 +1996,7 @@ mod tests {
             paused: false,
             open_error: l.open_error.as_deref(),
             run: None,
+            port_unlisted: false,
         });
         assert!(line.problem);
         assert!(

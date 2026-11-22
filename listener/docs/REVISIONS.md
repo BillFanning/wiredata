@@ -12,6 +12,16 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-20) — serial lines, shutdown and the event log:
+
+- **§3.1.** Exit code 3 no longer counts retries running out; nothing gives up.
+- **§14.3, §50.3, §161 (ADR-073).** An output line a profile leaves unset is set
+  low at open, so the level shown is the level set; under RTS/CTS flow control
+  RTS reads "RTS set by flow control". Lines show only while the port is running.
+- **§118.** A start fault that keeps repeating is written once, then at most once
+  every 10 minutes with a count.
+- **§3.1 (ADR-052).** The CLI reads a stop request while a port is still opening.
+
 Revision note (2026-11-19) — reconnect is on or off, at a fixed pace:
 
 - **§9.1, §80.1, §162 (ADR-072).** A Channel's `ReconnectPolicy` holds only

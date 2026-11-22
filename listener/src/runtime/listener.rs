@@ -665,8 +665,9 @@ pub enum OrchestratorError {
     },
     #[error(transparent)]
     Build(#[from] BuildError),
-    #[error("failed to open serial port: {0}")]
-    SerialOpen(#[source] serialport::Error),
+    /// The transport's error names the port and the open already.
+    #[error(transparent)]
+    SerialOpen(serialport::Error),
     #[error("failed to bind interface: {0}")]
     Bind(#[source] std::io::Error),
     #[error("serial control is not available (not a running serial channel)")]
