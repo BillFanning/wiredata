@@ -125,12 +125,21 @@ Found by a survey of every retry in the workspace on 2026-11-19.
     double the size, which the code halves.
   - Run a soak. `run-soak.sh` reads memory from `/proc`, which macOS lacks.
 
+## Releases (workspace)
+
+- [ ] **Version in the Windows .exe properties.** The window titles and
+  `--version` show the Cargo.toml version, but Properties → Details on each
+  .exe has no File version or Product version. Embed a Windows version
+  resource in the five release programs from a build script in talker and
+  listener (the winresource crate is one way, and the same resource could carry
+  an icon). It adds a build dependency, so record an ADR and run
+  `cargo deny check`.
+
 ## Project README
 
-There is no README yet. When there is, it should cover:
+The README covers downloading, the Linux build packages (ADR-003) and building
+from source. It does not yet cover:
 
-- [ ] The Linux system packages `eframe` needs (`libxcb`, `libxkbcommon` and
-  others), per ADR-003.
 - [ ] The MSRV policy and `rustup update stable`, per ADR-008.
 - [ ] **High-rate timing, for users** (ADR-017 has the rationale):
   - Windows wakes sleeps on a 15.625 ms tick. Talker requests 1 ms resolution

@@ -1,0 +1,112 @@
+name: Release
+
+# Pushing a tag such as v0.1.0 builds the five user-facing programs for Windows
+# and Linux and attaches them to a *draft* GitHub release. Nothing is public
+# until someone opens the draft and clicks Publish, which is the moment to check
+# that CI passed on the tagged commit. This workflow does not wait for CI.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x86_64
+            ext: .exe
+          # 22.04 rather than latest, for the reason in ci.yml: the binary
+          # needs a glibc at least as new as the one it was built against.
+          - os: ubuntu-22.04
+            target: linux-x86_64
+            ext: ""
+    steps:
+      - uses: actions/checkout@v5
+
+      # The programs show the version from Cargo.toml (window titles,
+      # --version, run summaries), not the tag. Refuse a tag that disagrees,
+      # so a v0.2.0 release cannot ship programs that call themselves 0.1.0.
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          cargo_version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$cargo_version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libudev-dev \
+            libxkbcommon-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # No rust-cache: a release builds from clean, so a stale cache cannot
+      # leak into what people download.
+      - name: Build release binaries
+        run: cargo build --release --locked -p talker -p listener
+
+      # The soak tools (wiredata-soak) are test tooling and are left out.
+      # Windows gets a zip; Linux gets a tar.gz so the execute bit survives.
+      - name: Pack
+        id: pack
+        shell: bash
+        run: |
+          name="wiredata-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          for bin in talker talker-gui listener listener-gui linemon; do
+            cp "target/release/${bin}${{ matrix.ext }}" "$name/"
+          done
+          cp README.md LICENSE-* "$name/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+            echo "file=$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            echo "file=$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.pack.outputs.file }}
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "wiredata $GITHUB_REF_NAME" \
+            --generate-notes
