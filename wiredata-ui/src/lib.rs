@@ -1,11 +1,13 @@
 //! Shared GUI **chrome** for the wiredata apps (talker ADR-016 / listener
 //! ADR-019): the bundled font stack, the severity/status color palette, the
 //! base widget style (both themes), compact diagnostic-card chrome, shared
-//! modal dialogs, the hover-text format, and small pure formatting helpers.
+//! modal dialogs, the hover-text format, small pure formatting helpers, and
+//! the serial port's two settings lines (talker ADR-071 / listener ADR-074).
 //!
 //! Scope is deliberately narrow — the pieces that make the two apps *look and
 //! feel* like one product. App-specific widgets, layouts, and view-models stay
-//! in each app. This crate depends only on `egui`; it must never depend on
+//! in each app; a shared widget works on neutral values each app maps to and
+//! from its own types. This crate depends only on `egui`; it must never depend on
 //! `talker`, `listener`, `eframe`, or any runtime crate.
 
 pub mod diagnostics;
@@ -17,6 +19,7 @@ pub mod hover;
 pub mod palette;
 pub mod repaint;
 pub mod selection;
+pub mod serial;
 pub mod style;
 
 /// One-call chrome install both apps run at creation, in the required order:
