@@ -23,6 +23,8 @@ pub(super) struct ChannelView {
     pub(super) notices: ChannelNotices,
     /// Rolling five-second acceptance rate for the channel row.
     pub(super) rate: RateTracker,
+    /// The banner showed a failed open when last drawn.
+    open_failure_shown: bool,
 }
 
 impl Default for ChannelView {
@@ -33,6 +35,7 @@ impl Default for ChannelView {
             // Not derived: the tracker's window is anchored to an epoch, and
             // `Instant` has no default to anchor it to.
             rate: RateTracker::new(),
+            open_failure_shown: false,
         }
     }
 }
@@ -50,5 +53,44 @@ impl ChannelView {
         self.display.reset_run_state();
         self.notices = ChannelNotices::default();
         self.rate = RateTracker::new();
+        self.open_failure_shown = false;
+    }
+
+    /// Whether a failed open has just appeared in the banner, given whether
+    /// one shows now. True once per failure, so the port list it is explained
+    /// against is refreshed then, not on every frame.
+    pub(super) fn open_failure_appeared(&mut self, shown: bool) -> bool {
+        let appeared = shown && !self.open_failure_shown;
+        self.open_failure_shown = shown;
+        appeared
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_port_list_is_refreshed_once_as_an_open_failure_appears() {
+        let mut view = ChannelView::default();
+        assert!(!view.open_failure_appeared(false), "no failure");
+        assert!(view.open_failure_appeared(true), "the failure appears");
+        assert!(
+            !view.open_failure_appeared(true),
+            "the same failure, a frame later, refreshes nothing"
+        );
+        assert!(!view.open_failure_appeared(false), "the failure clears");
+        assert!(view.open_failure_appeared(true), "a new failure appears");
+    }
+
+    #[test]
+    fn a_fresh_run_forgets_the_failure_it_had() {
+        let mut view = ChannelView::default();
+        assert!(view.open_failure_appeared(true));
+        view.start_run();
+        assert!(
+            view.open_failure_appeared(true),
+            "a new run's first failed open is a new failure"
+        );
     }
 }

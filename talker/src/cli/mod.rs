@@ -420,7 +420,7 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
                         say(reconcile_send_health(
                             &mut health,
                             channel,
-                            active_send_error.as_deref(),
+                            active_send_error.as_ref().map(|error| error.message.as_str()),
                             &send_retry,
                             now,
                         ));

@@ -17,9 +17,18 @@ again. Remove an item when it is done: the commit says what changed.
   while open, unplug and Start, the port list refresh, the markers, and RTS and
   DTR at open and when clicked, under each flow control. Still to check: type a
   custom baud; the refresh button lists a port plugged in or removed;
-  unplugging greys the lines out at once. Needs a loopback plug (RTS to CTS,
-  DTR to DSR): the circles follow the buttons. Needs a device on RTS/CTS: it
-  still sends while RTS reads "RTS high, set by flow control".
+  unplugging greys the lines out at once. Checked on 2026-11-22 with two FTDI
+  adapters and a null-modem cable: each side's CTS follows the other's RTS, and
+  DSR and DCD together follow its DTR, and talker on RTS/CTS sends to it while
+  its RTS reads "RTS high, set by flow control".
+- [ ] **Larger control-line circles that alone show the level (§161).**
+  `line_indicator` colours the whole label, glyph and line name together, and
+  the glyph is a text character the size of the name. Draw CTS, DSR, DCD and
+  RI as a larger circle, about the size of the RTS and DTR buttons, filled when
+  high and hollow when low, with the name beside it in the ordinary text
+  colour. The fill carries the level, so the change does not rest on colour.
+  `serial_lines_row` is shared, so Linemon and a Channel's settings change
+  together.
 - [ ] **Lay out a Channel's Configure interface as Linemon's bar (§14, §50.3).**
   `edit_interface` gives the serial settings five rows of radio buttons;
   Linemon puts port, baud and framing on one row of drop-downs, then Flow with

@@ -134,7 +134,7 @@ pub enum TalkerStatus {
         /// was dropped. Later retry errors refresh the live explanation without
         /// opening another counted episode. `None` likewise repairs a dropped
         /// [`SendRecovered`](Self::SendRecovered) edge.
-        active_send_error: Option<String>,
+        active_send_error: Option<ActiveError>,
         /// Exact monotonic instant at which `totals.timing` was collapsed. This is
         /// snapshot provenance, not necessarily the newest sample time.
         captured_at: Instant,
@@ -240,6 +240,33 @@ impl Default for ObserverPolicy {
     }
 }
 
+/// The obstacle a failing channel is stuck on, and which step met it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveError {
+    /// The error with its context chain, as the UI shows it.
+    pub message: String,
+    /// Reopening the interface failed, not a write. Only a failed open is
+    /// about whether the port is there at all, so only it is explained
+    /// against the port list.
+    pub reopening: bool,
+}
+
+impl ActiveError {
+    fn write(message: String) -> Self {
+        Self {
+            message,
+            reopening: false,
+        }
+    }
+
+    fn reopen(message: String) -> Self {
+        Self {
+            message,
+            reopening: true,
+        }
+    }
+}
+
 /// One failing episode: from the first failed send (reported) to the first
 /// successful one (reported with these counts). See [`RETRY_BACKOFF_INITIAL`].
 struct FailureEpisode {
@@ -247,7 +274,7 @@ struct FailureEpisode {
     /// counter snapshots until a successful write closes the episode. The
     /// episode's first failure remains in its edge-triggered log/status event;
     /// later retries update this live description without creating new edges.
-    active_error: String,
+    active_error: ActiveError,
     /// Sends attempted and failed, ≥ 1 (the reported first one), including
     /// those that were possibly partial.
     failures: u64,
@@ -1203,7 +1230,7 @@ impl<'a> RunState<'a> {
                 // send-call timing either; reopen work is outside
                 // both measurement boundaries.
                 if let Some(ep) = self.episode.as_mut() {
-                    ep.active_error = format!("{e:#}");
+                    ep.active_error = ActiveError::reopen(format!("{e:#}"));
                     ep.withheld += 1;
                     ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
                     ep.next_attempt = Instant::now() + ep.backoff;
@@ -1383,7 +1410,7 @@ impl<'a> RunState<'a> {
                     send_failed_line(&self.who.label, &message)
                 );
                 self.episode = Some(FailureEpisode {
-                    active_error: message.clone(),
+                    active_error: ActiveError::write(message.clone()),
                     failures: 1,
                     possibly_partial: partial,
                     withheld: 0,
@@ -1400,7 +1427,7 @@ impl<'a> RunState<'a> {
             }
             // A failed retry deepens the backoff; no re-report.
             Some(ep) => {
-                ep.active_error = format!("{e:#}");
+                ep.active_error = ActiveError::write(format!("{e:#}"));
                 ep.failures += 1;
                 ep.possibly_partial += partial;
                 ep.handle_needs_recovery = true;
@@ -3012,10 +3039,10 @@ mod tests {
         assert_eq!(sent, 0);
         assert!(failed >= 1, "the failed attempt is visible before stop");
         assert!(
-            active_send_error
-                .as_deref()
-                .is_some_and(|message| message.contains("mock send failure")),
-            "counter snapshots repeat the open failure episode"
+            active_send_error.is_some_and(
+                |error| !error.reopening && error.message.contains("mock send failure")
+            ),
+            "counter snapshots repeat the open failure episode, as a failed write"
         );
         assert!(
             withheld >= 1,
@@ -3478,8 +3505,17 @@ mod tests {
         assert!(
             active_errors
                 .iter()
-                .any(|error| error.contains("replacement device is absent")),
-            "counter snapshots should show the current reopen obstacle: {active_errors:#?}"
+                .any(|error| error.reopening
+                    && error.message.contains("replacement device is absent")),
+            "counter snapshots should show the current reopen obstacle, as a reopen: \
+             {active_errors:#?}"
+        );
+        assert!(
+            active_errors
+                .iter()
+                .filter(|error| error.message.contains("removed device handle"))
+                .all(|error| !error.reopening),
+            "the write that failed is not a reopen: {active_errors:#?}"
         );
         assert_eq!(
             failures, 1,

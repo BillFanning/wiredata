@@ -67,19 +67,24 @@ Found by a survey of every retry in the workspace on 2026-11-19.
   byte for byte the same, with tests that pin them before the switch. Then
   remove the `deny.toml` entry.
 
-## Checks by hand
-
-- [ ] **Serial recovery on real hardware (Windows).** With a schedule running,
-  unplug a USB serial adapter and plug it back in under the same COM name, and
-  confirm the same run resumes. Separately, hold CTS low through a write timeout
-  and confirm that flow control causes no port reopen or DTR-reset churn. Watch
-  for a possibly partial write while there (§4.4). The automated tests fix the
-  state and accounting contract; this checks real drivers. One adapter with
-  nothing on its DB9 is enough: under RTS/CTS, CTS is then never raised, so
-  every write waits until it times out. Watch the adapter's DTR light for churn.
-
 ## GUI
 
+- [ ] **A freeze not yet explained (Windows, FTDI).** On 2026-11-22 talker
+  stopped responding while flow control was changed in both talker and Linemon
+  during a CTS stall, over a null-modem pair. After it was force-closed, a
+  talker.exe stayed in the process list that could not be killed, with one
+  thread waiting in the system, which points at a serial call that never
+  returned in the driver. About 25 minutes of the same changes, in both
+  orders, and an unplug did not freeze it again. The window thread waits in
+  two places: shutdown joins every runner (`join_all`), and the port list is
+  read on it (`refresh_serial_ports`). If it happens again, leave the window
+  open and record its thread states before closing it.
+- [ ] **Read the serial port list off the window thread.**
+  `refresh_serial_ports` enumerates ports on the window thread, at startup,
+  from the Refresh button, and when an open failure appears. Enumeration
+  asks the driver, so a wedged driver can freeze the window, against the rule
+  that UI threads never block. Read it on a worker and show the last list
+  until the new one arrives.
 - [ ] **Cache the Cadence grouping and its tooltip.** `cadence_groups` allocates
   and `cadence_tooltip` builds about 1 kB of text every repaint, hovered or not.
   The better shape is a `wiredata-ui` change so `signal_row` builds its tooltip

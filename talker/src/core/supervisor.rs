@@ -30,8 +30,8 @@ use crate::core::internal_fault::InternalFaultTally;
 use crate::core::message::MessageConfig;
 use crate::core::run_summary::{RunId, RunSummary, RunTotals};
 use crate::core::runner::{
-    self, CommandExecution, CommandId, CommandTarget, ObserverPolicy, RunnerControlStatus,
-    RunnerIdentity, TalkerCommand, TalkerHandle, TalkerStatus,
+    self, ActiveError, CommandExecution, CommandId, CommandTarget, ObserverPolicy,
+    RunnerControlStatus, RunnerIdentity, TalkerCommand, TalkerHandle, TalkerStatus,
 };
 use crate::core::scheduler::Schedule;
 use crate::core::telemetry::{MessageTiming, SendTimingTelemetry};
@@ -119,6 +119,9 @@ pub struct ChannelTelemetry {
     /// delivered payload sample or a `SendRecovered` — live proof the
     /// interface works again — and on start.
     pub last_error: Option<String>,
+    /// `last_error` came from opening or reopening the interface, not from a
+    /// write. Meaningless while `last_error` is `None`.
+    last_error_opening: bool,
     /// The latest **control-plane** error (an undeliverable Stop/interface-
     /// update/interval command). A healthy sample must NOT clear this — the
     /// wire working says nothing about a command that never arrived. Cleared
@@ -136,6 +139,19 @@ impl ChannelTelemetry {
     /// wins over an interface error.
     pub fn banner_error(&self) -> Option<&str> {
         self.command_error.as_deref().or(self.last_error.as_deref())
+    }
+
+    /// Whether [`banner_error`](Self::banner_error) is a failed open or reopen
+    /// of the interface: the one error the port list can explain.
+    pub fn banner_is_open_failure(&self) -> bool {
+        self.command_error.is_none() && self.last_error.is_some() && self.last_error_opening
+    }
+
+    fn set_interface_error(&mut self, error: Option<ActiveError>) {
+        (self.last_error, self.last_error_opening) = match error {
+            Some(error) => (Some(error.message), error.reopening),
+            None => (None, false),
+        };
     }
 
     fn record_command_failure(&mut self, id: CommandId, target: CommandTarget, message: String) {
@@ -1154,7 +1170,7 @@ fn drain_statuses(
                 }
                 // The repeated Option is independently authoritative for the
                 // current state, so either dropped edge repairs the live banner.
-                telemetry.last_error = active_send_error;
+                telemetry.set_interface_error(active_send_error);
                 telemetry.timing = timing.cumulative;
                 telemetry.recent_timing = timing.recent;
                 telemetry.recent_timing_captured_at = Some(captured_at);
@@ -1170,7 +1186,7 @@ fn drain_statuses(
                 // Live proof of a working interface: clear the banner. During
                 // a failing episode sends are withheld, so no samples
                 // arrive and the banner correctly persists.
-                telemetry.last_error = None;
+                telemetry.set_interface_error(None);
                 samples.push(PayloadSample {
                     slot,
                     payload,
@@ -1180,14 +1196,20 @@ fn drain_statuses(
             TalkerStatus::SendFailed { message, .. } => {
                 telemetry.errors_total += 1;
                 telemetry.send_failure_episodes += 1;
-                telemetry.last_error = Some(message);
+                telemetry.set_interface_error(Some(ActiveError {
+                    message,
+                    reopening: false,
+                }));
             }
             TalkerStatus::OpenFailed { message, .. } => {
                 telemetry.errors_total += 1;
-                telemetry.last_error = Some(message);
+                telemetry.set_interface_error(Some(ActiveError {
+                    message,
+                    reopening: true,
+                }));
             }
             TalkerStatus::SendRecovered { .. } => {
-                telemetry.last_error = None;
+                telemetry.set_interface_error(None);
             }
         }
     }
@@ -1293,6 +1315,16 @@ mod tests {
     }
 
     fn failure_counter_at(active_send_error: Option<&str>, episodes: u64) -> TalkerStatus {
+        counter_with(
+            active_send_error.map(|message| ActiveError {
+                message: message.to_owned(),
+                reopening: false,
+            }),
+            episodes,
+        )
+    }
+
+    fn counter_with(active_send_error: Option<ActiveError>, episodes: u64) -> TalkerStatus {
         TalkerStatus::Counters {
             channel: ChannelId::mint(),
             totals: Box::new(RunTotals {
@@ -1301,7 +1333,7 @@ mod tests {
                 ..RunTotals::default()
             }),
             send_failure_episodes: episodes,
-            active_send_error: active_send_error.map(str::to_owned),
+            active_send_error,
             captured_at: Instant::now(),
             final_snapshot: false,
         }
@@ -1937,6 +1969,91 @@ mod tests {
             Some("writing to serial port: device removed"),
             "the still-open failure episode must reach the live banner"
         );
+    }
+
+    /// Only a failed open is about whether the port is there, so only it is
+    /// explained against the port list. A write that stalls on flow control,
+    /// or fails as a device goes, is not.
+    #[test]
+    fn only_a_failed_open_banner_is_an_open_failure() {
+        let channel = ChannelId::mint();
+        let after = |statuses: Vec<TalkerStatus>, start: ChannelTelemetry| {
+            let mut telemetry = start;
+            let (tx, rx) = crossbeam_channel::unbounded();
+            for status in statuses {
+                tx.send(status).unwrap();
+            }
+            drop(tx);
+            drain_statuses(0, &rx, &mut telemetry, &mut Vec::new());
+            telemetry
+        };
+        let reopen = || ActiveError {
+            message: "opening serial port \"COM4\": no device is present at COM4".into(),
+            reopening: true,
+        };
+
+        let opened = after(
+            vec![TalkerStatus::OpenFailed {
+                channel,
+                message: "opening serial port \"COM4\": access denied".into(),
+            }],
+            ChannelTelemetry::default(),
+        );
+        assert!(opened.banner_is_open_failure(), "a failed first open");
+
+        let reopened = after(
+            vec![counter_with(Some(reopen()), 1)],
+            ChannelTelemetry::default(),
+        );
+        assert!(reopened.banner_is_open_failure(), "a failed reopen");
+
+        let stalled = after(
+            vec![TalkerStatus::SendFailed {
+                channel,
+                message: "writing to serial port: the port took no data for 1 s \
+                          (write timed out)"
+                    .into(),
+            }],
+            ChannelTelemetry::default(),
+        );
+        assert!(!stalled.banner_is_open_failure(), "a failed write");
+
+        let back_to_writing = after(
+            vec![
+                counter_with(Some(reopen()), 1),
+                failure_counter(Some("writing to serial port: Access is denied.")),
+            ],
+            ChannelTelemetry::default(),
+        );
+        assert!(
+            !back_to_writing.banner_is_open_failure(),
+            "a reopen that worked, then a write that failed"
+        );
+
+        let with_command_error = after(
+            vec![counter_with(Some(reopen()), 1)],
+            ChannelTelemetry {
+                command_error: Some("the interval change was not carried out".into()),
+                ..ChannelTelemetry::default()
+            },
+        );
+        assert!(
+            !with_command_error.banner_is_open_failure(),
+            "a command error takes the banner, and it is no open failure"
+        );
+
+        let recovered = after(
+            vec![
+                counter_with(Some(reopen()), 1),
+                TalkerStatus::SendRecovered {
+                    channel,
+                    failures: 1,
+                    withheld: 1,
+                },
+            ],
+            ChannelTelemetry::default(),
+        );
+        assert!(!recovered.banner_is_open_failure(), "no banner at all");
     }
 
     #[test]

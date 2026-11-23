@@ -251,6 +251,12 @@ impl TalkerApp {
             telemetry.recent_timing_is_final,
         );
         let error: Option<String> = telemetry.banner_error().map(str::to_owned);
+        let open_failure = telemetry.banner_is_open_failure();
+        // A port can vanish while talker runs; the list is otherwise only as
+        // fresh as the last refresh, and would say an unplugged port is there.
+        if self.views[i].open_failure_appeared(open_failure) {
+            self.refresh_serial_ports();
+        }
         let (glyph, glyph_color, status_word) = lifecycle_indicator(running, error.is_some(), pal);
         let draft_kind = self.conn_drafts[i].kind();
         let draft_interface = self.conn_drafts.get(i).and_then(|draft| draft.to_config());
@@ -555,7 +561,9 @@ impl TalkerApp {
             ui.colored_label(pal.fault, format!("\u{26A0} {err}"));
             // Only the UI knows what is currently enumerated, so only the UI can
             // say whether the port the OS called absent is still in the list.
-            if draft_kind == ConnKind::Serial {
+            // Only a failed open is about that: under a stalled or failed write
+            // the hint would point at the wrong cause.
+            if open_failure && draft_kind == ConnKind::Serial {
                 let port = self.conn_drafts[i].serial_port.clone();
                 if !port.is_empty() {
                     let listed = self.serial_ports.contains(&port);

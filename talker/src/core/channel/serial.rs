@@ -174,10 +174,14 @@ impl std::error::Error for WriteTimedOut {}
 /// The error for a failed write. A timed-out write is said in talker's words;
 /// error 995 is not one, since it is what an unplug raises.
 fn write_error(failure: WriteFailure) -> anyhow::Error {
-    // Unix reports a write timeout as would-block, Windows as timed out.
+    // Unix reports a write timeout as would-block. Windows reports it as timed
+    // out, or, from a USB serial driver held up by CTS, as a write that took no
+    // bytes, which `write_counted` turns into write-zero.
     let timed_out = matches!(
         failure.io.kind(),
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::WriteZero
     ) && failure.io.raw_os_error() != Some(WINDOWS_ERROR_OPERATION_ABORTED);
     if timed_out {
         failure.into_error_as(
@@ -354,8 +358,14 @@ mod tests {
 
     #[test]
     fn a_write_timeout_is_said_in_talkers_words() {
-        // Unix reports a write timeout as would-block, Windows as timed out.
-        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+        // Unix reports a write timeout as would-block. On Windows the driver
+        // can report it as timed out, or as a write that took no bytes, which
+        // `write_counted` turns into write-zero.
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::WriteZero,
+        ] {
             let error = write_error(failure(kind, 0, 40));
             assert_eq!(
                 format!("{error:#}"),
