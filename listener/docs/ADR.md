@@ -2638,6 +2638,10 @@ it is reported high and reads "RTS high, set by flow control"
 to pace the sender, so it still reads "RTS set by flow control" with no level.
 Listener still never sets RTS under RTS/CTS.
 
+**Amendment (2026-11-22):** Talker follows this decision for its own serial
+channels, and all three programs name flow control None, XON/XOFF and RTS/CTS
+(talker ADR-070).
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

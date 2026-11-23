@@ -1,12 +1,14 @@
 # Talker — Program Specification
-**Version:** 2.5.9
+**Version:** 2.6.0
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-20) — exit code 3:
+Revision note (2026-11-22) — serial control lines and flow-control names:
 
-- **§3.1 exit codes** — exit code 3 no longer counts retries running out;
-  nothing in either application gives up retrying.
+- **§4.2 (ADR-070)** — a serial channel sets RTS and DTR and shows CTS, DSR,
+  DCD and RI, as listener does.
+- **§4.2 (ADR-070)** — flow control is named None, XON/XOFF and RTS/CTS.
+  XON/XOFF was supported but not listed.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -508,7 +510,17 @@ All standard RS-232 parameters are user-configurable:
 - Data bits (5, 6, 7, 8)
 - Parity (None, Even, Odd)
 - Stop bits (1, 2)
-- Hardware flow control (RTS/CTS, None)
+- Flow control: None, XON/XOFF or RTS/CTS, named so in Linemon and listener
+  too (ADR-070)
+
+**Control lines (ADR-070).** RTS and DTR are set low at every open, unless the
+profile's `rts` or `dtr` sets them, and while the channel runs a button sets
+each. Under RTS/CTS flow control RTS belongs to the flow control: it has no
+button and reads "RTS high, set by flow control" on Windows, "RTS set by flow
+control" elsewhere. CTS, DSR, DCD and RI are read from the port and shown while
+it is open, each as a circle filled when high; while the port is not open the
+lines are greyed out and a sentence says why. Setting a line neither reopens
+the port nor interrupts sending.
 
 If Windows describes an absent port with its known filesystem-oriented file- or
 path-not-found wording, the error instead reads `no device is present at

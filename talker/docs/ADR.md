@@ -1,13 +1,13 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.33
-**Date:** 2026-11-20
+**Version:** 1.34
+**Date:** 2026-11-22
 **Status:** Accepted
 
-Revision note (2026-11-20) — exit codes and log growth:
+Revision note (2026-11-22) — serial control lines:
 
-- **ADR-060** — exit code 3 no longer counts retries running out.
-- **ADR-069** — a repeating start fault is written once per 10 minutes.
+- **ADR-070** — talker sets and shows the serial control lines as listener
+  does, and all three programs name flow control None, XON/XOFF and RTS/CTS.
 
 ---
 
@@ -2742,6 +2742,51 @@ operator removes old files. An event log is diagnostics only, so a day's file
 is small next to a recording. The deploy notes say the files are kept. A listener
 Channel retrying a fault that never clears writes one line per 10 minutes, not
 one per attempt (listener §118).
+
+---
+
+## ADR-070 — Talker sets and shows the serial control lines; one name for each flow control
+
+**Status:** Accepted 2026-11-22. Amends spec §4.2.
+
+**Context:** Talker never set RTS or DTR, so they stayed as the driver left
+them, which on Windows is low. A device that waits for DTR high got nothing, and
+a CTS stall showed only as write timeouts, with the cause visible only from the
+far end. Listener and Linemon already set and show the lines (listener
+ADR-073). The null-modem checks of 2026-11-22 showed both gaps. The three
+programs also named flow control three ways: talker's editor said Software and
+Hardware, listener's drop-down Xon/Xoff, Linemon's markers XON/XOFF, and the
+talker spec left XON/XOFF out although talker supports it.
+
+**Decision:**
+
+- Talker follows listener ADR-073. RTS and DTR are set low at every open unless
+  the profile's `rts` or `dtr` sets them, and buttons set them while the
+  channel runs. Under RTS/CTS flow control RTS belongs to the flow control and
+  has no button. CTS, DSR, DCD and RI are shown while the port is open.
+- Flow control is named **None**, **XON/XOFF** and **RTS/CTS** on screen in
+  talker, listener and Linemon alike.
+- Talker shows the lines with the same row as listener and Linemon, as part of
+  sharing one interface layout across the three (listener TODO).
+
+**Boundary:** This does not change how flow control behaves, only what it is
+called, and it does not add a profile value for the input lines, which are only
+read. Profile keys keep their names.
+
+**Alternatives considered:**
+
+- **Leave talker without control lines:** Rejected. Talker drives devices, and
+  some take nothing until DTR or RTS is high.
+- **Set both high at open, as most terminal programs do:** Rejected for the
+  reasons in listener ADR-073: a board that resets on DTR would restart at
+  every open.
+- **Software and Hardware:** Rejected. XON/XOFF and RTS/CTS say what happens on
+  the wire, and they are what device manuals print.
+
+**Consequences:** A device that needs a line high stays silent until the line
+is clicked high or the profile sets it, and the display shows the line low,
+which says why. A stalled channel's CTS circle shows the cause in talker
+itself.
 
 ---
 

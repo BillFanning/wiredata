@@ -69,6 +69,10 @@ Found by a survey of every retry in the workspace on 2026-11-19.
 
 ## GUI
 
+- [ ] **One interface layout with Linemon and Listener.** Talker's serial and
+  UDP editors take Linemon's layout, talker gains the serial control lines, and
+  all three name flow control the same way (ADR-070). The item, with its
+  priority, is in [listener's TODO](../../listener/docs/TODO.md).
 - [ ] **A freeze not yet explained (Windows, FTDI).** On 2026-11-22 talker
   stopped responding while flow control was changed in both talker and Linemon
   during a CTS stall, over a null-modem pair. After it was force-closed, a

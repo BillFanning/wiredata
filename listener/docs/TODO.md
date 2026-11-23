@@ -12,6 +12,40 @@ again. Remove an item when it is done: the commit says what changed.
 
 ## Features
 
+- [ ] **One interface layout in Linemon, Listener and talker (§14, §50.3,
+  §161).** Priority: next after the small fixes. Linemon's bar is the model:
+  port, baud and framing on one row of drop-downs, then Flow with the control
+  lines (`serial_lines_row`), and two lines for UDP. A Listener Channel's
+  editor (`edit_interface`) gives the serial settings five rows of radio
+  buttons, and talker's (`show_serial_fields`, `show_udp_fields`) does the
+  same. Share the widgets and the layout so all three look the same. Keep what
+  differs on purpose: a Channel's edits wait for Apply & Restart, and Listener
+  has rows Linemon lacks (kernel timestamps, reconnect). Decide whether the
+  shared widgets live in `wiredata-ui` (talker ADR-016, listener ADR-019),
+  which allows only presentational, egui-only pieces, and record that as an
+  ADR.
+  - **Talker gets the control lines (talker ADR-070, spec §4.2).** It sets
+    RTS and DTR low at open and from buttons, and shows CTS, DSR, DCD and RI,
+    as listener ADR-073 does; `SerialConfig` gains optional `rts` and `dtr`.
+    Today talker never sets either, so a device that needs DTR high gets
+    nothing, and a CTS stall shows only as write timeouts.
+  - **One flow-control vocabulary: None, XON/XOFF, RTS/CTS (talker ADR-070).**
+    Talker's editor says Software and Hardware, and Listener's drop-down says
+    Xon/Xoff (`FLOW_CONTROL`) where its markers say XON/XOFF.
+  - **Larger control-line circles, done with it.** `line_indicator` colours the
+    whole label, glyph and line name together, and the glyph is a text
+    character the size of the name. Draw CTS, DSR, DCD and RI as a larger
+    circle, about the size of the RTS and DTR buttons, filled when high and
+    hollow when low, with the name beside it in the ordinary text colour. The
+    fill carries the level, so the change does not rest on colour.
+  - **Fit a narrow detail pane.** The window's minimum width is 640 and the
+    sidebar defaults to 320, so a Channel's detail pane is about 320 points
+    wide and scrolls only vertically. The UDP port and mode lines clip there,
+    partly because `udp_bind_choice` fixes its drop-down at 280 points. Wrap
+    those lines when narrow, with the multicast group always laid out so
+    nothing moves when the mode changes, and let the drop-down shrink to a
+    sensible minimum. Linemon's wide window must still show each on one line.
+    A headless egui layout test at 320 and 900 points can hold both.
 - [ ] **Finish Linemon's serial checks by hand (§50.3, §161).** Checked on
   2026-11-21 with one FTDI adapter and no loopback: opening, settings changed
   while open, unplug and Start, the port list refresh, the markers, and RTS and
@@ -21,21 +55,17 @@ again. Remove an item when it is done: the commit says what changed.
   adapters and a null-modem cable: each side's CTS follows the other's RTS, and
   DSR and DCD together follow its DTR, and talker on RTS/CTS sends to it while
   its RTS reads "RTS high, set by flow control".
-- [ ] **Larger control-line circles that alone show the level (§161).**
-  `line_indicator` colours the whole label, glyph and line name together, and
-  the glyph is a text character the size of the name. Draw CTS, DSR, DCD and
-  RI as a larger circle, about the size of the RTS and DTR buttons, filled when
-  high and hollow when low, with the name beside it in the ordinary text
-  colour. The fill carries the level, so the change does not rest on colour.
-  `serial_lines_row` is shared, so Linemon and a Channel's settings change
-  together.
-- [ ] **Lay out a Channel's Configure interface as Linemon's bar (§14, §50.3).**
-  `edit_interface` gives the serial settings five rows of radio buttons;
-  Linemon puts port, baud and framing on one row of drop-downs, then Flow with
-  the control lines (`serial_lines_row`, shared already). Share the widgets
-  and the layout, for serial and UDP, so the two look the same. Keep what
-  differs on purpose: a Channel's edits wait for Apply & Restart, and it has
-  rows Linemon lacks (kernel timestamps, reconnect).
+- [ ] **Does XON/XOFF hide 0x11 and 0x13 from the stream? (§14, ADR-010)**
+  Listener records the bytes as received, but with XON/XOFF on the driver may
+  take the XON and XOFF bytes out of the received data. Check with the
+  null-modem pair: talker sends a message with `‹11›` and `‹13›` in it,
+  Listener receives with XON/XOFF on. If they vanish, say so where XON/XOFF is
+  chosen, or decide whether a receive-only tool should offer it.
+- [ ] **Check Windows logoff while a serial port is slow to open, by hand
+  (ADR-049, ADR-052).** While the CLI is still opening a slow serial port, a
+  Windows logoff should stop it and finalize the recordings already running.
+  An automated test covers the code path; this checks the real OS. Optional:
+  do it when convenient.
 - [ ] **Disk guard in the GUI (§56.2).** Neither recording editor,
   `edit_raw_recording` nor `edit_display_recording`, sets `disk_guard`, so a
   guard comes only from a profile. With log files kept (talker ADR-069) and

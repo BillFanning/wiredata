@@ -15,6 +15,11 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-20) — exit code 3:
+
+- **§3.1 exit codes** — exit code 3 no longer counts retries running out;
+  nothing in either application gives up retrying.
+
 Revision note (2026-11-15) — button names in lower case:
 
 - **§3.2, §4.2** — the buttons read Start channel, Retry
@@ -493,6 +498,11 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-11-20) — exit codes and log growth:
+
+- **ADR-060** — exit code 3 no longer counts retries running out.
+- **ADR-069** — a repeating start fault is written once per 10 minutes.
 
 Revision note (2026-11-19) — log files are kept:
 
