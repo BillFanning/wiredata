@@ -15,6 +15,13 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-22) — serial control lines and flow-control names:
+
+- **§4.2 (ADR-070)** — a serial channel sets RTS and DTR and shows CTS, DSR,
+  DCD and RI, as listener does.
+- **§4.2 (ADR-070)** — flow control is named None, XON/XOFF and RTS/CTS.
+  XON/XOFF was supported but not listed.
+
 Revision note (2026-11-20) — exit code 3:
 
 - **§3.1 exit codes** — exit code 3 no longer counts retries running out;
@@ -498,6 +505,11 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-11-22) — serial control lines:
+
+- **ADR-070** — talker sets and shows the serial control lines as listener
+  does, and all three programs name flow control None, XON/XOFF and RTS/CTS.
 
 Revision note (2026-11-20) — exit codes and log growth:
 

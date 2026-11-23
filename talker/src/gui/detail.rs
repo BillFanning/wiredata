@@ -31,11 +31,12 @@ use wiredata_ui::{
 
 use super::draft::{ConnKind, PayloadKind, ScheduleDraft};
 use super::widgets::{
-    checksum_label, code_page_label, hex_valid, invalid_parse, lifecycle_indicator,
-    marker_aware_text_edit, message_editor_max_height, plain_text_edit_with_cursor,
-    preview_ascii_layout_job, red_bordered, show_display_pane, show_insert_byte_button,
-    show_insert_unit_button, show_interface_summary, show_serial_fields, show_tcp_fields,
-    show_udp_fields, start_button, LiveUpdateQueueGauge, UppercaseHex,
+    checksum_label, code_page_label, hex_valid, invalid_parse, lifecycle_indicator, live_lines,
+    marker_aware_text_edit, message_editor_max_height, output_request, plain_text_edit_with_cursor,
+    preview_ascii_layout_job, red_bordered, rts_by_flow, serial_editor_id, show_display_pane,
+    show_insert_byte_button, show_insert_unit_button, show_interface_summary, show_serial_fields,
+    show_tcp_fields, show_udp_fields, start_button, InterfaceEdit, LiveUpdateQueueGauge,
+    UppercaseHex,
 };
 use super::{MessageAnalysisCache, MessageDraftAnalysis, MessagePreview, TalkerApp};
 use wiredata_ui::hover::{Hover, ShowHover};
@@ -984,13 +985,22 @@ impl TalkerApp {
     }
 
     fn show_channel_body(&mut self, ui: &mut egui::Ui, i: usize, running: bool) {
+        // A serial channel's control lines belong to the port the runner has
+        // open: the last reading while the channel runs (ADR-070), and the
+        // flow control the runner confirmed, not the draft's, to word RTS.
+        let editor_id = serial_editor_id(self.sup.channel_id(i));
+        let live = live_lines(
+            running,
+            self.sup.telemetry_ref(i).and_then(|t| t.control_lines),
+        );
+        let rts_wording = rts_by_flow(self.sup.applied_run_config(i).map(|run| &run.interface));
         // "Configure interface" — the shared section title in both apps
         // (listener's Configure section uses the same words). Stays a plain
         // collapsing section — it does NOT auto-collapse on run (you often
         // want the interface params visible while a channel is live).
         // Default open; the user's expand/collapse choice persists via the
         // stable id_salt.
-        let (changed, refresh) = egui::CollapsingHeader::new("Configure interface")
+        let edit = egui::CollapsingHeader::new("Configure interface")
             .id_salt(("conn_section", i))
             .default_open(true)
             .show(ui, |ui| {
@@ -1002,21 +1012,26 @@ impl TalkerApp {
                         ui.push_id("serial_body", |ui| {
                             show_serial_fields(
                                 ui,
+                                editor_id,
                                 &mut self.conn_drafts[i],
                                 self.serial_ports.as_deref(),
+                                live,
+                                rts_wording,
                             )
                         })
                         .inner
                     }
                     ConnKind::Udp => {
-                        ui.push_id("udp_body", |ui| {
-                            (show_udp_fields(ui, &mut self.conn_drafts[i]), false)
+                        ui.push_id("udp_body", |ui| InterfaceEdit {
+                            changed: show_udp_fields(ui, &mut self.conn_drafts[i]),
+                            ..InterfaceEdit::default()
                         })
                         .inner
                     }
                     ConnKind::Tcp => {
-                        ui.push_id("tcp_body", |ui| {
-                            (show_tcp_fields(ui, &mut self.conn_drafts[i]), false)
+                        ui.push_id("tcp_body", |ui| InterfaceEdit {
+                            changed: show_tcp_fields(ui, &mut self.conn_drafts[i]),
+                            ..InterfaceEdit::default()
                         })
                         .inner
                     }
@@ -1049,12 +1064,18 @@ impl TalkerApp {
                 interface_result
             })
             .body_returned
-            .unwrap_or((false, false));
-        if changed {
+            .unwrap_or_default();
+        if edit.changed {
             self.deferred.apply.push(i);
         }
-        if refresh {
+        if edit.refresh_ports {
             self.deferred.refresh_ports = true;
+        }
+        if let Some(click) = edit.click {
+            let (line, high) = output_request(click);
+            // Undeliverable commands surface in the channel's banner, as the
+            // interval changes below do.
+            let _ = self.sup.set_output(i, line, high);
         }
 
         ui.separator();

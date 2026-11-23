@@ -100,6 +100,13 @@ pub struct SerialConfig {
     pub stop_bits: StopBits,
     #[serde(default)]
     pub flow_control: FlowControl,
+    /// RTS at open. `None` sets it low (ADR-070). Ignored under RTS/CTS flow
+    /// control, which sets RTS itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rts: Option<bool>,
+    /// DTR at open. `None` sets it low (ADR-070).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtr: Option<bool>,
 }
 
 fn default_baud() -> u32 {
@@ -115,7 +122,17 @@ impl SerialConfig {
             parity: Parity::default(),
             stop_bits: StopBits::default(),
             flow_control: FlowControl::default(),
+            rts: None,
+            dtr: None,
         }
+    }
+
+    /// The RTS and DTR levels an open sets (ADR-070, following listener
+    /// ADR-073): what the profile says, else low, so the level shown is the
+    /// level set. RTS is `None` under RTS/CTS flow control, which sets it.
+    pub fn outputs_at_open(&self) -> (Option<bool>, bool) {
+        let rts = (self.flow_control != FlowControl::Hardware).then(|| self.rts.unwrap_or(false));
+        (rts, self.dtr.unwrap_or(false))
     }
 }
 
@@ -283,6 +300,42 @@ impl TcpClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_serial_profile_sets_rts_and_dtr_only_when_it_says_so() {
+        let mut config = SerialConfig::new("COM3");
+        let plain = toml::to_string(&config).unwrap();
+        assert!(
+            !plain.contains("rts") && !plain.contains("dtr"),
+            "unset lines are not written: {plain}"
+        );
+        config.rts = Some(true);
+        config.dtr = Some(false);
+        let text = toml::to_string(&config).unwrap();
+        let back: SerialConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back, config, "{text}");
+        let unset: SerialConfig = toml::from_str("port = \"COM3\"").unwrap();
+        assert_eq!((unset.rts, unset.dtr), (None, None));
+    }
+
+    /// ADR-070, following listener ADR-073: both outputs low at open unless
+    /// the profile sets them, and RTS left to the flow control under RTS/CTS.
+    #[test]
+    fn the_outputs_set_at_open_follow_the_profile_and_the_flow_control() {
+        let mut config = SerialConfig::new("COM3");
+        assert_eq!(config.outputs_at_open(), (Some(false), false));
+        config.rts = Some(true);
+        config.dtr = Some(true);
+        assert_eq!(config.outputs_at_open(), (Some(true), true));
+        config.flow_control = FlowControl::Hardware;
+        assert_eq!(
+            config.outputs_at_open(),
+            (None, true),
+            "under RTS/CTS the flow control sets RTS"
+        );
+        config.flow_control = FlowControl::Software;
+        assert_eq!(config.outputs_at_open(), (Some(true), true));
+    }
     use crate::core::message::PayloadConfig;
 
     fn round_trip<T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug>(

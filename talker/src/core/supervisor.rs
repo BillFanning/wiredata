@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use crossbeam_channel::{Receiver, TrySendError};
 
-use crate::core::channel::{ChannelId, InterfaceConfig};
+use crate::core::channel::{ChannelId, ControlLines, InterfaceConfig, OutputLine};
 use crate::core::internal_fault::InternalFaultTally;
 use crate::core::message::MessageConfig;
 use crate::core::run_summary::{RunId, RunSummary, RunTotals};
@@ -122,6 +122,10 @@ pub struct ChannelTelemetry {
     /// `last_error` came from opening or reopening the interface, not from a
     /// write. Meaningless while `last_error` is `None`.
     last_error_opening: bool,
+    /// A serial channel's control lines as last reported while it runs
+    /// (ADR-070). `None` for any other interface, before the first reading, or
+    /// while the port cannot be read.
+    pub control_lines: Option<ControlLines>,
     /// The latest **control-plane** error (an undeliverable Stop/interface-
     /// update/interval command). A healthy sample must NOT clear this — the
     /// wire working says nothing about a command that never arrived. Cleared
@@ -233,7 +237,17 @@ pub struct AppliedRunConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandEffect {
     Interface(InterfaceConfig),
-    MessageInterval { index: usize, interval_ms: u64 },
+    MessageInterval {
+        index: usize,
+        interval_ms: u64,
+    },
+    /// A serial output line set live. It changes the open port only, not the
+    /// applied configuration: a reopen sets the profile's levels again, as
+    /// in listener (ADR-070).
+    Output {
+        line: OutputLine,
+        high: bool,
+    },
 }
 
 impl CommandEffect {
@@ -241,6 +255,7 @@ impl CommandEffect {
         match self {
             Self::Interface(_) => CommandTarget::Interface,
             Self::MessageInterval { index, .. } => CommandTarget::MessageInterval(*index),
+            Self::Output { line, .. } => CommandTarget::Output(*line),
         }
     }
 }
@@ -654,6 +669,22 @@ impl TalkerSupervisor {
         )
     }
 
+    /// Set a serial output line on channel `i`'s open port, live (ADR-070).
+    pub fn set_output(&mut self, i: usize, line: OutputLine, high: bool) -> CommandSubmission {
+        let id = CommandId::mint();
+        let what = match line {
+            OutputLine::Rts => "setting RTS",
+            OutputLine::Dtr => "setting DTR",
+        };
+        self.send_command(
+            i,
+            id,
+            CommandEffect::Output { line, high },
+            TalkerCommand::SetOutput { id, line, high },
+            what,
+        )
+    }
+
     /// Change message `index`'s send interval on channel `i`, live.
     pub fn set_interval(&mut self, i: usize, index: usize, interval_ms: u64) -> CommandSubmission {
         let id = CommandId::mint();
@@ -856,6 +887,11 @@ impl TalkerSupervisor {
             slot.retired_control.retain_mut(|control_rx| {
                 !drain_finished_summaries(control_rx, slot_id, last_run_summary, misrouted)
             });
+            // Only a running port's lines are live (ADR-070): a stopped or
+            // exited run, or one still winding down, has none to show.
+            if slot.handle.is_none() {
+                slot.telemetry.control_lines = None;
+            }
         }
         self.orphans.retain_mut(|d| {
             for _ in d.control_rx.try_iter() {}
@@ -994,6 +1030,8 @@ fn drain_control_statuses(
                                         message.interval_ms = *interval_ms;
                                     }
                                 }
+                                // Live on the open port only.
+                                CommandEffect::Output { .. } => {}
                             }
                         }
                         completions.push(CommandCompletion::Applied {
@@ -1009,6 +1047,9 @@ fn drain_control_statuses(
                                 format!("message {} interval update failed: {message}", index + 1)
                             }
                             CommandTarget::Stop => format!("stop command failed: {message}"),
+                            CommandTarget::Output(line) => {
+                                format!("setting {} failed: {message}", line.name())
+                            }
                         };
                         telemetry.record_command_failure(id, target, message.clone());
                         completions.push(CommandCompletion::Failed {
@@ -1105,6 +1146,9 @@ fn fail_unfinished_commands(
                 )
             }
             CommandTarget::Stop => format!("stop command did not complete: {reason}"),
+            CommandTarget::Output(line) => {
+                format!("setting {} did not complete: {reason}", line.name())
+            }
         };
         telemetry.record_command_failure(id, target, message.clone());
         completions.push(CommandCompletion::Failed {
@@ -1211,6 +1255,7 @@ fn drain_statuses(
             TalkerStatus::SendRecovered { .. } => {
                 telemetry.set_interface_error(None);
             }
+            TalkerStatus::ControlLines { lines, .. } => telemetry.control_lines = lines,
         }
     }
 }
@@ -1968,6 +2013,36 @@ mod tests {
             telemetry.last_error.as_deref(),
             Some("writing to serial port: device removed"),
             "the still-open failure episode must reach the live banner"
+        );
+    }
+
+    /// A serial channel's control-line readings reach its telemetry, and a
+    /// reading that cannot be taken clears the last one.
+    #[test]
+    fn control_line_readings_reach_the_telemetry() {
+        let mut telemetry = ChannelTelemetry::default();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let lines = ControlLines {
+            cts: true,
+            ..ControlLines::default()
+        };
+        tx.send(TalkerStatus::ControlLines {
+            channel: ChannelId::mint(),
+            lines: Some(lines),
+        })
+        .unwrap();
+        drain_statuses(0, &rx, &mut telemetry, &mut Vec::new());
+        assert_eq!(telemetry.control_lines, Some(lines));
+
+        tx.send(TalkerStatus::ControlLines {
+            channel: ChannelId::mint(),
+            lines: None,
+        })
+        .unwrap();
+        drain_statuses(0, &rx, &mut telemetry, &mut Vec::new());
+        assert_eq!(
+            telemetry.control_lines, None,
+            "an unplugged port has no reading"
         );
     }
 

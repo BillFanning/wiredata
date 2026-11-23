@@ -9,6 +9,7 @@ pub use config::{
     TcpClientConfig, UdpConfig, UdpMode,
 };
 pub(crate) use port_list::PortList;
+pub use serial::RTS_HIGH_UNDER_RTS_CTS;
 pub(crate) use tcp::{CONNECT_TIMEOUT, WRITE_TIMEOUT};
 
 /// Stable identity of one configured channel, minted when the channel is
@@ -54,6 +55,36 @@ impl std::fmt::Display for ChannelId {
     }
 }
 
+/// A serial port's six control lines (spec §4.2, ADR-070). RTS and DTR are
+/// what this computer last set, since an output cannot be read back; CTS, DSR,
+/// DCD and RI are read from the port.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlLines {
+    pub rts: bool,
+    pub dtr: bool,
+    pub cts: bool,
+    pub dsr: bool,
+    pub dcd: bool,
+    pub ri: bool,
+}
+
+/// A serial output line this computer sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum OutputLine {
+    Rts,
+    Dtr,
+}
+
+impl OutputLine {
+    /// The line's name as the screen shows it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Rts => "RTS",
+            Self::Dtr => "DTR",
+        }
+    }
+}
+
 /// A live interface that can send raw bytes.
 ///
 /// An interface is owned by a single talker thread; `Send` is required so it
@@ -88,6 +119,18 @@ pub trait Interface: Send {
         _next: &InterfaceConfig,
     ) -> anyhow::Result<bool> {
         Ok(false)
+    }
+
+    /// Set a serial output line on the open handle, never reopening it
+    /// (ADR-070). Only a serial port has control lines.
+    fn set_output(&mut self, _line: OutputLine, _high: bool) -> anyhow::Result<()> {
+        anyhow::bail!("this interface has no control lines")
+    }
+
+    /// The control lines now, or `None` when the interface has none or its
+    /// handle cannot be read, such as an unplugged port.
+    fn control_lines(&mut self) -> Option<ControlLines> {
+        None
     }
 }
 

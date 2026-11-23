@@ -1,13 +1,13 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.34
-**Date:** 2026-11-22
+**Version:** 1.35
+**Date:** 2026-11-23
 **Status:** Accepted
 
-Revision note (2026-11-22) — serial control lines:
+Revision note (2026-11-23) — shared serial settings lines:
 
-- **ADR-070** — talker sets and shows the serial control lines as listener
-  does, and all three programs name flow control None, XON/XOFF and RTS/CTS.
+- **ADR-071** — the serial settings lines are written once in `wiredata-ui`
+  and used by Linemon, listener and talker.
 
 ---
 
@@ -2787,6 +2787,52 @@ read. Profile keys keep their names.
 is clicked high or the profile sets it, and the display shows the line low,
 which says why. A stalled channel's CTS circle shows the cause in talker
 itself.
+
+---
+
+## ADR-071 — The serial settings lines are shared in `wiredata-ui`
+
+**Status:** Accepted 2026-11-23. Amends ADR-016 and spec §4.2; listener
+ADR-074 records the same decision for listener.
+
+**Context:** Linemon, a listener Channel and a talker channel each laid out a
+serial port's settings their own way: Linemon one line of drop-downs, then flow
+control with the control lines; listener and talker five rows of radio buttons.
+The baud lists differed three ways, listener offered parity and stop-bit values
+the serial library refuses, and only listener and Linemon showed the control
+lines. ADR-070 gave talker the lines, which made one layout possible.
+
+**Decision:**
+
+- The two lines are written once, in `wiredata-ui::serial`: the port with its
+  baud rate and framing, then flow control with the control lines. The input
+  lines are circles about the height of the buttons, filled when high and
+  hollow when low, with the name in the ordinary text colour.
+- They work on neutral values defined there. Each app maps its own serial types
+  to and from them, so `wiredata-ui` still depends on egui alone and stays
+  presentational.
+- The widgets choose no layout. Linemon keeps each line one row and grows its
+  window to fit; a channel's detail pane wraps them.
+- What each app does with an edit stays its own: Linemon applies it at once, a
+  listener Channel at Apply & Restart, a talker channel as before.
+- One baud list, 4800 to 921600, with any other rate typed. Only parity None,
+  Even and Odd and 1 or 2 stop bits are offered. A port can be typed by name.
+
+**Boundary:** UDP and TCP are not shared. Talker sends and listener receives, so
+their fields differ; they share only the shape of two lines. Nothing in this
+decision changes a profile's keys or what a port opens with.
+
+**Alternatives considered:**
+
+- **A copy in each app:** Rejected. The three had already drifted apart once.
+- **Talker depending on listener's GUI:** Rejected. The apps share chrome, not
+  each other.
+- **A new shared crate:** Rejected. The pieces are presentational and egui-only,
+  which is what `wiredata-ui` is for.
+
+**Consequences:** A change to the serial lines is made once and seen in all
+three. A listener profile that holds Mark or Space parity, or 1.5 stop bits,
+shows the value as not supported until another is chosen.
 
 ---
 

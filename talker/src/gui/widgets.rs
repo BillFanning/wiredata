@@ -11,7 +11,11 @@ use std::{
 
 use egui::{Align, Layout};
 use wiredata_ui::diagnostics::{dismissible_attention_callout, SignalTone};
+use wiredata_ui::serial::{self as shared, LineClick, RtsByFlow};
 
+use crate::core::channel::{
+    ChannelId, ControlLines, FlowControl, InterfaceConfig, OutputLine, RTS_HIGH_UNDER_RTS_CTS,
+};
 use crate::core::message::{
     code_page_encodes, decode_codepage_byte, repair_after_edit, segments, ChecksumAlgorithm,
     CodePage, Segment,
@@ -277,9 +281,9 @@ fn channel_blockers(conn: &ConnDraft, sink: &mut BlockerSink) -> ControlFlow<()>
             if conn.serial_port.is_empty() {
                 sink(&|| "Channel: select a serial port".to_string())?;
             }
-            if !conn.baud_custom.is_empty()
-                && conn.baud_custom.parse::<u32>().map_or(true, |b| b == 0)
-            {
+            // The editor applies only a positive rate, so zero can come only
+            // from a saved profile.
+            if conn.baud_rate == 0 {
                 sink(&|| "Channel: baud rate must be a positive number".to_string())?;
             }
         }
@@ -357,211 +361,153 @@ fn message_blockers(
 
 // ── Interface field editors (Serial / UDP / TCP) ─────────────────────────────
 
-pub(super) fn show_serial_fields(
-    ui: &mut egui::Ui,
-    conn: &mut ConnDraft,
-    ports: Option<&[String]>,
-) -> (bool, bool) {
-    let before = (
-        conn.serial_port.clone(),
-        conn.baud_rate,
-        conn.data_bits,
-        conn.parity,
-        conn.stop_bits,
-        conn.flow_control,
-        conn.baud_custom.clone(),
-    );
-    let mut refresh = false;
-
-    egui::Grid::new("serial_grid")
-        .num_columns(2)
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            ui.label("Port");
-            ui.horizontal(|ui| {
-                // The closed box shows the *configured* port, which outlives the
-                // hardware — it is saved in the profile. Say so when the port is
-                // not currently enumerated, or the box reads as though the
-                // device were present while the list behind it is empty.
-                // Until the first list arrives, nothing is known to be missing.
-                let label = if conn.serial_port.is_empty() {
-                    "select port\u{2026}".to_string()
-                } else if ports.is_none_or(|ports| ports.contains(&conn.serial_port)) {
-                    conn.serial_port.clone()
-                } else {
-                    format!("{} (not found)", conn.serial_port)
-                };
-                let combo = egui::ComboBox::from_label("")
-                    .selected_text(label)
-                    .width(180.0)
-                    .show_ui(ui, |ui| {
-                        // A way back to "no port". Without it a configured port
-                        // can never be unset: the list holds only real ports, so
-                        // when none are present it holds nothing selectable at
-                        // all, and a port whose hardware has gone is stuck.
-                        if !conn.serial_port.is_empty() {
-                            ui.selectable_value(
-                                &mut conn.serial_port,
-                                String::new(),
-                                "(clear selection)",
-                            );
-                        }
-                        match ports {
-                            None => {
-                                ui.weak("Listing ports\u{2026}");
-                            }
-                            Some([]) => {
-                                ui.weak("No ports found");
-                            }
-                            Some(ports) => {
-                                for port in ports {
-                                    ui.selectable_value(&mut conn.serial_port, port.clone(), port);
-                                }
-                            }
-                        }
-                    });
-                // Re-enumerate as the list is opened, not only at startup and
-                // on the refresh button: otherwise the choices are a snapshot
-                // from launch, and a port unplugged since then still looks
-                // selectable. Enumeration is not free, so this fires on the
-                // click that opens the list rather than every frame it is open.
-                // The new list arrives a frame or two later, from a helper thread.
-                if combo.response.clicked() {
-                    refresh = true;
-                }
-                if ui
-                    .small_button("\u{21ba}")
-                    .on_hover_text("Refresh port list")
-                    .clicked()
-                {
-                    refresh = true;
-                }
-            });
-            ui.end_row();
-
-            ui.label("Baud");
-            ui.horizontal(|ui| {
-                for &baud in &[4800u32, 9600, 19200, 38400, 57600, 115200] {
-                    if ui
-                        .radio_value(&mut conn.baud_rate, baud, baud.to_string())
-                        .clicked()
-                    {
-                        conn.baud_custom.clear();
-                    }
-                }
-                ui.separator();
-                let bad_baud = !conn.baud_custom.is_empty()
-                    && conn.baud_custom.parse::<u32>().map_or(true, |b| b == 0);
-                let r = red_bordered(
-                    ui,
-                    bad_baud,
-                    "enter a positive baud rate — e.g. 230400",
-                    |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut conn.baud_custom)
-                                .id_salt("serial_baud_custom")
-                                .desired_width(68.0)
-                                .hint_text("custom"),
-                        )
-                    },
-                );
-                if enter_committed(&r, ui) {
-                    if let Ok(b) = conn.baud_custom.parse::<u32>() {
-                        if b > 0 {
-                            conn.baud_rate = b;
-                        }
-                    }
-                }
-            });
-            ui.end_row();
-
-            ui.label("Data bits");
-            ui.horizontal(|ui| {
-                for &bits in &[8u8, 7, 6, 5] {
-                    ui.radio_value(&mut conn.data_bits, bits, bits.to_string());
-                }
-            });
-            ui.end_row();
-
-            ui.label("Parity");
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut conn.parity, 0u8, "None");
-                ui.radio_value(&mut conn.parity, 1u8, "Odd");
-                ui.radio_value(&mut conn.parity, 2u8, "Even");
-            });
-            ui.end_row();
-
-            ui.label("Stop bits");
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut conn.stop_bits, 1u8, "1");
-                ui.radio_value(&mut conn.stop_bits, 2u8, "2");
-            });
-            ui.end_row();
-
-            ui.label("Flow control");
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut conn.flow_control, 0u8, "None");
-                ui.radio_value(&mut conn.flow_control, 1u8, "Software");
-                ui.radio_value(&mut conn.flow_control, 2u8, "Hardware");
-            });
-            ui.end_row();
-        });
-
-    let after = (
-        conn.serial_port.clone(),
-        conn.baud_rate,
-        conn.data_bits,
-        conn.parity,
-        conn.stop_bits,
-        conn.flow_control,
-        conn.baud_custom.clone(),
-    );
-    (before != after, refresh)
+/// What an interface editor reports for one frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct InterfaceEdit {
+    /// A value was committed. A running channel takes it at once.
+    pub changed: bool,
+    /// The serial port list should be read again.
+    pub refresh_ports: bool,
+    /// An output line's button was clicked, on a serial channel.
+    pub click: Option<LineClick>,
 }
 
+/// The id a serial channel's editor keeps its drop-downs and typed text under,
+/// so two channels never share a half-typed port or baud rate. `None` is a
+/// slot that does not exist, which the detail pane never draws.
+pub(super) fn serial_editor_id(channel: Option<ChannelId>) -> egui::Id {
+    egui::Id::new(("serial_editor", channel))
+}
+
+/// The transport's control lines as the shared lines show them.
+pub(super) fn control_lines(lines: ControlLines) -> shared::ControlLines {
+    shared::ControlLines {
+        rts: lines.rts,
+        dtr: lines.dtr,
+        cts: lines.cts,
+        dsr: lines.dsr,
+        dcd: lines.dcd,
+        ri: lines.ri,
+    }
+}
+
+/// The lines to show live: the last reading, while the channel runs. A stopped
+/// channel's last reading is stale, and a running one without a reading (the
+/// first is not in yet, or the port cannot be read) has nothing to show, so
+/// the shared lines grey out and say why.
+pub(super) fn live_lines(
+    running: bool,
+    reading: Option<ControlLines>,
+) -> Option<shared::ControlLines> {
+    reading.filter(|_| running).map(control_lines)
+}
+
+/// What stands in for the RTS button: `None` unless the open port's flow
+/// control sets RTS (RTS/CTS), then whether its level is known on this
+/// platform (`RTS_HIGH_UNDER_RTS_CTS`). `open` is the interface the channel's
+/// runner confirmed open, which is the port the lines belong to, not the
+/// draft.
+pub(super) fn rts_by_flow(open: Option<&InterfaceConfig>) -> Option<RtsByFlow> {
+    match open {
+        Some(InterfaceConfig::Serial(serial)) if serial.flow_control == FlowControl::Hardware => {
+            Some(if RTS_HIGH_UNDER_RTS_CTS {
+                RtsByFlow::High
+            } else {
+                RtsByFlow::Paced
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The line and level a click on an output line's button asks for.
+pub(super) fn output_request(click: LineClick) -> (OutputLine, bool) {
+    match click {
+        LineClick::Rts(high) => (OutputLine::Rts, high),
+        LineClick::Dtr(high) => (OutputLine::Dtr, high),
+    }
+}
+
+/// A serial channel's editor, the two lines Linemon and Listener show
+/// (talker ADR-071), each wrapping to fit the detail pane: the port with its
+/// baud rate and framing, then Flow with the control lines. A change to a
+/// setting is reported at once, and a typed port or baud rate once its box is
+/// left or Enter is pressed.
+///
+/// The control lines are live, not part of the draft: `live` is the running
+/// port's last reading (`None` while the channel is not running), and
+/// `rts_by_flow` says whether the open port's flow control sets RTS. `id`
+/// keeps this channel's typed text apart from every other's.
+pub(super) fn show_serial_fields(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    conn: &mut ConnDraft,
+    ports: Option<&[String]>,
+    live: Option<shared::ControlLines>,
+    rts_by_flow: Option<RtsByFlow>,
+) -> InterfaceEdit {
+    let mut settings = conn.serial_settings();
+    let first = ui
+        .horizontal_wrapped(|ui| shared::settings_line(ui, id, &mut settings, ports))
+        .inner;
+    let second = ui
+        .horizontal_wrapped(|ui| {
+            shared::flow_and_lines(ui, id, &mut settings.flow, live, rts_by_flow)
+        })
+        .inner;
+    let changed = first.changed || second.changed;
+    if changed {
+        conn.apply_serial_settings(&settings);
+    }
+    InterfaceEdit {
+        changed,
+        refresh_ports: first.refresh_ports,
+        click: second.click,
+    }
+}
+
+/// A UDP channel's editor: two lines, each wrapping to fit the detail pane.
+/// The first is where the datagrams go, as an address and port, followed by
+/// the local port; the second is the mode. Returns `true` when a value was
+/// committed or the mode changed, which a running channel takes at once.
 pub(super) fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     let before_mode = conn.udp_mode;
     let mut apply = false;
 
-    // Per-mode Grid id even though all three modes now render the same
+    // Per-mode namespace even though all three modes render the same
     // [addr] [port] [local-port] shape — kept as defence-in-depth so any
-    // auto-derived (un-salted) widget id inside the Grid lives in its
+    // auto-derived (un-salted) widget id inside the lines lives in its
     // own namespace per mode, the same trick `message_grid_<kind>` uses
     // in the message editor.
-    let grid_id = match conn.udp_mode {
-        UdpModeDraft::Unicast => "udp_grid_unicast",
-        UdpModeDraft::Broadcast => "udp_grid_broadcast",
-        UdpModeDraft::Multicast => "udp_grid_multicast",
+    let namespace = match conn.udp_mode {
+        UdpModeDraft::Unicast => "udp_lines_unicast",
+        UdpModeDraft::Broadcast => "udp_lines_broadcast",
+        UdpModeDraft::Multicast => "udp_lines_multicast",
     };
-    egui::Grid::new(grid_id)
-        .num_columns(2)
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            apply |= show_udp_mode_row(ui, conn);
-            apply |= show_udp_destination_row(ui, conn);
-            apply |= show_udp_local_port_row(ui, conn);
+    ui.push_id(namespace, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            apply |= show_udp_destination(ui, conn);
+            apply |= show_udp_local_port(ui, conn);
         });
+        ui.horizontal_wrapped(|ui| show_udp_mode(ui, conn));
+    });
 
     apply || (conn.udp_mode != before_mode)
 }
 
-fn show_udp_mode_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
+fn show_udp_mode(ui: &mut egui::Ui, conn: &mut ConnDraft) {
     ui.label("Mode");
-    ui.horizontal(|ui| {
-        ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Broadcast, "Broadcast");
-        ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast");
-        ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Multicast, "Multicast");
-    });
-    ui.end_row();
-    false
+    ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Broadcast, "Broadcast");
+    ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast");
+    ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Multicast, "Multicast");
 }
 
 /// All three UDP modes have the same shape — an IPv4 address plus a port
-/// — so they share one row helper. The per-mode differences (label, hint
+/// — so they share one helper. The per-mode differences (label, hint
 /// text, validation message, tooltip, id salts, and which pair of
 /// `udp_unicast` / `udp_broadcast` / `udp_multicast` strings to point
 /// at) are looked up from a single match.
-fn show_udp_destination_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
+fn show_udp_destination(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     let mode = conn.udp_mode;
     // Compute validation flags up front while we still hold an immutable
     // borrow — the mutable destructure below precludes re-reading.
@@ -646,24 +592,86 @@ fn show_udp_destination_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     if apply {
         pair.submitted = true;
     }
-    ui.end_row();
     apply
 }
 
-fn show_udp_local_port_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
+fn show_udp_local_port(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     let bad_local = invalid_parse::<u16>(&conn.local_port);
+    keep_together(ui, local_port_width(ui));
     ui.label("Local port");
     let r = red_bordered(ui, bad_local, "enter a port number 1–65535", |ui| {
         ui.add(
             egui::TextEdit::singleline(&mut conn.local_port)
                 .id_salt("udp_local_port")
-                .desired_width(80.0)
+                .desired_width(LOCAL_PORT_FIELD_WIDTH)
                 .hint_text("auto"),
         )
     });
-    let apply = enter_committed(&r, ui);
-    ui.end_row();
-    apply
+    enter_committed(&r, ui)
+}
+
+const ADDR_FIELD_WIDTH: f32 = 140.0;
+const PORT_FIELD_WIDTH: f32 = 60.0;
+const LOCAL_PORT_FIELD_WIDTH: f32 = 80.0;
+
+/// How wide `text` is in `style`, laid out on one line.
+fn text_width(ui: &egui::Ui, style: egui::TextStyle, text: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            text.to_owned(),
+            style.resolve(ui.style()),
+            egui::Color32::PLACEHOLDER,
+        )
+        .size()
+        .x
+}
+
+/// How wide controls of these `widths` are side by side on one row, with the
+/// space between them.
+fn row_width(ui: &egui::Ui, widths: &[f32]) -> f32 {
+    let gaps = widths.len().saturating_sub(1);
+    widths.iter().sum::<f32>() + ui.spacing().item_spacing.x * gaps as f32
+}
+
+/// How wide a small button showing `glyph` is.
+fn small_button_width(ui: &egui::Ui, glyph: &str) -> f32 {
+    text_width(ui, egui::TextStyle::Button, glyph) + 2.0 * ui.spacing().button_padding.x
+}
+
+/// The width of the port stepper: its label, the two ± buttons and the field
+/// between them.
+fn port_stepper_width(ui: &egui::Ui) -> f32 {
+    row_width(
+        ui,
+        &[
+            text_width(ui, egui::TextStyle::Body, "Port:"),
+            small_button_width(ui, "\u{2212}"),
+            PORT_FIELD_WIDTH,
+            small_button_width(ui, "+"),
+        ],
+    )
+}
+
+/// The width of the local port's label and field.
+fn local_port_width(ui: &egui::Ui) -> f32 {
+    row_width(
+        ui,
+        &[
+            text_width(ui, egui::TextStyle::Body, "Local port"),
+            LOCAL_PORT_FIELD_WIDTH,
+        ],
+    )
+}
+
+/// In a wrapping line, start a new row first when the controls about to be
+/// added, `width` wide together, would not fit on the rest of this one, so a
+/// label is never left at the end of a row and its field at the start of the
+/// next. At the start of a row they are added where they are.
+fn keep_together(ui: &mut egui::Ui, width: f32) {
+    let at_row_start = ui.available_rect_before_wrap().left() <= ui.max_rect().left() + 0.5;
+    if !at_row_start && ui.available_size_before_wrap().x < width {
+        ui.end_row();
+    }
 }
 
 /// Parameters for [`show_addr_port_row`] — shared by all three UDP-mode
@@ -682,45 +690,45 @@ struct AddrPortRow<'a> {
     port_hold: &'a mut Option<PortHold>,
 }
 
-/// Render the right-hand side of a UDP destination row: address TextEdit,
-/// "Port:" label, hold-to-repeat ± buttons around the port TextEdit.
-/// Returns `true` if the user committed an edit (Enter on either field,
-/// or a ± click that changed the port).
+/// Add a UDP destination's controls to the caller's line: address TextEdit,
+/// "Port:" label, hold-to-repeat ± buttons around the port TextEdit. The
+/// caller chooses the layout; on a wrapping line the port label, buttons and
+/// field move to a new row together. Returns `true` if the user committed an
+/// edit (Enter on either field, or a ± click that changed the port).
 fn show_addr_port_row(ui: &mut egui::Ui, p: AddrPortRow) -> bool {
     let mut apply = false;
-    ui.horizontal(|ui| {
-        let addr_r = red_bordered(ui, p.bad_addr, p.addr_invalid_msg, |ui| {
-            ui.add(
-                egui::TextEdit::singleline(p.addr_field)
-                    .id_salt(p.addr_id_salt)
-                    .desired_width(140.0)
-                    .hint_text(p.addr_hint),
-            )
-        });
-        if enter_committed(&addr_r, ui) {
-            apply = true;
-        }
-        ui.label("Port:");
-        let r_minus = ui
-            .small_button("\u{2212}")
-            .on_hover_text("Decrement port (hold to accelerate)");
-        let port_r = red_bordered(ui, p.bad_port, "enter a port number 1–65535", |ui| {
-            ui.add(
-                egui::TextEdit::singleline(p.port_field)
-                    .id_salt(p.port_id_salt)
-                    .desired_width(60.0),
-            )
-        });
-        if enter_committed(&port_r, ui) {
-            apply = true;
-        }
-        let r_plus = ui
-            .small_button("+")
-            .on_hover_text("Increment port (hold to accelerate)");
-        if drive_port_hold(ui, p.port_hold, p.port_field, &r_minus, &r_plus) {
-            apply = true;
-        }
+    let addr_r = red_bordered(ui, p.bad_addr, p.addr_invalid_msg, |ui| {
+        ui.add(
+            egui::TextEdit::singleline(p.addr_field)
+                .id_salt(p.addr_id_salt)
+                .desired_width(ADDR_FIELD_WIDTH)
+                .hint_text(p.addr_hint),
+        )
     });
+    if enter_committed(&addr_r, ui) {
+        apply = true;
+    }
+    keep_together(ui, port_stepper_width(ui));
+    ui.label("Port:");
+    let r_minus = ui
+        .small_button("\u{2212}")
+        .on_hover_text("Decrement port (hold to accelerate)");
+    let port_r = red_bordered(ui, p.bad_port, "enter a port number 1–65535", |ui| {
+        ui.add(
+            egui::TextEdit::singleline(p.port_field)
+                .id_salt(p.port_id_salt)
+                .desired_width(PORT_FIELD_WIDTH),
+        )
+    });
+    if enter_committed(&port_r, ui) {
+        apply = true;
+    }
+    let r_plus = ui
+        .small_button("+")
+        .on_hover_text("Increment port (hold to accelerate)");
+    if drive_port_hold(ui, p.port_hold, p.port_field, &r_minus, &r_plus) {
+        apply = true;
+    }
     apply
 }
 
@@ -2065,21 +2073,25 @@ where
     // theme and deep on the dark one without a second constant.
     let tint = wiredata_ui::palette::tint(ui, red, TINT_ALPHA);
 
-    // Always `ui.scope`, even when valid, so the field's id derives
-    // from a stable position in the ui tree — flipping in and out of
-    // a scope on every keystroke would drop keyboard focus.
-    let inner = ui.scope(|ui| {
-        if invalid {
-            // Pink fill via the two fields TextEdit might read:
-            //  - `text_edit_bg_color` is the explicit override
-            //  - `extreme_bg_color` is the fallback when the former is `None`
-            let v = ui.visuals_mut();
-            v.text_edit_bg_color = Some(tint);
-            v.extreme_bg_color = tint;
-        }
+    // No `ui.scope`: a scope inherits a wrapping layout, and a field inside
+    // it then shrinks to the room left on the row instead of wrapping to the
+    // next one. The fill is set on the caller's own `Ui` and put back, so the
+    // field's id never depends on whether it is invalid either.
+    let resp = if invalid {
+        let v = ui.visuals_mut();
+        let saved = (v.text_edit_bg_color, v.extreme_bg_color);
+        // Pink fill via the two fields TextEdit might read:
+        //  - `text_edit_bg_color` is the explicit override
+        //  - `extreme_bg_color` is the fallback when the former is `None`
+        v.text_edit_bg_color = Some(tint);
+        v.extreme_bg_color = tint;
+        let resp = add(ui);
+        let v = ui.visuals_mut();
+        (v.text_edit_bg_color, v.extreme_bg_color) = saved;
+        resp
+    } else {
         add(ui)
-    });
-    let resp = inner.inner;
+    };
     if invalid {
         // Explicit outline outside the rect — guarantees a visible
         // 2-px red box regardless of which `Visuals` field a given
@@ -2176,6 +2188,7 @@ pub(super) fn checksum_label(algorithm: ChecksumAlgorithm) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::channel::{SerialConfig, UdpConfig};
 
     #[test]
     fn editor_galleys_preserve_newlines_without_soft_wrapping() {
@@ -2681,5 +2694,449 @@ mod tests {
         analysis.refresh(&message);
 
         assert!(start_blockers_analyzed(&conn, &[message], &[analysis]).is_empty());
+    }
+
+    // ── The serial editor on the shared lines ─────────────────────────────────
+
+    fn channel_blocker_texts(conn: &ConnDraft) -> Vec<String> {
+        let mut texts = Vec::new();
+        let _ = channel_blockers(conn, &mut |blocker| {
+            texts.push(blocker());
+            ControlFlow::Continue(())
+        });
+        texts
+    }
+
+    /// The shared baud box applies only a positive rate, so a rate of zero can
+    /// come only from a saved profile, and it still blocks Start.
+    #[test]
+    fn a_zero_baud_rate_blocks_start() {
+        let mut conn = ConnDraft::new(ConnKind::Serial);
+        conn.serial_port = "COM1".to_owned();
+        assert!(channel_blocker_texts(&conn).is_empty());
+        conn.baud_rate = 0;
+        assert_eq!(
+            channel_blocker_texts(&conn),
+            ["Channel: baud rate must be a positive number"]
+        );
+    }
+
+    fn serial_interface(flow: FlowControl) -> InterfaceConfig {
+        let mut config = SerialConfig::new("COM3");
+        config.flow_control = flow;
+        InterfaceConfig::Serial(config)
+    }
+
+    /// RTS has words instead of a button only under RTS/CTS, and which words
+    /// is the platform's fact (`RTS_HIGH_UNDER_RTS_CTS`). Only a running
+    /// serial port has any.
+    #[test]
+    fn rts_has_words_only_under_rts_cts() {
+        for flow in [FlowControl::None, FlowControl::Software] {
+            assert_eq!(rts_by_flow(Some(&serial_interface(flow))), None, "{flow:?}");
+        }
+        let expected = if RTS_HIGH_UNDER_RTS_CTS {
+            RtsByFlow::High
+        } else {
+            RtsByFlow::Paced
+        };
+        assert_eq!(
+            rts_by_flow(Some(&serial_interface(FlowControl::Hardware))),
+            Some(expected)
+        );
+        assert_eq!(rts_by_flow(None), None, "no running port");
+        let udp = InterfaceConfig::Udp(UdpConfig::unicast("127.0.0.1:9".parse().unwrap()));
+        assert_eq!(rts_by_flow(Some(&udp)), None, "a UDP channel has no RTS");
+    }
+
+    #[test]
+    fn the_control_lines_map_field_for_field() {
+        let lines = control_lines(ControlLines {
+            rts: true,
+            dtr: false,
+            cts: true,
+            dsr: false,
+            dcd: true,
+            ri: false,
+        });
+        assert_eq!(
+            (lines.rts, lines.dtr, lines.cts, lines.dsr, lines.dcd, lines.ri),
+            (true, false, true, false, true, false)
+        );
+        let flipped = control_lines(ControlLines {
+            rts: false,
+            dtr: true,
+            cts: false,
+            dsr: true,
+            dcd: false,
+            ri: true,
+        });
+        assert_eq!(
+            (
+                flipped.rts,
+                flipped.dtr,
+                flipped.cts,
+                flipped.dsr,
+                flipped.dcd,
+                flipped.ri
+            ),
+            (false, true, false, true, false, true)
+        );
+    }
+
+    /// The lines are live only while the channel runs and has a reading. A
+    /// stopped channel's last reading is stale, and a running one with none
+    /// (the first reading is not in, or the port cannot be read) has nothing
+    /// to show.
+    #[test]
+    fn the_lines_are_live_only_while_the_channel_runs_with_a_reading() {
+        let reading = ControlLines {
+            rts: true,
+            cts: true,
+            ..ControlLines::default()
+        };
+        assert_eq!(
+            live_lines(true, Some(reading)),
+            Some(control_lines(reading)),
+            "running with a reading"
+        );
+        assert_eq!(live_lines(false, Some(reading)), None, "not running");
+        assert_eq!(live_lines(true, None), None, "running, no reading");
+        assert_eq!(live_lines(false, None), None, "not running, no reading");
+    }
+
+    /// A click asks the supervisor for the line it was on and the level it
+    /// named, which is the opposite of the level shown.
+    #[test]
+    fn a_click_asks_for_the_line_and_level_it_names() {
+        assert_eq!(
+            output_request(LineClick::Rts(true)),
+            (OutputLine::Rts, true)
+        );
+        assert_eq!(
+            output_request(LineClick::Rts(false)),
+            (OutputLine::Rts, false)
+        );
+        assert_eq!(
+            output_request(LineClick::Dtr(true)),
+            (OutputLine::Dtr, true)
+        );
+        assert_eq!(
+            output_request(LineClick::Dtr(false)),
+            (OutputLine::Dtr, false)
+        );
+    }
+
+    /// Each channel's typed port and baud text lives under its own id, so two
+    /// channels' editors never share a half-typed value.
+    #[test]
+    fn two_channels_never_share_typed_text() {
+        let (a, b) = (ChannelId::mint(), ChannelId::mint());
+        assert_ne!(serial_editor_id(Some(a)), serial_editor_id(Some(b)));
+        assert_eq!(serial_editor_id(Some(a)), serial_editor_id(Some(a)));
+    }
+
+    // ── The narrow detail pane ────────────────────────────────────────────────
+
+    /// What a pane of some width shows of an editor drawn into it.
+    struct Pane {
+        /// Rows of controls the editor took.
+        rows: usize,
+        /// The right edge the editor reached.
+        drawn_right: f32,
+        /// The right edge the pane had.
+        room_right: f32,
+    }
+
+    impl Pane {
+        fn fits(&self) -> bool {
+            self.drawn_right <= self.room_right + 0.5
+        }
+    }
+
+    /// Draw an editor into a `width`-point pane, as the detail pane does.
+    fn in_pane(width: f32, mut draw: impl FnMut(&mut egui::Ui)) -> Pane {
+        let ctx = egui::Context::default();
+        let mut pane = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(width);
+            // Before drawing: a Ui grows its max rect to take in what overflows it.
+            let room_right = ui.max_rect().right();
+            draw(ui);
+            let used = ui.min_rect();
+            let row = ui.spacing().interact_size.y;
+            let gap = ui.spacing().item_spacing.y;
+            pane = Some(Pane {
+                rows: ((used.height() + gap) / (row + gap)).round() as usize,
+                drawn_right: used.right(),
+                room_right,
+            });
+        });
+        pane.expect("the frame ran")
+    }
+
+    fn serial_draft() -> ConnDraft {
+        let mut conn = ConnDraft::new(ConnKind::Serial);
+        conn.serial_port = "COM3".to_owned();
+        conn.flow_control = 2;
+        conn
+    }
+
+    /// The serial editor as the detail pane draws it, with the lines live and
+    /// RTS in words (the widest case) or greyed out with their sentence.
+    fn serial_pane(width: f32, live: bool) -> Pane {
+        let mut conn = serial_draft();
+        let ports = ["COM3".to_owned(), "COM14".to_owned()];
+        in_pane(width, |ui| {
+            let lines = live.then(shared::ControlLines::default);
+            let words = live.then_some(RtsByFlow::High);
+            let id = serial_editor_id(Some(ChannelId::mint()));
+            show_serial_fields(ui, id, &mut conn, Some(&ports), lines, words);
+        })
+    }
+
+    /// The UDP editor as the detail pane draws it, with every field valid or
+    /// every field in the red-border state.
+    fn udp_pane(width: f32, mode: UdpModeDraft, invalid: bool) -> Pane {
+        let mut conn = ConnDraft::new(ConnKind::Udp);
+        conn.udp_mode = mode;
+        conn.local_port = if invalid { "99999" } else { "50000" }.to_owned();
+        for pair in [
+            &mut conn.udp_unicast,
+            &mut conn.udp_broadcast,
+            &mut conn.udp_multicast,
+        ] {
+            pair.addr = if invalid {
+                "300.300.300.300"
+            } else {
+                "239.255.255.250"
+            }
+            .to_owned();
+            pair.port = if invalid { "99999" } else { "65535" }.to_owned();
+        }
+        in_pane(width, |ui| {
+            show_udp_fields(ui, &mut conn);
+        })
+    }
+
+    /// In a channel's detail pane, about 320 points wide, a serial channel's
+    /// two lines wrap rather than run off the edge.
+    #[test]
+    fn a_serial_channel_fits_a_narrow_pane() {
+        for live in [false, true] {
+            let pane = serial_pane(320.0, live);
+            assert!(
+                pane.fits(),
+                "the editor runs past the pane (live: {live}): {} against {}",
+                pane.drawn_right,
+                pane.room_right
+            );
+            assert!(
+                pane.rows > 2,
+                "a pane this narrow wraps the two lines (live: {live}), took {} rows",
+                pane.rows
+            );
+        }
+    }
+
+    /// With the room, each serial line is one row.
+    #[test]
+    fn each_serial_line_is_one_row_when_there_is_room() {
+        for live in [false, true] {
+            let pane = serial_pane(1400.0, live);
+            assert!(pane.fits(), "the editor runs past the pane (live: {live})");
+            assert_eq!(pane.rows, 2, "two lines, one row each (live: {live})");
+        }
+    }
+
+    /// A UDP channel's two lines wrap in the same pane, in every mode.
+    #[test]
+    fn a_udp_channel_fits_a_narrow_pane() {
+        for mode in [
+            UdpModeDraft::Unicast,
+            UdpModeDraft::Broadcast,
+            UdpModeDraft::Multicast,
+        ] {
+            for invalid in [false, true] {
+                let pane = udp_pane(320.0, mode, invalid);
+                assert!(
+                    pane.fits(),
+                    "the editor runs past the pane (invalid: {invalid}): {} against {}",
+                    pane.drawn_right,
+                    pane.room_right
+                );
+                assert!(
+                    pane.rows > 2,
+                    "a pane this narrow wraps the two lines, took {} rows",
+                    pane.rows
+                );
+            }
+        }
+    }
+
+    /// With the room, each UDP line is one row: the address and ports, then
+    /// the mode.
+    #[test]
+    fn each_udp_line_is_one_row_when_there_is_room() {
+        for mode in [
+            UdpModeDraft::Unicast,
+            UdpModeDraft::Broadcast,
+            UdpModeDraft::Multicast,
+        ] {
+            for invalid in [false, true] {
+                let pane = udp_pane(1400.0, mode, invalid);
+                assert!(pane.fits());
+                assert_eq!(pane.rows, 2, "two lines, one row each");
+            }
+        }
+    }
+
+    /// The red-border tint is on the field and only the field: the style is
+    /// put back, so the fields after it are not tinted.
+    #[test]
+    fn an_invalid_field_leaves_the_style_as_it_found_it() {
+        egui::__run_test_ui(|ui| {
+            let before = (
+                ui.visuals().text_edit_bg_color,
+                ui.visuals().extreme_bg_color,
+            );
+            let mut text = String::new();
+            let mut during = None;
+            red_bordered(ui, true, "bad", |ui| {
+                during = Some((
+                    ui.visuals().text_edit_bg_color,
+                    ui.visuals().extreme_bg_color,
+                ));
+                ui.add(egui::TextEdit::singleline(&mut text))
+            });
+            assert_ne!(
+                during,
+                Some(before),
+                "the field is tinted while it is drawn"
+            );
+            assert_eq!(
+                (
+                    ui.visuals().text_edit_bg_color,
+                    ui.visuals().extreme_bg_color
+                ),
+                before,
+                "and the tint is taken off after it"
+            );
+        });
+    }
+
+    /// Where a `width`-wide control lands in a 320-point wrapping line that
+    /// already holds a `filler`-wide one, after asking to keep it together.
+    /// Returns its top, and the line's top.
+    fn kept_together(filler: f32, width: f32) -> (f32, f32) {
+        let ctx = egui::Context::default();
+        let mut tops = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(320.0);
+            ui.horizontal_wrapped(|ui| {
+                let top = ui.cursor().top();
+                if filler > 0.0 {
+                    ui.allocate_space(egui::vec2(filler, 20.0));
+                }
+                keep_together(ui, width);
+                let placed = ui.allocate_space(egui::vec2(width, 20.0)).1;
+                tops = Some((placed.top(), top));
+            });
+        });
+        tops.expect("the frame ran")
+    }
+
+    /// Controls that belong together are moved to a new row whole, never
+    /// split across two, and only when they do not fit on this one.
+    #[test]
+    fn a_group_that_does_not_fit_starts_a_new_row() {
+        let (placed, top) = kept_together(100.0, 100.0);
+        assert_eq!(placed, top, "there is room, so it stays on the row");
+        let (placed, top) = kept_together(250.0, 100.0);
+        assert!(placed > top, "no room, so it starts a row of its own");
+        let (placed, top) = kept_together(0.0, 400.0);
+        assert_eq!(
+            placed, top,
+            "at the start of a row it is not pushed down, however wide"
+        );
+    }
+
+    /// The width the line allows for a group is the width the group takes,
+    /// or it would wrap too early or split anyway.
+    #[test]
+    fn the_widths_the_line_allows_are_the_widths_it_takes() {
+        let ctx = egui::Context::default();
+        let mut measured = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(1400.0);
+            let mut addr = String::new();
+            let mut port = String::new();
+            let mut hold = None;
+            let mut conn = ConnDraft::new(ConnKind::Udp);
+            let stepper = ui
+                .horizontal_wrapped(|ui| {
+                    show_addr_port_row(
+                        ui,
+                        AddrPortRow {
+                            addr_field: &mut addr,
+                            addr_id_salt: "a",
+                            addr_hint: "",
+                            addr_invalid_msg: "",
+                            bad_addr: false,
+                            port_field: &mut port,
+                            port_id_salt: "p",
+                            bad_port: false,
+                            port_hold: &mut hold,
+                        },
+                    );
+                })
+                .response
+                .rect
+                .width();
+            let local = ui
+                .horizontal_wrapped(|ui| {
+                    show_udp_local_port(ui, &mut conn);
+                })
+                .response
+                .rect
+                .width();
+            let gap = ui.spacing().item_spacing.x;
+            measured = Some((
+                stepper - ADDR_FIELD_WIDTH - gap,
+                port_stepper_width(ui),
+                local,
+                local_port_width(ui),
+            ));
+        });
+        let (stepper, allowed_stepper, local, allowed_local) = measured.expect("the frame ran");
+        assert!(
+            (stepper - allowed_stepper).abs() < 0.5,
+            "the port stepper takes {stepper}, the line allows {allowed_stepper}"
+        );
+        assert!(
+            (local - allowed_local).abs() < 0.5,
+            "the local port takes {local}, the line allows {allowed_local}"
+        );
+    }
+
+    /// A frame in which nothing was touched reports nothing, so it never
+    /// applies a change to a running channel.
+    #[test]
+    fn an_untouched_editor_reports_no_change() {
+        let ctx = egui::Context::default();
+        let mut serial = serial_draft();
+        let mut udp = ConnDraft::new(ConnKind::Udp);
+        udp.udp_unicast.addr = "192.168.1.50".to_owned();
+        udp.udp_unicast.port = "4000".to_owned();
+        let before = serial.serial_settings();
+        let id = serial_editor_id(Some(ChannelId::mint()));
+        for _ in 0..3 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let edit = show_serial_fields(ui, id, &mut serial, None, None, None);
+                assert_eq!(edit, InterfaceEdit::default());
+                assert!(!show_udp_fields(ui, &mut udp));
+            });
+        }
+        assert_eq!(serial.serial_settings(), before);
     }
 }

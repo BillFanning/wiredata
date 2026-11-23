@@ -1,7 +1,21 @@
 use anyhow::Context;
 
 use super::config::{DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits};
-use super::{change_or_restore, write_counted, Interface, MissingRetryConfiguration, WriteFailure};
+use super::{
+    change_or_restore, write_counted, ControlLines, Interface, MissingRetryConfiguration,
+    OutputLine, WriteFailure,
+};
+
+/// Whether RTS is known to be high under RTS/CTS flow control. serialport on
+/// Windows opens such a port with RTS switched on and leaves it on, so the
+/// level is known; on Linux and macOS the driver raises and lowers it to pace
+/// the sender. Listener's transport states the same fact (listener ADR-073).
+pub const RTS_HIGH_UNDER_RTS_CTS: bool = cfg!(windows);
+
+/// RTS and DTR as this computer last set them: from the profile at open
+/// (ADR-070), then from a click. RTS is `None` while RTS/CTS flow control
+/// sets it.
+type Outputs = (Option<bool>, bool);
 
 /// How long a serial write may stall, on flow control or a full driver buffer,
 /// before it fails as timed out.
@@ -20,6 +34,9 @@ pub(super) struct SerialInterface {
     /// then recover without a USB device having disappeared. The classifier
     /// still recognizes Windows' timeout-shaped aborted-write unplug error.
     reopen_required: bool,
+    /// The outputs as last set. An output cannot be read back, so this is
+    /// what the control lines report for RTS and DTR.
+    outputs: Outputs,
 }
 
 impl SerialInterface {
@@ -27,8 +44,28 @@ impl SerialInterface {
         Ok(Self {
             port: Some(open_port(config)?),
             reopen_required: false,
+            outputs: config.outputs_at_open(),
         })
     }
+}
+
+/// The outputs to keep after a live settings change to `next`: the levels as
+/// last set stay, except that RTS belongs to the flow control under RTS/CTS,
+/// and takes the profile's level, else low, when RTS/CTS is left.
+fn outputs_after_change(before: Outputs, next: &SerialConfig) -> Outputs {
+    let rts = (next.flow_control != FlowControl::Hardware)
+        .then(|| before.0.unwrap_or(next.rts.unwrap_or(false)));
+    (rts, before.1)
+}
+
+/// Write the outputs to the port. RTS is left alone when the flow control
+/// sets it.
+fn write_outputs(port: &mut dyn serialport::SerialPort, (rts, dtr): Outputs) -> anyhow::Result<()> {
+    if let Some(rts) = rts {
+        port.write_request_to_send(rts).context("setting RTS")?;
+    }
+    port.write_data_terminal_ready(dtr).context("setting DTR")?;
+    Ok(())
 }
 
 fn open_port(config: &SerialConfig) -> anyhow::Result<Box<dyn serialport::SerialPort>> {
@@ -40,6 +77,11 @@ fn open_port(config: &SerialConfig) -> anyhow::Result<Box<dyn serialport::Serial
         .timeout(WRITE_TIMEOUT)
         .open()
         .map_err(|error| describe_open_failure(&config.port, error))
+        .and_then(|mut port| {
+            // The levels shown are the levels set (ADR-070).
+            write_outputs(port.as_mut(), config.outputs_at_open())?;
+            Ok(port)
+        })
         // Names the port. Why a port that appears in the list can still fail to
         // open is the UI's to explain (`serial_port_hint`) — only it knows what
         // is currently enumerated, and saying it here too put the same sentence
@@ -107,6 +149,7 @@ impl Interface for SerialInterface {
         // failure so every later backoff retry performs another real open.
         drop(self.port.take());
         self.port = Some(open_port(config)?);
+        self.outputs = config.outputs_at_open();
         self.reopen_required = false;
         Ok(true)
     }
@@ -128,6 +171,7 @@ impl Interface for SerialInterface {
             // settings and no untrusted handle.
             drop(self.port.take());
             self.port = Some(open_port(next)?);
+            self.outputs = next.outputs_at_open();
             self.reopen_required = false;
             return Ok(true);
         }
@@ -141,6 +185,7 @@ impl Interface for SerialInterface {
             return Ok(false);
         }
 
+        let before = self.outputs;
         let changed = change_or_restore(
             &mut self.port,
             "serial port",
@@ -150,7 +195,57 @@ impl Interface for SerialInterface {
         );
         // A port left closed is reopened by the next retry.
         self.reopen_required = self.port.is_none();
+        // A change of flow control can move RTS, and a failed change may have
+        // put the old settings back in place or reopened the port, which sets
+        // the profile's levels. Either way, write the levels meant now, so the
+        // levels shown are the levels set.
+        let meant = if changed.is_ok() {
+            outputs_after_change(before, next)
+        } else {
+            before
+        };
+        if let Some(port) = self.port.as_mut() {
+            if let Err(error) = write_outputs(port.as_mut(), meant) {
+                tracing::warn!("serial port {:?}: {error:#}", next.port);
+            }
+            self.outputs = meant;
+        }
         changed.map(|()| true)
+    }
+
+    fn set_output(&mut self, line: OutputLine, high: bool) -> anyhow::Result<()> {
+        let port = self.port.as_mut().context("the serial port is not open")?;
+        match line {
+            OutputLine::Rts => {
+                anyhow::ensure!(
+                    self.outputs.0.is_some(),
+                    "RTS is set by RTS/CTS flow control"
+                );
+                port.write_request_to_send(high).context("setting RTS")?;
+                self.outputs.0 = Some(high);
+            }
+            OutputLine::Dtr => {
+                port.write_data_terminal_ready(high)
+                    .context("setting DTR")?;
+                self.outputs.1 = high;
+            }
+        }
+        Ok(())
+    }
+
+    fn control_lines(&mut self) -> Option<ControlLines> {
+        let port = self.port.as_mut()?;
+        let read = (|| -> serialport::Result<ControlLines> {
+            Ok(ControlLines {
+                rts: self.outputs.0.unwrap_or(false),
+                dtr: self.outputs.1,
+                cts: port.read_clear_to_send()?,
+                dsr: port.read_data_set_ready()?,
+                dcd: port.read_carrier_detect()?,
+                ri: port.read_ring_indicator()?,
+            })
+        })();
+        read.ok()
     }
 }
 
@@ -418,11 +513,41 @@ mod tests {
         );
     }
 
+    /// A live change keeps the levels as last set, but RTS/CTS takes RTS, and
+    /// leaving RTS/CTS gives RTS back at the profile's level, else low.
+    #[test]
+    fn a_settings_change_keeps_the_outputs_but_hands_rts_to_flow_control() {
+        let mut config = SerialConfig::new("COM3");
+        assert_eq!(
+            outputs_after_change((Some(true), true), &config),
+            (Some(true), true),
+            "a baud or framing change keeps what was clicked"
+        );
+        config.flow_control = FlowControl::Hardware;
+        assert_eq!(
+            outputs_after_change((Some(true), true), &config),
+            (None, true)
+        );
+        config.flow_control = FlowControl::None;
+        config.rts = Some(true);
+        assert_eq!(
+            outputs_after_change((None, false), &config),
+            (Some(true), false),
+            "leaving RTS/CTS sets the profile's RTS"
+        );
+        config.rts = None;
+        assert_eq!(
+            outputs_after_change((None, false), &config),
+            (Some(false), false)
+        );
+    }
+
     #[test]
     fn a_transient_retry_does_not_require_reopen_configuration() {
         let mut interface = SerialInterface {
             port: None,
             reopen_required: false,
+            outputs: (Some(false), false),
         };
 
         assert!(!interface
@@ -435,6 +560,7 @@ mod tests {
         let mut interface = SerialInterface {
             port: None,
             reopen_required: true,
+            outputs: (Some(false), false),
         };
 
         let error = interface.prepare_retry(None).unwrap_err();

@@ -12,6 +12,7 @@ use crate::core::{
     },
     timing::CadenceAlignment,
 };
+use wiredata_ui::serial as shared;
 
 // ── Channel interface ─────────────────────────────────────────────────────────
 
@@ -125,11 +126,14 @@ pub struct ConnDraft {
     // serial
     pub serial_port: String,
     pub baud_rate: u32,
-    pub baud_custom: String, // text buffer for non-preset baud rates
     pub data_bits: u8,
     pub parity: u8,       // 0=None 1=Odd 2=Even
     pub stop_bits: u8,    // 1 or 2
     pub flow_control: u8, // 0=None 1=Software 2=Hardware
+    /// The profile's RTS and DTR at open, kept as they are: the editor does
+    /// not set them, and a click on a running channel's line is live only.
+    pub serial_rts: Option<bool>,
+    pub serial_dtr: Option<bool>,
     // udp
     pub udp_mode: UdpModeDraft,
     /// Per-mode destination buffers, kept independently so switching
@@ -158,11 +162,12 @@ impl Default for ConnDraft {
             kind: ConnKind::Serial,
             serial_port: String::new(),
             baud_rate: 9600,
-            baud_custom: String::new(),
             data_bits: 8,
             parity: 0,
             stop_bits: 1,
             flow_control: 0,
+            serial_rts: None,
+            serial_dtr: None,
             udp_mode: UdpModeDraft::Unicast,
             udp_unicast: AddrPortPair {
                 // Prefill the first three octets of the LAN address so
@@ -188,40 +193,34 @@ impl Default for ConnDraft {
 impl From<&InterfaceConfig> for ConnDraft {
     fn from(cfg: &InterfaceConfig) -> Self {
         match cfg {
-            InterfaceConfig::Serial(s) => {
-                const PRESETS: &[u32] = &[4800, 9600, 19200, 38400, 57600, 115200];
-                Self {
-                    kind: ConnKind::Serial,
-                    serial_port: s.port.clone(),
-                    baud_rate: s.baud_rate,
-                    baud_custom: if PRESETS.contains(&s.baud_rate) {
-                        String::new()
-                    } else {
-                        s.baud_rate.to_string()
-                    },
-                    data_bits: match s.data_bits {
-                        DataBits::Five => 5,
-                        DataBits::Six => 6,
-                        DataBits::Seven => 7,
-                        _ => 8,
-                    },
-                    parity: match s.parity {
-                        Parity::Odd => 1,
-                        Parity::Even => 2,
-                        _ => 0,
-                    },
-                    stop_bits: match s.stop_bits {
-                        StopBits::Two => 2,
-                        _ => 1,
-                    },
-                    flow_control: match s.flow_control {
-                        FlowControl::Software => 1,
-                        FlowControl::Hardware => 2,
-                        _ => 0,
-                    },
-                    ..Default::default()
-                }
-            }
+            InterfaceConfig::Serial(s) => Self {
+                kind: ConnKind::Serial,
+                serial_port: s.port.clone(),
+                baud_rate: s.baud_rate,
+                data_bits: match s.data_bits {
+                    DataBits::Five => 5,
+                    DataBits::Six => 6,
+                    DataBits::Seven => 7,
+                    _ => 8,
+                },
+                parity: match s.parity {
+                    Parity::Odd => 1,
+                    Parity::Even => 2,
+                    _ => 0,
+                },
+                stop_bits: match s.stop_bits {
+                    StopBits::Two => 2,
+                    _ => 1,
+                },
+                flow_control: match s.flow_control {
+                    FlowControl::Software => 1,
+                    FlowControl::Hardware => 2,
+                    _ => 0,
+                },
+                serial_rts: s.rts,
+                serial_dtr: s.dtr,
+                ..Default::default()
+            },
             InterfaceConfig::Udp(u) => {
                 let mut draft = Self {
                     kind: ConnKind::Udp,
@@ -289,6 +288,71 @@ impl ConnDraft {
         self.kind
     }
 
+    /// The serial fields as the shared settings line edits them (talker
+    /// ADR-071). Talker offers only what the shared lists hold, so every
+    /// choice is [`shared::Choice::Offered`].
+    pub fn serial_settings(&self) -> shared::SerialSettings {
+        use shared::Choice::Offered;
+        shared::SerialSettings {
+            port: self.serial_port.clone(),
+            baud: self.baud_rate,
+            data_bits: match self.data_bits {
+                5 => shared::DataBits::Five,
+                6 => shared::DataBits::Six,
+                7 => shared::DataBits::Seven,
+                _ => shared::DataBits::Eight,
+            },
+            parity: Offered(match self.parity {
+                1 => shared::Parity::Odd,
+                2 => shared::Parity::Even,
+                _ => shared::Parity::None,
+            }),
+            stop_bits: Offered(if self.stop_bits == 2 {
+                shared::StopBits::Two
+            } else {
+                shared::StopBits::One
+            }),
+            flow: match self.flow_control {
+                1 => shared::FlowControl::XonXoff,
+                2 => shared::FlowControl::RtsCts,
+                _ => shared::FlowControl::None,
+            },
+        }
+    }
+
+    /// Take what the shared settings line edited back into the draft. A
+    /// parity or stop bits value still [`shared::Choice::Unsupported`] leaves
+    /// the draft's as it was, though talker never produces one. RTS and DTR
+    /// are not the line's to set and stay as they are.
+    pub fn apply_serial_settings(&mut self, settings: &shared::SerialSettings) {
+        self.serial_port.clone_from(&settings.port);
+        self.baud_rate = settings.baud;
+        self.data_bits = match settings.data_bits {
+            shared::DataBits::Five => 5,
+            shared::DataBits::Six => 6,
+            shared::DataBits::Seven => 7,
+            shared::DataBits::Eight => 8,
+        };
+        if let shared::Choice::Offered(parity) = settings.parity {
+            self.parity = match parity {
+                shared::Parity::None => 0,
+                shared::Parity::Odd => 1,
+                shared::Parity::Even => 2,
+            };
+        }
+        if let shared::Choice::Offered(stop_bits) = settings.stop_bits {
+            self.stop_bits = match stop_bits {
+                shared::StopBits::One => 1,
+                shared::StopBits::Two => 2,
+            };
+        }
+        self.flow_control = match settings.flow {
+            shared::FlowControl::None => 0,
+            shared::FlowControl::XonXoff => 1,
+            shared::FlowControl::RtsCts => 2,
+        };
+    }
+
     pub fn to_config(&self) -> Option<InterfaceConfig> {
         // Empty local_port = "let the OS pick". Non-empty but unparseable
         // (e.g. "444444444" > u16::MAX) is a user mistake; fail the whole
@@ -328,6 +392,8 @@ impl ConnDraft {
                         2 => FlowControl::Hardware,
                         _ => FlowControl::None,
                     },
+                    rts: self.serial_rts,
+                    dtr: self.serial_dtr,
                 }))
             }
             ConnKind::Udp => {
@@ -638,7 +704,147 @@ mod tests {
             parity: Parity::Even,
             stop_bits: StopBits::Two,
             flow_control: FlowControl::Hardware,
+            rts: Some(true),
+            dtr: Some(false),
         }));
+    }
+
+    // ── The shared serial settings ────────────────────────────────────────────
+
+    /// A draft whose serial fields all differ from the defaults, with RTS and
+    /// DTR set, so nothing passes by being left at its default.
+    fn busy_serial_draft() -> ConnDraft {
+        let mut draft = ConnDraft::new(ConnKind::Serial);
+        draft.serial_port = "COM9".to_owned();
+        draft.baud_rate = 250_000;
+        draft.data_bits = 7;
+        draft.parity = 1;
+        draft.stop_bits = 2;
+        draft.flow_control = 2;
+        draft.serial_rts = Some(true);
+        draft.serial_dtr = Some(false);
+        draft
+    }
+
+    /// Every value of the draft maps to the shared list's twin, as the
+    /// shared lines show it. Talker offers only what the lists hold, so each
+    /// is `Choice::Offered`.
+    #[test]
+    fn a_serial_draft_maps_to_the_shared_settings() {
+        use shared::Choice::Offered;
+        let settings = busy_serial_draft().serial_settings();
+        assert_eq!(settings.port, "COM9");
+        assert_eq!(settings.baud, 250_000);
+        assert_eq!(settings.data_bits, shared::DataBits::Seven);
+        assert_eq!(settings.parity, Offered(shared::Parity::Odd));
+        assert_eq!(settings.stop_bits, Offered(shared::StopBits::Two));
+        assert_eq!(settings.flow, shared::FlowControl::RtsCts);
+
+        let mut draft = ConnDraft::new(ConnKind::Serial);
+        for (bits, theirs) in [
+            (5, shared::DataBits::Five),
+            (6, shared::DataBits::Six),
+            (7, shared::DataBits::Seven),
+            (8, shared::DataBits::Eight),
+        ] {
+            draft.data_bits = bits;
+            assert_eq!(draft.serial_settings().data_bits, theirs);
+        }
+        for (ours, theirs) in [
+            (0, shared::Parity::None),
+            (1, shared::Parity::Odd),
+            (2, shared::Parity::Even),
+        ] {
+            draft.parity = ours;
+            assert_eq!(draft.serial_settings().parity, Offered(theirs));
+        }
+        for (ours, theirs) in [(1, shared::StopBits::One), (2, shared::StopBits::Two)] {
+            draft.stop_bits = ours;
+            assert_eq!(draft.serial_settings().stop_bits, Offered(theirs));
+        }
+        for (ours, theirs) in [
+            (0, shared::FlowControl::None),
+            (1, shared::FlowControl::XonXoff),
+            (2, shared::FlowControl::RtsCts),
+        ] {
+            draft.flow_control = ours;
+            assert_eq!(draft.serial_settings().flow, theirs);
+        }
+    }
+
+    /// What the shared lines edited goes back into the draft, field for
+    /// field, and RTS and DTR (not the lines' to set) stay as they were.
+    #[test]
+    fn edited_shared_settings_go_back_into_the_draft() {
+        use shared::Choice::Offered;
+        let mut draft = busy_serial_draft();
+        let settings = shared::SerialSettings {
+            port: "COM3".to_owned(),
+            baud: 1200,
+            data_bits: shared::DataBits::Five,
+            parity: Offered(shared::Parity::Even),
+            stop_bits: Offered(shared::StopBits::One),
+            flow: shared::FlowControl::XonXoff,
+        };
+        draft.apply_serial_settings(&settings);
+        assert_eq!(draft.serial_port, "COM3");
+        assert_eq!(draft.baud_rate, 1200);
+        assert_eq!(draft.data_bits, 5);
+        assert_eq!(draft.parity, 2);
+        assert_eq!(draft.stop_bits, 1);
+        assert_eq!(draft.flow_control, 1);
+        assert_eq!(draft.serial_rts, Some(true), "RTS is not the lines' to set");
+        assert_eq!(
+            draft.serial_dtr,
+            Some(false),
+            "DTR is not the lines' to set"
+        );
+    }
+
+    /// Everything each shared list offers survives a trip into the draft and
+    /// out again, and reaches the config the channel opens with.
+    #[test]
+    fn every_value_the_shared_lists_offer_survives_the_draft() {
+        use shared::Choice::Offered;
+        let mut settings = busy_serial_draft().serial_settings();
+        let mut draft = busy_serial_draft();
+        for &(bits, _) in shared::DATA_BITS {
+            settings.data_bits = bits;
+            draft.apply_serial_settings(&settings);
+            assert_eq!(draft.serial_settings(), settings);
+        }
+        for &(parity, _) in shared::PARITY {
+            settings.parity = Offered(parity);
+            draft.apply_serial_settings(&settings);
+            assert_eq!(draft.serial_settings(), settings);
+        }
+        for &(stop, _) in shared::STOP_BITS {
+            settings.stop_bits = Offered(stop);
+            draft.apply_serial_settings(&settings);
+            assert_eq!(draft.serial_settings(), settings);
+        }
+        for &(flow, _) in shared::FLOW_CONTROL {
+            settings.flow = flow;
+            draft.apply_serial_settings(&settings);
+            assert_eq!(draft.serial_settings(), settings);
+        }
+        for &baud in shared::BAUD_RATES {
+            settings.baud = baud;
+            draft.apply_serial_settings(&settings);
+            assert_eq!(draft.serial_settings(), settings);
+        }
+
+        // The last of each list is in the draft, so the config says the same.
+        let Some(InterfaceConfig::Serial(config)) = draft.to_config() else {
+            panic!("a serial draft with a port builds a serial config");
+        };
+        assert_eq!(config.baud_rate, 921_600);
+        assert_eq!(config.data_bits, DataBits::Five);
+        assert_eq!(config.parity, Parity::Odd);
+        assert_eq!(config.stop_bits, StopBits::Two);
+        assert_eq!(config.flow_control, FlowControl::Hardware);
+        assert_eq!(config.rts, Some(true));
+        assert_eq!(config.dtr, Some(false));
     }
 
     #[test]

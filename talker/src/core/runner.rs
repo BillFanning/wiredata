@@ -16,7 +16,10 @@ use wiredata_cli::doubling_retry;
 use wiredata_ui::format::{compact_duration, interval as whole_ms, thousands};
 
 use crate::core::{
-    channel::{ChannelId, Interface, InterfaceConfig, MissingRetryConfiguration, PartialWrite},
+    channel::{
+        ChannelId, ControlLines, Interface, InterfaceConfig, MissingRetryConfiguration, OutputLine,
+        PartialWrite,
+    },
     internal_fault::InternalFaultTally,
     run_summary::{RunEndReason, RunId, RunSummary, RunTotals},
     scheduler::{ClockStep, Schedule, Tick},
@@ -55,6 +58,8 @@ pub enum CommandTarget {
     Stop,
     Interface,
     MessageInterval(usize),
+    /// A serial output line (ADR-070).
+    Output(OutputLine),
 }
 
 /// What the runner did with an enqueued command.
@@ -101,6 +106,13 @@ pub enum TalkerCommand {
         id: CommandId,
         index: usize,
         interval_ms: u64,
+    },
+    /// Set a serial output line on the open port, live; never reopens it
+    /// (ADR-070).
+    SetOutput {
+        id: CommandId,
+        line: OutputLine,
+        high: bool,
     },
 }
 
@@ -183,7 +195,20 @@ pub enum TalkerStatus {
     },
     /// Opening the interface failed; the runner exits after sending this.
     OpenFailed { channel: ChannelId, message: String },
+    /// The serial control lines (ADR-070): sent when they change and at
+    /// least once a second while a serial port is open, so a dropped update
+    /// repairs itself. `None` when they cannot be read, such as
+    /// while an unplugged port waits to reopen.
+    ControlLines {
+        channel: ChannelId,
+        lines: Option<ControlLines>,
+    },
 }
+
+/// How often a serial channel's control lines are read.
+const LINES_POLL: Duration = Duration::from_millis(100);
+/// The longest a serial channel goes without reporting its control lines.
+const LINES_REPEAT: Duration = Duration::from_secs(1);
 
 /// First retry delay after a send failure (the **bounded-backoff** retry
 /// policy): while an interface is failing, due fires are withheld — counted,
@@ -968,6 +993,17 @@ struct RunState<'a> {
     // invariant from rendering, so its first occurrence must not suppress the
     // render invariant's first report (ADR-054).
     retry_config_faults: InternalFaultTally,
+    // When the control lines are next read. `None` unless the interface is
+    // serial (ADR-070).
+    lines_poll_at: Option<Instant>,
+    // The control lines as last reported, and when.
+    lines_reported: Option<(Option<ControlLines>, Instant)>,
+}
+
+/// When a run on `config` first reads its control lines: at once for a serial
+/// port, never for anything else.
+fn lines_poll_start(config: Option<&InterfaceConfig>, now: Instant) -> Option<Instant> {
+    matches!(config, Some(InterfaceConfig::Serial(_))).then_some(now)
 }
 
 impl<'a> RunState<'a> {
@@ -985,6 +1021,7 @@ impl<'a> RunState<'a> {
         policy: ObserverPolicy,
     ) -> Self {
         let message_count = schedule.len();
+        let lines_poll_at = lines_poll_start(current_config.as_ref(), Instant::now());
         Self {
             who,
             interface,
@@ -1014,6 +1051,8 @@ impl<'a> RunState<'a> {
             miss_episode: None,
             render_faults: InternalFaultTally::default(),
             retry_config_faults: InternalFaultTally::default(),
+            lines_poll_at,
+            lines_reported: None,
         }
     }
 
@@ -1044,6 +1083,7 @@ impl<'a> RunState<'a> {
                 };
                 match &execution {
                     CommandExecution::Applied => {
+                        self.lines_poll_at = lines_poll_start(Some(&config), Instant::now());
                         self.current_config = Some(config);
                         // A fresh interface deserves an immediate attempt:
                         // pull the next retry forward. The episode's counts
@@ -1111,6 +1151,73 @@ impl<'a> RunState<'a> {
                 );
                 Flow::Continue
             }
+            TalkerCommand::SetOutput { id, line, high } => {
+                let level = if high { "high" } else { "low" };
+                let execution = match self.interface.set_output(line, high) {
+                    Ok(()) => {
+                        tracing::info!(
+                            channel = self.who.id.as_u64(),
+                            "channel {} set {} {level}",
+                            self.who.label,
+                            line.name()
+                        );
+                        // Show the new level at once rather than at the next read.
+                        self.lines_poll_at = self.lines_poll_at.map(|_| Instant::now());
+                        CommandExecution::Applied
+                    }
+                    Err(e) => {
+                        let message = format!("{e:#}");
+                        tracing::warn!(
+                            channel = self.who.id.as_u64(),
+                            "channel {} could not set {} {level}: {message}",
+                            self.who.label,
+                            line.name()
+                        );
+                        CommandExecution::Failed(message)
+                    }
+                };
+                emit_control(
+                    self.control_tx,
+                    self.notify,
+                    RunnerControlStatus::CommandCompleted {
+                        channel: self.who.id,
+                        id,
+                        target: CommandTarget::Output(line),
+                        execution,
+                    },
+                );
+                Flow::Continue
+            }
+        }
+    }
+
+    /// When the control lines are next read, for the wait to wake at.
+    fn lines_deadline(&self) -> Option<Instant> {
+        self.lines_poll_at
+    }
+
+    /// Read a serial port's control lines when due, and report them when they
+    /// changed or [`LINES_REPEAT`] has passed since the last report.
+    fn poll_control_lines(&mut self) {
+        let now = Instant::now();
+        let Some(due) = self.lines_poll_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.lines_poll_at = Some(now + LINES_POLL);
+        let lines = self.interface.control_lines();
+        let report = match self.lines_reported {
+            Some((last, at)) => last != lines || now.duration_since(at) >= LINES_REPEAT,
+            None => true,
+        };
+        if report {
+            self.lines_reported = Some((lines, now));
+            self.timer.emit(TalkerStatus::ControlLines {
+                channel: self.who.id,
+                lines,
+            });
         }
     }
 
@@ -1608,6 +1715,8 @@ fn run_loop(
             }
         }
 
+        run.poll_control_lines();
+
         run.reconcile_before_poll();
 
         let poll_at = Instant::now();
@@ -1622,7 +1731,12 @@ fn run_loop(
             // fire deadline. Wakes instantly for a command, exactly on time
             // for the schedule, and detects a dropped handle.
             Tick::Wait(until) => {
+                // A serial port's lines are read while waiting too, so they
+                // stay current however far apart the sends are.
                 let wait_until = run.prepare_wait(until);
+                let wait_until = run
+                    .lines_deadline()
+                    .map_or(wait_until, |lines| lines.min(wait_until));
                 match cmd_rx.recv_deadline(wait_until) {
                     Ok(cmd) => {
                         if let Flow::Stop = run.on_command(cmd) {
@@ -1636,15 +1750,25 @@ fn run_loop(
                 }
             }
             // No active messages: nothing can happen until a command arrives,
-            // so block indefinitely — zero wakeups.
-            Tick::Idle => match cmd_rx.recv() {
-                Ok(cmd) => {
-                    if let Flow::Stop = run.on_command(cmd) {
-                        break 'run RunEndReason::StopCommand;
+            // so block indefinitely — zero wakeups — except to read a serial
+            // port's control lines.
+            Tick::Idle => {
+                let next = match run.lines_deadline() {
+                    Some(lines) => cmd_rx.recv_deadline(lines),
+                    None => cmd_rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                };
+                match next {
+                    Ok(cmd) => {
+                        if let Flow::Stop = run.on_command(cmd) {
+                            break 'run RunEndReason::StopCommand;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        break 'run RunEndReason::OwnerDisconnected;
                     }
                 }
-                Err(_) => break 'run RunEndReason::OwnerDisconnected,
-            },
+            }
         }
     };
 
@@ -1728,7 +1852,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::core::channel::{SerialConfig, TcpClientConfig};
+    use crate::core::channel::{SerialConfig, TcpClientConfig, UdpConfig};
     use crate::core::message::{CodePage, MessageConfig, PayloadConfig};
 
     /// Sustained overload must log twice, not once per missed send. This is
@@ -3778,5 +3902,162 @@ mod tests {
             }
             other => panic!("expected OpenFailed, got {:?}", other.is_ok()),
         }
+    }
+
+    /// A serial port with control lines, for the runner: it records the
+    /// outputs set and every reopen, and reports `lines` when read.
+    struct LinesInterface {
+        lines: Arc<Mutex<ControlLines>>,
+        set: Arc<Mutex<Vec<(OutputLine, bool)>>>,
+        reopens: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl Interface for LinesInterface {
+        fn send(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn prepare_retry(&mut self, _current: Option<&InterfaceConfig>) -> anyhow::Result<bool> {
+            self.reopens
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+
+        fn set_output(&mut self, line: OutputLine, high: bool) -> anyhow::Result<()> {
+            self.set.lock().unwrap().push((line, high));
+            let mut lines = self.lines.lock().unwrap();
+            match line {
+                OutputLine::Rts => lines.rts = high,
+                OutputLine::Dtr => lines.dtr = high,
+            }
+            Ok(())
+        }
+
+        fn control_lines(&mut self) -> Option<ControlLines> {
+            Some(*self.lines.lock().unwrap())
+        }
+    }
+
+    /// The newest control-line reading the runner reports within two seconds
+    /// that satisfies `wanted`.
+    fn wait_for_lines(
+        handle: &TalkerHandle,
+        wanted: impl Fn(&ControlLines) -> bool,
+    ) -> ControlLines {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Ok(TalkerStatus::ControlLines {
+                lines: Some(lines), ..
+            }) = handle.status_rx.recv_timeout(Duration::from_millis(20))
+            {
+                if wanted(&lines) {
+                    return lines;
+                }
+            }
+        }
+        panic!("no control-line reading matched in time");
+    }
+
+    fn completion(handle: &TalkerHandle, target: CommandTarget) -> CommandExecution {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Ok(RunnerControlStatus::CommandCompleted {
+                target: done,
+                execution,
+                ..
+            }) = handle.control_rx.recv_timeout(Duration::from_millis(20))
+            {
+                if done == target {
+                    return execution;
+                }
+            }
+        }
+        panic!("the command did not complete in time");
+    }
+
+    /// ADR-070: a serial channel reports its control lines while it runs,
+    /// and a click sets an output on the open port without reopening it.
+    #[test]
+    fn control_lines_are_reported_and_an_output_is_set_without_a_reopen() {
+        let lines = Arc::new(Mutex::new(ControlLines::default()));
+        let set = Arc::new(Mutex::new(Vec::new()));
+        let reopens = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let handle = spawn_interface_runner(
+            Box::new(LinesInterface {
+                lines: Arc::clone(&lines),
+                set: Arc::clone(&set),
+                reopens: Arc::clone(&reopens),
+            }),
+            Some(InterfaceConfig::Serial(SerialConfig::new("COM9"))),
+        );
+
+        wait_for_lines(&handle, |l| !l.cts);
+        lines.lock().unwrap().cts = true;
+        wait_for_lines(&handle, |l| l.cts);
+
+        let id = CommandId::mint();
+        handle
+            .cmd_tx
+            .send(TalkerCommand::SetOutput {
+                id,
+                line: OutputLine::Dtr,
+                high: true,
+            })
+            .unwrap();
+        assert_eq!(
+            completion(&handle, CommandTarget::Output(OutputLine::Dtr)),
+            CommandExecution::Applied
+        );
+        wait_for_lines(&handle, |l| l.dtr);
+        assert_eq!(*set.lock().unwrap(), [(OutputLine::Dtr, true)]);
+        assert_eq!(
+            reopens.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "setting a line never reopens the port"
+        );
+
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(2));
+    }
+
+    /// UDP and TCP have no control lines: no reading is reported, and a click
+    /// that reaches the runner anyway is refused with a reason.
+    #[test]
+    fn an_interface_without_control_lines_reports_none_and_refuses_a_click() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_interface_runner(
+            Box::new(MockInterface {
+                sent,
+                fail: false,
+                slow: None,
+            }),
+            Some(InterfaceConfig::Udp(UdpConfig::unicast(
+                "127.0.0.1:9".parse().unwrap(),
+            ))),
+        );
+        handle
+            .cmd_tx
+            .send(TalkerCommand::SetOutput {
+                id: CommandId::mint(),
+                line: OutputLine::Rts,
+                high: true,
+            })
+            .unwrap();
+        match completion(&handle, CommandTarget::Output(OutputLine::Rts)) {
+            CommandExecution::Failed(message) => {
+                assert!(message.contains("no control lines"), "{message}");
+            }
+            CommandExecution::Applied => panic!("a UDP channel has no RTS"),
+        }
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            if let Ok(TalkerStatus::ControlLines { .. }) =
+                handle.status_rx.recv_timeout(Duration::from_millis(20))
+            {
+                panic!("a UDP channel reported control lines");
+            }
+        }
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(2));
     }
 }

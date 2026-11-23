@@ -1,14 +1,16 @@
 # Talker — Program Specification
-**Version:** 2.6.0
+**Version:** 2.6.1
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-22) — serial control lines and flow-control names:
+Revision note (2026-11-23) — the serial settings lines:
 
-- **§4.2 (ADR-070)** — a serial channel sets RTS and DTR and shows CTS, DSR,
-  DCD and RI, as listener does.
-- **§4.2 (ADR-070)** — flow control is named None, XON/XOFF and RTS/CTS.
-  XON/XOFF was supported but not listed.
+- **§4.2 (ADR-071)** — a serial channel's settings are laid out as Linemon's
+  and listener's: the port, baud rate and framing on one line of drop-downs,
+  then flow control and the control lines.
+- **§4.2** — the baud list runs from 4800 to 921600, and any other rate,
+  slower ones included, is typed. A port the system does not list can be
+  typed by name.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -505,13 +507,21 @@ The channel abstraction in `core::channel` is designed for easy addition of futu
 
 All standard RS-232 parameters are user-configurable:
 
-- Port (e.g., COM3, /dev/ttyUSB0)
-- Baud rate: common standard rates are selectable from a list (110, 300, 1200, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600); a free-entry field allows specifying any rate outside this range
+- Port: chosen from the ports the system lists, or typed by name (e.g., COM3,
+  /dev/ttyUSB0). On Windows, where port names ignore case, a typed name is put
+  in capitals.
+- Baud rate: chosen from 4800, 9600, 19200, 38400, 57600, 115200, 230400,
+  460800 and 921600, or typed: any other rate, slower ones included, in up to
+  eight digits
 - Data bits (5, 6, 7, 8)
 - Parity (None, Even, Odd)
 - Stop bits (1, 2)
 - Flow control: None, XON/XOFF or RTS/CTS, named so in Linemon and listener
   too (ADR-070)
+
+In the GUI these are two lines, as in Linemon and listener (ADR-071): the port,
+baud rate, data bits, parity and stop bits, then flow control and the control
+lines. In a narrow pane each line wraps.
 
 **Control lines (ADR-070).** RTS and DTR are set low at every open, unless the
 profile's `rts` or `dtr` sets them, and while the channel runs a button sets
