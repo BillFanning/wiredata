@@ -2642,6 +2642,29 @@ Listener still never sets RTS under RTS/CTS.
 channels, and all three programs name flow control None, XON/XOFF and RTS/CTS
 (talker ADR-070).
 
+## ADR-074 — Linemon and a Channel share the serial settings lines with talker
+
+**Status:** Accepted 2026-11-23. Amends §14.1, §14.3, §50.3 and ADR-019;
+talker ADR-071 records the same decision for talker.
+
+**Context:** A Channel's editor laid out its serial settings as five rows of
+radio buttons, Linemon as one line of drop-downs, and the editor offered Mark
+and Space parity and 1.5 stop bits, which the serial library refuses at open.
+
+**Decision:** Linemon and a Channel's editor use the two lines in
+`wiredata-ui::serial`, as talker does (talker ADR-071): the port with its baud
+rate and framing, then Flow with the control lines. Listener maps its config to
+and from the shared values. Only what a port opens with is offered; a profile's
+Mark, Space or 1.5 is shown as not supported and kept until another is chosen,
+never changed unasked. A port the system does not list can be typed by name
+(§14.4).
+
+**Boundary:** A Channel's edits still wait for Apply & Restart and Linemon's
+still apply at once. The profile keys and their accepted values are unchanged.
+
+**Consequences:** A profile with Mark, Space or 1.5 still cannot start, as
+before; the editor now says why instead of offering it as a choice.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

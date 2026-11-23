@@ -1,23 +1,19 @@
-# Listener Specification v2.6.6
+# Listener Specification v2.6.7
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-21) — Linemon's serial markers and RTS under RTS/CTS:
+Revision note (2026-11-23) — the serial settings lines:
 
-- **§14.3, §50.3, §161 (ADR-073).** On Windows, RTS under RTS/CTS flow control
-  is known to be high and reads "RTS high, set by flow control"; elsewhere it
-  still reads "RTS set by flow control".
-- **§14.3.** In a Channel's settings, Flow is a drop-down and the control lines
-  follow it on its row, as in Linemon.
-- **§50.3.** A serial marker line gives the whole settings line: port, framing,
-  flow control (none included) and the RTS and DTR levels. A change of RTS or
-  DTR writes one too, once the port reports it.
-- **§50.3.** When the port fails to open or stops, Linemon refreshes the port
-  list and says when the port is no longer in it. A port that opens while
-  unlisted refreshes the list too.
+- **§14.1, §14.3, §50.3 (ADR-074).** A Channel's serial settings are laid out
+  as Linemon's, with the same widgets: the port, baud rate and framing on one
+  line of drop-downs, then Flow and the control lines. The input lines are
+  circles filled when high.
+- **§14.1.** The standard baud rates run from 4800 to 921600; any other rate
+  is typed. Only parity None, Even and Odd and 1 or 2 stop bits are offered.
+- **§50.3.** A port the system does not list can be typed by name.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -546,9 +542,16 @@ Baud Rate shall support both:
 Standard values should include:
 
 ```text
-110, 300, 1200, 4800, 9600, 19200, 38400,
-57600, 115200, 921600
+4800, 9600, 19200, 38400, 57600, 115200,
+230400, 460800, 921600
 ```
+
+Any other rate, slower ones included, is typed, in up to eight digits.
+
+The editors offer only what a port opens with: parity None, Even or Odd, and 1
+or 2 stop bits (ADR-074). A profile may still hold Mark or Space parity or 1.5
+stop bits; the editor shows such a value as not supported until another is
+chosen, and the Channel cannot start with it.
 
 ### 14.2 Serial Control Signals
 
@@ -585,9 +588,12 @@ open-time setting. While a Serial Channel is Running:
   except RTS under RTS/CTS flow control, which the driver sets and which is shown
   as set by flow control, with no control. On Windows the driver keeps it high,
   so it is shown high; elsewhere the driver moves it and its level is not shown.
-- **Where they are shown.** In a Channel's interface settings the lines follow
-  Flow, a drop-down, on its row, drawn as Linemon draws them (§50.3), and
-  greyed out with a sentence saying why while the port is not running.
+- **Where they are shown.** A Channel's interface settings are two lines, the
+  same as Linemon's (§50.3, ADR-074): the port, baud rate and framing as
+  drop-downs, then Flow and the control lines. Each input line is a circle
+  filled when high and hollow when low, its name in the ordinary text colour.
+  The lines are greyed out with a sentence saying why while the port is not
+  running. In a narrow pane each line wraps.
 - **Input lines CTS, DSR, DCD, RI** are **live-monitored**; a change is reflected
   in Channel status/snapshot and signalled by `ControlLinesChanged` (§137).
 
@@ -1016,7 +1022,9 @@ it is not opened from Listener, and Listener need not be running.
 - **Reopen port on start.** With this ticked, Linemon opens the port it last
   had when it starts. With it unticked, Linemon waits for Start. It starts
   ticked.
-- **Choosing a port.** A drop-down lists the serial ports. For UDP, − and +
+- **Choosing a port.** A drop-down lists the serial ports, with a box at its
+  foot for a port name the system did not list. On Windows, where port names
+  ignore case, a typed name is put in capitals. For UDP, − and +
   beside the port number move it one down or up.
 - **Settings.** For a serial port the bar has two lines: the port with its
   baud rate, data bits, parity and stop bits, then flow control with the

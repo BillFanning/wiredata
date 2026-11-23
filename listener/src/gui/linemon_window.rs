@@ -31,11 +31,9 @@ use super::linemon::LinemonStream;
 use super::port_list::PortList;
 use super::view_prefs::ViewPrefs;
 use super::widgets::{
-    combo_width, option_combo, rts_set_by_flow_control, serial_lines_row, LineClick,
-};
-use super::widgets::{
-    template_for, udp_bind_choice, udp_mode_and_sharing, AddKind, Refresh, BAUD_RATES, DATA_BITS,
-    FLOW_CONTROL, PARITY, STOP_BITS, UDP_MODE_HOVER, UDP_PORT_HOVER,
+    apply_serial_settings, control_lines, rts_by_flow, serial_settings, template_for,
+    udp_bind_choice, udp_mode_and_sharing, AddKind, LineClick, Refresh, UDP_MODE_HOVER,
+    UDP_PORT_HOVER,
 };
 use super::StreamRenderCache;
 use crate::transport::SerialControlLines;
@@ -347,18 +345,6 @@ fn step_udp_port(port: u16, step: i32) -> u16 {
     next.clamp(1, i32::from(u16::MAX)) as u16
 }
 
-/// The baud rate to apply from the custom box: only when the box has lost the
-/// keyboard, no preset was chosen in the same frame, and the text, ignoring
-/// spaces around it, is a whole number above 0. A clicked preset wins because
-/// egui takes the box's focus away on the click, which is the frame the preset
-/// is set, so the box would otherwise overwrite it with the text typed before.
-fn custom_baud(lost_focus: bool, preset_chosen: bool, text: &str) -> Option<u32> {
-    if !lost_focus || preset_chosen {
-        return None;
-    }
-    text.trim().parse::<u32>().ok().filter(|&rate| rate > 0)
-}
-
 // ---------------------------------------------------------------------------
 // Status line
 // ---------------------------------------------------------------------------
@@ -554,8 +540,7 @@ pub(super) struct Linemon {
     /// The serial port failed, so the port list is read again at the next
     /// frame: a removed adapter then shows as not found.
     ports_stale: bool,
-    /// Text typed into the custom baud and UDP port fields.
-    baud_text: String,
+    /// Text typed into the UDP port field.
     udp_port_text: String,
     jump_to_bottom: bool,
     copy_all: bool,
@@ -599,7 +584,6 @@ impl Linemon {
             port_list: PortList::default(),
             port_list_seen: 0,
             ports_stale: false,
-            baud_text: String::new(),
             udp_port_text: String::new(),
             jump_to_bottom: false,
             copy_all: false,
@@ -908,132 +892,24 @@ impl Linemon {
             });
     }
 
+    /// The serial port's first line: the port with its refresh button, then the
+    /// baud rate and the framing. The shared widget (listener ADR-074) draws it
+    /// into the caller's row, and keeps what is being typed in the port and baud
+    /// boxes itself.
     fn serial_controls(&mut self, ui: &mut egui::Ui, refresh: &mut Option<Refresh>) {
-        ui.label("Port");
-        let current = self.settings.serial.port.clone();
-        let label = if current.is_empty() {
-            "select port\u{2026}".to_owned()
-        } else if self
-            .serial_ports
-            .as_ref()
-            .is_none_or(|ports| ports.contains(&current))
-        {
-            // Until the first list arrives, nothing is known to be missing.
-            current.clone()
-        } else {
-            format!("{current} (not found)")
-        };
-        let listed = self.serial_ports.as_deref().unwrap_or_default();
-        let width = combo_width(
+        let mut settings = serial_settings(&self.settings.serial);
+        let response = wiredata_ui::serial::settings_line(
             ui,
-            std::iter::once(label.as_str()).chain(listed.iter().map(String::as_str)),
+            egui::Id::new("linemon_serial"),
+            &mut settings,
+            self.serial_ports.as_deref(),
         );
-        let combo = egui::ComboBox::from_id_salt("linemon_serial_port")
-            .selected_text(label.as_str())
-            .width(width)
-            .show_ui(ui, |ui| {
-                if !current.is_empty() {
-                    ui.selectable_value(
-                        &mut self.settings.serial.port,
-                        String::new(),
-                        "(clear selection)",
-                    );
-                }
-                match &self.serial_ports {
-                    None => {
-                        ui.weak("Listing ports\u{2026}");
-                    }
-                    Some(ports) if ports.is_empty() => {
-                        ui.weak("No ports found");
-                    }
-                    Some(ports) => {
-                        for port in ports {
-                            ui.selectable_value(&mut self.settings.serial.port, port.clone(), port);
-                        }
-                    }
-                }
-            });
-        // Listed again as the drop-down opens: a port may have come or gone.
-        if combo.response.clicked() {
+        if response.changed {
+            apply_serial_settings(&mut self.settings.serial, &settings);
+        }
+        if response.refresh_ports {
             *refresh = Some(Refresh::SerialPorts);
         }
-        if ui
-            .small_button("\u{2B6E}")
-            .on_hover_text("Refresh port list")
-            .clicked()
-        {
-            *refresh = Some(Refresh::SerialPorts);
-        }
-
-        ui.label("Baud");
-        let baud = self.settings.serial.baud_rate;
-        let rates: Vec<String> = BAUD_RATES
-            .iter()
-            .chain(std::iter::once(&baud))
-            .map(u32::to_string)
-            .collect();
-        let width = combo_width(ui, rates.iter().map(String::as_str));
-        // The standard rates, then a box for any other rate at the bottom of
-        // the same list. The list stays open while the box is clicked into and
-        // typed in, so it closes itself after a choice. A custom rate is applied
-        // when a valid number is entered and the box is left or Enter is
-        // pressed, never on a half-typed value.
-        let width = width.max(combo_width(ui, ["custom"]));
-        egui::ComboBox::from_id_salt("linemon_baud")
-            .selected_text(baud.to_string())
-            .width(width)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .show_ui(ui, |ui| {
-                let mut preset_chosen = false;
-                for &rate in BAUD_RATES {
-                    let chosen = ui
-                        .selectable_value(
-                            &mut self.settings.serial.baud_rate,
-                            rate,
-                            rate.to_string(),
-                        )
-                        .clicked();
-                    if chosen {
-                        preset_chosen = true;
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                let custom = ui.add(
-                    egui::TextEdit::singleline(&mut self.baud_text)
-                        .id_salt("linemon_baud_custom")
-                        .desired_width(ui.available_width())
-                        .hint_text("custom"),
-                );
-                // A preset clicked this frame wins over text typed in the box.
-                if let Some(rate) = custom_baud(custom.lost_focus(), preset_chosen, &self.baud_text)
-                {
-                    self.settings.serial.baud_rate = rate;
-                }
-                if custom.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    ui.close();
-                }
-                if preset_chosen || !custom.has_focus() {
-                    self.baud_text.clear();
-                }
-            });
-
-        let serial = &mut self.settings.serial;
-        option_combo(
-            ui,
-            "linemon_data_bits",
-            "Data bits",
-            &mut serial.data_bits,
-            DATA_BITS,
-        );
-        option_combo(ui, "linemon_parity", "Parity", &mut serial.parity, PARITY);
-        option_combo(
-            ui,
-            "linemon_stop_bits",
-            "Stop bits",
-            &mut serial.stop_bits,
-            STOP_BITS,
-        );
     }
 
     /// The serial port's second line: flow control, then the control lines
@@ -1045,16 +921,21 @@ impl Linemon {
     /// are live only while the port is running; otherwise they are greyed out
     /// and a sentence says why.
     fn serial_lines(&mut self, ui: &mut egui::Ui, out: &mut Vec<UiCommand>) {
-        option_combo(
+        let mut settings = serial_settings(&self.settings.serial);
+        let response = wiredata_ui::serial::flow_and_lines(
             ui,
-            "linemon_flow",
-            "Flow",
-            &mut self.settings.serial.flow_control,
-            FLOW_CONTROL,
+            egui::Id::new("linemon_serial"),
+            &mut settings.flow,
+            self.live_control_lines().map(control_lines),
+            rts_by_flow(&self.settings.interface()),
         );
-        ui.separator();
-        let rts_by_flow = rts_set_by_flow_control(&self.settings.interface());
-        match serial_lines_row(ui, self.live_control_lines(), rts_by_flow) {
+        if response.changed {
+            apply_serial_settings(&mut self.settings.serial, &settings);
+            // What stands in for RTS follows the flow control just chosen, so
+            // draw the line again with it.
+            ui.ctx().request_repaint();
+        }
+        match response.click {
             Some(LineClick::Rts(on)) => out.push(UiCommand::LinemonSetRts(on)),
             Some(LineClick::Dtr(on)) => out.push(UiCommand::LinemonSetDtr(on)),
             None => {}
@@ -1502,45 +1383,6 @@ mod tests {
         assert!(!is_port_change(&PortKey::Udp(5005), &PortKey::Udp(5005)));
         assert!(is_port_change(&com4, &PortKey::Udp(5005)));
         assert!(is_port_change(&PortKey::Udp(5005), &com4));
-    }
-
-    // ---- custom baud rate ----
-
-    #[test]
-    fn a_chosen_preset_wins_over_text_in_the_custom_box() {
-        assert_eq!(custom_baud(true, true, "23456"), None);
-        assert_eq!(custom_baud(false, true, "23456"), None);
-    }
-
-    #[test]
-    fn a_custom_rate_applies_when_the_box_is_left() {
-        assert_eq!(custom_baud(true, false, "23456"), Some(23_456));
-    }
-
-    #[test]
-    fn a_custom_rate_does_not_apply_while_the_box_has_the_keyboard() {
-        assert_eq!(custom_baud(false, false, "23456"), None);
-    }
-
-    #[test]
-    fn half_typed_or_non_numeric_text_is_not_a_custom_rate() {
-        assert_eq!(custom_baud(true, false, ""), None);
-        assert_eq!(custom_baud(true, false, "   "), None);
-        assert_eq!(custom_baud(true, false, "96x"), None);
-        assert_eq!(custom_baud(true, false, "abc"), None);
-        assert_eq!(custom_baud(true, false, "-9600"), None);
-        assert_eq!(custom_baud(true, false, "99999999999"), None);
-    }
-
-    #[test]
-    fn a_custom_rate_of_zero_is_not_applied() {
-        assert_eq!(custom_baud(true, false, "0"), None);
-        assert_eq!(custom_baud(true, false, " 000 "), None);
-    }
-
-    #[test]
-    fn spaces_around_a_custom_rate_are_ignored() {
-        assert_eq!(custom_baud(true, false, "  57600 "), Some(57_600));
     }
 
     // ---- stepping ----
@@ -2198,5 +2040,57 @@ mod tests {
         assert!(!l.can_start(), "already open");
         l.open_error = Some("busy".into());
         assert!(l.can_start(), "try again after a failure");
+    }
+
+    /// Draw `kind`'s two settings lines in a `width`-point pane and return
+    /// their height and how far they ran, from the pane's left edge.
+    fn drawn_lines(kind: SourceKind, width: f32) -> (f32, f32) {
+        let ctx = egui::Context::default();
+        let mut l = Linemon::new(None);
+        let mut drawn = (0.0, 0.0);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(width);
+            let left = ui.max_rect().left();
+            let rect = ui
+                .vertical(|ui| {
+                    l.settings_lines(
+                        ui,
+                        kind,
+                        &LocalAddresses::NotListed,
+                        &mut None,
+                        &mut Vec::new(),
+                        4.0,
+                    );
+                })
+                .response
+                .rect;
+            drawn = (rect.height(), rect.right() - left);
+        });
+        drawn
+    }
+
+    /// The serial lines are two rows whatever the width: in a pane too narrow
+    /// for them they run past it, and the window's minimum width is what keeps
+    /// them whole.
+    #[test]
+    fn the_serial_lines_never_wrap() {
+        let (wide_height, wide_run) = drawn_lines(SourceKind::Serial, 1400.0);
+        let (narrow_height, narrow_run) = drawn_lines(SourceKind::Serial, 320.0);
+        assert_eq!(narrow_height, wide_height, "the lines wrapped");
+        assert_eq!(narrow_run, wide_run);
+        assert!(
+            narrow_run > 320.0,
+            "the lines are wider than the narrow pane"
+        );
+    }
+
+    /// The same holds for the UDP lines, the port line with its binding
+    /// address and the mode line with its group.
+    #[test]
+    fn the_udp_lines_never_wrap() {
+        let (wide_height, wide_run) = drawn_lines(SourceKind::Udp, 1400.0);
+        let (narrow_height, _) = drawn_lines(SourceKind::Udp, 320.0);
+        assert_eq!(narrow_height, wide_height, "the lines wrapped");
+        assert!(wide_run < 1400.0, "each line fits the wide pane");
     }
 }

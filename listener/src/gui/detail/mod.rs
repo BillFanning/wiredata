@@ -16,8 +16,8 @@ use super::state::{ChannelStatus, ReconnectPrompt};
 use super::widgets::{
     config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
     paint_glyph, recording_facts, recording_glyph_size, recording_indicator, rename_problem,
-    rts_set_by_flow_control, start_button, status_color, status_glyph, status_words, stop_enabled,
-    LineClick, Refresh,
+    rts_by_flow, start_button, status_color, status_glyph, status_words, stop_enabled, LineClick,
+    Refresh,
 };
 use super::ListenerApp;
 use wiredata_ui::fonts::bold;
@@ -245,11 +245,8 @@ impl ListenerApp {
         // The serial control lines (§161) are live, not part of the draft: the
         // running port's last reading, and whether the flow control it was
         // opened with sets RTS. They are kept only while the port runs.
-        let (lines, rts_by_flow) = self.state.channel(id).map_or((None, false), |v| {
-            (
-                v.control_lines,
-                rts_set_by_flow_control(&v.config.interface),
-            )
+        let (lines, by_flow) = self.state.channel(id).map_or((None, None), |v| {
+            (v.control_lines, rts_by_flow(&v.config.interface))
         });
         // Configure is edit-only: there's no Apply button here. Edits commit via the
         // Start / Apply & Restart button at the top, which applies the pending draft.
@@ -275,7 +272,7 @@ impl ListenerApp {
                                 ports.as_deref(),
                                 &addresses,
                                 lines,
-                                rts_by_flow,
+                                by_flow,
                             )
                         })
                         .inner;

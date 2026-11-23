@@ -12,6 +12,20 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-21) — Linemon's serial markers and RTS under RTS/CTS:
+
+- **§14.3, §50.3, §161 (ADR-073).** On Windows, RTS under RTS/CTS flow control
+  is known to be high and reads "RTS high, set by flow control"; elsewhere it
+  still reads "RTS set by flow control".
+- **§14.3.** In a Channel's settings, Flow is a drop-down and the control lines
+  follow it on its row, as in Linemon.
+- **§50.3.** A serial marker line gives the whole settings line: port, framing,
+  flow control (none included) and the RTS and DTR levels. A change of RTS or
+  DTR writes one too, once the port reports it.
+- **§50.3.** When the port fails to open or stops, Linemon refreshes the port
+  list and says when the port is no longer in it. A port that opens while
+  unlisted refreshes the list too.
+
 Revision note (2026-11-20) — serial lines, shutdown and the event log:
 
 - **§3.1.** Exit code 3 no longer counts retries running out; nothing gives up.
