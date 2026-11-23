@@ -184,15 +184,26 @@ impl ListenerApp {
         // channel to Faulted and leaves its reason to the runtime's diagnostics
         // headline rather than setting `last_error`, so gating on the error
         // alone hid this hint in exactly the case it was written for.
+        // Nor is it said from a list not yet read, or being read again: until
+        // the read ends the list may still show a port that has gone.
         let port = serial_port.filter(|p| !p.is_empty());
+        // A port can vanish and come back while Listener runs; the list is
+        // otherwise only as fresh as the last read, and would say an unplugged
+        // port is there, or a returned one is not found.
+        let problem = port.is_some() && (status == ChannelStatus::Faulted || last_error.is_some());
+        if port_problem_changed(&mut self.port_problem_seen, id, problem) {
+            self.refresh_serial_ports();
+        }
+        let fresh_ports = self
+            .serial_ports
+            .as_deref()
+            .filter(|_| !self.port_list.is_reading());
         let hint = port
             .as_deref()
             .filter(|_| status == ChannelStatus::Faulted || last_error.is_some())
-            .map(|port| {
-                wiredata_ui::format::serial_port_hint(
-                    port,
-                    self.serial_ports.iter().any(|p| p == port),
-                )
+            .zip(fresh_ports)
+            .map(|(port, ports)| {
+                wiredata_ui::format::serial_port_hint(port, ports.iter().any(|p| p == port))
             });
         // The error and its hint are one problem, so one paragraph in one colour.
         let text = match (&last_error, hint) {
@@ -257,7 +268,15 @@ impl ListenerApp {
                 .show(ui, |ui| {
                     (refresh, click) = ui
                         .push_id("edit_iface", |ui| {
-                            edit_interface(ui, id, config, &ports, &addresses, lines, rts_by_flow)
+                            edit_interface(
+                                ui,
+                                id,
+                                config,
+                                ports.as_deref(),
+                                &addresses,
+                                lines,
+                                rts_by_flow,
+                            )
                         })
                         .inner;
                     // The reconnect choice inside applies live (§9.1); see
@@ -972,10 +991,54 @@ fn shorten_path(path: &std::path::Path) -> String {
     format!("{head}…{sep}{file}")
 }
 
+/// Whether the port problem shown for channel `id` has just appeared or
+/// cleared, given whether one shows now. `seen` holds the channel last shown
+/// and whether it had one. Moving to another channel counts only when that
+/// one shows a problem. Once per change, not on every frame.
+fn port_problem_changed(seen: &mut Option<(ChannelId, bool)>, id: ChannelId, shown: bool) -> bool {
+    let changed = match *seen {
+        Some((was_id, was)) if was_id == id => was != shown,
+        _ => shown,
+    };
+    *seen = Some((id, shown));
+    changed
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{headline_phrase, problem_text, FINAL_SNAPSHOT_TOOLTIP, THROUGHPUT_TOOLTIP};
+    use super::{
+        headline_phrase, port_problem_changed, problem_text, FINAL_SNAPSHOT_TOOLTIP,
+        THROUGHPUT_TOOLTIP,
+    };
+    use crate::core::ChannelId;
     use crate::transport::serial::open_error_prefix;
+
+    #[test]
+    fn the_port_list_is_read_again_as_a_port_problem_comes_and_goes() {
+        let (a, b) = (ChannelId::new(), ChannelId::new());
+        let mut seen = None;
+        assert!(!port_problem_changed(&mut seen, a, false), "no problem");
+        assert!(
+            port_problem_changed(&mut seen, a, true),
+            "the problem appears"
+        );
+        assert!(
+            !port_problem_changed(&mut seen, a, true),
+            "the same problem, a frame later, reads nothing"
+        );
+        assert!(
+            port_problem_changed(&mut seen, a, false),
+            "the problem clears: the port may be back"
+        );
+        assert!(
+            port_problem_changed(&mut seen, b, true),
+            "another channel, shown with a problem"
+        );
+        assert!(
+            !port_problem_changed(&mut seen, a, false),
+            "back to a channel with none"
+        );
+    }
 
     #[test]
     fn a_serial_open_error_names_the_port_once() {

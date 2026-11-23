@@ -1,4 +1,5 @@
 mod config;
+mod port_list;
 mod serial;
 mod tcp;
 mod udp;
@@ -7,6 +8,7 @@ pub use config::{
     ChannelConfig, DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits,
     TcpClientConfig, UdpConfig, UdpMode,
 };
+pub(crate) use port_list::PortList;
 pub(crate) use tcp::{CONNECT_TIMEOUT, WRITE_TIMEOUT};
 
 /// Stable identity of one configured channel, minted when the channel is

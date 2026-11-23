@@ -361,7 +361,7 @@ pub(super) fn edit_interface(
     ui: &mut egui::Ui,
     channel_id: ChannelId,
     config: &mut ChannelConfig,
-    serial_ports: &[String],
+    serial_ports: Option<&[String]>,
     local_addresses: &LocalAddresses,
     lines: Option<SerialControlLines>,
     rts_by_flow: bool,
@@ -416,9 +416,11 @@ pub(super) fn edit_interface(
                         // Say so when the port is not currently enumerated, or
                         // the box reads as though the device were present while
                         // the list behind it is empty.
+                        // Until the first list arrives, nothing is known to
+                        // be missing.
                         let label = if serial.port.is_empty() {
                             "select port\u{2026}".to_string()
-                        } else if serial_ports.contains(&serial.port) {
+                        } else if serial_ports.is_none_or(|ports| ports.contains(&serial.port)) {
                             serial.port.clone()
                         } else {
                             format!("{} (not found)", serial.port)
@@ -439,11 +441,21 @@ pub(super) fn edit_interface(
                                         "(clear selection)",
                                     );
                                 }
-                                if serial_ports.is_empty() {
-                                    ui.weak("No ports found");
-                                } else {
-                                    for port in serial_ports {
-                                        ui.selectable_value(&mut serial.port, port.clone(), port);
+                                match serial_ports {
+                                    None => {
+                                        ui.weak("Listing ports\u{2026}");
+                                    }
+                                    Some([]) => {
+                                        ui.weak("No ports found");
+                                    }
+                                    Some(ports) => {
+                                        for port in ports {
+                                            ui.selectable_value(
+                                                &mut serial.port,
+                                                port.clone(),
+                                                port,
+                                            );
+                                        }
                                     }
                                 }
                             });
@@ -453,6 +465,8 @@ pub(super) fn edit_interface(
                         // unplugged since then still looks selectable.
                         // Enumeration is not free, so this fires on the click
                         // that opens the list rather than every frame it is open.
+                        // The new list arrives a frame or two later, from a
+                        // helper thread.
                         if combo.response.clicked() {
                             refresh = Some(Refresh::SerialPorts);
                         }
@@ -676,15 +690,6 @@ fn reconnect_hover() -> Hover {
         ),
         "When it is not ticked, the channel stays down until you start it again.".to_owned(),
     ])
-}
-
-/// The available serial port names, sorted (§14.4). Empty if enumeration fails.
-pub(super) fn list_serial_ports() -> Vec<String> {
-    let mut ports: Vec<String> = serialport::available_ports()
-        .map(|list| list.into_iter().map(|p| p.port_name).collect())
-        .unwrap_or_default();
-    ports.sort();
-    ports
 }
 
 /// A fresh template config for the given interface kind. New UDP channels default

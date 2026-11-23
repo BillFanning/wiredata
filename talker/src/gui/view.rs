@@ -56,13 +56,15 @@ impl ChannelView {
         self.open_failure_shown = false;
     }
 
-    /// Whether a failed open has just appeared in the banner, given whether
-    /// one shows now. True once per failure, so the port list it is explained
-    /// against is refreshed then, not on every frame.
-    pub(super) fn open_failure_appeared(&mut self, shown: bool) -> bool {
-        let appeared = shown && !self.open_failure_shown;
+    /// Whether a failed open has just appeared in the banner or left it, given
+    /// whether one shows now. The port list is read again at each: as one
+    /// appears, to say whether the port has gone, and as one clears, since a
+    /// port that opens again may be back in the list. Once per change, not on
+    /// every frame.
+    pub(super) fn open_failure_changed(&mut self, shown: bool) -> bool {
+        let changed = shown != self.open_failure_shown;
         self.open_failure_shown = shown;
-        appeared
+        changed
     }
 }
 
@@ -71,25 +73,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_port_list_is_refreshed_once_as_an_open_failure_appears() {
+    fn the_port_list_is_refreshed_as_an_open_failure_comes_and_goes() {
         let mut view = ChannelView::default();
-        assert!(!view.open_failure_appeared(false), "no failure");
-        assert!(view.open_failure_appeared(true), "the failure appears");
+        assert!(!view.open_failure_changed(false), "no failure");
+        assert!(view.open_failure_changed(true), "the failure appears");
         assert!(
-            !view.open_failure_appeared(true),
+            !view.open_failure_changed(true),
             "the same failure, a frame later, refreshes nothing"
         );
-        assert!(!view.open_failure_appeared(false), "the failure clears");
-        assert!(view.open_failure_appeared(true), "a new failure appears");
+        assert!(
+            view.open_failure_changed(false),
+            "the failure clears: the port may be back"
+        );
+        assert!(
+            !view.open_failure_changed(false),
+            "no failure, a frame later, refreshes nothing"
+        );
+        assert!(view.open_failure_changed(true), "a new failure appears");
     }
 
     #[test]
     fn a_fresh_run_forgets_the_failure_it_had() {
         let mut view = ChannelView::default();
-        assert!(view.open_failure_appeared(true));
+        assert!(view.open_failure_changed(true));
         view.start_run();
         assert!(
-            view.open_failure_appeared(true),
+            view.open_failure_changed(true),
             "a new run's first failed open is a new failure"
         );
     }

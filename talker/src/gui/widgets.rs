@@ -360,7 +360,7 @@ fn message_blockers(
 pub(super) fn show_serial_fields(
     ui: &mut egui::Ui,
     conn: &mut ConnDraft,
-    ports: &[String],
+    ports: Option<&[String]>,
 ) -> (bool, bool) {
     let before = (
         conn.serial_port.clone(),
@@ -383,9 +383,10 @@ pub(super) fn show_serial_fields(
                 // hardware — it is saved in the profile. Say so when the port is
                 // not currently enumerated, or the box reads as though the
                 // device were present while the list behind it is empty.
+                // Until the first list arrives, nothing is known to be missing.
                 let label = if conn.serial_port.is_empty() {
                     "select port\u{2026}".to_string()
-                } else if ports.contains(&conn.serial_port) {
+                } else if ports.is_none_or(|ports| ports.contains(&conn.serial_port)) {
                     conn.serial_port.clone()
                 } else {
                     format!("{} (not found)", conn.serial_port)
@@ -405,11 +406,17 @@ pub(super) fn show_serial_fields(
                                 "(clear selection)",
                             );
                         }
-                        if ports.is_empty() {
-                            ui.weak("No ports found");
-                        } else {
-                            for port in ports {
-                                ui.selectable_value(&mut conn.serial_port, port.clone(), port);
+                        match ports {
+                            None => {
+                                ui.weak("Listing ports\u{2026}");
+                            }
+                            Some([]) => {
+                                ui.weak("No ports found");
+                            }
+                            Some(ports) => {
+                                for port in ports {
+                                    ui.selectable_value(&mut conn.serial_port, port.clone(), port);
+                                }
                             }
                         }
                     });
@@ -418,6 +425,7 @@ pub(super) fn show_serial_fields(
                 // from launch, and a port unplugged since then still looks
                 // selectable. Enumeration is not free, so this fires on the
                 // click that opens the list rather than every frame it is open.
+                // The new list arrives a frame or two later, from a helper thread.
                 if combo.response.clicked() {
                     refresh = true;
                 }

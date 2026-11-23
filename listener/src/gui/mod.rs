@@ -16,6 +16,7 @@ mod linemon;
 mod linemon_app;
 mod linemon_window;
 mod popout;
+mod port_list;
 
 pub mod state;
 mod view_prefs;
@@ -24,16 +25,22 @@ mod widgets;
 use anyhow::anyhow;
 use wiredata_ui::selection;
 
-use crate::config::ChannelConfig;
+use crate::config::{ChannelConfig, InterfaceConfig};
 use crate::core::ChannelId;
 use crate::display::{CharacterRendering, DisplayMode, StreamRenderer};
 
 use bridge::{BridgeHandle, UiCommand};
 
+use port_list::PortList;
 use state::{AppState, ChannelStatus, ResumeState};
-use widgets::{
-    config_incomplete, list_serial_ports, status_color, status_glyph, template_for, AddKind,
-};
+use widgets::{config_incomplete, status_color, status_glyph, template_for, AddKind};
+
+/// Whether `config` opens a serial port. Starting one reads the port list again:
+/// a start is often a port plugged back in after a failure, and the list should
+/// be current from there.
+fn is_serial(config: &ChannelConfig) -> bool {
+    matches!(config.interface, InterfaceConfig::Serial(_))
+}
 
 /// Detach the inherited console when going graphical. The binary is a
 /// console-subsystem app so the headless CLI works when launched from a terminal
@@ -185,9 +192,16 @@ struct ListenerApp {
     show_info: bool,
     show_warn: bool,
     show_error: bool,
-    /// Available serial port names for the serial port dropdown (§14.4); refreshed
-    /// on demand via the ⟳ button.
-    serial_ports: Vec<String>,
+    /// Available serial port names for the serial port dropdown (§14.4), `None`
+    /// until the first list arrives. Refreshed on demand via the ⟳ button.
+    serial_ports: Option<Vec<String>>,
+    /// Lists the serial ports on a helper thread, never on this one.
+    port_list: PortList,
+    /// The read count of the list in `serial_ports`.
+    port_list_seen: u64,
+    /// The channel last shown in the detail pane, and whether it showed a
+    /// serial port problem, so the list is read again as one comes or goes.
+    port_problem_seen: Option<(ChannelId, bool)>,
     /// Memoized stream-view rows for the detail pane. The scrollback can reach the
     /// 256 KB scroll cap, so rendering + line-splitting it every frame (even at
     /// 5 Hz) is wasteful and, with a non-virtualized layout, was stalling the UI
@@ -329,6 +343,12 @@ impl ListenerApp {
             .and_then(|s| s.get_string(RESUME_PROFILE_KEY))
             .filter(|path| !path.is_empty())
             .map(std::path::PathBuf::from);
+        let port_list = PortList::default();
+        {
+            let repaint = std::sync::Arc::clone(&repaint);
+            port_list.set_notify(std::sync::Arc::new(move || repaint.notify()));
+        }
+        port_list.refresh();
         let mut app = Self {
             bridge,
             repaint,
@@ -345,7 +365,10 @@ impl ListenerApp {
             show_info: true,
             show_warn: true,
             show_error: true,
-            serial_ports: list_serial_ports(),
+            serial_ports: None,
+            port_list,
+            port_list_seen: 0,
+            port_problem_seen: None,
             stream_cache: None,
             resume_scroll_bottom: None,
             popouts: Vec::new(),
@@ -374,8 +397,9 @@ impl ListenerApp {
         self.recent_profiles.truncate(MAX_RECENT_PROFILES);
     }
 
+    /// Ask for a fresh port list. It arrives on a later frame.
     pub(super) fn refresh_serial_ports(&mut self) {
-        self.serial_ports = list_serial_ports();
+        self.port_list.refresh();
     }
 
     /// Ask the driver to list the host's local addresses for the UDP bind
@@ -613,6 +637,9 @@ impl ListenerApp {
         if let Some(view) = self.state.channel_mut(id) {
             view.last_error = None;
         }
+        if is_serial(&config) {
+            self.refresh_serial_ports();
+        }
         self.send(UiCommand::CommitAndStart {
             id,
             config: Some(Box::new(config)),
@@ -650,6 +677,9 @@ impl ListenerApp {
             }
         }
         if !batch.is_empty() {
+            if batch.iter().any(|(_, config)| is_serial(config)) {
+                self.refresh_serial_ports();
+            }
             self.send(UiCommand::StartAll(batch));
         }
     }
@@ -750,6 +780,10 @@ impl eframe::App for ListenerApp {
         // either lands in this frame's batch or triggers a fresh wake.
         self.repaint.frame_started();
         self.drain_updates();
+        if let Some((seen, ports)) = self.port_list.newer_than(self.port_list_seen) {
+            self.port_list_seen = seen;
+            self.serial_ports = Some(ports);
+        }
         self.show_popouts(ctx);
     }
 

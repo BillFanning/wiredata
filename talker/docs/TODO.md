@@ -79,16 +79,11 @@ Found by a survey of every retry in the workspace on 2026-11-19.
   talker.exe stayed in the process list that could not be killed, with one
   thread waiting in the system, which points at a serial call that never
   returned in the driver. About 25 minutes of the same changes, in both
-  orders, and an unplug did not freeze it again. The window thread waits in
-  two places: shutdown joins every runner (`join_all`), and the port list is
-  read on it (`refresh_serial_ports`). If it happens again, leave the window
-  open and record its thread states before closing it.
-- [ ] **Read the serial port list off the window thread.**
-  `refresh_serial_ports` enumerates ports on the window thread, at startup,
-  from the Refresh button, and when an open failure appears. Enumeration
-  asks the driver, so a wedged driver can freeze the window, against the rule
-  that UI threads never block. Read it on a worker and show the last list
-  until the new one arrives.
+  orders, and an unplug did not freeze it again. The window thread waits on
+  other threads only when talker closes, joining every runner (`join_all`); it
+  read the port list itself until that moved to a helper thread (`PortList`),
+  which may have been the freeze. If it happens again, leave the window open
+  and record its thread states before closing it.
 - [ ] **Cache the Cadence grouping and its tooltip.** `cadence_groups` allocates
   and `cadence_tooltip` builds about 1 kB of text every repaint, hovered or not.
   The better shape is a `wiredata-ui` change so `signal_row` builds its tooltip

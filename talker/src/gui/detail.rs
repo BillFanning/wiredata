@@ -252,9 +252,10 @@ impl TalkerApp {
         );
         let error: Option<String> = telemetry.banner_error().map(str::to_owned);
         let open_failure = telemetry.banner_is_open_failure();
-        // A port can vanish while talker runs; the list is otherwise only as
-        // fresh as the last refresh, and would say an unplugged port is there.
-        if self.views[i].open_failure_appeared(open_failure) {
+        // A port can vanish and come back while talker runs; the list is
+        // otherwise only as fresh as the last refresh, and would say an
+        // unplugged port is there, or a returned one is not found.
+        if self.views[i].open_failure_changed(open_failure) {
             self.refresh_serial_ports();
         }
         let (glyph, glyph_color, status_word) = lifecycle_indicator(running, error.is_some(), pal);
@@ -562,12 +563,18 @@ impl TalkerApp {
             // Only the UI knows what is currently enumerated, so only the UI can
             // say whether the port the OS called absent is still in the list.
             // Only a failed open is about that: under a stalled or failed write
-            // the hint would point at the wrong cause.
-            if open_failure && draft_kind == ConnKind::Serial {
-                let port = self.conn_drafts[i].serial_port.clone();
+            // the hint would point at the wrong cause. Nor is a list being read
+            // again: the failure asked for that read, and until it ends the list
+            // may still show a port that has gone.
+            let fresh_ports = self
+                .serial_ports
+                .as_deref()
+                .filter(|_| !self.port_list.is_reading());
+            if let (true, ConnKind::Serial, Some(ports)) = (open_failure, draft_kind, fresh_ports) {
+                let port = &self.conn_drafts[i].serial_port;
                 if !port.is_empty() {
-                    let listed = self.serial_ports.contains(&port);
-                    ui.colored_label(pal.warning, serial_port_hint(&port, listed));
+                    let listed = ports.contains(port);
+                    ui.colored_label(pal.warning, serial_port_hint(port, listed));
                 }
             }
         }
@@ -993,7 +1000,11 @@ impl TalkerApp {
                     // shift each other's auto-ids across egui's two layout passes.
                     ConnKind::Serial => {
                         ui.push_id("serial_body", |ui| {
-                            show_serial_fields(ui, &mut self.conn_drafts[i], &self.serial_ports)
+                            show_serial_fields(
+                                ui,
+                                &mut self.conn_drafts[i],
+                                self.serial_ports.as_deref(),
+                            )
                         })
                         .inner
                     }

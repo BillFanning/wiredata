@@ -18,7 +18,7 @@ use wiredata_ui::diagnostics::{attention_callout, SignalTone};
 use wiredata_ui::selection;
 
 use crate::core::{
-    channel::{ChannelConfig, ChannelId, InterfaceConfig},
+    channel::{ChannelConfig, ChannelId, InterfaceConfig, PortList},
     logging::{
         FileLogConfig, FileLogState, FileLogToggle, GuiLogHealth, LogEvent, LogFolderOpener,
         LogFolderState, LogLevel, LogLevelHandle, LoggingConfig,
@@ -478,7 +478,12 @@ struct TalkerApp {
     /// see [`view`] for the bug that argued for it.
     views: Vec<ChannelView>,
     last_title: String,
-    serial_ports: Vec<String>,
+    /// The serial ports last listed, `None` until the first list arrives.
+    serial_ports: Option<Vec<String>>,
+    /// Lists the serial ports on a helper thread, never on this one.
+    port_list: PortList,
+    /// The read count of the list in `serial_ports`.
+    port_list_seen: u64,
     /// `true` = dark theme, `false` = light. Persisted; toggled from
     /// the top-bar sun/moon button next to the zoom control.
     dark_mode: bool,
@@ -708,6 +713,11 @@ impl TalkerApp {
             sup.set_notify(std::sync::Arc::new(move || r.notify()));
         }
         let file_log_state = file_log.state();
+        let port_list = PortList::default();
+        {
+            let repaint = std::sync::Arc::clone(&repaint);
+            port_list.set_notify(std::sync::Arc::new(move || repaint.notify()));
+        }
         let mut app = Self {
             repaint,
             profile: Profile::default(),
@@ -723,7 +733,9 @@ impl TalkerApp {
             log_level_handle,
             views: Vec::new(),
             last_title: String::new(),
-            serial_ports: Vec::new(),
+            serial_ports: None,
+            port_list,
+            port_list_seen: 0,
             dark_mode,
             selected: None,
             channels_collapsed: false,
@@ -873,13 +885,9 @@ impl TalkerApp {
         )
     }
 
+    /// Ask for a fresh port list. It arrives on a later frame.
     fn refresh_serial_ports(&mut self) {
-        self.serial_ports = serialport::available_ports()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.port_name)
-            .collect();
-        self.serial_ports.sort();
+        self.port_list.refresh();
     }
 
     fn window_title(&self) -> String {
@@ -1123,6 +1131,15 @@ impl TalkerApp {
         if let Some(view) = self.views.get_mut(i) {
             view.start_run();
         }
+        // A start is often a port plugged back in after a failure that took it
+        // out of the list; read the list again so it is current from here.
+        if self
+            .conn_drafts
+            .get(i)
+            .is_some_and(|draft| draft.kind() == ConnKind::Serial)
+        {
+            self.refresh_serial_ports();
+        }
     }
 
     /// Stop channel `i` without blocking the UI (the supervisor parks the
@@ -1264,6 +1281,11 @@ impl TalkerApp {
         // drains the public completion feed so it stays bounded.
         let _ = self.sup.take_command_completions();
 
+        if let Some((seen, ports)) = self.port_list.newer_than(self.port_list_seen) {
+            self.port_list_seen = seen;
+            self.serial_ports = Some(ports);
+        }
+
         // Refresh the per-channel rolling five-second acceptance rates.
         let now = Instant::now();
         for i in 0..self.views.len() {
@@ -1382,7 +1404,7 @@ impl eframe::App for TalkerApp {
     /// Every runner gets Stop and is then joined, so serial ports and sockets
     /// close cleanly before the process dies instead of being killed
     /// mid-write. The join has no limit of its own; see
-    /// [`Supervisor::join_all`](crate::core::supervisor::Supervisor::join_all)
+    /// [`TalkerSupervisor::join_all`](crate::core::supervisor::TalkerSupervisor::join_all)
     /// for how long it can take.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_all();

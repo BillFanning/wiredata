@@ -28,13 +28,14 @@ use crate::transport::udp::UdpMode;
 use super::bind_scope::LocalAddresses;
 use super::bridge::{LinemonUpdate, UiCommand};
 use super::linemon::LinemonStream;
+use super::port_list::PortList;
 use super::view_prefs::ViewPrefs;
 use super::widgets::{
     combo_width, option_combo, rts_set_by_flow_control, serial_lines_row, LineClick,
 };
 use super::widgets::{
-    list_serial_ports, template_for, udp_bind_choice, udp_mode_and_sharing, AddKind, Refresh,
-    BAUD_RATES, DATA_BITS, FLOW_CONTROL, PARITY, STOP_BITS, UDP_MODE_HOVER, UDP_PORT_HOVER,
+    template_for, udp_bind_choice, udp_mode_and_sharing, AddKind, Refresh, BAUD_RATES, DATA_BITS,
+    FLOW_CONTROL, PARITY, STOP_BITS, UDP_MODE_HOVER, UDP_PORT_HOVER,
 };
 use super::StreamRenderCache;
 use crate::transport::SerialControlLines;
@@ -544,8 +545,13 @@ pub(super) struct Linemon {
     /// The open serial port's control lines, as last read. `None` while no
     /// serial port is open.
     control_lines: Option<SerialControlLines>,
-    serial_ports: Vec<String>,
-    /// The serial port failed, so the port list is refreshed at the next
+    /// The serial ports last listed, `None` until the first list arrives.
+    serial_ports: Option<Vec<String>>,
+    /// Lists the serial ports on a helper thread, never on the window's.
+    port_list: PortList,
+    /// The read count of the list in `serial_ports`.
+    port_list_seen: u64,
+    /// The serial port failed, so the port list is read again at the next
     /// frame: a removed adapter then shows as not found.
     ports_stale: bool,
     /// Text typed into the custom baud and UDP port fields.
@@ -589,7 +595,9 @@ impl Linemon {
             control_lines: None,
             open_error: None,
             run: None,
-            serial_ports: Vec::new(),
+            serial_ports: None,
+            port_list: PortList::default(),
+            port_list_seen: 0,
             ports_stale: false,
             baud_text: String::new(),
             udp_port_text: String::new(),
@@ -613,7 +621,7 @@ impl Linemon {
     /// port Linemon last had when Reopen port on start is ticked and a port is
     /// chosen.
     pub fn start_up(&mut self) {
-        self.serial_ports = list_serial_ports();
+        self.port_list.refresh();
         self.jump_to_bottom = true;
         self.started =
             self.settings.reopen_on_start && port_key(&self.settings.interface()).is_some();
@@ -700,11 +708,21 @@ impl Linemon {
         }
     }
 
-    /// Whether the chosen serial port is missing from the port list.
+    /// Wake the window when a new port list arrives.
+    pub fn set_port_list_notify(&self, notify: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.port_list.set_notify(notify);
+    }
+
+    /// Whether the chosen serial port is missing from the port list. Never
+    /// before the first list arrives.
     fn port_unlisted(&self) -> bool {
         match &self.settings.interface() {
             InterfaceConfig::Serial(serial) => {
-                !serial.port.is_empty() && !self.serial_ports.contains(&serial.port)
+                !serial.port.is_empty()
+                    && self
+                        .serial_ports
+                        .as_ref()
+                        .is_some_and(|ports| !ports.contains(&serial.port))
             }
             InterfaceConfig::Udp(_) => false,
         }
@@ -775,6 +793,10 @@ impl Linemon {
         local_addresses: &LocalAddresses,
         out: &mut Vec<UiCommand>,
     ) {
+        if let Some((seen, ports)) = self.port_list.newer_than(self.port_list_seen) {
+            self.port_list_seen = seen;
+            self.serial_ports = Some(ports);
+        }
         // No line under the panel: the status box ends it, and the display
         // starts right below.
         egui::Panel::top("linemon_bar")
@@ -859,10 +881,10 @@ impl Linemon {
         );
         ui.add_space((unseen.min_rect().height() - shown).max(0.0));
         if std::mem::take(&mut self.ports_stale) {
-            self.serial_ports = list_serial_ports();
+            self.port_list.refresh();
         }
         match refresh {
-            Some(Refresh::SerialPorts) => self.serial_ports = list_serial_ports(),
+            Some(Refresh::SerialPorts) => self.port_list.refresh(),
             Some(Refresh::LocalAddresses) => out.push(UiCommand::ListLocalAddresses),
             None => {}
         }
@@ -891,14 +913,20 @@ impl Linemon {
         let current = self.settings.serial.port.clone();
         let label = if current.is_empty() {
             "select port\u{2026}".to_owned()
-        } else if self.serial_ports.contains(&current) {
+        } else if self
+            .serial_ports
+            .as_ref()
+            .is_none_or(|ports| ports.contains(&current))
+        {
+            // Until the first list arrives, nothing is known to be missing.
             current.clone()
         } else {
             format!("{current} (not found)")
         };
+        let listed = self.serial_ports.as_deref().unwrap_or_default();
         let width = combo_width(
             ui,
-            std::iter::once(label.as_str()).chain(self.serial_ports.iter().map(String::as_str)),
+            std::iter::once(label.as_str()).chain(listed.iter().map(String::as_str)),
         );
         let combo = egui::ComboBox::from_id_salt("linemon_serial_port")
             .selected_text(label.as_str())
@@ -911,11 +939,18 @@ impl Linemon {
                         "(clear selection)",
                     );
                 }
-                if self.serial_ports.is_empty() {
-                    ui.weak("No ports found");
-                }
-                for port in &self.serial_ports {
-                    ui.selectable_value(&mut self.settings.serial.port, port.clone(), port);
+                match &self.serial_ports {
+                    None => {
+                        ui.weak("Listing ports\u{2026}");
+                    }
+                    Some(ports) if ports.is_empty() => {
+                        ui.weak("No ports found");
+                    }
+                    Some(ports) => {
+                        for port in ports {
+                            ui.selectable_value(&mut self.settings.serial.port, port.clone(), port);
+                        }
+                    }
                 }
             });
         // Listed again as the drop-down opens: a port may have come or gone.
@@ -1221,7 +1256,8 @@ impl Linemon {
             paused: self.paused,
             open_error: self.open_error.as_deref(),
             run: self.run.as_ref(),
-            port_unlisted: self.port_unlisted(),
+            // A list being read again may be the one about to say it is back.
+            port_unlisted: self.port_unlisted() && !self.port_list.is_reading(),
         });
         let mut text = egui::RichText::new(line.text);
         if line.problem {
@@ -1693,7 +1729,7 @@ mod tests {
             bytes_per_sec: 0.0,
             fault: None,
         };
-        l.serial_ports = vec!["COM3".into()];
+        l.serial_ports = Some(vec!["COM3".into()]);
         l.take_run(run(ChannelState::Running));
         assert!(!l.ports_stale, "open and listed");
         l.take_run(run(ChannelState::Faulted));
@@ -1702,7 +1738,7 @@ mod tests {
         // Plugged back in and opened before the list was refreshed: the list
         // still lacks it, so it is refreshed once, at the open.
         l.ports_stale = false;
-        l.serial_ports.clear();
+        l.serial_ports = Some(Vec::new());
         assert!(l.port_unlisted());
         l.take_run(run(ChannelState::Running));
         assert!(l.ports_stale, "it opened, so it is there");

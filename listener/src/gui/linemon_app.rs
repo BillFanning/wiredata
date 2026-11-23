@@ -63,6 +63,10 @@ impl LinemonApp {
         storage: Option<&dyn eframe::Storage>,
     ) -> Self {
         let mut linemon = Linemon::new(storage.and_then(|s| s.get_string(LINEMON_KEY)).as_deref());
+        {
+            let repaint = Arc::clone(&repaint);
+            linemon.set_port_list_notify(Arc::new(move || repaint.notify()));
+        }
         linemon.start_up();
         let mut app = Self {
             bridge,
