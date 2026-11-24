@@ -14,8 +14,9 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Local, NaiveTime, TimeDelta, TimeZone, Timelike};
+use jiff::tz::TimeZone;
 
+use crate::core::timing::to_timestamp;
 use crate::core::RecordError;
 
 use super::FileRotationPolicy;
@@ -50,11 +51,22 @@ pub(crate) fn ensure_rotation_dir(dir: &Path) -> Result<(), RecordError> {
 /// byte stream (still contiguous), and the local-time readability is the deliberate
 /// choice here.
 pub(crate) fn period_key(policy: FileRotationPolicy, at: SystemTime) -> Option<String> {
-    let dt: DateTime<Local> = at.into();
+    period_key_in(policy, at, &TimeZone::system())
+}
+
+/// [`period_key`] in `zone`, so a test does not read the machine's zone.
+fn period_key_in(policy: FileRotationPolicy, at: SystemTime, zone: &TimeZone) -> Option<String> {
+    let local = zone.to_datetime(to_timestamp(at));
+    let day = format!(
+        "{:04}-{:02}-{:02}",
+        local.year(),
+        local.month(),
+        local.day()
+    );
     match policy {
         FileRotationPolicy::None => None,
-        FileRotationPolicy::Hourly => Some(dt.format("%Y-%m-%d_%H").to_string()),
-        FileRotationPolicy::Daily => Some(dt.format("%Y-%m-%d").to_string()),
+        FileRotationPolicy::Hourly => Some(format!("{day}_{:02}", local.hour())),
+        FileRotationPolicy::Daily => Some(day),
     }
 }
 
@@ -62,24 +74,39 @@ pub(crate) fn period_key(policy: FileRotationPolicy, at: SystemTime) -> Option<S
 /// rotation countdown in status (§56.2). `None` when the recording does not
 /// rotate.
 pub(crate) fn next_period_start(policy: FileRotationPolicy, now: SystemTime) -> Option<SystemTime> {
-    let local: DateTime<Local> = now.into();
+    next_period_start_in(policy, now, TimeZone::system())
+}
+
+/// [`next_period_start`] in `zone`, so a test does not read the machine's zone.
+fn next_period_start_in(
+    policy: FileRotationPolicy,
+    now: SystemTime,
+    zone: TimeZone,
+) -> Option<SystemTime> {
+    let local = to_timestamp(now).to_zoned_datetime(zone);
     let next = match policy {
         FileRotationPolicy::None => return None,
-        FileRotationPolicy::Hourly => {
-            local.with_minute(0)?.with_second(0)?.with_nanosecond(0)? + TimeDelta::hours(1)
-        }
-        FileRotationPolicy::Daily => {
-            let tomorrow = local.date_naive().succ_opt()?;
-            // A few zones skip midnight at a DST change; the day then starts
-            // at the first hour that exists.
-            (0..3).find_map(|hour| {
-                Local
-                    .from_local_datetime(&tomorrow.and_time(NaiveTime::from_hms_opt(hour, 0, 0)?))
-                    .earliest()
-            })?
-        }
+        // The start of this local hour, then an hour of elapsed time on: in
+        // the hour a fall-back repeats, the start keeps this hour's offset.
+        FileRotationPolicy::Hourly => local
+            .with()
+            .minute(0)
+            .second(0)
+            .subsec_nanosecond(0)
+            .build()
+            .ok()?
+            .checked_add(jiff::SignedDuration::from_hours(1))
+            .ok()?,
+        // A few zones skip midnight at a DST change; the day then starts at
+        // the first local time that exists.
+        FileRotationPolicy::Daily => local
+            .date()
+            .tomorrow()
+            .ok()?
+            .to_zoned_datetime(local.time_zone().clone())
+            .ok()?,
     };
-    Some(next.into())
+    SystemTime::try_from(next.timestamp()).ok()
 }
 
 /// `<channel>_<key><ext>` (§59), e.g. `GPS_2026-06-03_08.raw`.
@@ -117,17 +144,93 @@ pub fn is_filesystem_safe(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     /// A `SystemTime` at a fixed **local** instant, so period keys are deterministic
     /// regardless of the test machine's timezone (period keys are local time).
     /// Avoids the DST-ambiguity edge by picking ordinary mid-day/mid-night times.
-    fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> SystemTime {
-        Local
-            .with_ymd_and_hms(y, mo, d, h, mi, 0)
-            .single()
-            .expect("unambiguous local time")
-            .into()
+    fn local(y: i16, mo: i8, d: i8, h: i8, mi: i8) -> SystemTime {
+        in_zone(&TimeZone::system(), y, mo, d, h, mi)
+    }
+
+    /// The instant a clock in `zone` reads `y-mo-d h:mi`, taking the first of
+    /// two in a repeated hour.
+    fn in_zone(zone: &TimeZone, y: i16, mo: i8, d: i8, h: i8, mi: i8) -> SystemTime {
+        let local = jiff::civil::date(y, mo, d)
+            .at(h, mi, 0, 0)
+            .to_zoned_datetime(zone.clone())
+            .unwrap();
+        SystemTime::try_from(local.timestamp()).unwrap()
+    }
+
+    /// `at` as an ISO 8601 time in `zone`, for comparing instants readably.
+    fn shown(at: SystemTime, zone: &TimeZone) -> String {
+        to_timestamp(at).to_zoned_datetime(zone.clone()).to_string()
+    }
+
+    fn zone(name: &str) -> TimeZone {
+        TimeZone::get(name).unwrap()
+    }
+
+    /// Daylight-saving changes, in named zones. Spring forward: the hour
+    /// after 01:00 starts at 03:00. Fall back: the repeated 01:00 hour gives
+    /// the same key twice, and the next hour starts an hour of elapsed time
+    /// on. A skipped midnight starts the next day at the first local time.
+    #[test]
+    fn period_edges_at_daylight_saving_changes() {
+        let york = zone("America/New_York");
+        let spring = in_zone(&york, 2026, 3, 8, 1, 30);
+        assert_eq!(
+            shown(
+                next_period_start_in(FileRotationPolicy::Hourly, spring, york.clone()).unwrap(),
+                &york
+            ),
+            "2026-03-08T03:00:00-04:00[America/New_York]"
+        );
+
+        let first = in_zone(&york, 2026, 11, 1, 1, 30);
+        let second = first + std::time::Duration::from_secs(3600);
+        for at in [first, second] {
+            assert_eq!(
+                period_key_in(FileRotationPolicy::Hourly, at, &york).as_deref(),
+                Some("2026-11-01_01")
+            );
+        }
+        assert_eq!(
+            shown(
+                next_period_start_in(FileRotationPolicy::Hourly, first, york.clone()).unwrap(),
+                &york
+            ),
+            "2026-11-01T01:00:00-05:00[America/New_York]"
+        );
+
+        let paulo = zone("America/Sao_Paulo");
+        let eve = in_zone(&paulo, 2018, 11, 3, 8, 0);
+        assert_eq!(
+            shown(
+                next_period_start_in(FileRotationPolicy::Daily, eve, paulo.clone()).unwrap(),
+                &paulo
+            ),
+            "2018-11-04T01:00:00-02:00[America/Sao_Paulo]"
+        );
+    }
+
+    /// In a zone half an hour off the hour, the local hour still names the
+    /// key and starts the next period.
+    #[test]
+    fn a_half_hour_zone_keys_and_rotates_on_its_own_hours() {
+        let kolkata = zone("Asia/Kolkata");
+        let at = in_zone(&kolkata, 2026, 6, 3, 8, 45);
+        assert_eq!(
+            period_key_in(FileRotationPolicy::Hourly, at, &kolkata).as_deref(),
+            Some("2026-06-03_08")
+        );
+        assert_eq!(
+            shown(
+                next_period_start_in(FileRotationPolicy::Hourly, at, kolkata.clone()).unwrap(),
+                &kolkata
+            ),
+            "2026-06-03T09:00:00+05:30[Asia/Kolkata]"
+        );
     }
 
     #[test]

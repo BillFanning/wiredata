@@ -19,7 +19,7 @@ use std::{
         Arc, Mutex, RwLock,
     },
     thread::JoinHandle,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -87,8 +87,12 @@ pub fn open_rolling_file(config: &LogFileConfig) -> anyhow::Result<RollingLogFil
                 .with_context(context)?,
         ),
         None => RollingInner::Local(
-            LocalDailyFile::open(&config.directory, &config.prefix, chrono::Local::now())
-                .with_context(context)?,
+            LocalDailyFile::open(
+                &config.directory,
+                &config.prefix,
+                &jiff::ZonedDateTime::now(),
+            )
+            .with_context(context)?,
         ),
     };
     Ok(RollingLogFile { inner })
@@ -128,33 +132,29 @@ struct LocalDailyFile {
     prefix: String,
     file: std::fs::File,
     /// When the next day's file takes over.
-    rollover_at: SystemTime,
+    rollover_at: jiff::Timestamp,
 }
 
 impl LocalDailyFile {
-    fn open(
-        directory: &Path,
-        prefix: &str,
-        now: chrono::DateTime<chrono::Local>,
-    ) -> io::Result<Self> {
+    fn open(directory: &Path, prefix: &str, now: &jiff::ZonedDateTime) -> io::Result<Self> {
         std::fs::create_dir_all(directory)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(directory.join(local_day_file_name(prefix, now.date_naive())))?;
+            .open(directory.join(local_day_file_name(prefix, now.date())))?;
         Ok(Self {
             directory: directory.to_path_buf(),
             prefix: prefix.to_owned(),
             file,
-            rollover_at: next_local_midnight(now).into(),
+            rollover_at: next_local_midnight(now).timestamp(),
         })
     }
 }
 
 impl Write for LocalDailyFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if SystemTime::now() >= self.rollover_at {
-            let next = Self::open(&self.directory, &self.prefix, chrono::Local::now())?;
+        if jiff::Timestamp::now() >= self.rollover_at {
+            let next = Self::open(&self.directory, &self.prefix, &jiff::ZonedDateTime::now())?;
             self.file.flush()?;
             *self = next;
         }
@@ -166,23 +166,25 @@ impl Write for LocalDailyFile {
     }
 }
 
-fn local_day_file_name(prefix: &str, day: chrono::NaiveDate) -> String {
-    format!("{prefix}.{}", day.format("%Y-%m-%d"))
+fn local_day_file_name(prefix: &str, day: jiff::civil::Date) -> String {
+    format!(
+        "{prefix}.{:04}-{:02}-{:02}",
+        day.year(),
+        day.month(),
+        day.day()
+    )
 }
 
-/// The first instant of the local day after `now`. Where a time-zone change
-/// skips local midnight, the day starts at the first local time that exists;
-/// failing that, an hour from now, so rotation is late rather than never.
-fn next_local_midnight(now: chrono::DateTime<chrono::Local>) -> chrono::DateTime<chrono::Local> {
-    use chrono::TimeZone as _;
-    let fallback = now + chrono::Duration::hours(1);
-    let Some(tomorrow) = now.date_naive().succ_opt() else {
-        return fallback;
-    };
-    (0..3)
-        .filter_map(|hour| tomorrow.and_hms_opt(hour, 0, 0))
-        .find_map(|start| chrono::Local.from_local_datetime(&start).earliest())
-        .unwrap_or(fallback)
+/// The first instant of the local day after `now`, in `now`'s zone. Where a
+/// time-zone change skips local midnight, the day starts at the first local
+/// time that exists, and where midnight comes twice, at the first. Failing
+/// that, an hour from now, so rotation is late rather than never.
+fn next_local_midnight(now: &jiff::ZonedDateTime) -> jiff::ZonedDateTime {
+    now.date()
+        .tomorrow()
+        .and_then(|day| day.to_zoned_datetime(now.time_zone().clone()))
+        .or_else(|_| now.checked_add(jiff::SignedDuration::from_hours(1)))
+        .unwrap_or_else(|_| now.clone())
 }
 
 /// Runtime state of an optional file destination.
@@ -957,25 +959,40 @@ mod tests {
 
     #[test]
     fn a_local_day_file_is_named_for_the_local_date_and_rolls_at_local_midnight() {
-        use chrono::{Datelike as _, TimeZone as _, Timelike as _};
-        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        let day = jiff::civil::date(2026, 9, 30);
         assert_eq!(
             local_day_file_name("listener.log", day),
             "listener.log.2026-09-30"
         );
-
-        let late = chrono::Local
-            .from_local_datetime(&day.and_hms_opt(23, 59, 0).unwrap())
-            .earliest()
-            .unwrap();
-        let next = next_local_midnight(late);
-        assert!(next > late);
-        assert_eq!(next.date_naive(), day.succ_opt().unwrap());
-        assert!(
-            next.hour() < 3,
-            "the next day starts at its first local hour"
+        assert_eq!(
+            local_day_file_name("app.log", jiff::civil::date(2026, 1, 2)),
+            "app.log.2026-01-02"
         );
-        assert_eq!(next.day(), 1);
+
+        let zone = jiff::tz::TimeZone::get("America/New_York").unwrap();
+        let late = day.at(23, 59, 0, 0).to_zoned_datetime(zone).unwrap();
+        let next = next_local_midnight(&late);
+        assert_eq!(
+            next.to_string(),
+            "2026-10-01T00:00:00-04:00[America/New_York]"
+        );
+    }
+
+    /// Where a daylight-saving change skips local midnight, the next day
+    /// starts at the first local time that exists. Sao Paulo moved its clocks
+    /// from 00:00 to 01:00 on 2018-11-04.
+    #[test]
+    fn a_skipped_midnight_starts_the_day_at_the_first_local_time() {
+        let zone = jiff::tz::TimeZone::get("America/Sao_Paulo").unwrap();
+        let late = jiff::civil::date(2018, 11, 3)
+            .at(23, 59, 0, 0)
+            .to_zoned_datetime(zone)
+            .unwrap();
+        let next = next_local_midnight(&late);
+        assert_eq!(
+            next.to_string(),
+            "2018-11-04T01:00:00-02:00[America/Sao_Paulo]"
+        );
     }
 
     #[test]
@@ -990,7 +1007,7 @@ mod tests {
             file.write_all(line).unwrap();
             file.flush().unwrap();
         }
-        let today = local_day_file_name("app.log", chrono::Local::now().date_naive());
+        let today = local_day_file_name("app.log", jiff::ZonedDateTime::now().date());
         let text = std::fs::read_to_string(dir.join(today)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(text, "first run\nsecond run\n");

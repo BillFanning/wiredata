@@ -1,6 +1,10 @@
 //! Per-message ISO 8601 timestamp (spec §5.4).
 
-use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
+use std::fmt::Write as _;
+use std::time::SystemTime;
+
+use jiff::tz::{Offset, TimeZone};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the timestamp prepended to a message's wire output.
@@ -44,48 +48,76 @@ impl TimestampConfig {
 
     /// Format `now` as an ISO 8601 timestamp per this configuration: UTC when
     /// [`Self::utc`], otherwise the computer's local time at that instant.
-    pub fn format(&self, now: DateTime<Utc>) -> String {
-        let local = now.with_timezone(&Local).offset().fix();
-        self.format_at(now, local)
+    pub fn format(&self, now: Timestamp) -> String {
+        self.format_at(now, TimeZone::system().to_offset(now))
     }
 
     /// [`Self::format`] with the local offset given, so the zone is not read
-    /// from the machine.
-    pub(crate) fn format_at(&self, now: DateTime<Utc>, local: FixedOffset) -> String {
-        let mut pattern = String::with_capacity(20);
+    /// from the machine. Written field by field: every field has a fixed
+    /// width, which [`Self::wire_len`] relies on, and milliseconds are cut,
+    /// never rounded.
+    pub(crate) fn format_at(&self, now: Timestamp, local: Offset) -> String {
+        let at = if self.utc {
+            Offset::UTC.to_datetime(now)
+        } else {
+            local.to_datetime(now)
+        };
+        let mut out = String::with_capacity(self.wire_len());
+        // Writing to a String cannot fail.
         if self.include_date {
-            pattern.push_str("%Y-%m-%dT");
+            let _ = write!(out, "{:04}-{:02}-{:02}T", at.year(), at.month(), at.day());
         }
-        pattern.push_str("%H:%M:%S");
+        let _ = write!(
+            out,
+            "{:02}:{:02}:{:02}",
+            at.hour(),
+            at.minute(),
+            at.second()
+        );
         if self.include_millis {
-            pattern.push_str("%.3f");
+            let _ = write!(out, ".{:03}", at.subsec_nanosecond() / 1_000_000);
         }
         if self.include_timezone {
-            pattern.push_str(if self.utc { "Z" } else { "%:z" });
+            if self.utc {
+                out.push('Z');
+            } else {
+                out.push_str(&offset_text(local));
+            }
         }
-        if self.utc {
-            now.format(&pattern).to_string()
-        } else {
-            now.with_timezone(&local).format(&pattern).to_string()
-        }
+        out
     }
+}
+
+/// `offset` as ISO 8601 writes it, `+hh:mm`: `+00:00` for UTC, and any
+/// seconds left off, so the width is always six.
+pub(crate) fn offset_text(offset: Offset) -> String {
+    let seconds = offset.seconds();
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let minutes = seconds.unsigned_abs() / 60;
+    format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// `at` as a jiff timestamp. A clock reading is always within jiff's range,
+/// the years -9999 to 9999; one outside it is held at the nearer end.
+pub(crate) fn to_timestamp(at: SystemTime) -> Timestamp {
+    Timestamp::try_from(at).unwrap_or(if at < SystemTime::UNIX_EPOCH {
+        Timestamp::MIN
+    } else {
+        Timestamp::MAX
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Timelike};
 
     /// 2026-05-22 14:30:45.123 UTC
-    fn sample() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 5, 22, 14, 30, 45)
-            .unwrap()
-            .with_nanosecond(123_000_000)
-            .unwrap()
+    fn sample() -> Timestamp {
+        instant(1_779_460_245, 123_000_000)
     }
 
-    fn zone(seconds: i32) -> FixedOffset {
-        FixedOffset::east_opt(seconds).unwrap()
+    fn zone(seconds: i32) -> Offset {
+        Offset::from_seconds(seconds).unwrap()
     }
 
     fn cfg(date: bool, millis: bool, tz: bool, utc: bool) -> TimestampConfig {
@@ -149,6 +181,43 @@ mod tests {
         );
     }
 
+    /// `seconds` after 1970 UTC, plus `nanos`.
+    fn instant(seconds: i64, nanos: i32) -> Timestamp {
+        Timestamp::new(seconds, nanos).unwrap()
+    }
+
+    /// Milliseconds are cut, never rounded, and always three digits.
+    #[test]
+    fn milliseconds_are_truncated_to_three_digits() {
+        let c = cfg(false, true, false, true);
+        // 2026-05-22 14:30:45 UTC
+        assert_eq!(
+            c.format_at(instant(1_779_460_245, 999_999_999), zone(0)),
+            "14:30:45.999"
+        );
+        assert_eq!(
+            c.format_at(instant(1_779_460_245, 0), zone(0)),
+            "14:30:45.000"
+        );
+        assert_eq!(
+            c.format_at(instant(1_779_460_245, 7_000_000), zone(0)),
+            "14:30:45.007"
+        );
+    }
+
+    /// A zero local offset is written `+00:00`, never `Z`, and a zone west
+    /// of Greenwich can put the local date on the day before.
+    #[test]
+    fn a_zero_local_offset_and_a_west_zone_across_midnight() {
+        let c = cfg(true, false, true, false);
+        assert_eq!(c.format_at(sample(), zone(0)), "2026-05-22T14:30:45+00:00");
+        // 2026-05-22 03:00:00 UTC
+        assert_eq!(
+            c.format_at(instant(1_779_418_800, 0), zone(-5 * 3600)),
+            "2026-05-21T22:00:00-05:00"
+        );
+    }
+
     #[test]
     fn time_only_local_is_the_default() {
         assert_eq!(
@@ -159,14 +228,32 @@ mod tests {
 
     #[test]
     fn format_agrees_with_the_machine_local_offset() {
-        let local = sample().with_timezone(&Local).offset().fix();
+        let local = TimeZone::system().to_offset(sample());
         let c = cfg(true, true, true, false);
         assert_eq!(c.format(sample()), c.format_at(sample(), local));
         assert!(
-            c.format(sample()).ends_with(&local.to_string()),
+            c.format(sample()).ends_with(&offset_text(local)),
             "{}",
             c.format(sample())
         );
+    }
+
+    #[test]
+    fn offsets_are_written_as_iso_8601_hours_and_minutes() {
+        assert_eq!(offset_text(zone(0)), "+00:00");
+        assert_eq!(offset_text(zone(-4 * 3600)), "-04:00");
+        assert_eq!(offset_text(zone(5 * 3600 + 1800)), "+05:30");
+        assert_eq!(offset_text(zone(-(3 * 3600 + 1800))), "-03:30");
+        assert_eq!(offset_text(zone(14 * 3600)), "+14:00");
+    }
+
+    #[test]
+    fn a_clock_reading_converts_and_one_out_of_range_is_held_at_the_end() {
+        use std::time::Duration;
+        let at = SystemTime::UNIX_EPOCH + Duration::new(1_779_460_245, 123_000_000);
+        assert_eq!(to_timestamp(at), sample());
+        let far = SystemTime::UNIX_EPOCH + Duration::from_secs(400_000_000_000);
+        assert_eq!(to_timestamp(far), Timestamp::MAX);
     }
 
     #[test]

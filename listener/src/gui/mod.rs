@@ -500,11 +500,13 @@ impl ListenerApp {
             ResumeState::Resuming => ("Resuming…".to_owned(), "Dismiss"),
             ResumeState::Refused(why) => (format!("\u{26A0} Did not resume: {why}"), "Dismiss"),
             ResumeState::Resumed(name, at) => {
-                let at: chrono::DateTime<chrono::Local> = (*at).into();
+                let at = jiff::tz::TimeZone::system()
+                    .to_datetime(crate::core::timing::to_timestamp(*at));
                 (
                     format!(
-                        "Resumed \u{201C}{name}\u{201D} automatically at {}",
-                        at.format("%H:%M")
+                        "Resumed \u{201C}{name}\u{201D} automatically at {:02}:{:02}",
+                        at.hour(),
+                        at.minute()
                     ),
                     "Dismiss",
                 )

@@ -4,11 +4,14 @@ mod gui_layer;
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
+use jiff::tz::{Offset, TimeZone};
 use serde::{Deserialize, Serialize};
 use tracing_appender::non_blocking::{ErrorCounter, NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, reload, util::SubscriberInitExt, Layer, Registry,
 };
+
+use crate::core::message::{offset_text, to_timestamp};
 
 pub(crate) use folder::{LogFolderOpener, LogFolderState};
 pub use gui_layer::{GuiLogHealth, GuiLogLayer, LogEvent};
@@ -159,12 +162,30 @@ struct LocalTime;
 
 impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
-        write!(
-            w,
-            "{}",
-            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z")
-        )
+        w.write_str(&local_iso(std::time::SystemTime::now()))
     }
+}
+
+/// `at` as ISO 8601 local time with milliseconds and the zone's offset.
+fn local_iso(at: std::time::SystemTime) -> String {
+    local_iso_at(at, TimeZone::system().to_offset(to_timestamp(at)))
+}
+
+/// [`local_iso`] in the zone `offset`, so a test does not read the machine's
+/// zone. Milliseconds are cut, never rounded.
+fn local_iso_at(at: std::time::SystemTime, offset: Offset) -> String {
+    let t = offset.to_datetime(to_timestamp(at));
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}{}",
+        t.year(),
+        t.month(),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.subsec_nanosecond() / 1_000_000,
+        offset_text(offset)
+    )
 }
 
 // ── Console ───────────────────────────────────────────────────────────────────
@@ -445,6 +466,28 @@ fn to_level_filter(level: LogLevel) -> LevelFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zone(seconds: i32) -> Offset {
+        Offset::from_seconds(seconds).unwrap()
+    }
+
+    /// A log line's time: local, milliseconds cut rather than rounded, and the
+    /// offset, `+00:00` included.
+    #[test]
+    fn log_line_times_are_local_iso_with_milliseconds_and_offset() {
+        use std::time::{Duration, SystemTime};
+        // 2026-05-22 14:30:45 UTC
+        let at = SystemTime::UNIX_EPOCH + Duration::new(1_779_460_245, 512_999_999);
+        assert_eq!(
+            local_iso_at(at, zone(-4 * 3600)),
+            "2026-05-22T10:30:45.512-04:00"
+        );
+        assert_eq!(local_iso_at(at, zone(0)), "2026-05-22T14:30:45.512+00:00");
+        assert_eq!(
+            local_iso_at(at, zone(9 * 3600 + 1800)),
+            "2026-05-23T00:00:45.512+09:30"
+        );
+    }
 
     // ── Console ───────────────────────────────────────────────────────────────
 

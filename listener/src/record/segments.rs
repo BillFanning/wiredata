@@ -449,15 +449,14 @@ mod tests {
     use super::*;
     use crate::core::{ChannelId, ChunkTime, RecordingState};
     use crate::record::controller::{start_recording, StreamPos, Timings};
-    use chrono::{Local, TimeZone};
     use std::time::{Duration, Instant};
 
-    fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> SystemTime {
-        Local
-            .with_ymd_and_hms(y, mo, d, h, mi, 0)
-            .single()
-            .expect("unambiguous local time")
-            .into()
+    fn local(y: i16, mo: i8, d: i8, h: i8, mi: i8) -> SystemTime {
+        let zoned = jiff::civil::date(y, mo, d)
+            .at(h, mi, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::system())
+            .expect("a local time jiff can represent");
+        SystemTime::try_from(zoned.timestamp()).expect("a time the clock can hold")
     }
 
     fn chunk_at(bytes: &[u8], at: SystemTime) -> (Arc<ReceivedData>, StreamPos) {

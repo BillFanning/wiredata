@@ -4,10 +4,11 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use chrono::{DateTime, Local, SecondsFormat, Utc};
+use jiff::tz::{Offset, TimeZone};
 
 use super::{
     channel::ChannelId,
+    message::to_timestamp,
     telemetry::{DurationHistogram, MessageTiming, SendTimingReport},
     timing::{CadenceAlignment, TimerIntent, TimerMode, TimerStatus},
 };
@@ -343,14 +344,38 @@ impl RunSummary {
     }
 }
 
+/// `time` in UTC as RFC 3339 with milliseconds, which are cut, never rounded.
 fn format_utc(time: SystemTime) -> String {
-    DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Millis, true)
+    let t = Offset::UTC.to_datetime(to_timestamp(time));
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        t.month(),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.subsec_nanosecond() / 1_000_000
+    )
 }
 
 fn format_local(time: SystemTime) -> String {
-    DateTime::<Local>::from(time)
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
+    format_local_at(time, TimeZone::system().to_offset(to_timestamp(time)))
+}
+
+/// [`format_local`] in the zone `offset`, so a test does not read the
+/// machine's zone.
+fn format_local_at(time: SystemTime, offset: Offset) -> String {
+    let t = offset.to_datetime(to_timestamp(time));
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        t.year(),
+        t.month(),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
 }
 
 fn optional_us(duration: Option<Duration>) -> String {
@@ -422,6 +447,43 @@ mod tests {
     use super::*;
     use crate::core::telemetry::SendTimingTelemetry;
     use crate::core::timing::ActiveCadence;
+
+    fn zone(seconds: i32) -> Offset {
+        Offset::from_seconds(seconds).unwrap()
+    }
+
+    /// `seconds` after 1970 UTC, plus `millis`.
+    fn wall(seconds: u64, millis: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(seconds) + Duration::from_millis(millis)
+    }
+
+    /// A summary's UTC time has milliseconds, cut rather than rounded, and `Z`.
+    #[test]
+    fn utc_times_are_rfc3339_with_milliseconds() {
+        // 2026-05-22 14:30:45 UTC
+        assert_eq!(
+            format_utc(wall(1_779_460_245, 123)),
+            "2026-05-22T14:30:45.123Z"
+        );
+        assert_eq!(
+            format_utc(wall(1_779_460_245, 0)),
+            "2026-05-22T14:30:45.000Z"
+        );
+        let almost = wall(1_779_460_245, 0) + Duration::from_nanos(999_999_999);
+        assert_eq!(format_utc(almost), "2026-05-22T14:30:45.999Z");
+    }
+
+    /// A summary's local time is to the second, in the zone given.
+    #[test]
+    fn local_times_are_to_the_second_in_the_local_zone() {
+        let at = wall(1_779_460_245, 999);
+        assert_eq!(format_local_at(at, zone(0)), "2026-05-22 14:30:45");
+        assert_eq!(format_local_at(at, zone(-4 * 3600)), "2026-05-22 10:30:45");
+        assert_eq!(
+            format_local_at(at, zone(9 * 3600 + 1800)),
+            "2026-05-23 00:00:45"
+        );
+    }
 
     fn histogram(sample: Duration) -> DurationHistogram {
         let mut histogram = DurationHistogram::default();

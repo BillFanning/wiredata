@@ -103,14 +103,14 @@ impl GapMark {
 /// A wall-clock instant as ISO 8601 local time with milliseconds and the zone's
 /// offset (`2026-11-13T14:02:04.000-05:00`), for gap records.
 pub fn local_time(at: std::time::SystemTime) -> String {
-    iso_with_offset(chrono::DateTime::<chrono::Local>::from(at))
+    let offset = jiff::tz::TimeZone::system().to_offset(crate::core::timing::to_timestamp(at));
+    local_time_at(at, offset)
 }
 
-fn iso_with_offset<Tz: chrono::TimeZone>(at: chrono::DateTime<Tz>) -> String
-where
-    Tz::Offset: std::fmt::Display,
-{
-    at.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string()
+/// [`local_time`] in the zone `offset`, so a test does not read the machine's
+/// zone.
+fn local_time_at(at: std::time::SystemTime, offset: jiff::tz::Offset) -> String {
+    crate::core::timing::iso_local_at(at, offset)
 }
 
 /// Writes received chunks verbatim, exactly as received (§53, §142).
@@ -573,7 +573,11 @@ mod tests {
 #[cfg(test)]
 mod local_time_tests {
     use super::*;
-    use chrono::{FixedOffset, TimeZone};
+    use std::time::{Duration, SystemTime};
+
+    fn zone(seconds: i32) -> jiff::tz::Offset {
+        jiff::tz::Offset::from_seconds(seconds).unwrap()
+    }
 
     #[test]
     fn iso_shape_at_fixed_offsets() {
@@ -583,24 +587,32 @@ mod local_time_tests {
             (5 * 3600 + 1800, "+05:30"),
             (-(9 * 3600 + 1800), "-09:30"),
         ] {
-            let at = FixedOffset::east_opt(secs)
-                .unwrap()
-                .with_ymd_and_hms(2026, 11, 13, 14, 2, 4)
-                .unwrap();
+            // 2026-11-13 14:02:04 in a zone `secs` east of UTC.
+            let at = SystemTime::UNIX_EPOCH
+                + Duration::from_secs(u64::try_from(1_794_578_524 - i64::from(secs)).unwrap());
             assert_eq!(
-                iso_with_offset(at),
+                local_time_at(at, zone(secs)),
                 format!("2026-11-13T14:02:04.000{text}")
             );
         }
+    }
+
+    /// Milliseconds are cut, never rounded up into the next second.
+    #[test]
+    fn milliseconds_are_truncated() {
+        // 2026-11-13 14:02:04 UTC
+        let at = SystemTime::UNIX_EPOCH + Duration::new(1_794_578_524, 999_999_999);
+        assert_eq!(local_time_at(at, zone(0)), "2026-11-13T14:02:04.999+00:00");
+        let at = SystemTime::UNIX_EPOCH + Duration::new(1_794_578_524, 250_000_000);
+        assert_eq!(local_time_at(at, zone(0)), "2026-11-13T14:02:04.250+00:00");
     }
 
     #[test]
     fn local_time_is_the_local_formatter_of_the_same_instant() {
         let at =
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_250);
-        let expected = chrono::DateTime::<chrono::Local>::from(at)
-            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
-            .to_string();
+        let offset = jiff::tz::TimeZone::system().to_offset(crate::core::timing::to_timestamp(at));
+        let expected = local_time_at(at, offset);
         assert_eq!(local_time(at), expected);
         assert_eq!(expected.len(), "2026-11-13T14:02:04.000-05:00".len());
     }

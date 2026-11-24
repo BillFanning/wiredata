@@ -73,7 +73,7 @@ crc = { workspace = true }
 rfd = { workspace = true }
 
 # Timestamps
-chrono = { workspace = true }
+jiff = { workspace = true }
 
 # FreeConsole for the GUI path of the console binary (`talker --gui`), so a
 # double-click of talker.exe into the GUI doesn't keep an empty console window.

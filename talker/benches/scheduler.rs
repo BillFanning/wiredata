@@ -71,11 +71,12 @@ fn bench_poll_due_send(c: &mut Criterion) {
 }
 
 /// The dynamic-render counterpart of `due-and-render`: the same 64-byte payload
-/// with a full timestamp (date+millis+timezone, three chrono format calls into
-/// a temporary `String`) prepended and a CRC-16/KERMIT appended per send. The
-/// static case's `render_into` KILL verdict covered only the plain payload
-/// clone; this is the case that says whether that verdict generalizes to the
-/// per-send rendering path (the "observer-path allocations" TODO).
+/// with a full timestamp (date+millis+timezone, written field by field into one
+/// `String` by `TimestampConfig::format_at`) prepended and a CRC-16/KERMIT
+/// appended per send. The static case's `render_into` KILL verdict covered only
+/// the plain payload clone; this is the case that says whether that verdict
+/// generalizes to the per-send rendering path (the "observer-path allocations"
+/// TODO).
 // The config structs are `#[non_exhaustive]`, so a bench (outside the crate)
 // cannot use struct literals — Default + field assignment is the only way in.
 #[allow(clippy::field_reassign_with_default)]

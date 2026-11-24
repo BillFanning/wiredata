@@ -15,7 +15,7 @@ pub struct LogEvent {
     pub level: tracing::Level,
     pub target: String,
     pub message: String,
-    pub timestamp: chrono::DateTime<chrono::Local>,
+    pub timestamp: jiff::ZonedDateTime,
     /// The **stable id** of the channel this event is about (ADR-020), when
     /// the emitter attributed it via a structured `channel = <id>` tracing
     /// field (the runner, the supervisor, and the GUI lifecycle logs do).
@@ -116,7 +116,7 @@ impl<S: Subscriber> Layer<S> for GuiLogLayer {
             level: *meta.level(),
             target: meta.target().to_string(),
             message: visitor.message,
-            timestamp: chrono::Local::now(),
+            timestamp: jiff::ZonedDateTime::now(),
             channel: visitor.channel,
         };
 
@@ -174,7 +174,7 @@ mod tests {
             level: tracing::Level::INFO,
             target: "test".to_owned(),
             message: message.to_owned(),
-            timestamp: chrono::Local::now(),
+            timestamp: jiff::ZonedDateTime::now(),
             channel: None,
         }
     }
@@ -185,7 +185,7 @@ mod tests {
             level: tracing::Level::INFO,
             target: "my::module".to_string(),
             message: "hello world".to_string(),
-            timestamp: chrono::Local::now(),
+            timestamp: jiff::ZonedDateTime::now(),
             channel: None,
         };
         assert_eq!(event.level, tracing::Level::INFO);
@@ -199,7 +199,7 @@ mod tests {
             level: tracing::Level::WARN,
             target: "t".to_string(),
             message: "msg".to_string(),
-            timestamp: chrono::Local::now(),
+            timestamp: jiff::ZonedDateTime::now(),
             channel: None,
         };
         let cloned = event.clone();

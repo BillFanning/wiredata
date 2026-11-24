@@ -506,6 +506,11 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 
 ## Architecture Decision Record
 
+Revision note (2026-11-23) — shared serial settings lines:
+
+- **ADR-071** — the serial settings lines are written once in `wiredata-ui`
+  and used by Linemon, listener and talker.
+
 Revision note (2026-11-22) — serial control lines:
 
 - **ADR-070** — talker sets and shows the serial control lines as listener

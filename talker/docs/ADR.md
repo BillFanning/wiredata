@@ -1,13 +1,13 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.35
+**Version:** 1.36
 **Date:** 2026-11-23
 **Status:** Accepted
 
-Revision note (2026-11-23) — shared serial settings lines:
+Revision note (2026-11-23) — jiff replaces chrono:
 
-- **ADR-071** — the serial settings lines are written once in `wiredata-ui`
-  and used by Linemon, listener and talker.
+- **ADR-072** — dates and times are read and written with jiff, not chrono,
+  which is unmaintained. Nothing on screen, in a file or on the wire changes.
 
 ---
 
@@ -2833,6 +2833,62 @@ decision changes a profile's keys or what a port opens with.
 **Consequences:** A change to the serial lines is made once and seen in all
 three. A listener profile that holds Mark or Space parity, or 1.5 stop bits,
 shows the value as not supported until another is chosen.
+
+---
+
+## ADR-072 — Dates and times use jiff, not chrono
+
+**Status:** Accepted 2026-11-23. Applies to talker, listener and
+`wiredata-log`; the time policy is still ADR-067's.
+
+**Context:** chrono, which all three used for local times, offsets and
+formatting, is unmaintained (RUSTSEC-2026-0543) and has no safe upgrade.
+`deny.toml` ignored the advisory only until chrono was gone. Every time on
+screen, in a file and on the wire had to stay byte for byte the same.
+
+**Decision:**
+
+- jiff 1.0 reads and converts times. The computer's zone comes from jiff's
+  system zone: the zone database on Linux and macOS, and on Windows the
+  system's zone looked up in the database jiff bundles.
+- Formats are written field by field at fixed widths, with milliseconds cut,
+  never rounded, as chrono's were. Before the switch, tests pinned each
+  format with literal strings against chrono; after it, only their helpers
+  changed. Each format that depends on the machine's zone has a version that
+  takes the zone, so a test can pin it.
+- jiff can load a named zone, so the daylight-saving edges are now tested
+  in real zones: a skipped hour, a repeated hour, a skipped midnight, and a
+  zone half an hour off the hour.
+
+**Boundary:** Nothing a user sees, reads in a file or receives on the wire
+changes. ADR-067's policy is unchanged, NMEA's own sign included.
+
+**Alternatives considered:**
+
+- **The `time` crate:** Already in the tree through `tracing-appender`.
+  Rejected. On Linux and macOS it refuses to give the local offset in a
+  program with more than one thread unless built with a flag it calls
+  unsound, and both apps have several threads.
+- **chrono with a zone database crate:** Rejected. It keeps chrono.
+- **Formatting by hand from the system clock:** Rejected. Local time needs
+  a zone database.
+
+**Consequences:**
+
+- Two tests are deleted, one in talker and one in listener. Each fed a
+  chrono-only leap second, 23:59:60.800, to an NMEA time field. The system
+  clock never reports a leap second, and jiff cannot represent one.
+- jiff keeps the computer's zone for up to five minutes, so a change of zone
+  shows within five minutes. If the zone cannot be read, jiff uses UTC.
+- In the hour a fall-back repeats, listener's countdown to the next hourly
+  file is now shown. chrono refused that ambiguous local time, so none was.
+- Windows builds carry jiff's zone database, about 0.6 MB in each program.
+- A message timestamp costs about half what it did. In one run of talker's
+  scheduler bench, a send with a timestamp and a CRC took about 1.07 µs
+  against 128 ns for a plain 64-byte payload; under chrono the same pair
+  measured about 2.1 µs against 126 ns. Live NMEA is unchanged at about
+  2.2 µs, since building the sentence dominates it.
+- `deny.toml` no longer ignores RUSTSEC-2026-0543.
 
 ---
 

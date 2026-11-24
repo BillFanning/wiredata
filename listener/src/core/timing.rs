@@ -9,7 +9,10 @@
 
 use std::time::{Instant, SystemTime};
 
-use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
+use std::fmt::Write as _;
+
+use jiff::tz::{Offset, TimeZone};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// Where a chunk's wall-clock arrival timestamp was captured.
@@ -90,20 +93,69 @@ impl TimestampConfig {
     /// Format a wall-clock instant as a **local** timestamp per this configuration.
     /// The timezone toggle emits the local UTC offset (e.g. `-07:00`), not `Z`.
     pub fn format(&self, at: SystemTime) -> String {
-        let local: DateTime<Local> = at.into();
+        self.format_at(at, TimeZone::system().to_offset(to_timestamp(at)))
+    }
+
+    /// [`Self::format`] in the zone `offset`, so a test does not read the
+    /// machine's zone. Milliseconds are cut, never rounded.
+    fn format_at(&self, at: SystemTime, offset: Offset) -> String {
+        let local = offset.to_datetime(to_timestamp(at));
         let mut s = String::new();
+        // Writing to a String cannot fail.
         if self.include_date {
-            s.push_str(&local.format("%Y-%m-%dT").to_string());
+            let _ = write!(
+                s,
+                "{:04}-{:02}-{:02}T",
+                local.year(),
+                local.month(),
+                local.day()
+            );
         }
-        s.push_str(&local.format("%H:%M:%S").to_string());
+        let _ = write!(
+            s,
+            "{:02}:{:02}:{:02}",
+            local.hour(),
+            local.minute(),
+            local.second()
+        );
         if self.include_millis {
-            s.push_str(&local.format("%.3f").to_string());
+            let _ = write!(s, ".{:03}", local.subsec_nanosecond() / 1_000_000);
         }
         if self.include_timezone {
-            s.push_str(&local.format("%:z").to_string());
+            s.push_str(&offset_text(offset));
         }
         s
     }
+}
+
+/// `at` as ISO 8601 local time in the zone `offset`, with milliseconds cut
+/// rather than rounded: `2026-11-13T14:02:04.000-05:00`.
+pub(crate) fn iso_local_at(at: SystemTime, offset: Offset) -> String {
+    TimestampConfig {
+        include_date: true,
+        include_millis: true,
+        include_timezone: true,
+    }
+    .format_at(at, offset)
+}
+
+/// `offset` as ISO 8601 writes it, `+hh:mm`: `+00:00` for UTC, and any
+/// seconds left off.
+pub(crate) fn offset_text(offset: Offset) -> String {
+    let seconds = offset.seconds();
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let minutes = seconds.unsigned_abs() / 60;
+    format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// `at` as a jiff timestamp. A clock reading is always within jiff's range,
+/// the years -9999 to 9999; one outside it is held at the nearer end.
+pub(crate) fn to_timestamp(at: SystemTime) -> Timestamp {
+    Timestamp::try_from(at).unwrap_or(if at < SystemTime::UNIX_EPOCH {
+        Timestamp::MIN
+    } else {
+        Timestamp::MAX
+    })
 }
 
 /// Safety cap for custom NMEA ZDA talker IDs used by Mark annotations.
@@ -147,26 +199,26 @@ pub fn zda_sentence(
     at: SystemTime,
     include_millis: bool,
 ) -> Result<String, ZdaTalkerIdError> {
-    let utc: DateTime<Utc> = at.into();
-    let local: DateTime<Local> = at.into();
-    zda_sentence_at(talker, utc, local.offset().fix(), include_millis)
+    let at = to_timestamp(at);
+    zda_sentence_at(talker, at, TimeZone::system().to_offset(at), include_millis)
 }
 
 fn zda_sentence_at(
     talker: &str,
-    at: DateTime<Utc>,
-    local_offset: FixedOffset,
+    at: Timestamp,
+    local_offset: Offset,
     include_millis: bool,
 ) -> Result<String, ZdaTalkerIdError> {
-    use chrono::{Datelike, Timelike};
     use nmea0183::{format_utc_time, NmeaSentence, SentenceType, TalkerId};
 
     validate_zda_talker_id(talker)?;
+    let at = Offset::UTC.to_datetime(at);
+    let field = |value: i8| u32::from(value.unsigned_abs());
     let time = format_utc_time(
-        at.hour(),
-        at.minute(),
-        at.second(),
-        at.timestamp_subsec_millis(),
+        field(at.hour()),
+        field(at.minute()),
+        field(at.second()),
+        at.subsec_nanosecond().unsigned_abs() / 1_000_000,
         include_millis,
     );
     let (zone_hours, zone_minutes) = zda_zone_fields(local_offset);
@@ -188,11 +240,11 @@ fn zda_sentence_at(
 
 /// ZDA's local-zone hours and minutes for `offset`, in NMEA 0183's sense: the
 /// time added to local time to get UTC. That is UTC minus local, the opposite
-/// sign to ISO 8601 and chrono's offset, so a zone east of Greenwich is
-/// negative (§50.2). The minutes take the hours' sign. Both are empty for an
-/// offset that is not a whole number of minutes or is beyond ±13:59.
-fn zda_zone_fields(offset: FixedOffset) -> (String, String) {
-    let seconds = -offset.local_minus_utc();
+/// sign to ISO 8601's offset, so a zone east of Greenwich is negative
+/// (§50.2). The minutes take the hours' sign. Both are empty for an offset
+/// that is not a whole number of minutes or is beyond ±13:59.
+fn zda_zone_fields(offset: Offset) -> (String, String) {
+    let seconds = -offset.seconds();
     let total_minutes = seconds / 60;
     if seconds % 60 != 0 || total_minutes.unsigned_abs() > 13 * 60 + 59 {
         return (String::new(), String::new());
@@ -221,13 +273,11 @@ mod tests {
     /// `SystemTime`, so `format` reproduces the same local wall-clock regardless of
     /// the host timezone.
     fn sample() -> SystemTime {
-        use chrono::{TimeZone, Timelike};
-        let local = Local
-            .with_ymd_and_hms(2026, 5, 22, 14, 30, 45)
-            .unwrap()
-            .with_nanosecond(123_000_000)
+        let local = jiff::civil::date(2026, 5, 22)
+            .at(14, 30, 45, 123_000_000)
+            .to_zoned_datetime(TimeZone::system())
             .unwrap();
-        SystemTime::from(local)
+        SystemTime::try_from(local.timestamp()).unwrap()
     }
 
     #[test]
@@ -271,25 +321,21 @@ mod tests {
 
     #[test]
     fn timezone_offset_matches_the_local_offset() {
-        use chrono::{DateTime, Local};
         let cfg = TimestampConfig {
             include_date: false,
             include_millis: false,
             include_timezone: true,
         };
         // The emitted suffix is the local UTC offset for that instant (e.g. -07:00),
-        // never a fixed `Z`. Compare against chrono's own offset for the same instant.
-        let local: DateTime<Local> = sample().into();
-        let expected = format!("14:30:45{}", local.format("%:z"));
+        // never a fixed `Z`. Compare against the zone's offset for the same instant.
+        let offset = TimeZone::system().to_offset(to_timestamp(sample()));
+        let expected = format!("14:30:45{}", offset_text(offset));
         assert_eq!(cfg.format(sample()), expected);
     }
 
-    fn utc_sample() -> DateTime<Utc> {
-        use chrono::{TimeZone, Timelike};
-        Utc.with_ymd_and_hms(2026, 5, 22, 0, 30, 45)
-            .unwrap()
-            .with_nanosecond(123_000_000)
-            .unwrap()
+    /// 2026-05-22 00:30:45.123 UTC
+    fn utc_sample() -> Timestamp {
+        Timestamp::new(1_779_409_845, 123_000_000).unwrap()
     }
 
     #[test]
@@ -297,7 +343,7 @@ mod tests {
         let text = zda_sentence_at(
             "RECEIVER_A",
             utc_sample(),
-            FixedOffset::west_opt(3 * 3600 + 30 * 60).unwrap(),
+            zone(-(3 * 3600 + 30 * 60)),
             true,
         )
         .unwrap();
@@ -314,31 +360,10 @@ mod tests {
 
     #[test]
     fn zda_uses_utc_calendar_fields_not_local_calendar_date() {
-        let text = zda_sentence_at(
-            "GP",
-            utc_sample(),
-            FixedOffset::west_opt(5 * 3600).unwrap(),
-            false,
-        )
-        .unwrap();
+        let text = zda_sentence_at("GP", utc_sample(), zone(-(5 * 3600)), false).unwrap();
         let parsed = nmea0183::NmeaSentence::parse(&text).unwrap();
 
         assert_eq!(parsed.fields, ["003045", "22", "05", "2026", "+05", "00"]);
-    }
-
-    #[test]
-    fn zda_helper_formats_a_chrono_leap_second_at_fixed_width() {
-        use chrono::{TimeZone, Timelike};
-
-        let leap = Utc
-            .with_ymd_and_hms(2016, 12, 31, 23, 59, 59)
-            .unwrap()
-            .with_nanosecond(1_800_000_000)
-            .unwrap();
-        let text = zda_sentence_at("GP", leap, FixedOffset::east_opt(0).unwrap(), true).unwrap();
-        let parsed = nmea0183::NmeaSentence::parse(&text).unwrap();
-
-        assert_eq!(parsed.field(0), Some("235960.800"));
     }
 
     /// NMEA's zone is the hours added to local time to get UTC, the opposite
@@ -346,42 +371,85 @@ mod tests {
     /// minutes take the hours' sign.
     #[test]
     fn zda_zone_fields_follow_the_nmea_sign() {
-        let zone = |hours: &str, minutes: &str| (hours.to_string(), minutes.to_string());
-        assert_eq!(
-            zda_zone_fields(FixedOffset::east_opt(0).unwrap()),
-            zone("00", "00")
-        );
+        let fields = |hours: &str, minutes: &str| (hours.to_string(), minutes.to_string());
+        assert_eq!(zda_zone_fields(zone(0)), fields("00", "00"));
         // US Eastern, UTC-5: add 5 hours to local time to get UTC.
-        assert_eq!(
-            zda_zone_fields(FixedOffset::west_opt(5 * 3600).unwrap()),
-            zone("+05", "00")
-        );
+        assert_eq!(zda_zone_fields(zone(-(5 * 3600))), fields("+05", "00"));
         // Central Europe, UTC+1.
-        assert_eq!(
-            zda_zone_fields(FixedOffset::east_opt(3600).unwrap()),
-            zone("-01", "00")
-        );
+        assert_eq!(zda_zone_fields(zone(3600)), fields("-01", "00"));
         // India, UTC+5:30, and the edge of the range, UTC+13:45.
         assert_eq!(
-            zda_zone_fields(FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap()),
-            zone("-05", "-30")
+            zda_zone_fields(zone(5 * 3600 + 30 * 60)),
+            fields("-05", "-30")
         );
         assert_eq!(
-            zda_zone_fields(FixedOffset::east_opt(13 * 3600 + 45 * 60).unwrap()),
-            zone("-13", "-45")
+            zda_zone_fields(zone(13 * 3600 + 45 * 60)),
+            fields("-13", "-45")
         );
         // Newfoundland, UTC-3:30.
         assert_eq!(
-            zda_zone_fields(FixedOffset::west_opt(3 * 3600 + 30 * 60).unwrap()),
-            zone("+03", "30")
+            zda_zone_fields(zone(-(3 * 3600 + 30 * 60))),
+            fields("+03", "30")
         );
         assert_eq!(
-            zda_zone_fields(FixedOffset::east_opt(14 * 3600).unwrap()),
+            zda_zone_fields(zone(14 * 3600)),
             (String::new(), String::new())
         );
+        assert_eq!(zda_zone_fields(zone(3601)), (String::new(), String::new()));
+    }
+
+    fn zone(seconds: i32) -> Offset {
+        Offset::from_seconds(seconds).unwrap()
+    }
+
+    /// 2026-05-22 14:30:45 UTC plus `nanos`.
+    fn wall(nanos: u32) -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::new(1_779_460_245, nanos)
+    }
+
+    /// Every toggle, in fixed zones, with literal results: milliseconds cut
+    /// rather than rounded, `+00:00` for a zero offset, and a local date that
+    /// differs from UTC's.
+    #[test]
+    fn mark_timestamps_in_fixed_zones() {
+        let cfg = |include_date, include_millis, include_timezone| TimestampConfig {
+            include_date,
+            include_millis,
+            include_timezone,
+        };
+        let at = wall(123_999_999);
+        assert_eq!(cfg(false, false, false).format_at(at, zone(0)), "14:30:45");
         assert_eq!(
-            zda_zone_fields(FixedOffset::east_opt(3601).unwrap()),
-            (String::new(), String::new())
+            cfg(false, true, false).format_at(at, zone(0)),
+            "14:30:45.123"
+        );
+        assert_eq!(
+            cfg(false, false, true).format_at(at, zone(0)),
+            "14:30:45+00:00"
+        );
+        assert_eq!(
+            cfg(true, true, true).format_at(at, zone(-4 * 3600)),
+            "2026-05-22T10:30:45.123-04:00"
+        );
+        assert_eq!(
+            cfg(true, false, true).format_at(at, zone(9 * 3600 + 1800)),
+            "2026-05-23T00:00:45+09:30"
+        );
+        assert_eq!(
+            cfg(false, true, false).format_at(wall(0), zone(0)),
+            "14:30:45.000"
+        );
+    }
+
+    /// ZDA's milliseconds are cut, never rounded up into the next second.
+    #[test]
+    fn zda_milliseconds_are_truncated() {
+        let at = to_timestamp(wall(999_999_999));
+        let text = zda_sentence_at("GP", at, zone(0), true).unwrap();
+        let parsed = nmea0183::NmeaSentence::parse(&text).unwrap();
+        assert_eq!(
+            parsed.fields,
+            ["143045.999", "22", "05", "2026", "00", "00"]
         );
     }
 

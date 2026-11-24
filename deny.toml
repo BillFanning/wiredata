@@ -32,13 +32,6 @@ ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
-    # chrono is unmaintained (advisory of 2026-11, no safe upgrade). Our own
-    # direct dependency, in talker, listener and wiredata-log, for local times
-    # and timestamps (talker ADR-067); nothing else in the tree uses it.
-    # Unmaintained, not vulnerable: a new vulnerability has a new ID and still
-    # fails. Moving to a maintained library is a TODO in talker's TODO.md;
-    # remove this entry when chrono is gone.
-    "RUSTSEC-2026-0543",
 ]
 
 [licenses]

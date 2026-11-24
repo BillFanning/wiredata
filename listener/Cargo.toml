@@ -61,7 +61,7 @@ serialport = { workspace = true }
 
 # Calendar time for time-based recording-file rotation (§59) — local-time period
 # keys, so rotated filenames match the operator's wall clock
-chrono = { workspace = true }
+jiff = { workspace = true }
 
 # Raw socket options: SO_RCVBUF to mitigate kernel UDP drops (§167, §101), and
 # address reuse for a shared UDP port (§15); `all` adds SO_REUSEPORT on Unix

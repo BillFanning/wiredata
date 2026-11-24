@@ -237,8 +237,8 @@ impl MessageDraftAnalysis {
             };
         };
 
-        let reference = chrono::DateTime::<chrono::Utc>::from_timestamp(1_704_110_400, 0)
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+        let reference =
+            jiff::Timestamp::from_second(1_704_110_400).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
         match config.compile() {
             Ok(compiled) => {
                 let timestamp_len = config
@@ -1255,7 +1255,14 @@ impl TalkerApp {
                 let c = self.log_counts.entry(id).or_default();
                 c.record(event.level);
             }
-            let ts = event.timestamp.format("%H:%M:%S%.3f");
+            // Milliseconds are cut, never rounded.
+            let ts = format!(
+                "{:02}:{:02}:{:02}.{:03}",
+                event.timestamp.hour(),
+                event.timestamp.minute(),
+                event.timestamp.second(),
+                event.timestamp.subsec_nanosecond() / 1_000_000
+            );
             let line = format!("[{ts}] [{:<5}] {}", event.level, event.message);
             self.log_lines.push((line, event.level));
         }

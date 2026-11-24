@@ -422,6 +422,7 @@ impl ListenerApp {
                         let log_w = ui.available_width();
                         ui.set_max_width(log_w);
                         let mut shown = 0usize;
+                        let zone = jiff::tz::TimeZone::system();
                         for d in dv.entries.iter().rev() {
                             let (enabled, color, level) = match d.severity {
                                 DiagnosticSeverity::Event => {
@@ -437,7 +438,9 @@ impl ListenerApp {
                             if !enabled {
                                 continue;
                             }
-                            let dt: chrono::DateTime<chrono::Local> = d.timestamp.into();
+                            // Local time of day; milliseconds are cut, never rounded.
+                            let dt =
+                                zone.to_datetime(crate::core::timing::to_timestamp(d.timestamp));
                             let msg = &d.message;
                             shown += 1;
                             // Wrap long entries so the full message stays readable
@@ -445,8 +448,11 @@ impl ListenerApp {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(format!(
-                                        "{}  {level}  {msg}",
-                                        dt.format("%H:%M:%S%.3f")
+                                        "{:02}:{:02}:{:02}.{:03}  {level}  {msg}",
+                                        dt.hour(),
+                                        dt.minute(),
+                                        dt.second(),
+                                        dt.subsec_nanosecond() / 1_000_000
                                     ))
                                     .color(color),
                                 )

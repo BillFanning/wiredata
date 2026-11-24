@@ -100,6 +100,7 @@ pub(crate) fn code_page_replacements(
 }
 
 pub use timestamp::TimestampConfig;
+pub(crate) use timestamp::{offset_text, to_timestamp};
 
 use serde::{Deserialize, Serialize};
 
@@ -222,7 +223,7 @@ impl CompiledMessage {
     /// The timestamp and any live NMEA fields use the same current instant;
     /// the outer checksum is computed over timestamp and payload together.
     pub fn render(&self) -> Vec<u8> {
-        self.render_at(chrono::Utc::now())
+        self.render_at(jiff::Timestamp::now())
     }
 
     /// Wire bytes one send produces, without producing them.
@@ -252,7 +253,7 @@ impl CompiledMessage {
     /// Like [`Self::render`], but uses `now` for the prepended timestamp and
     /// live NMEA fields instead of reading the wall clock. Useful for stable
     /// previews and deterministic tests.
-    pub fn render_at(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+    pub fn render_at(&self, now: jiff::Timestamp) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.payload.wire_len_hint() + 16);
         if let Some(ts) = &self.timestamp {
             out.extend_from_slice(ts.format(now).as_bytes());
@@ -431,7 +432,7 @@ impl CompiledPayload {
         }
     }
 
-    fn append_at(&self, now: chrono::DateTime<chrono::Utc>, out: &mut Vec<u8>) {
+    fn append_at(&self, now: jiff::Timestamp, out: &mut Vec<u8>) {
         match self {
             Self::Static(bytes) => out.extend_from_slice(bytes),
             Self::NmeaLive(template) => template.append_at(now, out),
@@ -467,7 +468,7 @@ impl NmeaLiveTemplate {
         };
         // All substituted fields are fixed width. Render once at compile time
         // so the send path does not stringify IDs or rescan fields for capacity.
-        template.wire_len_hint = template.render_at(chrono::Utc::now()).len();
+        template.wire_len_hint = template.render_at(jiff::Timestamp::now()).len();
         template
     }
 
@@ -475,15 +476,18 @@ impl NmeaLiveTemplate {
         self.wire_len_hint
     }
 
-    fn render_at(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+    fn render_at(&self, now: jiff::Timestamp) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.wire_len_hint());
         self.append_at(now, &mut out);
         out
     }
 
-    fn append_at(&self, now: chrono::DateTime<chrono::Utc>, out: &mut Vec<u8>) {
-        use chrono::{Datelike, Timelike};
+    fn append_at(&self, now: jiff::Timestamp, out: &mut Vec<u8>) {
         use nmea0183::{format_utc_time, NmeaSentence, TimeFieldKind};
+
+        // NMEA's time and date fields are UTC.
+        let now = jiff::tz::Offset::UTC.to_datetime(now);
+        let field = |value: i8| u32::from(value.unsigned_abs());
 
         let time_fields = self.sentence_type.time_fields();
         let required_len = time_fields.last().map_or(self.fields.len(), |(index, _)| {
@@ -495,10 +499,10 @@ impl NmeaLiveTemplate {
         for &(index, kind) in time_fields {
             fields[index] = match kind {
                 TimeFieldKind::UtcTime => format_utc_time(
-                    now.hour(),
-                    now.minute(),
-                    now.second(),
-                    now.timestamp_subsec_millis(),
+                    field(now.hour()),
+                    field(now.minute()),
+                    field(now.second()),
+                    now.subsec_nanosecond().unsigned_abs() / 1_000_000,
                     self.include_millis,
                 ),
                 TimeFieldKind::DateDdmmyy => {
@@ -671,27 +675,26 @@ fn compile_parsed_nmea(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Timelike};
 
     fn utc_at(
-        year: i32,
-        month: u32,
-        day: u32,
-        hour: u32,
-        minute: u32,
-        second: u32,
-        millis: u32,
-    ) -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc
-            .with_ymd_and_hms(year, month, day, hour, minute, second)
+        year: i16,
+        month: i8,
+        day: i8,
+        hour: i8,
+        minute: i8,
+        second: i8,
+        millis: i32,
+    ) -> jiff::Timestamp {
+        jiff::civil::date(year, month, day)
+            .at(hour, minute, second, millis * 1_000_000)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
             .unwrap()
-            .with_nanosecond(millis * 1_000_000)
-            .unwrap()
+            .timestamp()
     }
 
     fn parse_rendered_nmea(
         message: &CompiledMessage,
-        at: chrono::DateTime<chrono::Utc>,
+        at: jiff::Timestamp,
     ) -> nmea0183::NmeaSentence {
         let wire = String::from_utf8(message.render_at(at)).unwrap();
         nmea0183::NmeaSentence::parse(&wire).unwrap()
@@ -972,7 +975,7 @@ mod tests {
         };
         let compiled = message.compile().unwrap();
 
-        assert_eq!(compiled.render_at(chrono::Utc::now()).len(), 24 + 4);
+        assert_eq!(compiled.render_at(jiff::Timestamp::now()).len(), 24 + 4);
         assert_eq!(compiled.replacement_wire_offsets(), &[25, 27]);
     }
 
@@ -1098,21 +1101,18 @@ mod tests {
         assert_eq!(parse_rendered_nmea(&with, at).field(0), Some("010203.045"));
     }
 
+    /// The live time's milliseconds are cut, never rounded up into the next
+    /// second.
     #[test]
-    fn live_time_formats_a_chrono_leap_second_without_growing_the_field() {
-        let without =
-            MessageConfig::new(PayloadConfig::nmea_live("GP", "GGA", vec![], false), 1000)
-                .compile()
-                .unwrap();
-        let with = MessageConfig::new(PayloadConfig::nmea_live("GP", "GGA", vec![], true), 1000)
+    fn live_time_milliseconds_are_truncated() {
+        let with = MessageConfig::new(PayloadConfig::nmea_live("GP", "ZDA", vec![], true), 1000)
             .compile()
             .unwrap();
-        let leap = utc_at(2016, 12, 31, 23, 59, 59, 1_800);
-
-        assert_eq!(parse_rendered_nmea(&without, leap).field(0), Some("235960"));
+        // 2026-05-22 14:30:45.999999999 UTC
+        let at = jiff::Timestamp::new(1_779_460_245, 999_999_999).unwrap();
         assert_eq!(
-            parse_rendered_nmea(&with, leap).field(0),
-            Some("235960.800")
+            parse_rendered_nmea(&with, at).fields,
+            ["143045.999", "22", "05", "2026"]
         );
     }
 

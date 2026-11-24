@@ -55,18 +55,6 @@ Found by a survey of every retry in the workspace on 2026-11-19.
   from `OPEN_RETRY_FIRST` to `OPEN_RETRY_MAX` (1 s to 30 s). The fast pace suits
   a scheduled send stream, but no document sets the two side by side.
 
-## Dependencies (workspace)
-
-- [ ] **Replace chrono (RUSTSEC-2026-0543).** chrono is unmaintained, with no
-  safe upgrade, and `deny.toml` ignores the advisory only until chrono is gone.
-  talker, listener and `wiredata-log` use it directly, in about 50 places, for
-  local times, offsets and formatting under the time policy (ADR-067: local
-  unless UTC, ISO 8601 offsets in files and logs, NMEA's own sign inside NMEA
-  fields). Candidates: `jiff`, or `time`, which is already in the tree through
-  `tracing-appender`. Keep every format on screen, in files and on the wire
-  byte for byte the same, with tests that pin them before the switch. Then
-  remove the `deny.toml` entry.
-
 ## GUI
 
 - [ ] **Say why a port refuses 5 or 6 data bits (workspace).** On 2026-11-23,
