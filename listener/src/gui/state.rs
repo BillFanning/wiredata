@@ -9,14 +9,12 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::config::ChannelConfig;
-use crate::config::LowDiskAction;
 use crate::core::{
     ChannelId, ChannelState, MatchRuleId, RecordingState, RecordingTap, RuntimeEvent,
 };
 use crate::diagnostics::Diagnostic;
 use crate::runtime::{ChannelSnapshot, ReconnectProgress, RecordingStatus, TriggeredMatch};
 use crate::transport::SerialControlLines;
-use wiredata_ui::format::human_bytes;
 
 use super::bind_scope::LocalAddresses;
 use super::bridge::UiUpdate;
@@ -873,22 +871,10 @@ impl ReconnectPrompt {
 }
 
 /// One recording's lasting faults, a line each, naming the Channel and the
-/// recording (§56.1, §56.2).
+/// recording (§56.1).
 fn lasting_fault_lines(channel: &str, tap: RecordingTap, status: &RecordingStatus) -> Vec<String> {
     let what = format!("{channel} {} recording", tap.label());
     let mut lines = Vec::new();
-    if status.low_disk {
-        let free = status
-            .free_space
-            .map_or_else(String::new, |free| format!(" ({} free)", human_bytes(free)));
-        let effect = match status.guard.map(|guard| guard.on_low) {
-            Some(LowDiskAction::StopRecording) => {
-                "is paused until free space recovers; reception continues"
-            }
-            _ => "continues, but the disk may fill",
-        };
-        lines.push(format!("Low disk{free}: {what} {effect}"));
-    }
     if status.unstable {
         lines.push(format!(
             "Recording unstable: {what} keeps failing, so it retries less often until you stop it"
@@ -1342,9 +1328,8 @@ mod tests {
 
     #[test]
     fn lasting_recording_faults_name_the_channel_and_stay_until_they_clear() {
-        // §56.1/§56.2: low disk and instability stay listed, whichever channel
-        // is selected, until a poll shows them gone.
-        use crate::config::{DiskGuard, DiskThreshold};
+        // §56.1: instability stays listed, whichever channel is selected, until
+        // a poll shows it gone.
         let mut state = AppState::default();
         let (gps, ais) = (ChannelId::new(), ChannelId::new());
         state.apply(added(gps, "GPS", "UDP · test"));
@@ -1352,15 +1337,6 @@ mod tests {
         assert!(state.lasting_recording_faults().is_empty());
 
         let mut snap = snapshot_with(gps, 0, 0.0, 0);
-        snap.raw_recording_status = Some(RecordingStatus {
-            free_space: Some(500_000),
-            guard: Some(DiskGuard {
-                min_free: DiskThreshold::Bytes { bytes: 1_000_000 },
-                on_low: LowDiskAction::StopRecording,
-            }),
-            low_disk: true,
-            ..RecordingStatus::default()
-        });
         snap.display_recording_status = Some(RecordingStatus {
             unstable: true,
             ..RecordingStatus::default()
@@ -1369,15 +1345,13 @@ mod tests {
         assert_eq!(
             state.lasting_recording_faults(),
             [
-                "Low disk (500.000 kB free): GPS Raw recording is paused until free space \
-                 recovers; reception continues",
                 "Recording unstable: GPS Display recording keeps failing, so it retries \
-                 less often until you stop it",
+              less often until you stop it"
             ]
         );
 
         let mut snap = snapshot_with(gps, 0, 0.0, 0);
-        snap.raw_recording_status = Some(RecordingStatus::default());
+        snap.display_recording_status = Some(RecordingStatus::default());
         state.apply(UiUpdate::Snapshot(gps, Box::new(snap)));
         assert!(state.lasting_recording_faults().is_empty());
     }

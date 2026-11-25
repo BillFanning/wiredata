@@ -70,7 +70,7 @@ socket2 = { workspace = true, features = ["all"] }
 # The host's local addresses, listed in the UDP bind choice (§15, ADR-047)
 if-addrs = { workspace = true }
 
-# Filesystem free space for the recording disk-space guard (§168, §56.2)
+# Filesystem free space for the recording readout (§56.2)
 fs4 = { workspace = true }
 
 # async methods in the recorder traits (§142)

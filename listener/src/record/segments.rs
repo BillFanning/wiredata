@@ -853,45 +853,21 @@ mod tests {
         chunk_at(text.as_bytes(), SystemTime::now()).0
     }
 
-    /// How the gap in a recording is made.
-    enum MakeGap {
-        /// A queue overflow: "EF" is offered at second 4 and lost.
-        LostBytes,
-        /// Low disk with nothing offered: the gap loses no bytes.
-        NothingLost,
-    }
-
-    /// Offer "AB", make a gap, wait for recording to resume, offer "GH" at
-    /// second 12, and stop. Returns the reports and the contents of the files
+    /// Offer "AB", overflow the queue so "EF" is lost, wait for recording to
+    /// resume, offer "GH" at second 12, and stop. Returns the reports and the contents of the files
     /// the recording wrote, in order.
     async fn record_across_a_gap<I: RecordItem, S: SegmentSource<I>>(
         source: S,
         make: impl Fn(&str) -> I,
-        gap: MakeGap,
         dir: &Path,
         ext: &str,
     ) -> (Vec<RecorderReport>, Vec<Vec<u8>>) {
         let budget = 2 * (2 + PER_ITEM_OVERHEAD); // room for two 2-byte items
         let mut recording = start_recording(source, budget, fast());
         recording.try_record(make("AB"), at(0));
-        match gap {
-            MakeGap::LostBytes => {
-                recording.try_record(make("CD"), at(2));
-                recording.try_record(make("EF"), at(4)); // does not fit
-            }
-            MakeGap::NothingLost => {
-                // Let "AB" reach the file first: a gap begun while it is still
-                // queued would count it as lost.
-                while recording.bytes_written() == 0 {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-                recording.set_low_disk(true);
-                while recording.state() != RecordingState::Gap(GapReason::LowDisk) {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-                recording.set_low_disk(false);
-            }
-        }
+        // A queue overflow: "EF" is offered at second 4 and lost.
+        recording.try_record(make("CD"), at(2));
+        recording.try_record(make("EF"), at(4)); // does not fit
         let mut reports = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !reports.iter().any(|r| {
@@ -928,14 +904,8 @@ mod tests {
     async fn a_display_recording_resumes_with_a_gap_line_before_the_first_item() {
         let dir = temp_dir("gap-mark");
         std::fs::create_dir_all(&dir).unwrap();
-        let (reports, files) = record_across_a_gap(
-            display_source(&dir, true),
-            rendered,
-            MakeGap::LostBytes,
-            &dir,
-            ".disp",
-        )
-        .await;
+        let (reports, files) =
+            record_across_a_gap(display_source(&dir, true), rendered, &dir, ".disp").await;
         assert!(reports
             .iter()
             .any(|r| matches!(r, RecorderReport::GapClosed { start: Some(_), .. })));
@@ -958,34 +928,9 @@ mod tests {
     async fn a_display_recording_with_marks_off_resumes_with_just_the_item() {
         let dir = temp_dir("gap-mark-off");
         std::fs::create_dir_all(&dir).unwrap();
-        let (_, files) = record_across_a_gap(
-            display_source(&dir, false),
-            rendered,
-            MakeGap::LostBytes,
-            &dir,
-            ".disp",
-        )
-        .await;
+        let (_, files) =
+            record_across_a_gap(display_source(&dir, false), rendered, &dir, ".disp").await;
         assert_eq!(files, vec![b"ABCD".to_vec(), b"GH".to_vec()]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn a_gap_that_lost_no_bytes_leaves_no_line() {
-        let dir = temp_dir("gap-mark-nothing-lost");
-        std::fs::create_dir_all(&dir).unwrap();
-        let (reports, files) = record_across_a_gap(
-            display_source(&dir, true),
-            rendered,
-            MakeGap::NothingLost,
-            &dir,
-            ".disp",
-        )
-        .await;
-        assert!(reports
-            .iter()
-            .any(|r| matches!(r, RecorderReport::GapClosed { start: None, .. })));
-        assert_eq!(files, vec![b"AB".to_vec(), b"GH".to_vec()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -994,8 +939,7 @@ mod tests {
         let dir = temp_dir("gap-mark-raw");
         std::fs::create_dir_all(&dir).unwrap();
         let source = RawSegments::new(plan(&dir.join("run.raw"), FileRotationPolicy::None), false);
-        let (reports, files) =
-            record_across_a_gap(source, raw_item, MakeGap::LostBytes, &dir, ".raw").await;
+        let (reports, files) = record_across_a_gap(source, raw_item, &dir, ".raw").await;
         assert!(reports
             .iter()
             .any(|r| matches!(r, RecorderReport::GapClosed { start: Some(_), .. })));

@@ -36,8 +36,8 @@ use crate::config::limits::{
     capacity_error, MAX_INGEST_CHUNKS, MAX_RECORDING_QUEUE_BYTES, MAX_UI_EVENTS,
 };
 use crate::config::{
-    DiskGuard, DiskThreshold, LimitError, LowDiskAction, MarkPosition, MarkTimestampStyle,
-    MatchAction, MatchRule, RecordControl, RecordTarget, RetentionConfig,
+    LimitError, MarkPosition, MarkTimestampStyle, MatchAction, MatchRule, RecordControl,
+    RecordTarget, RetentionConfig,
 };
 
 use crate::core::{
@@ -55,7 +55,7 @@ use crate::record::{
 };
 use crate::transport::udp::SharedPortStatus;
 use crate::transport::{ReceivedData, SerialStallState, TransportNotice, STALL_WARNING};
-use wiredata_ui::format::{compact_duration, human_bytes, thousands};
+use wiredata_ui::format::{compact_duration, thousands};
 
 use super::queue::DropOldestQueue;
 
@@ -381,7 +381,7 @@ struct Tap<S> {
     /// emits `RecordingFaulted` — it doesn't fail silently.
     auto_begin: bool,
     /// The running recording's destination as the disk check last saw it
-    /// (§56.2): free space, the recording's size, and the lasting low-disk fault.
+    /// (§56.2): free space and the recording's size.
     disk: DiskWatch,
 }
 
@@ -433,8 +433,8 @@ pub trait TapExtra {
 }
 
 /// The settings needed to build a recording when a `Record { Begin }` fires
-/// (§50.2, §165) — destination, overwrite, rotation, queue budget, size cap and
-/// disk guard, packaged so they can be sent to the pipeline task (which runs on
+/// (§50.2, §165) — destination, overwrite, rotation, queue budget and size cap,
+/// packaged so they can be sent to the pipeline task (which runs on
 /// its own async task and can't read the config directly). Built from the
 /// channel's recording config, either at channel start or — for a live toggle —
 /// read from the editor at click time (ADR-012). `X` is the tap's own part.
@@ -448,8 +448,6 @@ pub struct RecordingSettings<X> {
     pub queue_budget: usize,
     /// The soft size cap per file, in bytes (§59).
     pub size_cap: u64,
-    /// The disk guard on this recording's destination (§56.2).
-    pub disk_guard: Option<DiskGuard>,
     /// What only this tap has.
     pub extra: X,
 }
@@ -1456,9 +1454,6 @@ impl ChannelPipeline {
             settings.queue_budget,
             Timings::default(),
         );
-        if self.low_disk_holds_recording(RecordingTap::Raw) {
-            recording.set_low_disk(true);
-        }
         self.raw_recorder = Some(recording);
         self.raw.begin_faulted = false;
     }
@@ -1636,9 +1631,6 @@ impl ChannelPipeline {
             settings.queue_budget,
             Timings::default(),
         );
-        if self.low_disk_holds_recording(RecordingTap::Display) {
-            recording.set_low_disk(true);
-        }
         self.set_display_recorder(settings.extra.renderer.clone(), recording);
         self.display.begin_faulted = false;
     }
@@ -1824,14 +1816,11 @@ impl ChannelPipeline {
         }
     }
 
-    /// Act on one disk check (§56.2): keep the sizes for status, report a failed
-    /// check once, and raise or clear the lasting low-disk fault. With
-    /// `StopRecording` a low disk gaps the recording, which resumes in a new file
-    /// once free space is 10% above the threshold.
+    /// Act on one disk check (§56.2): keep the sizes and free space for status,
+    /// and report a failed check once, and its recovery once.
     fn apply_disk_check(&mut self, tap: RecordingTap, result: Result<DiskFound, String>) {
         let what = format!("{} recording", tap.label());
         let channel = self.channel_name.clone();
-        let guard = self.tap_guard(tap);
         let watch = self.disk_watch_mut(tap);
         let found = match result {
             Ok(found) => found,
@@ -1850,56 +1839,10 @@ impl ChannelPipeline {
         watch.free_space = Some(found.free);
         watch.total_size = Some(found.files);
         watch.others = found.others;
-        let was_low = watch.low;
         if check_recovered {
             self.diagnostics.record(Diagnostic::event(format!(
                 "free disk space for {what} on channel {channel} can be checked again"
             )));
-        }
-        let Some(guard) = guard else {
-            return;
-        };
-        let pauses = guard.on_low == LowDiskAction::StopRecording;
-        let free = human_bytes(found.free);
-        if was_low {
-            // Hysteresis: a low episode ends only 10% above the threshold, so
-            // free space hovering at the line cannot churn files (§56.2).
-            if disk_has_recovered(found.free, found.total, guard.min_free) {
-                self.disk_watch_mut(tap).low = false;
-                self.diagnostics.record(Diagnostic::event(format!(
-                    "free disk space for {what} on channel {channel} has recovered: {free} free"
-                )));
-                if pauses {
-                    self.set_low_disk(tap, false);
-                }
-            }
-            return;
-        }
-        if !disk_is_low(found.free, found.total, guard.min_free) {
-            return;
-        }
-        self.disk_watch_mut(tap).low = true;
-        let consequence = if pauses {
-            format!(
-                "the recording waits in a gap until {} is free",
-                describe_threshold(guard.min_free, true)
-            )
-        } else {
-            "the recording continues".to_owned()
-        };
-        self.diagnostics.record(Diagnostic::warning(format!(
-            "low disk for {what} on channel {channel}: {free} free, below the guard's {}; \
-             {consequence}",
-            describe_threshold(guard.min_free, false)
-        )));
-        if let Some(events) = &self.events {
-            let _ = events.try_send(RuntimeEvent::DiskSpaceLow(self.channel_id));
-        }
-        if pauses {
-            self.set_low_disk(tap, true);
-            if let Some(events) = &self.events {
-                let _ = events.try_send(RuntimeEvent::RecordingStoppedLowDisk(self.channel_id));
-            }
         }
     }
 
@@ -1910,47 +1853,9 @@ impl ChannelPipeline {
         }
     }
 
-    /// The disk guard of `tap`'s recording, from its settings (§56.2).
-    fn tap_guard(&self, tap: RecordingTap) -> Option<DiskGuard> {
-        match tap {
-            RecordingTap::Raw => self.raw.settings.as_ref()?.disk_guard,
-            RecordingTap::Display => self.display.settings.as_ref()?.disk_guard,
-        }
-    }
-
-    /// Whether a low-disk episode is holding `tap` in a gap (§56.2), so a
-    /// recording begun during it starts in that gap too.
-    fn low_disk_holds_recording(&self, tap: RecordingTap) -> bool {
-        let low = match tap {
-            RecordingTap::Raw => self.raw.disk.low,
-            RecordingTap::Display => self.display.disk.low,
-        };
-        low && self
-            .tap_guard(tap)
-            .is_some_and(|guard| guard.on_low == LowDiskAction::StopRecording)
-    }
-
-    /// Tell `tap`'s recording that free space is low, or has recovered (§56.2).
-    /// The recorder handles it in its own task, so this never waits on a file
-    /// (§96).
-    fn set_low_disk(&self, tap: RecordingTap, low: bool) {
-        match tap {
-            RecordingTap::Raw => {
-                if let Some(recorder) = &self.raw_recorder {
-                    recorder.set_low_disk(low);
-                }
-            }
-            RecordingTap::Display => {
-                if let Some(rec) = &self.display_recorder {
-                    rec.recording.set_low_disk(low);
-                }
-            }
-        }
-    }
-
     /// What status shows about the running `tap` recording (§56.2).
     fn recording_status(&self, tap: RecordingTap) -> Option<RecordingStatus> {
-        let (current_file, bytes_written, unstable, rotation, guard, watch) = match tap {
+        let (current_file, bytes_written, unstable, rotation, watch) = match tap {
             RecordingTap::Raw => {
                 let recorder = self.raw_recorder.as_ref()?;
                 let settings = self.raw.settings.as_ref();
@@ -1959,7 +1864,6 @@ impl ChannelPipeline {
                     recorder.bytes_written(),
                     recorder.is_unstable(),
                     settings.map(|s| s.file_rotation),
-                    settings.and_then(|s| s.disk_guard),
                     &self.raw.disk,
                 )
             }
@@ -1971,7 +1875,6 @@ impl ChannelPipeline {
                     recording.bytes_written(),
                     recording.is_unstable(),
                     settings.map(|s| s.file_rotation),
-                    settings.and_then(|s| s.disk_guard),
                     &self.display.disk,
                 )
             }
@@ -1983,8 +1886,6 @@ impl ChannelPipeline {
             free_space: watch.free_space,
             next_rotation: rotation
                 .and_then(|policy| next_period_start(policy, std::time::SystemTime::now())),
-            guard,
-            low_disk: watch.low,
             unstable,
         })
     }
@@ -2326,9 +2227,8 @@ const DISK_CHECK_LIMIT: Duration = Duration::from_secs(2);
 /// What one disk check found (§56.2).
 #[derive(Clone, Debug)]
 struct DiskFound {
-    /// Free and total bytes on the destination's filesystem.
+    /// Free bytes on the destination's filesystem.
     free: u64,
-    total: u64,
     /// The total size of the recording's files.
     files: u64,
     /// What the size was built from, to carry into the next check.
@@ -2358,9 +2258,6 @@ struct DiskCheck {
 struct DiskWatch {
     free_space: Option<u64>,
     total_size: Option<u64>,
-    /// The lasting low-disk fault: below the guard's threshold, until free
-    /// space is 10% above it.
-    low: bool,
     /// A failed check has been reported; the next success notes the recovery.
     check_failing: bool,
     check: Option<DiskCheck>,
@@ -2384,12 +2281,10 @@ impl DiskWatch {
         let handle = tokio::task::spawn_blocking(move || {
             let folder = plan.folder();
             let free = fs4::available_space(&folder)?;
-            let total = fs4::total_space(&folder)?;
             let Some(current) = current else {
                 // No segment is open, so there is nothing to keep a scan for.
                 return Ok(DiskFound {
                     free,
-                    total,
                     files: plan.files_size()?,
                     others: None,
                 });
@@ -2404,7 +2299,6 @@ impl DiskWatch {
             let own = plan.segment_size(&others.current);
             Ok(DiskFound {
                 free,
-                total,
                 files: others.size.saturating_add(own),
                 others: Some(others),
             })
@@ -2414,49 +2308,6 @@ impl DiskWatch {
             overdue: false,
             handle,
         });
-    }
-}
-
-/// A disk-guard threshold in words; `resume` gives the point 10% above it,
-/// where a low episode ends (§56.2).
-fn describe_threshold(threshold: DiskThreshold, resume: bool) -> String {
-    match threshold {
-        DiskThreshold::Bytes { bytes } => {
-            let bytes = if resume {
-                bytes.saturating_add(bytes.div_ceil(10))
-            } else {
-                bytes
-            };
-            human_bytes(bytes)
-        }
-        DiskThreshold::Percent { percent } => {
-            let tenths = u32::from(percent) * if resume { 11 } else { 10 };
-            match tenths % 10 {
-                0 => format!("{}% of the disk", tenths / 10),
-                frac => format!("{}.{frac}% of the disk", tenths / 10),
-            }
-        }
-    }
-}
-
-/// Whether `free` bytes is below the disk-guard threshold (§168).
-fn disk_is_low(free: u64, total: u64, threshold: DiskThreshold) -> bool {
-    match threshold {
-        DiskThreshold::Bytes { bytes } => free < bytes,
-        DiskThreshold::Percent { percent } => {
-            total > 0 && (free as u128) * 100 < (total as u128) * (percent as u128)
-        }
-    }
-}
-
-/// Whether `free` bytes is at least 10% above the disk-guard threshold — the
-/// point a low episode ends (§56.2).
-fn disk_has_recovered(free: u64, total: u64, threshold: DiskThreshold) -> bool {
-    match threshold {
-        DiskThreshold::Bytes { bytes } => (free as u128) * 10 >= (bytes as u128) * 11,
-        DiskThreshold::Percent { percent } => {
-            total > 0 && (free as u128) * 1000 >= (total as u128) * (percent as u128) * 11
-        }
     }
 }
 
@@ -2504,8 +2355,8 @@ pub async fn run_channel(
     let mut requests_open = true;
     let mut notices_open = true;
     let mut ingest_open = true;
-    // Periodic disk-space guard poll (§56.2, §168) — not per write. Cheap when no
-    // guard is configured (the check returns immediately).
+    // Periodic free-space and size check for running recordings (§56.2) — not
+    // per write. Nothing is checked while no recording runs.
     let mut disk_check = tokio::time::interval(Duration::from_secs(5));
     disk_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Recorder maintenance cadence, independent of rule timing. It bounds
@@ -3357,31 +3208,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn disk_is_low_compares_bytes_and_percent_thresholds() {
-        assert!(disk_is_low(9, 100, DiskThreshold::Bytes { bytes: 10 }));
-        assert!(!disk_is_low(10, 100, DiskThreshold::Bytes { bytes: 10 }));
-        assert!(disk_is_low(4, 100, DiskThreshold::Percent { percent: 5 }));
-        assert!(!disk_is_low(5, 100, DiskThreshold::Percent { percent: 5 }));
-        // A zero-total filesystem is never "low" (avoids division weirdness).
-        assert!(!disk_is_low(0, 0, DiskThreshold::Percent { percent: 5 }));
-    }
-
-    #[test]
-    fn a_low_disk_episode_ends_ten_percent_above_the_threshold() {
-        // §56.2: hysteresis, so free space hovering at the line cannot churn files.
-        let bytes = DiskThreshold::Bytes { bytes: 1000 };
-        assert!(!disk_has_recovered(1000, 0, bytes));
-        assert!(!disk_has_recovered(1099, 0, bytes));
-        assert!(disk_has_recovered(1100, 0, bytes));
-        let percent = DiskThreshold::Percent { percent: 10 };
-        assert!(!disk_has_recovered(109, 1000, percent));
-        assert!(disk_has_recovered(110, 1000, percent));
-        assert!(!disk_has_recovered(0, 0, percent));
-    }
-
-    /// Raw settings recording to `path` with `guard`.
-    fn raw_settings(path: &std::path::Path, guard: Option<DiskGuard>) -> RawRecordingSettings {
+    /// Raw settings recording to `path`.
+    fn raw_settings(path: &std::path::Path) -> RawRecordingSettings {
         RawRecordingSettings {
             destination: path.to_path_buf(),
             channel_name: "guarded".to_string(),
@@ -3390,24 +3218,11 @@ mod tests {
             file_rotation: FileRotationPolicy::None,
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
-            disk_guard: guard,
         }
-    }
-
-    /// A threshold no disk can meet, so the guard always finds it low.
-    fn impossible_guard() -> Option<DiskGuard> {
-        Some(DiskGuard {
-            min_free: DiskThreshold::Bytes { bytes: u64::MAX },
-            on_low: LowDiskAction::StopRecording,
-        })
     }
 
     fn raw_status(p: &ChannelPipeline) -> Option<RecordingStatus> {
         p.stats().raw_recording_status
-    }
-
-    fn display_status(p: &ChannelPipeline) -> Option<RecordingStatus> {
-        p.stats().display_recording_status
     }
 
     /// Run disk checks until `done` holds: each check runs on the blocking pool
@@ -3459,7 +3274,7 @@ mod tests {
         p.set_recording(false, None).await; // so its detached stop never lands
 
         let started = Instant::now();
-        p.set_recording(true, Some(raw_settings(&path, None))).await;
+        p.set_recording(true, Some(raw_settings(&path))).await;
         assert!(
             started.elapsed() < RETIRE_WAIT + Duration::from_secs(2),
             "the begin waited {:?}",
@@ -3477,7 +3292,7 @@ mod tests {
         let cid = ChannelId::new();
         let path = temp_path("redundant-begin");
         let mut p = pipeline(cid, PipelineCapacities::default());
-        p.set_recording(true, Some(raw_settings(&path, None))).await;
+        p.set_recording(true, Some(raw_settings(&path))).await;
         assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
         // A detached stop that never lands.
         p.retiring.spawn(std::future::pending());
@@ -3512,7 +3327,6 @@ mod tests {
             file_rotation: FileRotationPolicy::None,
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
-            disk_guard: None,
         };
         p.set_display_recording(true, Some(settings)).await;
         assert_eq!(p.display_recording_state(), Some(RecordingState::Enabled));
@@ -3528,131 +3342,6 @@ mod tests {
             started.elapsed()
         );
         p.retiring.abort_all();
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[tokio::test]
-    async fn the_disk_guard_gaps_recording_once_and_emits_events() {
-        // §56.2/§168: an impossible byte threshold (u64::MAX) is always "low", so
-        // the guard warns, ends the file cleanly in a low-disk gap, raises the
-        // lasting fault, and does not report the same episode twice.
-        let cid = ChannelId::new();
-        let path = temp_path("guard");
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
-        let mut p = pipeline(cid, PipelineCapacities::default()).with_event_sender(event_tx);
-        p.set_recording(true, Some(raw_settings(&path, impossible_guard())))
-            .await;
-        p.ingest(bytes_chunk(cid, b"data"));
-        settle(&mut p, "the first write", |p| {
-            raw_status(p).is_some_and(|s| s.bytes_written == 4)
-        })
-        .await;
-
-        settle_disks(&mut p, "the low-disk gap", |p| {
-            p.raw_recording_state() == Some(RecordingState::Gap(crate::core::GapReason::LowDisk))
-        })
-        .await;
-        assert!(raw_status(&p).unwrap().low_disk, "the fault is lasting");
-        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"data");
-        let count = |rx: &mut tokio::sync::mpsc::Receiver<RuntimeEvent>| {
-            let (mut low, mut gapped) = (0, 0);
-            while let Ok(ev) = rx.try_recv() {
-                match ev {
-                    RuntimeEvent::DiskSpaceLow(id) if id == cid => low += 1,
-                    RuntimeEvent::RecordingStoppedLowDisk(id) if id == cid => gapped += 1,
-                    _ => {}
-                }
-            }
-            (low, gapped)
-        };
-        assert_eq!(count(&mut event_rx), (1, 1));
-
-        // Another check in the same episode reports nothing new.
-        p.check_recording_disks();
-        settle_disks(&mut p, "the second check", |p| p.raw.disk.check.is_none()).await;
-        assert_eq!(count(&mut event_rx), (0, 0));
-        p.finish().await;
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[tokio::test]
-    async fn a_display_only_recording_is_guarded_too() {
-        // §56.2: each recording has its own guard, on its own destination.
-        let cid = ChannelId::new();
-        let path = temp_path("guard-disp");
-        let mut p = pipeline(cid, PipelineCapacities::default());
-        let settings = DisplayRecordingSettings {
-            destination: path.clone(),
-            channel_name: "guarded".to_string(),
-            overwrite: OverwritePolicy::Overwrite,
-            file_rotation: FileRotationPolicy::None,
-            queue_budget: DEFAULT_QUEUE_BUDGET,
-            size_cap: DEFAULT_SIZE_CAP,
-            disk_guard: impossible_guard(),
-            extra: DisplayExtra {
-                renderer: DisplayView::default(),
-                mark_gaps: false,
-            },
-        };
-        p.set_display_recording(true, Some(settings)).await;
-        settle_disks(&mut p, "the Display low-disk gap", |p| {
-            p.display_recording_state()
-                == Some(RecordingState::Gap(crate::core::GapReason::LowDisk))
-        })
-        .await;
-        assert!(display_status(&p).unwrap().low_disk);
-        assert!(p.raw_recording_state().is_none(), "Raw is not involved");
-        p.finish().await;
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    #[tokio::test]
-    async fn a_low_disk_fault_lasts_until_space_is_ten_percent_above_the_threshold() {
-        // §56.2: the fault stays until free space recovers, and the recording
-        // resumes in a new file only once it is 10% above the threshold.
-        let cid = ChannelId::new();
-        let path = temp_path("guard-lasting");
-        let guard = DiskGuard {
-            min_free: DiskThreshold::Bytes { bytes: 1000 },
-            on_low: LowDiskAction::StopRecording,
-        };
-        let mut p = pipeline(cid, PipelineCapacities::default());
-        p.set_recording(true, Some(raw_settings(&path, Some(guard))))
-            .await;
-        let found = |free| {
-            Ok(DiskFound {
-                free,
-                total: 1_000_000,
-                files: 0,
-                others: None,
-            })
-        };
-
-        p.apply_disk_check(RecordingTap::Raw, found(900));
-        assert!(raw_status(&p).unwrap().low_disk);
-        settle(&mut p, "the low-disk gap", |p| {
-            p.raw_recording_state() == Some(RecordingState::Gap(crate::core::GapReason::LowDisk))
-        })
-        .await;
-        let warning = p.diagnostics().warnings().last().unwrap().message.clone();
-        assert!(
-            warning.contains("below the guard's 1.000 kB") && warning.contains("until 1.100 kB"),
-            "the warning says where it resumes: {warning}"
-        );
-
-        p.apply_disk_check(RecordingTap::Raw, found(1050));
-        assert!(
-            raw_status(&p).unwrap().low_disk,
-            "above the threshold is not enough"
-        );
-
-        p.apply_disk_check(RecordingTap::Raw, found(1100));
-        assert!(!raw_status(&p).unwrap().low_disk);
-        settle(&mut p, "the recording to resume", |p| {
-            p.raw_recording_state() == Some(RecordingState::Enabled)
-        })
-        .await;
-        p.finish().await;
         let _ = tokio::fs::remove_file(&path).await;
     }
 
@@ -3726,7 +3415,7 @@ mod tests {
         let cid = ChannelId::new();
         let path = temp_path("guard-failing");
         let mut p = pipeline(cid, PipelineCapacities::default()).with_channel_name("GPS");
-        p.set_recording(true, Some(raw_settings(&path, None))).await;
+        p.set_recording(true, Some(raw_settings(&path))).await;
 
         for _ in 0..2 {
             p.apply_disk_check(RecordingTap::Raw, Err("the device is not ready".to_owned()));
@@ -3749,7 +3438,6 @@ mod tests {
             RecordingTap::Raw,
             Ok(DiskFound {
                 free: 5,
-                total: 10,
                 files: 3,
                 others: None,
             }),
@@ -3772,7 +3460,7 @@ mod tests {
         let cid = ChannelId::new();
         let path = temp_path("size-scan");
         let mut p = pipeline(cid, PipelineCapacities::default());
-        p.set_recording(true, Some(raw_settings(&path, None))).await;
+        p.set_recording(true, Some(raw_settings(&path))).await;
         p.ingest(bytes_chunk(cid, b"abc"));
         settle(&mut p, "the first write", |p| {
             raw_status(p).is_some_and(|s| s.bytes_written == 3)
@@ -3807,7 +3495,7 @@ mod tests {
         let cid = ChannelId::new();
         let path = temp_path("status");
         let mut p = pipeline(cid, PipelineCapacities::default());
-        p.set_recording(true, Some(raw_settings(&path, None))).await;
+        p.set_recording(true, Some(raw_settings(&path))).await;
         p.ingest(bytes_chunk(cid, b"abc"));
         settle(&mut p, "the first write", |p| {
             raw_status(p).is_some_and(|s| s.bytes_written == 3)
@@ -3834,7 +3522,7 @@ mod tests {
         let mut p = pipeline(cid, PipelineCapacities::default());
         let rotating = RawRecordingSettings {
             file_rotation: FileRotationPolicy::Hourly,
-            ..raw_settings(&dir, None)
+            ..raw_settings(&dir)
         };
         p.set_recording(true, Some(rotating)).await;
         let next = raw_status(&p)
@@ -4223,7 +3911,6 @@ mod tests {
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
-                disk_guard: None,
             });
 
         // Before the match: nothing on disk, nothing recorded.
@@ -4284,7 +3971,6 @@ mod tests {
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
-                disk_guard: None,
             })
             .with_display_recording_settings(DisplayRecordingSettings {
                 destination: disp_path.clone(),
@@ -4297,7 +3983,6 @@ mod tests {
                     renderer: DisplayView::default(),
                     mark_gaps: false,
                 },
-                disk_guard: None,
             });
         for read in reads {
             p.ingest(bytes_chunk(cid, read));
@@ -4420,7 +4105,6 @@ mod tests {
                     renderer: DisplayView::default(),
                     mark_gaps: false,
                 },
-                disk_guard: None,
             });
 
         p.ingest(bytes_chunk(cid, b"before "));
@@ -4482,7 +4166,6 @@ mod tests {
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
-                disk_guard: None,
             })
             .with_display_recording_settings(DisplayRecordingSettings {
                 destination: disp_path.clone(),
@@ -4495,7 +4178,6 @@ mod tests {
                     renderer: DisplayView::default(),
                     mark_gaps: false,
                 },
-                disk_guard: None,
             });
 
         p.ingest(bytes_chunk(cid, b"BEGIN"));
@@ -4540,7 +4222,6 @@ mod tests {
             file_rotation: FileRotationPolicy::None,
             queue_budget: DEFAULT_QUEUE_BUDGET,
             size_cap: DEFAULT_SIZE_CAP,
-            disk_guard: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
         let mut p = pipeline(cid, PipelineCapacities::default()).with_event_sender(event_tx);
@@ -4596,7 +4277,6 @@ mod tests {
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
-                disk_guard: None,
             },
         );
 
@@ -4643,7 +4323,6 @@ mod tests {
                 file_rotation: FileRotationPolicy::None,
                 queue_budget: DEFAULT_QUEUE_BUDGET,
                 size_cap: DEFAULT_SIZE_CAP,
-                disk_guard: None,
             },
         );
         p.set_recording(true, None).await;
@@ -4846,7 +4525,6 @@ mod tests {
                 renderer: DisplayView::default(),
                 mark_gaps: false,
             },
-            disk_guard: None,
         };
         p.set_display_recording(true, Some(settings)).await;
         assert_eq!(p.display_recording_state(), Some(RecordingState::Enabled));
@@ -4910,7 +4588,6 @@ mod tests {
                 renderer: DisplayView::default(),
                 mark_gaps: false,
             },
-            disk_guard: None,
         };
         let mut p = pipeline(cid, PipelineCapacities::default());
         p.set_display_recording(true, Some(first_settings.clone()))
@@ -5009,7 +4686,6 @@ mod tests {
                         renderer: DisplayView::default(),
                         mark_gaps: false,
                     },
-                    disk_guard: None,
                 });
             for read in reads {
                 p.ingest(bytes_chunk(cid, read));

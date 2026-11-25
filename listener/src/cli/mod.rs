@@ -712,10 +712,6 @@ fn format_event(event: &RuntimeEvent, names: &HashMap<ChannelId, String>) -> Opt
             compact_duration(*dur),
         ),
         RuntimeEvent::ControlLinesChanged(id) => format!("[{}] control lines changed", label(id)),
-        RuntimeEvent::DiskSpaceLow(id) => format!("[{}] LOW DISK", label(id)),
-        RuntimeEvent::RecordingStoppedLowDisk(id) => {
-            format!("[{}] recording stopped (low disk)", label(id))
-        }
         RuntimeEvent::MatchTriggered(id, rule) => {
             format!("[{}] match rule {rule} fired", label(id))
         }
@@ -1085,13 +1081,13 @@ mod tests {
         let id = crate::core::ChannelId::new();
         let names = std::collections::HashMap::from([(id, "GPS feed".to_owned())]);
         assert_eq!(
-            format_event(&RuntimeEvent::DiskSpaceLow(id), &names).as_deref(),
-            Some("[GPS feed] LOW DISK")
+            format_event(&RuntimeEvent::ControlLinesChanged(id), &names).as_deref(),
+            Some("[GPS feed] control lines changed")
         );
         let unnamed = crate::core::ChannelId::new();
         assert_eq!(
-            format_event(&RuntimeEvent::DiskSpaceLow(unnamed), &names),
-            Some(format!("[{unnamed}] LOW DISK"))
+            format_event(&RuntimeEvent::ControlLinesChanged(unnamed), &names),
+            Some(format!("[{unnamed}] control lines changed"))
         );
     }
 

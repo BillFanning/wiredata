@@ -12,6 +12,18 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-24) — control characters in a new view, a shorter baud
+list, and the interface line:
+
+- **§78 (ADR-075).** A new Channel's view, and a profile with no view,
+  shows control characters as control pictures (␊) instead of passing them
+  through.
+- **§14.1.** The baud list runs from 4800 to 115200, so it opens without
+  scrolling; any other rate is typed.
+- **§15 (ADR-047).** The line under a Channel's name gives a UDP Channel's mode,
+  address and port as talker's does, without the scope words; its hover says
+  who can reach the address.
+
 Revision note (2026-11-23) — the serial settings lines:
 
 - **§14.1, §14.3, §50.3 (ADR-074).** A Channel's serial settings are laid out

@@ -527,10 +527,10 @@ impl ListenerApp {
         }
     }
 
-    /// Lasting recording faults (§56.1, §56.2): low disk and "recording
-    /// unstable" stay on screen until they clear, whichever Channel is
-    /// selected, rather than scrolling away in the log. The glyph and the words
-    /// carry the fault; the colour only reinforces them.
+    /// Lasting recording faults (§56.1): "recording unstable" stays on screen
+    /// until it clears, whichever Channel is selected, rather than scrolling
+    /// away in the log. The glyph and the words carry the fault; the colour
+    /// only reinforces them.
     fn show_recording_faults_banner(&mut self, ui: &mut egui::Ui) {
         let lines = self.state.lasting_recording_faults();
         if lines.is_empty() {

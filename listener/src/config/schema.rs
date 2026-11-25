@@ -268,9 +268,6 @@ pub struct RawRecordingConfig {
     /// The soft size cap per file, in bytes (§59); `None` is the default cap.
     #[serde(default)]
     pub size_cap: Option<u64>,
-    /// Disk-space guard for long-running recordings (§56.2, §168); `None` = off.
-    #[serde(default)]
-    pub disk_guard: Option<DiskGuard>,
 }
 
 impl RawRecordingConfig {
@@ -327,7 +324,6 @@ impl Default for RawRecordingConfig {
             overwrite_policy: OverwritePolicy::AppendIfExists,
             file_rotation: FileRotationPolicy::Hourly,
             size_cap: None,
-            disk_guard: None,
         }
     }
 }
@@ -353,9 +349,6 @@ pub struct DisplayRecordingConfig {
     /// The soft size cap per file, in bytes (§59); `None` is the default cap.
     #[serde(default)]
     pub size_cap: Option<u64>,
-    /// Disk-space guard on the Display destination (§56.2); `None` = off.
-    #[serde(default)]
-    pub disk_guard: Option<DiskGuard>,
     /// Write a `‹GAP …›` line in the file a recording resumes in after bytes were
     /// lost (§56.1). On by default, so a profile saved before this option existed
     /// gets the lines.
@@ -381,41 +374,9 @@ impl Default for DisplayRecordingConfig {
             overwrite_policy: OverwritePolicy::AppendIfExists,
             file_rotation: FileRotationPolicy::Hourly,
             size_cap: None,
-            disk_guard: None,
             mark_gaps: true,
         }
     }
-}
-
-/// Disk-space guard for a recording (§56.2, §168). When free space on the
-/// destination filesystem falls below `min_free`, Listener raises a lasting
-/// low-disk fault and, if `on_low` is `StopRecording`, ends the current file
-/// cleanly and waits in a gap until free space is 10% above the threshold, while
-/// reception continues. Free space is polled periodically, not per write.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DiskGuard {
-    pub min_free: DiskThreshold,
-    pub on_low: LowDiskAction,
-}
-
-/// A low-disk threshold (§168): absolute bytes or a percentage of the filesystem.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
-pub enum DiskThreshold {
-    Bytes { bytes: u64 },
-    Percent { percent: u8 },
-}
-
-/// What to do when free disk space is low (§168).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum LowDiskAction {
-    /// Warn only; recording continues.
-    #[default]
-    Warn,
-    /// End the current file cleanly and wait in a gap until space returns;
-    /// reception continues (§96).
-    StopRecording,
 }
 
 /// A per-Channel Match Rule (§50.2, §165): a predicate over received data that

@@ -1444,7 +1444,8 @@ independently.
 - **Low disk** is a lasting, prominent fault, not a warning that scrolls away.
   Display-only recordings are guarded too. With `StopRecording`, the recording
   enters a Gap with reason low disk and resumes in a new segment once free space
-  is 10% above the threshold.
+  is 10% above the threshold. (Amended 2026-11-25: the disk guard is removed,
+  ADR-076. A full drive gaps a recording as a failed write.)
 - **A Display Recording marks its gaps.** `RecordingStopReason` is gone, and a stop
   always writes the accepted backlog, then finalizes. When a Display Recording resumes
   after a gap that lost bytes, the new segment starts with one line, `‹GAP <reason> ·
@@ -2687,6 +2688,47 @@ included, and the ctrl-chars row still has no button for it.
 **Consequences:** A new Channel's Display Recording is in the same form, so a
 `.disp` recorded with the default view holds ␍␊ instead of line breaks.
 Rendered keeps line breaks.
+
+## ADR-076 — The disk guard is removed; the size and free-space readout stays
+
+**Status:** Accepted 2026-11-25. Amends §56.1, §56.2, §71, §79, §137, §168 and
+Appendix A, and ADR-043.
+
+**Context:** A recording could carry a disk-space guard: a low-disk threshold,
+in bytes or a percentage of the drive, that raised a lasting low-disk fault and
+could pause recording in a gap until free space was 10% above it, while
+reception continued. Only a profile could set one; neither recording editor had
+a control for it. Asked to plan that control, the user chose to remove the
+guard instead, and to keep the recording line's size and free-space figures.
+
+**Decision:**
+
+- **The guard is removed, not hidden.** The `disk_guard` settings, the
+  threshold and recovery logic, the low-disk gap, the lasting low-disk fault and
+  the `DiskSpaceLow` and `RecordingStoppedLowDisk` events are gone.
+- **A profile with `disk_guard` is refused** as an unknown key (ADR-048). No
+  profiles are in use.
+- **The readout stays.** Each running recording's line still gives the size of
+  its files and the free space on its drive, checked every 5 s off the reception
+  path, with a failed check reported once (ADR-061).
+- **Re-adding a guard needs a new decision.** The removed design is this
+  entry's Context; ADR-013 and ADR-022 mention the guard as it was.
+
+**Boundary:** Listener still never deletes recordings (ADR-043). Talker never
+had a guard.
+
+**Alternatives considered:**
+
+- **Give the guard a control in each recording's setup:** the plan at the time;
+  the user chose removal.
+- **Remove the size and free-space figures as well:** declined by the user, so a
+  filling drive stays visible.
+
+**Consequences:** A drive that fills during a long run shows in the recording
+line but is not acted on. Once it is full, writes fail and the recording gaps
+with "writing the file failed" and retries (§56.1), which repeated faults turn
+into the lasting "recording unstable" fault. The case of a gap that lost no
+bytes, which low disk made, is now tested through a failed flush.
 
 ## Open questions
 

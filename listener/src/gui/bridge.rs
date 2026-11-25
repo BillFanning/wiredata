@@ -558,8 +558,6 @@ fn event_channel(event: &RuntimeEvent) -> ChannelId {
         | RuntimeEvent::ControlLinesChanged(id)
         | RuntimeEvent::ChannelReconnecting(id, _)
         | RuntimeEvent::ChannelReconnected(id)
-        | RuntimeEvent::DiskSpaceLow(id)
-        | RuntimeEvent::RecordingStoppedLowDisk(id)
         | RuntimeEvent::MatchTriggered(id, _) => *id,
     }
 }
@@ -3123,7 +3121,6 @@ mod tests {
             RuntimeEvent::RecordingStarted(id, crate::core::RecordingTap::Raw),
             RuntimeEvent::ChannelReconnecting(id, 1),
             RuntimeEvent::ChannelReconnected(id),
-            RuntimeEvent::DiskSpaceLow(id),
         ];
         for event in events {
             assert!(UiUpdate::Event(event.clone()).is_periodic(), "{event:?}");

@@ -57,7 +57,6 @@ pub(crate) fn recording_indicator(
             glyphs::RECONNECTING,
             pal.warning,
             match reason {
-                GapReason::LowDisk => "gap — waiting for disk space",
                 GapReason::DestinationMissing => "gap — waiting for the folder",
                 GapReason::QueueOverflow | GapReason::WriteFailed | GapReason::OpenFailed => {
                     "gap — retrying"

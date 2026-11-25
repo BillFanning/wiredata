@@ -22,7 +22,6 @@ use std::time::{Duration, SystemTime};
 
 use tokio::sync::oneshot;
 
-use crate::config::DiskGuard;
 use crate::core::{ChannelId, ChannelState, MatchRuleId, RecordingState};
 use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 
@@ -133,11 +132,6 @@ pub struct RecordingStatus {
     pub free_space: Option<u64>,
     /// When the next rotation is due, when the recording rotates (§59).
     pub next_rotation: Option<SystemTime>,
-    /// The disk guard, when one is configured (§56.2).
-    pub guard: Option<DiskGuard>,
-    /// Lasting fault: free space is below the guard's threshold. It clears
-    /// once free space is 10% above the threshold (§56.2).
-    pub low_disk: bool,
     /// Lasting fault: faults keep repeating, so retries have slowed. It
     /// clears when the recording is stopped (§56.1).
     pub unstable: bool,
@@ -146,7 +140,7 @@ pub struct RecordingStatus {
 impl RecordingStatus {
     /// Whether a lasting fault is active — the ones that stay on screen.
     pub fn has_lasting_fault(&self) -> bool {
-        self.low_disk || self.unstable
+        self.unstable
     }
 }
 

@@ -261,7 +261,6 @@ async fn talker_input_gets_zda_in_live_mark_and_disp_but_never_raw() {
         timestamp_enabled: false,
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
-        disk_guard: None,
         size_cap: None,
     };
     config.display_recording = DisplayRecordingConfig {
@@ -270,7 +269,6 @@ async fn talker_input_gets_zda_in_live_mark_and_disp_but_never_raw() {
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
         size_cap: None,
-        disk_guard: None,
         mark_gaps: true,
     };
 
@@ -463,7 +461,6 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
         timestamp_enabled: false,
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::Hourly,
-        disk_guard: None,
         size_cap: None,
     };
 
@@ -526,7 +523,6 @@ async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
         timestamp_enabled: false,
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
-        disk_guard: None,
         size_cap: None,
     };
 
@@ -605,7 +601,6 @@ async fn set_display_recording_toggles_display_recording_live_through_the_orches
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
         size_cap: None,
-        disk_guard: None,
         mark_gaps: true,
     };
 
@@ -699,7 +694,6 @@ async fn raw_and_display_recording_run_to_independent_destinations() {
         timestamp_enabled: false,
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
-        disk_guard: None,
         size_cap: None,
     };
     config.display_recording = DisplayRecordingConfig {
@@ -708,7 +702,6 @@ async fn raw_and_display_recording_run_to_independent_destinations() {
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
         size_cap: None,
-        disk_guard: None,
         mark_gaps: true,
     };
 

@@ -312,14 +312,6 @@ pub fn validate_channel(
         .chain(limits::size_cap_error(
             "display",
             channel.display_recording.size_cap,
-        ))
-        .chain(limits::disk_guard_error(
-            "raw",
-            channel.raw_recording.disk_guard,
-        ))
-        .chain(limits::disk_guard_error(
-            "display",
-            channel.display_recording.disk_guard,
         ));
     errors.extend(limits.map(ChannelConfigError::Limit));
 
@@ -924,14 +916,6 @@ actions = [{ kind = "PauseDisplay", view = 1 }, { kind = "Notify", severity = "E
 
         let mut udp = templates::udp_template();
         udp.name = ChannelName::new("udp");
-        udp.raw_recording.disk_guard = Some(DiskGuard {
-            min_free: DiskThreshold::Percent { percent: 5 },
-            on_low: LowDiskAction::Warn,
-        });
-        udp.display_recording.disk_guard = Some(DiskGuard {
-            min_free: DiskThreshold::Bytes { bytes: 1 << 30 },
-            on_low: LowDiskAction::StopRecording,
-        });
         udp.match_rules = vec![
             MatchRule {
                 name: "gga".to_owned(),
@@ -1000,16 +984,7 @@ actions = [{ kind = "PauseDisplay", view = 1 }, { kind = "Notify", severity = "E
             ("channels.0.display.view", "DisplayViewConfig"),
             ("channels.0.display.view.hex_grouping", "HexGrouping"),
             ("channels.0.raw_recording", "RawRecordingConfig"),
-            ("channels.0.raw_recording.disk_guard", "DiskGuard"),
-            (
-                "channels.0.raw_recording.disk_guard.min_free",
-                "DiskThreshold::Percent",
-            ),
             ("channels.0.display_recording", "DisplayRecordingConfig"),
-            (
-                "channels.0.display_recording.disk_guard.min_free",
-                "DiskThreshold::Bytes",
-            ),
             ("channels.0.retention", "RetentionConfig"),
             ("channels.0.match_rules.0", "MatchRule"),
             (
@@ -1109,29 +1084,6 @@ actions = [{ kind = "PauseDisplay", view = 1 }, { kind = "Notify", severity = "E
             ChannelConfigError::Limit(limits[0].clone()).to_string(),
             limits[0].to_string()
         );
-    }
-
-    #[test]
-    fn a_disk_guard_threshold_the_guard_cannot_act_on_skips_the_channel() {
-        let with = |min_free| {
-            let mut channel = templates::udp_template();
-            channel.raw_recording.disk_guard = Some(DiskGuard {
-                min_free,
-                on_low: LowDiskAction::Warn,
-            });
-            validate_channel(&channel, &DefaultConfig::default())
-        };
-        assert_eq!(with(DiskThreshold::Percent { percent: 90 }), Ok(()));
-        assert_eq!(with(DiskThreshold::Bytes { bytes: 1 }), Ok(()));
-        let errors = with(DiskThreshold::Percent { percent: 91 }).unwrap_err();
-        assert_eq!(
-            errors,
-            vec![ChannelConfigError::Limit(LimitError::DiskGuardPercent {
-                recording: "raw",
-                found: 91
-            })]
-        );
-        assert!(with(DiskThreshold::Bytes { bytes: 0 }).is_err());
     }
 
     #[test]

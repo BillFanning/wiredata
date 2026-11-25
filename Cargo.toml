@@ -34,7 +34,7 @@ libc = "0.2"
 # ── Local network addresses for the UDP bind choice (listener ADR-047) ────────
 if-addrs = "0.15"
 
-# ── Filesystem free space for the recording disk guard (§168) ─────────────────
+# ── Filesystem free space for the recording readout (§56.2) ───────────────────
 # fs4 is the maintained successor to fs2 (same free-function disk-space API). The
 # recording-destination advisory lock (§121, ADR-014) uses std's own
 # `File::try_lock` (stable since 1.89), not fs4 — so no extra fs4 feature is needed.

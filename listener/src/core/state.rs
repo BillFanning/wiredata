@@ -83,8 +83,6 @@ pub enum GapReason {
     OpenFailed,
     /// The recording folder, or its marker, is not there (§59).
     DestinationMissing,
-    /// Free space is below the disk guard's threshold (§56.2).
-    LowDisk,
 }
 
 impl GapReason {
@@ -95,7 +93,6 @@ impl GapReason {
             Self::WriteFailed => "writing the file failed",
             Self::OpenFailed => "the next file could not be opened",
             Self::DestinationMissing => "the recording folder is missing",
-            Self::LowDisk => "free disk space is low",
         }
     }
 }

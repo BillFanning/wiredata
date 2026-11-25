@@ -54,7 +54,6 @@ async fn sustained_recording_records_every_byte() {
         timestamp_enabled: false,
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
-        disk_guard: None,
         size_cap: None,
     };
 

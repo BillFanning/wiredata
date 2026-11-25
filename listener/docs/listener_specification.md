@@ -1,21 +1,16 @@
-# Listener Specification v2.6.8
+# Listener Specification v2.6.9
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-24) — control characters in a new view, a shorter baud
-list, and the interface line:
+Revision note (2026-11-25) — the disk guard is removed:
 
-- **§78 (ADR-075).** A new Channel's view, and a profile with no view,
-  shows control characters as control pictures (␊) instead of passing them
-  through.
-- **§14.1.** The baud list runs from 4800 to 115200, so it opens without
-  scrolling; any other rate is typed.
-- **§15 (ADR-047).** The line under a Channel's name gives a UDP Channel's mode,
-  address and port as talker's does, without the scope words; its hover says
-  who can reach the address.
+- **§56.2, §71, §79, §137, §168 (ADR-076).** A recording has no disk-space
+  guard: no low-disk threshold, no lasting low-disk fault, no low-disk gap and
+  no low-disk events. A profile with `disk_guard` is refused as an unknown key.
+  Status still shows each recording's size and the free space on its drive.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -1253,8 +1248,8 @@ any state → Stopping → Off
   flush: a gap is opened from the first byte not known to be on disk, it is
   reported and counted like any other gap, and recording resumes in a new file
   through the usual retry. When the close fails as recording stops for a full
-  queue or low disk, the gap already being opened is widened back to that byte
-  and the failure is named in its detail.
+  queue, the gap already being opened is widened back to that byte and the
+  failure is named in its detail.
 - **Flush.** A flush that is due is not put off by a backlog of queued data; it
   runs before the next queued item is written. A flush hands the data to the
   operating system. It is not guaranteed to be on the storage medium.
@@ -1267,38 +1262,23 @@ byte-exact for the data it contains, with a known end**; the recording as a whol
 is the segments in name order plus the gap records between them — not
 guaranteed complete.
 
-### 56.2 Disk-Space Guard
+### 56.2 Recording Size and Free Space
 
-To protect long-duration recording (extended logging, §123), a recording may
-configure a **disk-space guard** (`DiskGuard`, §79/§80.1) on its destination
-filesystem:
+Listener never deletes recordings; retention is the operator's (ADR-043). So the
+operator can see a drive filling during a long recording (extended logging,
+§123), status/snapshot expose the current recording file, bytes written, the
+total size of the recording's files, the free space on the destination's
+filesystem, and — when rotation is configured (§59) — the time remaining until
+the next rotation.
 
-```rust
-struct DiskGuard {
-    min_free: Option<DiskThreshold>,  // minimum free space (bytes or percent)
-    on_low: LowDiskAction,            // Warn | StopRecording
-}
-```
+The sizes and free space are **polled periodically**, not checked on every
+write, and the check runs where a hung drive or share cannot hold up reception
+(§96). A failed check is itself reported, naming the Channel, and so is its
+recovery.
 
-Raw and Display recordings may each configure a guard, on their own destination.
-
-Free space is **polled periodically**, not checked on every write. When it falls
-below the threshold Listener raises a **lasting** low-disk fault (§93) that stays
-on screen until free space recovers, rather than a warning that scrolls away. A
-failed free-space check is itself reported, naming the Channel. If `on_low` is
-`StopRecording`, the recorder finalizes the current segment cleanly and enters a
-gap with reason low disk (§56.1), emitting `RecordingStoppedLowDisk` (§137) while
-**reception continues** (§96). It resumes in a new segment once free space is 10%
-above the threshold.
-
-A percentage threshold must be 1 to 90 and a byte threshold more than 0;
-anything else makes the Channel invalid (§71), since a percentage above 90
-could never reach the resume level.
-
-Listener never deletes recordings; retention is the operator's (ADR-043).
-Status/snapshot expose the current recording file, bytes written, the total size
-of the recording's files, free space, and — when rotation is configured (§59) —
-the time remaining until the next rotation.
+Listener has no disk-space guard: a filling drive is shown, not acted on
+(ADR-076, Appendix A). A full drive makes writes fail, which gaps the recording
+like any failed write (§56.1).
 
 ## 57. Timestamp Recording
 
@@ -1530,9 +1510,6 @@ UDP Feed           Valid
 
 Resources that cannot be validated until Start shall be validated during Start.
 
-Validation includes each recording's disk-guard threshold: 1 to 90 percent, or
-more than 0 bytes (§56.2).
-
 **Strict parsing (ADR-048).** An unknown key, or a missing `schema_version`, is
 a parse error rather than a Channel error: the profile does not load, and the
 message names the key and where it is (for a missing version, "add
@@ -1733,7 +1710,6 @@ struct RawRecordingConfig {            // §53 — the verbatim byte stream (.ra
     overwrite_policy: OverwritePolicy,
     file_rotation: FileRotationPolicy, // §59; default None
     size_cap: Option<u64>,             // §59 soft cap in bytes; None = 2 GiB; ≥ 64 MiB
-    disk_guard: Option<DiskGuard>,     // §56.2
 }
 
 struct DisplayRecordingConfig {        // §54 — the rendered view output (.disp)
@@ -1742,7 +1718,6 @@ struct DisplayRecordingConfig {        // §54 — the rendered view output (.di
     overwrite_policy: OverwritePolicy, // first file of an enable only (§55)
     file_rotation: FileRotationPolicy, // §59; default None
     size_cap: Option<u64>,             // §59, as for Raw
-    disk_guard: Option<DiskGuard>,     // §56.2, on the Display destination
     mark_gaps: bool,                   // §54; default true — a ‹GAP …› line
                                        //   where recording resumes after lost bytes
 }                                      // no timestamp field — the only display
@@ -1823,8 +1798,8 @@ pub struct DefaultConfig {
 }
 
 // (FileRotationPolicy §59, MatchRule/MatchCondition/MatchAction/RecordTarget/
-//  RecordControl §50.2, DiskGuard §56.2, and SerialControlLines §14.3 are defined
-//  in their body sections.)
+//  RecordControl §50.2, and SerialControlLines §14.3 are defined in their body
+//  sections.)
 
 // §45; groups_per_line 0 = fit to the display width.
 pub struct HexGrouping { pub bytes_per_group: u8, pub groups_per_line: u8 }
@@ -1838,9 +1813,6 @@ pub struct MatchRuleId(uuid::Uuid); // §50.2
 pub struct ReconnectPolicy {        // §9.1; enabled defaults false; the pace is fixed (ADR-072)
     pub enabled: bool,
 }
-
-pub enum DiskThreshold { Bytes(u64), Percent(u8) } // §56.2
-pub enum LowDiskAction { Warn, StopRecording }     // §56.2; Stop gaps, then resumes
 ```
 
 A profile's defaults are resolved once, at load, by one function that validation, the GUI loader and the CLI loader all use (ADR-067). Each Channel that leaves a setting unset takes the profile's default and from then on carries its own explicit value, so a GUI Save writes per-Channel values with an empty defaults section, and loading that file behaves the same. Retention is inherited whole when the Channel sets no limit at all; individual limits are never merged. Display is inherited when the Channel's display equals the built-in default, because display settings have no unset state, so a Channel cannot ask for the built-in display under a profile whose default differs.
@@ -2906,8 +2878,6 @@ pub enum RuntimeEvent {
     MatchTriggered(ChannelId, MatchRuleId),   // §50.2: a rule fired (Notify/Mark observable here)
     ChannelReconnecting(ChannelId, u32 /*attempt*/), // §9.1
     ChannelReconnected(ChannelId),
-    DiskSpaceLow(ChannelId),                  // §56.2
-    RecordingStoppedLowDisk(ChannelId),
 }
 ```
 
@@ -3304,12 +3274,11 @@ reception (§91.1).
 _Deferred (§76.1, Appendix A)._ Network parameters change through the
 apply-pending restart (§13).
 
-## 168. Disk-Space Guard
+## 168. Recording Size and Free Space
 
-On low disk a recording shall raise a lasting fault and, if configured, finalize
-cleanly and gap while reception continues, resuming in a new segment once free
-space recovers; status shall surface current file, bytes written, the
-recordings' total size, free space, and rotation countdown (§56.2).
+Status shall surface each running recording's current file, bytes written, the
+total size of its files, the free space on its drive, and the rotation
+countdown (§56.2). Listener has no disk-space guard (ADR-076).
 
 ## 169. Unattended Operation
 
@@ -3322,7 +3291,7 @@ with the §3.1 codes. Every diagnostic shall reach the persistent event log
 
 # Appendix A — Deferred Features
 
-Deferred (ADR-023/ADR-024/ADR-047):
+Deferred (ADR-023/ADR-024/ADR-047/ADR-076):
 
 - Multiple simultaneous Display Views per Channel (§48 — one view with switchable
   modes ships; per-view render state would be required for independent pause)
@@ -3333,6 +3302,9 @@ Deferred (ADR-023/ADR-024/ADR-047):
   `recv_buffer_bytes` on accepted sockets — and a default connection cap,
   per-OS keepalive timings, and per-connection accept-error handling
 - Export (§60–§64)
+- A disk-space guard: a low-disk threshold per recording that warns, or pauses
+  recording while reception continues (§56.2, ADR-076). Its code was removed;
+  re-adding it needs a new decision
 - Network live adjustment: receive buffer and multicast membership without a
   re-bind (§76.1, §167)
 

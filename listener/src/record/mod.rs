@@ -11,7 +11,7 @@
 //!
 //! Each runs as its own [`controller`] task draining a queue bounded in bytes
 //! (§142). The producer's enqueue is non-blocking. A fault — a full queue, a
-//! failed write or open, a missing destination, low disk — opens a **gap**
+//! failed write or open, a missing destination — opens a **gap**
 //! rather than ending the recording: bytes are omitted, the gap is recorded,
 //! and recording continues in a new numbered segment (ADR-043, §56.1).
 

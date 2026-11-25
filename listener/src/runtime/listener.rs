@@ -1018,7 +1018,6 @@ impl Listener {
                 file_rotation: display.file_rotation,
                 queue_budget: self.caps.recording_queue_budget,
                 size_cap: display.size_cap(),
-                disk_guard: display.disk_guard,
                 extra: DisplayExtra {
                     renderer,
                     mark_gaps: display.mark_gaps,
@@ -1901,7 +1900,6 @@ impl Listener {
             // (§55) rather than a start fault.
             None,
             None,
-            // Each recording's disk guard travels in its settings (§56.2).
             // Match Rules (§50.2, §165) plus the Raw recording settings a match-
             // triggered `Record` needs (lazy-create from the destination — nothing
             // until a match fires).
@@ -1978,7 +1976,6 @@ impl Listener {
                 file_rotation: raw.file_rotation,
                 queue_budget: self.caps.recording_queue_budget,
                 size_cap: raw.size_cap(),
-                disk_guard: raw.disk_guard,
                 extra: RawExtra {
                     timestamps: raw.timestamp_enabled,
                 },
@@ -2553,7 +2550,6 @@ mod tests {
             timestamp_enabled: false,
             overwrite_policy: OverwritePolicy::Refuse,
             file_rotation: FileRotationPolicy::Hourly,
-            disk_guard: None,
             size_cap: None,
         };
         let settings = listener.settings_from(&raw, "GPS").unwrap();
@@ -2584,7 +2580,6 @@ mod tests {
             timestamp_enabled: false,
             overwrite_policy: OverwritePolicy::Overwrite,
             file_rotation: FileRotationPolicy::None,
-            disk_guard: None,
             size_cap: None,
         };
         assert!(
@@ -3628,7 +3623,6 @@ mod tests {
             timestamp_enabled: false,
             overwrite_policy: OverwritePolicy::Refuse,
             file_rotation: FileRotationPolicy::None,
-            disk_guard: None,
             size_cap: None,
         };
         let id = listener.add_channel(config);
@@ -3999,7 +3993,6 @@ mod tests {
             timestamp_enabled: false,
             overwrite_policy: OverwritePolicy::Overwrite,
             file_rotation: FileRotationPolicy::None,
-            disk_guard: None,
             size_cap: None,
         };
 

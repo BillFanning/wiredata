@@ -77,7 +77,7 @@ fn lock_recording_destination(path: &Path) -> Result<std::fs::File, RecordError>
 /// Unix a deleted file can stay locked), so two would write at once.
 pub(crate) fn lock_file(lock: &Path) -> Result<std::fs::File, RecordError> {
     // `std::fs::File::try_lock` (stable since Rust 1.89) — no fs4 needed
-    // for the lock; fs4 stays for the disk-space free functions (§168).
+    // for the lock; fs4 stays for the free-space readout (§56.2).
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

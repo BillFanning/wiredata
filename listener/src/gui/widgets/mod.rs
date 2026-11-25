@@ -907,10 +907,6 @@ mod tests {
         assert_eq!(glyph, wiredata_ui::glyphs::RECONNECTING);
         assert_eq!(label, "gap — retrying");
         assert_eq!(
-            recording_indicator(Some(RecordingState::Gap(GapReason::LowDisk)), pal).2,
-            "gap — waiting for disk space"
-        );
-        assert_eq!(
             recording_indicator(
                 Some(RecordingState::Gap(GapReason::DestinationMissing)),
                 pal

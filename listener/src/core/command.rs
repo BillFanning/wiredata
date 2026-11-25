@@ -69,12 +69,6 @@ pub enum RuntimeEvent {
     ChannelReconnecting(ChannelId, u32),
     /// Auto-reconnect succeeded — the Channel is Running again.
     ChannelReconnected(ChannelId),
-    /// Free disk space for a Channel's recording fell below its guard threshold
-    /// (§56.2, §168). Recording may continue (Warn) or stop (see below).
-    DiskSpaceLow(ChannelId),
-    /// A recording was stopped and finalized because of low disk (§168); reception
-    /// continues.
-    RecordingStoppedLowDisk(ChannelId),
     /// A Match Rule fired on a Channel (§50.2, §165). Carries the runtime id of the
     /// rule that matched; `Notify`/`Mark` actions are observable here.
     MatchTriggered(ChannelId, MatchRuleId),
