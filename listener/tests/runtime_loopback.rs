@@ -232,6 +232,9 @@ async fn talker_input_gets_zda_in_live_mark_and_disp_but_never_raw() {
         udp.bind_address = "127.0.0.1".to_string();
         udp.port = port;
     }
+    // Control characters as they are, so the `.disp` holds the sentence's own
+    // CR LF and the assertions below can look for the wire text verbatim.
+    config.display.view.character_rendering = listener::display::CharacterRendering::Native;
     config.match_rules = vec![MatchRule {
         name: "ZDA correlate".to_string(),
         condition: MatchCondition::BytePattern {

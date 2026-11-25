@@ -204,13 +204,13 @@ pub struct DisplayViewConfig {
 }
 
 impl Default for DisplayViewConfig {
-    /// Raw bytes as UTF-8, characters shown as they are, no wrapping: the
-    /// renderer's own default (`display::DisplayView`).
+    /// Raw bytes as UTF-8, control characters as control pictures (␊), no
+    /// wrapping (§78, ADR-075).
     fn default() -> Self {
         Self {
             mode: DisplayMode::Raw,
             encoding: DisplayEncoding::Utf8,
-            character_rendering: CharacterRendering::Native,
+            character_rendering: CharacterRendering::Glyph,
             font: None,
             font_size: None,
             foreground_color: None,

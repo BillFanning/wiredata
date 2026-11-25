@@ -2665,6 +2665,26 @@ still apply at once. The profile keys and their accepted values are unchanged.
 **Consequences:** A profile with Mark, Space or 1.5 still cannot start, as
 before; the editor now says why instead of offering it as a choice.
 
+## ADR-075 — A new view shows control characters as control pictures
+
+**Status:** Accepted 2026-11-24. Amends §78 and ADR-060's default view.
+
+**Context:** A new Channel's view was Raw with control characters passed
+through (`Native`). The ctrl-chars row offers only ␊, [LF] and <0A>, so none
+was selected. Passed through, a line feed still broke the line on screen,
+in the mode meant to show control characters rather than act on them.
+
+**Decision:** The default view is Raw / Utf8 / Glyph / NoWrap: a new Channel,
+and a profile that gives no view, show control characters as control
+pictures. `Native` stays a valid profile value.
+
+**Boundary:** A profile that names a character rendering keeps it, `Native`
+included, and the ctrl-chars row still has no button for it.
+
+**Consequences:** A new Channel's Display Recording is in the same form, so a
+`.disp` recorded with the default view holds ␍␊ instead of line breaks.
+Rendered keeps line breaks.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

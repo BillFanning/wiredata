@@ -200,4 +200,17 @@ mod tests {
         let prefs = ViewPrefs::from_config(&config);
         assert_eq!(prefs.font_size, DEFAULT_FONT_SIZE);
     }
+
+    /// A new channel's Raw view shows control characters as control pictures,
+    /// so one of the ctrl-chars buttons is selected from the start. Native has
+    /// no button, and it let a line feed break the line in a view that
+    /// promises not to interpret control characters.
+    #[test]
+    fn a_new_channel_shows_control_characters_as_glyphs() {
+        for config in [templates::udp_template(), templates::serial_template()] {
+            let prefs = ViewPrefs::from_config(&config);
+            assert_eq!(prefs.mode, DisplayMode::Raw);
+            assert_eq!(prefs.chars, CharacterRendering::Glyph);
+        }
+    }
 }

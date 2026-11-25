@@ -12,6 +12,16 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-23) — the serial settings lines:
+
+- **§14.1, §14.3, §50.3 (ADR-074).** A Channel's serial settings are laid out
+  as Linemon's, with the same widgets: the port, baud rate and framing on one
+  line of drop-downs, then Flow and the control lines. The input lines are
+  circles filled when high.
+- **§14.1.** The standard baud rates run from 4800 to 921600; any other rate
+  is typed. Only parity None, Even and Odd and 1 or 2 stop bits are offered.
+- **§50.3.** A port the system does not list can be typed by name.
+
 Revision note (2026-11-21) — Linemon's serial markers and RTS under RTS/CTS:
 
 - **§14.3, §50.3, §161 (ADR-073).** On Windows, RTS under RTS/CTS flow control

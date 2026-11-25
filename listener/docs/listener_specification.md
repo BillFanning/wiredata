@@ -1,19 +1,15 @@
-# Listener Specification v2.6.7
+# Listener Specification v2.6.8
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-23) — the serial settings lines:
+Revision note (2026-11-24) — control characters in a new view:
 
-- **§14.1, §14.3, §50.3 (ADR-074).** A Channel's serial settings are laid out
-  as Linemon's, with the same widgets: the port, baud rate and framing on one
-  line of drop-downs, then Flow and the control lines. The input lines are
-  circles filled when high.
-- **§14.1.** The standard baud rates run from 4800 to 921600; any other rate
-  is typed. Only parity None, Even and Odd and 1 or 2 stop bits are offered.
-- **§50.3.** A port the system does not list can be typed by name.
+- **§78 (ADR-075).** A new Channel's view, and a profile with no view,
+  shows control characters as control pictures (␊) instead of passing them
+  through.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -1693,8 +1689,8 @@ _Removed. There is no decoder (§29); `DecoderConfig` is gone._
 ```rust
 struct DisplayConfig {
     view: DisplayViewConfig,           // one per Channel (§48); a missing table
-                                       //   is the default Raw / Utf8 / Native /
-                                       //   NoWrap view
+                                       //   is the default Raw / Utf8 / Glyph /
+                                       //   NoWrap view (ADR-075)
 }
 
 struct DisplayViewConfig {
