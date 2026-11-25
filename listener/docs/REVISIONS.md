@@ -12,6 +12,15 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-25) — kernel arrival times on Linux:
+
+- **§15, §26, §75, §84 (ADR-077).** A UDP Channel on Linux always uses the
+  kernel's receive timestamp as each datagram's arrival time. The Kernel
+  timestamp setting and the `kernel_timestamps` profile key are gone; a profile
+  with the key is refused as unknown. Windows and macOS, which have no such
+  timestamp, use the post-read time as before. The event log says once, as a UDP
+  Channel starts, where its arrival times come from.
+
 Revision note (2026-11-25) — the disk guard is removed:
 
 - **§56.2, §71, §79, §137, §168 (ADR-076).** A recording has no disk-space

@@ -1,18 +1,14 @@
-# Listener Specification v2.6.10
+# Listener Specification v2.6.11
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-25) — kernel arrival times on Linux:
+Revision note (2026-11-25) — the recording lock files:
 
-- **§15, §26, §75, §84 (ADR-077).** A UDP Channel on Linux always uses the
-  kernel's receive timestamp as each datagram's arrival time. The Kernel
-  timestamp setting and the `kernel_timestamps` profile key are gone; a profile
-  with the key is refused as unknown. Windows and macOS, which have no such
-  timestamp, use the post-read time as before. The event log says once, as a UDP
-  Channel starts, where its arrival times come from.
+- **§121.** The recording lock is named: an empty `.raw.lock` or `.disp.lock`
+  file beside the recording, which stays in place after recording stops.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -2530,6 +2526,14 @@ the Channel Running (reception continues; recording stays off). On a local files
 this is robust on Windows, macOS, and Linux. Residual gaps (identical on every OS): an
 unrelated external program that writes without locking is not blocked on Unix (advisory
 locks), and advisory locks over a network filesystem are unreliable.
+
+**The lock is a file of its own.** A recording to one file locks `<file>.lock`
+beside it, so `GPS.raw` has `GPS.raw.lock`; a rotating recording locks
+`<channel>.raw.lock` or `<channel>.disp.lock` in its folder. The file is empty,
+is locked for the recording's whole life, and stays in place after recording
+stops: deleting it on release could let two recorders write at once, since on
+Unix a deleted file can stay locked. It may be deleted only while no Listener is
+running.
 
 ## 122. Privileged Resources
 

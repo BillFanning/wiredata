@@ -63,14 +63,6 @@ again. Remove an item when it is done: the commit says what changed.
 The retry questions shared with talker are in
 [`talker/docs/TODO.md`](../../talker/docs/TODO.md), under Retry and backoff.
 
-## Specification
-
-- [ ] **Name the lock files in §121 at the next spec bump.** §121 says each
-  recording holds an advisory lock. It doesn't say the lock is a separate
-  `.raw.lock` or `.disp.lock` file that stays in the folder after recording stops
-  (`lock_file`). `deploy/README.md` tells operators this. A spec change needs a
-  version bump, so this waits for the next one.
-
 ## Soak
 
 - [ ] **The Serial stall cell under sustained backpressure (ADR-034).**

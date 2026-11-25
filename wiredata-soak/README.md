@@ -88,6 +88,11 @@ Done on Windows 2026-10-01: all three passed. So did one minute at run 2's
 rate (16 × 1,000/s, Display on one Channel): 16 × 60,003 records, nothing
 missing, 12.7 MiB peak private memory.
 
+Again on Windows 2026-11-25, after the disk guard was removed and a faulted
+Channel was made to keep answering status: all three passed, and one minute at
+run 2's rate gave 16 × 60,001 records, nothing missing, 10.4 MiB peak private
+memory.
+
 ## Run 1: expected load (PLAN 7.4)
 
 72 hours, 4 Channels × 100 datagrams a second, about 6.5 GB, on Windows and then
