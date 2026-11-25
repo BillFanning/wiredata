@@ -1,6 +1,7 @@
-//! A UDP Channel's bind scope in words (§15, ADR-047): who can reach a socket
-//! bound to its address. "0.0.0.0" does not tell a reader that the socket is
-//! reachable from the network; these words do.
+//! A UDP Channel's binding-address choices (§15, ADR-047): every interface,
+//! or one of the host's local addresses, each named in words. "0.0.0.0" does
+//! not tell a reader that the socket is reachable from the network; the
+//! choice's label does.
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -9,48 +10,6 @@ pub const ALL_INTERFACES_ADDRESS: &str = "0.0.0.0";
 
 /// How the editor labels binding to every interface (§15).
 pub const ALL_INTERFACES: &str = "All interfaces (reachable from the network)";
-
-/// Who can reach a socket bound to an address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BindScope {
-    /// Every interface, so anything on any network this computer is on.
-    AllInterfaces,
-    /// A loopback address: programs on this computer only.
-    ThisComputer,
-    /// One interface's address: what can reach that interface.
-    OneInterface,
-    /// Not an IP address. The Channel cannot start, and says why when it tries.
-    Unreadable,
-}
-
-impl BindScope {
-    /// The scope of a configured bind address. An IPv6 address may be written
-    /// with the brackets the socket address needs.
-    pub fn of(bind_address: &str) -> Self {
-        let address = bind_address.trim();
-        let address = address
-            .strip_prefix('[')
-            .and_then(|a| a.strip_suffix(']'))
-            .unwrap_or(address);
-        match address.parse::<IpAddr>() {
-            Ok(ip) if ip.is_unspecified() => Self::AllInterfaces,
-            Ok(ip) if ip.is_loopback() => Self::ThisComputer,
-            Ok(_) => Self::OneInterface,
-            Err(_) => Self::Unreadable,
-        }
-    }
-
-    /// The scope for the Channel header, or `None` when the address is
-    /// unreadable.
-    pub fn words(self) -> Option<&'static str> {
-        match self {
-            Self::AllInterfaces => Some("all interfaces (reachable from the network)"),
-            Self::ThisComputer => Some("this computer only"),
-            Self::OneInterface => Some("one interface only"),
-            Self::Unreadable => None,
-        }
-    }
-}
 
 /// The host's local addresses, as the driver last listed them.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -154,26 +113,6 @@ mod tests {
             ip: Ipv4Addr::from(ip),
             interface: interface.to_owned(),
         }
-    }
-
-    #[test]
-    fn the_scope_says_who_can_reach_the_socket() {
-        assert_eq!(BindScope::of("0.0.0.0"), BindScope::AllInterfaces);
-        assert_eq!(BindScope::of(" 0.0.0.0 "), BindScope::AllInterfaces);
-        assert_eq!(BindScope::of("[::]"), BindScope::AllInterfaces);
-        assert_eq!(BindScope::of("127.0.0.1"), BindScope::ThisComputer);
-        assert_eq!(BindScope::of("[::1]"), BindScope::ThisComputer);
-        assert_eq!(BindScope::of("192.168.1.20"), BindScope::OneInterface);
-        assert_eq!(BindScope::of("not-an-address"), BindScope::Unreadable);
-        assert_eq!(BindScope::of(""), BindScope::Unreadable);
-
-        assert_eq!(
-            BindScope::AllInterfaces.words(),
-            Some("all interfaces (reachable from the network)")
-        );
-        assert_eq!(BindScope::ThisComputer.words(), Some("this computer only"));
-        assert_eq!(BindScope::OneInterface.words(), Some("one interface only"));
-        assert_eq!(BindScope::Unreadable.words(), None);
     }
 
     #[test]

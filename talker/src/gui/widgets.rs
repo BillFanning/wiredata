@@ -10,7 +10,8 @@ use wiredata_ui::diagnostics::{dismissible_attention_callout, SignalTone};
 use wiredata_ui::serial::{self as shared, LineClick, RtsByFlow};
 
 use crate::core::channel::{
-    ChannelId, ControlLines, FlowControl, InterfaceConfig, OutputLine, RTS_HIGH_UNDER_RTS_CTS,
+    ChannelId, ControlLines, FlowControl, InterfaceConfig, LocalAddress, OutputLine,
+    RTS_HIGH_UNDER_RTS_CTS,
 };
 use crate::core::message::{
     code_page_encodes, decode_codepage_byte, repair_after_edit, segments, ChecksumAlgorithm,
@@ -31,7 +32,9 @@ pub(super) struct LiveUpdateQueueGauge {
     pub capacity: usize,
 }
 
-use super::draft::{ConnDraft, ConnKind, PayloadKind, PortHold, ScheduleDraft, UdpModeDraft};
+use super::draft::{
+    multicast_ttl, ConnDraft, ConnKind, PayloadKind, PortHold, ScheduleDraft, UdpModeDraft,
+};
 use super::notice::DismissedNotice;
 use super::{MessageAnalysisCache, MessageDraftAnalysis};
 
@@ -103,9 +106,21 @@ pub(super) fn start_button(
 
 // ── Interface summary / start blockers ────────────────────────────────────────
 
+/// The hover of the line in a channel's header that gives its interface.
+const INTERFACE_SUMMARY_HOVER: Hover = Hover::new(
+    "This channel's interface, as Configure interface sets it.\n\n\
+     For UDP: the mode, then the address and port the datagrams go to, and the local \
+     port they are sent from when one is set.\n\n\
+     For serial: the port, then the baud rate, data bits, parity and stop bits, as in \
+     9600,8,N,1, and the flow control.\n\n\
+     A ? marks a setting that is missing or not valid yet. The channel cannot start \
+     until it is filled in.",
+);
+
 /// Render [`interface_summary`] in a channel header, splitting on `?`
 /// markers so unknown / unfilled fields show up as a **bold red** glyph
-/// rather than blending into the rest of the weak-grey summary text.
+/// rather than blending into the rest of the weak-grey summary text. Every
+/// piece carries the line's hover.
 pub(super) fn show_interface_summary(ui: &mut egui::Ui, conn: &ConnDraft) {
     let text = interface_summary(conn);
     ui.horizontal(|ui| {
@@ -113,7 +128,8 @@ pub(super) fn show_interface_summary(ui: &mut egui::Ui, conn: &ConnDraft) {
         let mut buf = String::new();
         let flush = |ui: &mut egui::Ui, buf: &mut String| {
             if !buf.is_empty() {
-                ui.weak(std::mem::take(buf));
+                ui.weak(std::mem::take(buf))
+                    .on_hover(&INTERFACE_SUMMARY_HOVER);
             }
         };
         // Render the ? as inline text with a red background — RichText
@@ -132,7 +148,8 @@ pub(super) fn show_interface_summary(ui: &mut egui::Ui, conn: &ConnDraft) {
                         .color(egui::Color32::WHITE)
                         .strong()
                         .background_color(red_bg),
-                );
+                )
+                .on_hover(&INTERFACE_SUMMARY_HOVER);
             } else {
                 buf.push(c);
             }
@@ -296,6 +313,11 @@ fn channel_blockers(conn: &ConnDraft, sink: &mut BlockerSink) -> ControlFlow<()>
             if invalid_parse::<u16>(&conn.local_port) {
                 sink(&|| "Channel: local port must be 1–65535".to_string())?;
             }
+            if conn.udp_mode == UdpModeDraft::Multicast
+                && multicast_ttl(&conn.udp_multicast_ttl).is_none()
+            {
+                sink(&|| "Channel: multicast TTL must be 0–255".to_string())?;
+            }
         }
     }
     ControlFlow::Continue(())
@@ -355,6 +377,8 @@ pub(super) struct InterfaceEdit {
     pub changed: bool,
     /// The serial port list should be read again.
     pub refresh_ports: bool,
+    /// This computer's network address list should be read again.
+    pub refresh_addresses: bool,
     /// An output line's button was clicked, on a serial channel.
     pub click: Option<LineClick>,
 }
@@ -450,16 +474,24 @@ pub(super) fn show_serial_fields(
         changed,
         refresh_ports: first.refresh_ports,
         click: second.click,
+        ..InterfaceEdit::default()
     }
 }
 
-/// A UDP channel's editor: two lines, each wrapping to fit the detail pane.
-/// The first is where the datagrams go, as an address and port, followed by
-/// the local port; the second is the mode. Returns `true` when a value was
-/// committed or the mode changed, which a running channel takes at once.
-pub(super) fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
+/// A UDP channel's editor: lines that each wrap to fit the detail pane. The
+/// first is where the datagrams go, as an address and port, followed by the
+/// local port; the second is the mode; in Multicast a third gives the outgoing
+/// interface and the TTL. `changed` is set when a value was committed or the
+/// mode changed, which a running channel takes at once. `addresses` is this
+/// computer's network addresses, `None` until they are first listed.
+pub(super) fn show_udp_fields(
+    ui: &mut egui::Ui,
+    conn: &mut ConnDraft,
+    addresses: Option<&[LocalAddress]>,
+) -> InterfaceEdit {
     let before_mode = conn.udp_mode;
     let mut apply = false;
+    let mut refresh_addresses = false;
 
     // Per-mode namespace even though all three modes render the same
     // [addr] [port] [local-port] shape — kept as defence-in-depth so any
@@ -477,17 +509,216 @@ pub(super) fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
             apply |= show_udp_local_port(ui, conn);
         });
         ui.horizontal_wrapped(|ui| show_udp_mode(ui, conn));
+        if conn.udp_mode == UdpModeDraft::Multicast {
+            ui.horizontal_wrapped(|ui| {
+                let (changed, refresh) = show_multicast_interface(ui, conn, addresses);
+                apply |= changed;
+                refresh_addresses = refresh;
+                apply |= show_multicast_ttl(ui, conn);
+            });
+        }
     });
 
-    apply || (conn.udp_mode != before_mode)
+    InterfaceEdit {
+        changed: apply || (conn.udp_mode != before_mode),
+        refresh_addresses,
+        ..InterfaceEdit::default()
+    }
+}
+
+/// How the multicast interface choice names letting the system choose.
+const MULTICAST_SYSTEM_DEFAULT: &str = "System default";
+
+const BROADCAST_DESTINATION_HOVER: Hover = Hover::new(
+    "Where the broadcast datagrams go.\n\n\
+     255.255.255.255 reaches every device on the local network, but leaves through \
+     one network adapter only: the one the system routes it through, usually the \
+     adapter with the default route.\n\n\
+     On a computer with more than one network adapter, use the broadcast address of \
+     the network you want instead: its address with the host part all ones, such as \
+     192.168.1.255 for a 192.168.1.x network with mask 255.255.255.0. The datagrams \
+     then leave through the adapter on that network.\n\n\
+     While the channel runs, Enter applies a change at once; leaving the box \
+     any other way keeps it for Apply & Restart.",
+);
+
+const MULTICAST_INTERFACE_HOVER: Hover = Hover::new(
+    "The network adapter the multicast datagrams leave through.\n\n\
+     System default lets the system choose, usually the adapter with the default \
+     route. On a computer with more than one network adapter, choose the address of \
+     the adapter on the receivers' network.\n\n\
+     The list shows this computer's IPv4 addresses on adapters that are up, and is \
+     read again each time it is opened.",
+);
+
+const MULTICAST_TTL_HOVER: Hover = Hover::new(
+    "How many routers the multicast datagrams may cross.\n\n\
+     Left empty, it is 1, which keeps them on the local network. 0 keeps them on \
+     this computer. Raise it only when the receivers are on another network and the \
+     routers between forward multicast.\n\n\
+     While the channel runs, Enter applies a change at once; leaving the box \
+     any other way keeps it for Apply & Restart.",
+);
+
+/// The outgoing interface choices, as (interface, label): the system default
+/// first, then each local address. The configured address is always among
+/// them, so it is never silently replaced; once the addresses are listed, one
+/// that is not among them says so. `listed` is `None` until they are.
+pub(super) fn multicast_interface_choices(
+    configured: Option<Ipv4Addr>,
+    listed: Option<&[LocalAddress]>,
+) -> Vec<(Option<Ipv4Addr>, String)> {
+    let mut choices = vec![(None, MULTICAST_SYSTEM_DEFAULT.to_owned())];
+    for address in listed.unwrap_or_default() {
+        let label = if address.ip.is_loopback() {
+            format!("{} \u{2014} this computer only", address.ip)
+        } else {
+            format!("{} \u{2014} {}", address.ip, address.interface)
+        };
+        choices.push((Some(address.ip), label));
+    }
+    if let Some(ip) = configured {
+        if !choices.iter().any(|(choice, _)| *choice == Some(ip)) {
+            let label = match listed {
+                Some(_) => format!("{ip} \u{2014} not on this computer now"),
+                None => ip.to_string(),
+            };
+            choices.push((Some(ip), label));
+        }
+    }
+    choices
+}
+
+/// The outgoing interface's label and drop-down. Returns whether the choice
+/// changed, and whether the address list should be read again, which opening
+/// the drop-down asks for.
+fn show_multicast_interface(
+    ui: &mut egui::Ui,
+    conn: &mut ConnDraft,
+    addresses: Option<&[LocalAddress]>,
+) -> (bool, bool) {
+    let choices = multicast_interface_choices(conn.udp_multicast_interface, addresses);
+    // As wide as the longest choice, so the TTL after it stays put whichever
+    // is chosen.
+    let widest = choices
+        .iter()
+        .map(|(_, label)| text_width(ui, egui::TextStyle::Button, label))
+        .fold(0.0, f32::max);
+    // Never wider than the pane: a long adapter name is cut with an ellipsis
+    // in the closed box, and shown whole in the open list.
+    let box_width = (widest + ui.spacing().icon_width + 3.0 * ui.spacing().button_padding.x)
+        .min(ui.max_rect().width());
+    let label = "Outgoing interface";
+    keep_together(
+        ui,
+        row_width(
+            ui,
+            &[text_width(ui, egui::TextStyle::Body, label), box_width],
+        ),
+    );
+    ui.label(label).on_hover(&MULTICAST_INTERFACE_HOVER);
+    // A drop-down does not wrap on its own, so when it cannot sit beside its
+    // label it starts the next row.
+    keep_together(ui, box_width);
+    let selected = choices
+        .iter()
+        .find(|(choice, _)| *choice == conn.udp_multicast_interface)
+        .map_or(MULTICAST_SYSTEM_DEFAULT, |(_, label)| label.as_str())
+        .to_owned();
+    let before = conn.udp_multicast_interface;
+    let response = egui::ComboBox::from_id_salt("udp_multicast_interface")
+        .width(box_width)
+        .truncate()
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            for (choice, label) in &choices {
+                ui.selectable_value(&mut conn.udp_multicast_interface, *choice, label);
+            }
+        });
+    (
+        conn.udp_multicast_interface != before,
+        response
+            .response
+            .on_hover(&MULTICAST_INTERFACE_HOVER)
+            .clicked(),
+    )
+}
+
+/// The multicast TTL field. Returns `true` when a value was committed.
+fn show_multicast_ttl(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
+    let bad = multicast_ttl(&conn.udp_multicast_ttl).is_none();
+    keep_together(
+        ui,
+        row_width(
+            ui,
+            &[
+                text_width(ui, egui::TextStyle::Body, "TTL"),
+                TTL_FIELD_WIDTH,
+            ],
+        ),
+    );
+    ui.label("TTL").on_hover(&MULTICAST_TTL_HOVER);
+    let r = red_bordered(ui, bad, "enter a TTL from 0 to 255", |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut conn.udp_multicast_ttl)
+                .id_salt("udp_multicast_ttl")
+                .desired_width(TTL_FIELD_WIDTH)
+                .char_limit(3)
+                .hint_text("1"),
+        )
+    })
+    .on_hover(&MULTICAST_TTL_HOVER);
+    enter_committed(&r, ui)
 }
 
 fn show_udp_mode(ui: &mut egui::Ui, conn: &mut ConnDraft) {
-    ui.label("Mode");
-    ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Broadcast, "Broadcast");
-    ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast");
-    ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Multicast, "Multicast");
+    ui.label("Mode").on_hover(&UDP_MODE_HOVER);
+    ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Broadcast, "Broadcast")
+        .on_hover(&UDP_MODE_HOVER);
+    ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast")
+        .on_hover(&UDP_MODE_HOVER);
+    ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Multicast, "Multicast")
+        .on_hover(&UDP_MODE_HOVER);
 }
+
+const UDP_MODE_HOVER: Hover = Hover::new(
+    "Who receives the datagrams.\n\n\
+     Broadcast: every device on the local network.\n\n\
+     Unicast: the one computer or device at the destination address.\n\n\
+     Multicast: the receivers that have joined the multicast group.\n\n\
+     Each mode keeps its own destination, so switching modes does not lose what was \
+     typed for another.",
+);
+
+const UNICAST_DESTINATION_HOVER: Hover = Hover::new(
+    "The IPv4 address of the one computer or device the datagrams go to.\n\n\
+     While the channel runs, Enter applies a change at once; leaving the box \
+     any other way keeps it for Apply & Restart.",
+);
+
+const MULTICAST_GROUP_HOVER: Hover = Hover::new(
+    "An IPv4 multicast group address, from 224.0.0.0 to 239.255.255.255.\n\n\
+     Receivers must join the same group and port to see these datagrams. Addresses \
+     in 239.x.x.x are the usual choice on a local network.\n\n\
+     While the channel runs, Enter applies a change at once; leaving the box \
+     any other way keeps it for Apply & Restart.",
+);
+
+const UDP_PORT_HOVER: Hover = Hover::new(
+    "The UDP port the datagrams are sent to. The receiver must listen on this port.\n\n\
+     A number from 1 to 65535. The minus and plus buttons step it, faster the \
+     longer they are held.\n\n\
+     While the channel runs, Enter or a button applies a change at once; leaving \
+     the box any other way keeps it for Apply & Restart.",
+);
+
+const LOCAL_PORT_HOVER: Hover = Hover::new(
+    "The UDP port the datagrams are sent from.\n\n\
+     Left empty, the system picks a free port each time the channel opens. Set one \
+     only when the receiver accepts datagrams from one port.\n\n\
+     While the channel runs, Enter applies a change at once; leaving the box \
+     any other way keeps it for Apply & Restart.",
+);
 
 /// All three UDP modes have the same shape — an IPv4 address plus a port
 /// — so they share one helper. The per-mode differences (label, hint
@@ -519,10 +750,10 @@ fn show_udp_destination(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
         )
     };
 
-    let (label, label_tip, hint, invalid_msg, addr_salt, port_salt) = match mode {
+    let (label, hover, hint, invalid_msg, addr_salt, port_salt) = match mode {
         UdpModeDraft::Unicast => (
             "Destination",
-            None,
+            UNICAST_DESTINATION_HOVER,
             "192.168.1.100",
             "enter an IPv4 address — e.g. 192.168.1.100",
             "udp_unicast_addr",
@@ -530,7 +761,7 @@ fn show_udp_destination(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
         ),
         UdpModeDraft::Broadcast => (
             "Destination",
-            None,
+            BROADCAST_DESTINATION_HOVER,
             "255.255.255.255",
             "enter an IPv4 address — e.g. 255.255.255.255",
             "udp_broadcast_addr",
@@ -538,21 +769,14 @@ fn show_udp_destination(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
         ),
         UdpModeDraft::Multicast => (
             "Multicast group",
-            Some(Hover::new(
-                "An IPv4 multicast group address, from 224.0.0.0 to 239.255.255.255.\n\n\
-                 Receivers must join the same group and port to see these packets. Addresses in \
-                 239.x.x.x are the usual choice on a local network.",
-            )),
+            MULTICAST_GROUP_HOVER,
             "239.0.0.1",
             "enter IPv4 multicast address — e.g. 239.0.0.1",
             "udp_multicast_addr",
             "udp_multicast_port",
         ),
     };
-    let label_resp = ui.label(label);
-    if let Some(t) = label_tip {
-        let _ = label_resp.on_hover(&t);
-    }
+    ui.label(label).on_hover(&hover);
 
     let pair = match mode {
         UdpModeDraft::Unicast => &mut conn.udp_unicast,
@@ -566,6 +790,7 @@ fn show_udp_destination(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
             addr_id_salt: addr_salt,
             addr_hint: hint,
             addr_invalid_msg: invalid_msg,
+            addr_hover: &hover,
             bad_addr,
             port_field: &mut pair.port,
             port_id_salt: port_salt,
@@ -585,7 +810,7 @@ fn show_udp_destination(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
 fn show_udp_local_port(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     let bad_local = invalid_parse::<u16>(&conn.local_port);
     keep_together(ui, local_port_width(ui));
-    ui.label("Local port");
+    ui.label("Local port").on_hover(&LOCAL_PORT_HOVER);
     let r = red_bordered(ui, bad_local, "enter a port number 1–65535", |ui| {
         ui.add(
             egui::TextEdit::singleline(&mut conn.local_port)
@@ -593,13 +818,15 @@ fn show_udp_local_port(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                 .desired_width(LOCAL_PORT_FIELD_WIDTH)
                 .hint_text("auto"),
         )
-    });
+    })
+    .on_hover(&LOCAL_PORT_HOVER);
     enter_committed(&r, ui)
 }
 
 const ADDR_FIELD_WIDTH: f32 = 140.0;
 const PORT_FIELD_WIDTH: f32 = 60.0;
 const LOCAL_PORT_FIELD_WIDTH: f32 = 80.0;
+const TTL_FIELD_WIDTH: f32 = 40.0;
 
 /// How wide `text` is in `style`, laid out on one line.
 fn text_width(ui: &egui::Ui, style: egui::TextStyle, text: &str) -> f32 {
@@ -670,6 +897,7 @@ struct AddrPortRow<'a> {
     addr_id_salt: &'a str,
     addr_hint: &'a str,
     addr_invalid_msg: &'a str,
+    addr_hover: &'a Hover,
     bad_addr: bool,
     port_field: &'a mut String,
     port_id_salt: &'a str,
@@ -691,12 +919,13 @@ fn show_addr_port_row(ui: &mut egui::Ui, p: AddrPortRow) -> bool {
                 .desired_width(ADDR_FIELD_WIDTH)
                 .hint_text(p.addr_hint),
         )
-    });
+    })
+    .on_hover(p.addr_hover);
     if enter_committed(&addr_r, ui) {
         apply = true;
     }
     keep_together(ui, port_stepper_width(ui));
-    ui.label("Port:");
+    ui.label("Port:").on_hover(&UDP_PORT_HOVER);
     let r_minus = ui
         .small_button("\u{2212}")
         .on_hover_text("Decrement port (hold to accelerate)");
@@ -706,7 +935,8 @@ fn show_addr_port_row(ui: &mut egui::Ui, p: AddrPortRow) -> bool {
                 .id_salt(p.port_id_salt)
                 .desired_width(PORT_FIELD_WIDTH),
         )
-    });
+    })
+    .on_hover(&UDP_PORT_HOVER);
     if enter_committed(&port_r, ui) {
         apply = true;
     }
@@ -2857,11 +3087,23 @@ mod tests {
     }
 
     /// The UDP editor as the detail pane draws it, with every field valid or
-    /// every field in the red-border state.
+    /// every field in the red-border state, and a long adapter name listed.
     fn udp_pane(width: f32, mode: UdpModeDraft, invalid: bool) -> Pane {
         let mut conn = ConnDraft::new(ConnKind::Udp);
         conn.udp_mode = mode;
         conn.local_port = if invalid { "99999" } else { "50000" }.to_owned();
+        conn.udp_multicast_ttl = if invalid { "999" } else { "255" }.to_owned();
+        let addresses = [
+            LocalAddress {
+                ip: Ipv4Addr::new(192, 168, 100, 200),
+                interface: "vEthernet (Default Switch)".to_owned(),
+            },
+            LocalAddress {
+                ip: Ipv4Addr::LOCALHOST,
+                interface: "Loopback Pseudo-Interface 1".to_owned(),
+            },
+        ];
+        conn.udp_multicast_interface = Some(addresses[0].ip);
         for pair in [
             &mut conn.udp_unicast,
             &mut conn.udp_broadcast,
@@ -2876,7 +3118,7 @@ mod tests {
             pair.port = if invalid { "99999" } else { "65535" }.to_owned();
         }
         in_pane(width, |ui| {
-            show_udp_fields(ui, &mut conn);
+            show_udp_fields(ui, &mut conn, Some(&addresses));
         })
     }
 
@@ -2935,8 +3177,8 @@ mod tests {
         }
     }
 
-    /// With the room, each UDP line is one row: the address and ports, then
-    /// the mode.
+    /// With the room, each UDP line is one row: the address and ports, the
+    /// mode, and in Multicast the outgoing interface and TTL.
     #[test]
     fn each_udp_line_is_one_row_when_there_is_room() {
         for mode in [
@@ -2947,7 +3189,12 @@ mod tests {
             for invalid in [false, true] {
                 let pane = udp_pane(1400.0, mode, invalid);
                 assert!(pane.fits());
-                assert_eq!(pane.rows, 2, "two lines, one row each");
+                let lines = if mode == UdpModeDraft::Multicast {
+                    3
+                } else {
+                    2
+                };
+                assert_eq!(pane.rows, lines, "one row per line");
             }
         }
     }
@@ -3043,6 +3290,7 @@ mod tests {
                             addr_id_salt: "a",
                             addr_hint: "",
                             addr_invalid_msg: "",
+                            addr_hover: &UNICAST_DESTINATION_HOVER,
                             bad_addr: false,
                             port_field: &mut port,
                             port_id_salt: "p",
@@ -3080,6 +3328,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_interface_choices_name_the_default_and_each_address() {
+        let listed = [
+            LocalAddress {
+                ip: Ipv4Addr::new(192, 168, 1, 20),
+                interface: "Ethernet".to_owned(),
+            },
+            LocalAddress {
+                ip: Ipv4Addr::LOCALHOST,
+                interface: "lo".to_owned(),
+            },
+        ];
+        assert_eq!(
+            multicast_interface_choices(None, Some(&listed)),
+            [
+                (None, "System default".to_owned()),
+                (
+                    Some(Ipv4Addr::new(192, 168, 1, 20)),
+                    "192.168.1.20 \u{2014} Ethernet".to_owned()
+                ),
+                (
+                    Some(Ipv4Addr::LOCALHOST),
+                    "127.0.0.1 \u{2014} this computer only".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_configured_interface_is_kept_and_says_when_it_is_not_here() {
+        let gone = Some(Ipv4Addr::new(10, 9, 9, 9));
+        let listed = [LocalAddress {
+            ip: Ipv4Addr::new(192, 168, 1, 20),
+            interface: "Ethernet".to_owned(),
+        }];
+        assert_eq!(
+            multicast_interface_choices(gone, Some(&listed)).last(),
+            Some(&(
+                gone,
+                "10.9.9.9 \u{2014} not on this computer now".to_owned()
+            ))
+        );
+        // Before the list arrives, nothing is known to be missing.
+        assert_eq!(
+            multicast_interface_choices(gone, None),
+            [
+                (None, "System default".to_owned()),
+                (gone, "10.9.9.9".to_owned())
+            ]
+        );
+    }
+
     /// A frame in which nothing was touched reports nothing, so it never
     /// applies a change to a running channel.
     #[test]
@@ -3095,7 +3395,10 @@ mod tests {
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let edit = show_serial_fields(ui, id, &mut serial, None, None, None);
                 assert_eq!(edit, InterfaceEdit::default());
-                assert!(!show_udp_fields(ui, &mut udp));
+                assert_eq!(
+                    show_udp_fields(ui, &mut udp, None),
+                    InterfaceEdit::default()
+                );
             });
         }
         assert_eq!(serial.serial_settings(), before);

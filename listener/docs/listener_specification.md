@@ -5,11 +5,17 @@ Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-24) — control characters in a new view:
+Revision note (2026-11-24) — control characters in a new view, a shorter baud
+list, and the interface line:
 
 - **§78 (ADR-075).** A new Channel's view, and a profile with no view,
   shows control characters as control pictures (␊) instead of passing them
   through.
+- **§14.1.** The baud list runs from 4800 to 115200, so it opens without
+  scrolling; any other rate is typed.
+- **§15 (ADR-047).** The line under a Channel's name gives a UDP Channel's mode,
+  address and port as talker's does, without the scope words; its hover says
+  who can reach the address.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -538,11 +544,10 @@ Baud Rate shall support both:
 Standard values should include:
 
 ```text
-4800, 9600, 19200, 38400, 57600, 115200,
-230400, 460800, 921600
+4800, 9600, 19200, 38400, 57600, 115200
 ```
 
-Any other rate, slower ones included, is typed, in up to eight digits.
+Any other rate, faster or slower, is typed, in up to eight digits.
 
 The editors offer only what a port opens with: parity None, Even or Odd, and 1
 or 2 stop bits (ADR-074). A profile may still hold Mark or Space parity or 1.5
@@ -633,7 +638,9 @@ UDP datagram boundaries shall be preserved (as a reception/recording detail, §5
 
 **Bind scope is stated in words** (ADR-047). The UDP editor lists the host's
 local addresses and labels the all-interfaces choice "All interfaces (reachable
-from the network)"; the Channel header shows the scope.
+from the network)". The line under the Channel's name gives the mode, address
+and port, as in "UDP unicast 0.0.0.0:10110", and its hover says who can reach
+the address.
 
 **Request shared port.** A broadcast or multicast Channel may request a shared
 port, off by default, so another program can bind the same port. Listener sets

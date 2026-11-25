@@ -8,6 +8,9 @@ Revision note (2026-11-24) — the TCP client is removed:
 
 - **ADR-073** — talker has no TCP client, as listener has no TCP receive.
   ADR-059, the design it had, is kept as the starting point for any return.
+- **ADR-071** — the shared baud list runs from 4800 to 115200.
+- **ADR-046** — the Cadence row no longer gives the worst figure as a share of
+  the shortest interval.
 
 ---
 
@@ -1568,8 +1571,11 @@ scheduled send, and the send call is timed for writes that failed, so such a
 difference is evidence rather than noise.
 
 Keep the maximum in one syntactic position. For Cadence it leads as `worst X
-behind schedule`; its share of the shortest interval and a distinct percentile
-follow together in one parenthesis. Render and send-call boundaries likewise
+behind schedule`, and a distinct percentile follows in a parenthesis. (Amended
+2026-11-24: the worst figure's share of the shortest interval was in that
+parenthesis too. It was removed because it made the row wrap while the channel
+ran, moving the controls below, and the schedule phrase already names the
+shortest interval.) Render and send-call boundaries likewise
 lead with `longest`. A percentile appearing or disappearing must not move the
 primary figure under the reader.
 
@@ -2817,8 +2823,10 @@ lines. ADR-070 gave talker the lines, which made one layout possible.
   window to fit; a channel's detail pane wraps them.
 - What each app does with an edit stays its own: Linemon applies it at once, a
   listener Channel at Apply & Restart, a talker channel as before.
-- One baud list, 4800 to 921600, with any other rate typed. Only parity None,
-  Even and Odd and 1 or 2 stop bits are offered. A port can be typed by name.
+- One baud list, 4800 to 115200 (amended 2026-11-24 from 4800 to 921600, so
+  the list opens without scrolling), with any other rate typed. Only parity
+  None, Even and Odd and 1 or 2 stop bits are offered. A port can be typed by
+  name.
 
 **Boundary:** UDP and TCP are not shared. Talker sends and listener receives, so
 their fields differ; they share only the shape of two lines. Nothing in this

@@ -1642,7 +1642,10 @@ the network.
   and per-connection handling of accept errors with rate-limited logging.
 - **Bind scope in words.** The UDP editor lists local addresses, and labels the
   all-interfaces choice "All interfaces (reachable from the network)". The Channel
-  header shows the scope.
+  header shows the scope. (Amended 2026-11-24: the header line gives
+  the mode, address and port as talker's does, and its hover says who can
+  reach the address. The user asked for the line to read as talker's; the
+  editor's choice already names the scope.)
 - **"Request shared port"** is a per-Channel UDP option, off by default and offered for
   broadcast and multicast only. It sets the platform's address-reuse option before
   binding, and status reports whether the OS applied it.

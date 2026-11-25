@@ -49,6 +49,7 @@ crossbeam-channel = { workspace = true }
 
 # Sockets (multicast interface / TTL selection)
 socket2 = { workspace = true }
+if-addrs = { workspace = true }   # the multicast interface choices
 
 # Logging
 tracing            = { workspace = true }

@@ -32,7 +32,7 @@ use crate::core::telemetry::{
 };
 use crate::core::timing::{ActiveCadence, TimerIntent, TimerMode, TimerStatus};
 use wiredata_ui::diagnostics::{tone_marker, SignalTone};
-use wiredata_ui::format::{compact_duration, interval as format_interval, percent, thousands};
+use wiredata_ui::format::{compact_duration, interval as format_interval, thousands};
 use wiredata_ui::hover::Hover;
 
 use super::MessageAnalysisCache;
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(
             cadence.text,
             "3 messages: 2 at 50 ms, 1 at 1,000 ms · recent timing unavailable · last \
-             update 11.0 s ago · worst this run 1.00 ms (2% of the shortest interval)"
+             update 11.0 s ago · worst this run 1.00 ms"
         );
         assert_eq!(
             timing_detail_text(timing, timing, state),

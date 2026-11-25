@@ -3470,6 +3470,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "if-addrs",
  "jiff",
  "nmea0183",
  "rfd",

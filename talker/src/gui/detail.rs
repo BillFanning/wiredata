@@ -35,7 +35,7 @@ use super::widgets::{
     marker_aware_text_edit, message_editor_max_height, output_request, plain_text_edit_with_cursor,
     preview_ascii_layout_job, red_bordered, rts_by_flow, serial_editor_id, show_display_pane,
     show_insert_byte_button, show_insert_unit_button, show_interface_summary, show_serial_fields,
-    show_udp_fields, start_button, InterfaceEdit, LiveUpdateQueueGauge, UppercaseHex,
+    show_udp_fields, start_button, LiveUpdateQueueGauge, UppercaseHex,
 };
 use super::{MessageAnalysisCache, MessageDraftAnalysis, MessagePreview, TalkerApp};
 use wiredata_ui::hover::{Hover, ShowHover};
@@ -189,8 +189,6 @@ impl TalkerApp {
                 let running = self.is_connection_running(i);
                 self.show_channel_header(ui, i, running);
                 ui.separator();
-                self.show_channel_body(ui, i, running);
-                ui.separator();
                 // The sent total proves whether Output payload updates
                 // were omitted; retained Output history is a separate concern.
                 // Dropped updates are the pane's other completeness limit and
@@ -234,8 +232,8 @@ impl TalkerApp {
     /// The detail header, laid out like listener's channel block so the two
     /// apps read as one product: name row (status glyph · name · label), a
     /// `status · interface` row, sent/unsent totals, throughput, the
-    /// performance readouts for high-rate health, and the lifecycle button
-    /// pair. Channel removal lives on the channel-list rows (the ✕ overlay),
+    /// lifecycle button pair, the interface and message editors, and then the
+    /// performance readouts for high-rate health. Channel removal lives on the channel-list rows (the ✕ overlay),
     /// as in listener.
     fn show_channel_header(&mut self, ui: &mut egui::Ui, i: usize, running: bool) {
         let pal = theme_palette(ui);
@@ -574,6 +572,11 @@ impl TalkerApp {
         ui.add_space(12.0); // a blank line between the readouts and the buttons
         self.show_lifecycle_buttons(ui, i, running, iface_drift || run_drift, error.is_some());
         ui.add_space(6.0);
+        // The editors sit right under Start and Stop, as in listener, so what a
+        // Start applies is beside the button that applies it. The readouts that
+        // need interpretation follow.
+        self.show_channel_body(ui, i, running);
+        ui.separator();
 
         // No header row: every reason the old badge rose for is marked on its
         // own row or callout, or on the Send outcomes line above (ADR-066).
@@ -1014,9 +1017,12 @@ impl TalkerApp {
                         .inner
                     }
                     ConnKind::Udp => {
-                        ui.push_id("udp_body", |ui| InterfaceEdit {
-                            changed: show_udp_fields(ui, &mut self.conn_drafts[i]),
-                            ..InterfaceEdit::default()
+                        ui.push_id("udp_body", |ui| {
+                            show_udp_fields(
+                                ui,
+                                &mut self.conn_drafts[i],
+                                self.local_addresses.as_deref(),
+                            )
                         })
                         .inner
                     }
@@ -1055,6 +1061,9 @@ impl TalkerApp {
         }
         if edit.refresh_ports {
             self.deferred.refresh_ports = true;
+        }
+        if edit.refresh_addresses {
+            self.deferred.refresh_addresses = true;
         }
         if let Some(click) = edit.click {
             let (line, high) = output_request(click);

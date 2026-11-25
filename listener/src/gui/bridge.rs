@@ -29,7 +29,7 @@ use crate::runtime::{
 use crate::transport::udp::UdpMode;
 use crate::transport::SerialControlLines;
 
-use super::bind_scope::{local_addresses, BindScope, LocalAddress};
+use super::bind_scope::{local_addresses, LocalAddress};
 
 /// The longest one poll round may run before the Channels it has not reached
 /// are left for the next round. Each request already waits at most
@@ -433,12 +433,9 @@ fn describe_interface(config: &ChannelConfig) -> String {
                 UdpMode::Broadcast => "broadcast",
                 UdpMode::Multicast => "multicast",
             };
-            let endpoint = format!("UDP {mode} · bind {}:{}", udp.bind_address, udp.port);
-            // Who can reach it, in words (§15, ADR-047).
-            match BindScope::of(&udp.bind_address).words() {
-                Some(scope) => format!("{endpoint} · {scope}"),
-                None => endpoint,
-            }
+            // As talker writes it: the mode, then the address and port. The
+            // header's hover says who can reach the address (§15, ADR-047).
+            format!("UDP {mode} {}:{}", udp.bind_address, udp.port)
         }
         InterfaceConfig::Serial(serial) => {
             // Conventional serial notation — `9600,8,N,1` — so the line reads
@@ -1772,21 +1769,20 @@ mod tests {
         config
     }
 
+    /// The header line reads as talker's does: the mode, then the address
+    /// and port. Who can reach the address is the hover's to explain.
     #[test]
-    fn a_udp_header_states_who_can_reach_it() {
+    fn a_udp_header_reads_as_talker_s_does() {
         let mut config = templates::udp_template();
         let InterfaceConfig::Udp(udp) = &mut config.interface else {
             unreachable!("the UDP template is UDP")
         };
         udp.bind_address = "0.0.0.0".to_string();
         udp.port = 10110;
-        assert_eq!(
-            describe_interface(&config),
-            "UDP unicast · bind 0.0.0.0:10110 · all interfaces (reachable from the network)"
-        );
+        assert_eq!(describe_interface(&config), "UDP unicast 0.0.0.0:10110");
         assert_eq!(
             describe_interface(&udp_config(10110)),
-            "UDP unicast · bind 127.0.0.1:10110 · this computer only"
+            "UDP unicast 127.0.0.1:10110"
         );
     }
 

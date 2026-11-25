@@ -8,6 +8,11 @@ Revision note (2026-11-24) — TCP is deferred:
 - **§4.1, §4.4, §4.5 (ADR-073)** — talker has no TCP client, as listener has
   no TCP receive. `+ Add` offers UDP and Serial, and a profile that names a
   TCP client is refused.
+- **§4.2** — the baud list runs from 4800 to 115200, so it opens without
+  scrolling; any other rate is typed.
+- **§3.2** — Configure interface and Configure messages sit directly under
+  Start and Stop, above the readouts that need interpretation, as Configure
+  interface does in listener.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -438,7 +443,10 @@ The **detail pane** (right) shows the selected channel:
 - **Lifecycle buttons** — the labeled pair (shared with listener):
   [Start channel / Apply & Restart / Retry channel] + [Stop channel]; the Start
   side's label and enabled state derive from run state, drift, and draft
-  validity (a disabled Start's tooltip lists the exact blockers).
+  validity (a disabled Start's tooltip lists the exact blockers). They sit under
+  the Send outcomes and Sent lines, and the **Configure interface** and
+  **Configure messages** sections (the editors) follow directly beneath them,
+  above the Capacity and Cadence readouts and the rest of the diagnostics.
 - **Last completed run** — one collapsed process-local summary retained for the
   channel's newest completed runner. Its heading shows elapsed, sent, and unsent;
   expansion shows wall-clock start/finish, exact final outcomes, cumulative timing,
@@ -449,8 +457,7 @@ The **detail pane** (right) shows the selected channel:
   `blocking_sends` — each positionally aligned with `per_message_sent`, so
   column *N* of every line describes the same message and one fact can be diffed
   across runs without re-assembling a block per message.
-- **Configure interface** / **Configure messages** sections (the editors), and
-  the **Output** display pane, headed by the three live-update and sampling lines
+- The **Output** display pane, headed by the three live-update and sampling lines
   described in §5.7.
 
 The deadline-wait policy is derived from the shortest active interval —
@@ -506,9 +513,8 @@ All standard RS-232 parameters are user-configurable:
 - Port: chosen from the ports the system lists, or typed by name (e.g., COM3,
   /dev/ttyUSB0). On Windows, where port names ignore case, a typed name is put
   in capitals.
-- Baud rate: chosen from 4800, 9600, 19200, 38400, 57600, 115200, 230400,
-  460800 and 921600, or typed: any other rate, slower ones included, in up to
-  eight digits
+- Baud rate: chosen from 4800, 9600, 19200, 38400, 57600 and 115200, or
+  typed: any other rate, faster or slower, in up to eight digits
 - Data bits (5, 6, 7, 8)
 - Parity (None, Even, Odd)
 - Stop bits (1, 2)

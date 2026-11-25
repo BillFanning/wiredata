@@ -138,11 +138,10 @@ pub struct ConnDraft {
     pub udp_unicast: AddrPortPair,
     pub udp_broadcast: AddrPortPair,
     pub udp_multicast: AddrPortPair,
-    /// Multicast outgoing interface / TTL. No editor widget yet (that comes
-    /// with the GUI merge); carried through load → save so a profile that
-    /// sets them via TOML is never silently stripped on the next save.
+    /// Multicast outgoing interface; `None` lets the system choose.
     pub udp_multicast_interface: Option<Ipv4Addr>,
-    pub udp_multicast_ttl: Option<u32>,
+    /// Multicast TTL as typed; empty means the default, 1.
+    pub udp_multicast_ttl: String,
     /// Transient hold-to-repeat state for the active mode's ± port
     /// buttons. Shared because only one mode is being edited at a time.
     pub udp_port_hold: Option<PortHold>,
@@ -177,7 +176,7 @@ impl Default for ConnDraft {
             },
             udp_multicast: AddrPortPair::default(),
             udp_multicast_interface: None,
-            udp_multicast_ttl: None,
+            udp_multicast_ttl: String::new(),
             udp_port_hold: None,
             local_port: String::new(),
         }
@@ -256,7 +255,8 @@ impl From<&InterfaceConfig> for ConnDraft {
                             submitted: true,
                         };
                         draft.udp_multicast_interface = *interface;
-                        draft.udp_multicast_ttl = *ttl;
+                        draft.udp_multicast_ttl =
+                            ttl.map(|ttl| ttl.to_string()).unwrap_or_default();
                     }
                 }
                 draft
@@ -400,7 +400,7 @@ impl ConnDraft {
                         addr,
                         port,
                         self.udp_multicast_interface,
-                        self.udp_multicast_ttl,
+                        multicast_ttl(&self.udp_multicast_ttl)?,
                     ),
                 };
                 udp.local_port = local_port;
@@ -408,6 +408,16 @@ impl ConnDraft {
             }
         }
     }
+}
+
+/// A typed multicast TTL: empty is the default, `Some(None)`; 0 to 255 is that
+/// TTL; anything else is `None`, so the channel cannot start.
+pub fn multicast_ttl(typed: &str) -> Option<Option<u32>> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return Some(None);
+    }
+    typed.parse::<u8>().ok().map(|ttl| Some(u32::from(ttl)))
 }
 
 // ── Message ───────────────────────────────────────────────────────────────────
@@ -820,7 +830,7 @@ mod tests {
         let Some(InterfaceConfig::Serial(config)) = draft.to_config() else {
             panic!("a serial draft with a port builds a serial config");
         };
-        assert_eq!(config.baud_rate, 921_600);
+        assert_eq!(config.baud_rate, 115_200);
         assert_eq!(config.data_bits, DataBits::Five);
         assert_eq!(config.parity, Parity::Odd);
         assert_eq!(config.stop_bits, StopBits::Two);
@@ -853,13 +863,41 @@ mod tests {
 
     #[test]
     fn udp_multicast_draft_preserves_interface_and_ttl() {
-        // No editor widget yet, but a load → save must not strip these.
         conn_round_trip(InterfaceConfig::Udp(UdpConfig::multicast_with(
             "239.0.0.7".parse().unwrap(),
             5500,
             Some("192.168.5.4".parse().unwrap()),
             Some(16),
         )));
+    }
+
+    #[test]
+    fn a_typed_ttl_is_empty_for_the_default_or_0_to_255() {
+        assert_eq!(multicast_ttl(""), Some(None));
+        assert_eq!(multicast_ttl("  "), Some(None));
+        assert_eq!(multicast_ttl("0"), Some(Some(0)));
+        assert_eq!(multicast_ttl(" 32 "), Some(Some(32)));
+        assert_eq!(multicast_ttl("255"), Some(Some(255)));
+        assert_eq!(multicast_ttl("256"), None);
+        assert_eq!(multicast_ttl("-1"), None);
+        assert_eq!(multicast_ttl("one"), None);
+    }
+
+    #[test]
+    fn a_bad_ttl_stops_only_a_multicast_channel() {
+        let mut draft = ConnDraft::from(&InterfaceConfig::Udp(UdpConfig::multicast(
+            "239.0.0.7".parse().unwrap(),
+            5500,
+        )));
+        draft.udp_multicast_ttl = "300".to_owned();
+        assert_eq!(draft.to_config(), None, "a TTL above 255 cannot start");
+        draft.udp_mode = UdpModeDraft::Unicast;
+        draft.udp_unicast = AddrPortPair {
+            addr: "127.0.0.1".to_owned(),
+            port: "5000".to_owned(),
+            submitted: true,
+        };
+        assert!(draft.to_config().is_some(), "unicast ignores the TTL");
     }
 
     #[test]

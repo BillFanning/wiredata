@@ -18,7 +18,7 @@ use wiredata_ui::diagnostics::{attention_callout, SignalTone};
 use wiredata_ui::selection;
 
 use crate::core::{
-    channel::{ChannelConfig, ChannelId, InterfaceConfig, PortList},
+    channel::{AddressList, ChannelConfig, ChannelId, InterfaceConfig, LocalAddress, PortList},
     logging::{
         FileLogConfig, FileLogState, FileLogToggle, GuiLogHealth, LogEvent, LogFolderOpener,
         LogFolderState, LogLevel, LogLevelHandle, LoggingConfig,
@@ -484,6 +484,13 @@ struct TalkerApp {
     port_list: PortList,
     /// The read count of the list in `serial_ports`.
     port_list_seen: u64,
+    /// This computer's network addresses, for the multicast interface
+    /// choice; `None` until the first list arrives.
+    local_addresses: Option<Vec<LocalAddress>>,
+    /// Lists the network addresses on a helper thread, never on this one.
+    address_list: AddressList,
+    /// The read count of the list in `local_addresses`.
+    address_list_seen: u64,
     /// `true` = dark theme, `false` = light. Persisted; toggled from
     /// the top-bar sun/moon button next to the zoom control.
     dark_mode: bool,
@@ -537,6 +544,7 @@ struct DeferredActions {
     /// Add a channel of this kind (from the list header's `+ Add` menu).
     add_channel: Option<ConnKind>,
     refresh_ports: bool,
+    refresh_addresses: bool,
 }
 
 /// Per-channel tallies of log events attributed via the structured
@@ -718,6 +726,11 @@ impl TalkerApp {
             let repaint = std::sync::Arc::clone(&repaint);
             port_list.set_notify(std::sync::Arc::new(move || repaint.notify()));
         }
+        let address_list = AddressList::default();
+        {
+            let repaint = std::sync::Arc::clone(&repaint);
+            address_list.set_notify(std::sync::Arc::new(move || repaint.notify()));
+        }
         let mut app = Self {
             repaint,
             profile: Profile::default(),
@@ -736,6 +749,9 @@ impl TalkerApp {
             serial_ports: None,
             port_list,
             port_list_seen: 0,
+            local_addresses: None,
+            address_list,
+            address_list_seen: 0,
             dark_mode,
             selected: None,
             channels_collapsed: false,
@@ -761,6 +777,7 @@ impl TalkerApp {
             deferred: DeferredActions::default(),
         };
         app.refresh_serial_ports();
+        app.address_list.refresh();
 
         // CLI arg takes precedence; fall back to last path saved in
         // storage. The storage path is also filtered through
@@ -1291,6 +1308,10 @@ impl TalkerApp {
         if let Some((seen, ports)) = self.port_list.newer_than(self.port_list_seen) {
             self.port_list_seen = seen;
             self.serial_ports = Some(ports);
+        }
+        if let Some((seen, addresses)) = self.address_list.newer_than(self.address_list_seen) {
+            self.address_list_seen = seen;
+            self.local_addresses = Some(addresses);
         }
 
         // Refresh the per-channel rolling five-second acceptance rates.
@@ -1937,6 +1958,9 @@ impl TalkerApp {
         }
         if d.refresh_ports {
             self.refresh_serial_ports();
+        }
+        if d.refresh_addresses {
+            self.address_list.refresh();
         }
     }
 }

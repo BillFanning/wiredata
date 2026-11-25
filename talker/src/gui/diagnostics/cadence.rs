@@ -6,36 +6,6 @@
 
 use super::*;
 
-/// Scale a delay against the channel's tightest cadence, for schedule context.
-///
-/// The interval is named but not restated: the schedule phrase leads the same
-/// line, shortest group first. There is no `≤`, because this only ever
-/// qualifies an exact maximum, never a bucket bound (ADR-046).
-pub(in crate::gui) fn relative_to_shortest(
-    duration: std::time::Duration,
-    shortest: std::time::Duration,
-) -> String {
-    share_of_shortest(duration, shortest)
-        .map(|share| format!(" ({share})"))
-        .unwrap_or_default()
-}
-
-/// The bare phrase, for a caller assembling its own bracket.
-///
-/// `None` when there is no interval to scale against, which is not the same as
-/// an empty string: a caller joining qualifiers must leave the separator out
-/// too.
-fn share_of_shortest(
-    duration: std::time::Duration,
-    shortest: std::time::Duration,
-) -> Option<String> {
-    if shortest.is_zero() {
-        return None;
-    }
-    let percentage = duration.as_secs_f64() / shortest.as_secs_f64() * 100.0;
-    Some(format!("{} of the shortest interval", percent(percentage)))
-}
-
 /// The most interval groups the schedule phrase will name before summarizing.
 const MAX_CADENCE_GROUPS: usize = 3;
 
@@ -124,18 +94,8 @@ fn cadence_schedule_phrase(
 
 /// How late a send started, in the reader's terms: a send is "late" by the time
 /// between the clock reaching its scheduled moment and the runner starting it.
-fn lateness_phrase(
-    label: &str,
-    lateness: std::time::Duration,
-    shortest: Option<std::time::Duration>,
-) -> String {
-    format!(
-        "{label} {}{}",
-        compact_duration(lateness),
-        shortest
-            .map(|interval| relative_to_shortest(lateness, interval))
-            .unwrap_or_default()
-    )
+fn lateness_phrase(label: &str, lateness: std::time::Duration) -> String {
+    format!("{label} {}", compact_duration(lateness))
 }
 
 pub(in crate::gui) fn cadence_decision(
@@ -150,9 +110,8 @@ pub(in crate::gui) fn cadence_decision(
     let run_samples = cumulative.deadline_lateness.sample_count();
     let snapshot_label = recent_snapshot_label(snapshot_state);
     let schedule = cadence_schedule_phrase(cadence, groups, setup_incomplete);
-    // The percentage denominator comes from whichever source drew the schedule
-    // above it, so the percentage always scales against an interval the reader
-    // can see in the schedule phrase on the same line.
+    // Nothing is scheduled when neither the drafted groups nor the running
+    // cadence has an interval.
     let shortest = groups
         .first()
         .map(|(interval, _)| *interval)
@@ -168,7 +127,7 @@ pub(in crate::gui) fn cadence_decision(
         } else {
             format!(
                 "{schedule} · {snapshot_label} · {}",
-                lateness_phrase("worst this run", run_max, shortest)
+                lateness_phrase("worst this run", run_max)
             )
         }
     } else if run_samples == 0 {
@@ -187,12 +146,12 @@ pub(in crate::gui) fn cadence_decision(
         };
         format!(
             "{schedule} · {recent_state} · {}",
-            lateness_phrase("worst this run", run_max, shortest)
+            lateness_phrase("worst this run", run_max)
         )
     } else {
-        // One measured state at every sample count. The optional percentage
-        // scales the worst value; the percentile is separate distribution
-        // context and follows it only when the two figures differ.
+        // One measured state at every sample count. The percentile is
+        // distribution context and follows the worst value only when the two
+        // figures differ.
         let recent_max = recent.deadline_lateness.max().unwrap_or_default();
         let recent_p99 = recent
             .deadline_lateness
@@ -203,20 +162,13 @@ pub(in crate::gui) fn cadence_decision(
         // whether to attempt anything. The population therefore includes work
         // later withheld and excludes skipped points the channel never reached.
         // One skeleton whatever the figures do (ADR-046): the worst figure holds
-        // its position, and the share of the shortest interval and the
-        // percentile follow in one bracket, separated by a semicolon because
-        // they are distinct statistics.
-        let mut qualifiers = Vec::new();
-        if let Some(share) = shortest.and_then(|interval| share_of_shortest(recent_max, interval)) {
-            qualifiers.push(share);
-        }
-        if recent_p99 < recent_max {
-            qualifiers.push(format!("99% within {}", compact_duration(recent_p99)));
-        }
-        let qualifiers = if qualifiers.is_empty() {
-            String::new()
+        // its position, and the percentile follows it in a bracket. The share
+        // of the shortest interval is not on the line: it made the line wrap,
+        // and the schedule phrase already names the shortest interval.
+        let qualifiers = if recent_p99 < recent_max {
+            format!(" (99% within {})", compact_duration(recent_p99))
         } else {
-            format!(" ({})", qualifiers.join("; "))
+            String::new()
         };
         // The sample count is not on the line; the tooltip states it with its
         // window (ADR-046). The line keeps the window itself, which says the
@@ -289,8 +241,7 @@ pub(in crate::gui) fn cadence_tooltip(
          does not include how long the send itself took, and it says nothing about when the \
          data arrived."
             .to_owned(),
-        "The percentage compares the worst figure with the shortest interval on the channel. \
-         \"99% within …\" means 99 of every 100 sends were within that time; it is shown only \
+        "\"99% within …\" means 99 of every 100 sends were within that time; it is shown only \
          when it differs from the worst."
             .to_owned(),
     ];
@@ -336,8 +287,7 @@ mod tests {
         );
         assert_eq!(
             few.text,
-            "3 messages: 2 at 50 ms, 1 at 1,000 ms · worst 1.00 ms behind schedule \
-             (2% of the shortest interval) · last ~10 s"
+            "3 messages: 2 at 50 ms, 1 at 1,000 ms · worst 1.00 ms behind schedule · last ~10 s"
         );
         assert_eq!(few.tone, SignalTone::Neutral);
 
@@ -377,11 +327,10 @@ mod tests {
         assert_eq!(
             spread.text,
             "3 messages: 2 at 50 ms, 1 at 1,000 ms · worst 40 ms behind schedule \
-             (80% of the shortest interval; 99% within 1.00 ms) · last ~10 s"
+             (99% within 1.00 ms) · last ~10 s"
         );
 
-        // The normalization and percentile are distinct facts in one compact
-        // bracket; the semicolon must preserve that distinction.
+        // The percentile takes one bracket after the worst figure.
         assert_eq!(
             spread.text.matches('(').count(),
             1,
@@ -408,9 +357,7 @@ mod tests {
             );
         }
         assert!(
-            spread
-                .text
-                .contains("behind schedule (80% of the shortest interval; 99% within"),
+            spread.text.contains("behind schedule (99% within"),
             "the percentile trails the primary figure as a distinct statistic: {}",
             spread.text
         );
@@ -546,9 +493,8 @@ mod tests {
         let behind = "\"Behind schedule\" is how long after its scheduled time the channel got to \
                       a send. It does not include how long the send itself took, and it says \
                       nothing about when the data arrived.";
-        let figures = "The percentage compares the worst figure with the shortest interval on \
-                       the channel. \"99% within …\" means 99 of every 100 sends were within \
-                       that time; it is shown only when it differs from the worst.";
+        let figures = "\"99% within …\" means 99 of every 100 sends were within that time; \
+                       it is shown only when it differs from the worst.";
         let missed = "Missed sends are not counted here. They are on the Send outcomes line above.";
 
         let many = cadence_tooltip(mixed_cadence(), &mixed_groups(), 1_234, 2_001, current);

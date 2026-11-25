@@ -64,11 +64,10 @@ pub const FLOW_CONTROL: &[(FlowControl, &str)] = &[
     (FlowControl::XonXoff, "XON/XOFF"),
     (FlowControl::RtsCts, "RTS/CTS"),
 ];
-/// The baud rates offered. Any other rate, slower ones included, is typed into
-/// the box at the bottom of the list.
-pub const BAUD_RATES: &[u32] = &[
-    4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600,
-];
+/// The baud rates offered: few enough that the list opens without scrolling.
+/// Any other rate, faster or slower, is typed into the box at the bottom of the
+/// list.
+pub const BAUD_RATES: &[u32] = &[4800, 9600, 19200, 38400, 57600, 115200];
 
 /// A setting shown in a drop-down: a value it offers, or one a profile holds
 /// that it does not. An unsupported value is shown as itself and kept until
@@ -166,7 +165,7 @@ pub fn settings_line(
     let refresh_width = ui.spacing().item_spacing.x
         + text_width(ui, REFRESH_GLYPH, egui::TextStyle::Button)
         + ui.spacing().button_padding.x * 2.0;
-    label_for_combo(ui, "Port", width + refresh_width);
+    label_for_combo(ui, "Port", &PORT_HOVER, width + refresh_width);
     let text_id = id.with("port_text");
     let mut typed = ui
         .data(|d| d.get_temp::<String>(text_id))
@@ -218,7 +217,7 @@ pub fn settings_line(
         });
     ui.data_mut(|d| d.insert_temp(text_id, typed));
     // Listed again as the drop-down opens: a port may have come or gone.
-    refresh_ports |= combo.response.clicked();
+    refresh_ports |= combo.response.on_hover(&PORT_HOVER).clicked();
     refresh_ports |= ui
         .small_button(REFRESH_GLYPH)
         .on_hover_text("Refresh port list")
@@ -227,21 +226,21 @@ pub fn settings_line(
     baud_combo(ui, id, &mut settings.baud);
     option_combo(
         ui,
-        "Data bits",
+        ("Data bits", &DATA_BITS_HOVER),
         id.with("data_bits"),
         &mut settings.data_bits,
         DATA_BITS,
     );
     choice_combo(
         ui,
-        "Parity",
+        ("Parity", &PARITY_HOVER),
         id.with("parity"),
         &mut settings.parity,
         PARITY,
     );
     choice_combo(
         ui,
-        "Stop bits",
+        ("Stop bits", &STOP_BITS_HOVER),
         id.with("stop_bits"),
         &mut settings.stop_bits,
         STOP_BITS,
@@ -268,7 +267,13 @@ pub fn flow_and_lines(
     rts_by_flow: Option<RtsByFlow>,
 ) -> LinesResponse {
     let before = *flow;
-    option_combo(ui, "Flow", id.with("flow"), flow, FLOW_CONTROL);
+    option_combo(
+        ui,
+        ("Flow", &FLOW_HOVER),
+        id.with("flow"),
+        flow,
+        FLOW_CONTROL,
+    );
     ui.separator();
 
     let lines = live.unwrap_or_default();
@@ -318,6 +323,41 @@ pub fn flow_and_lines(
         click,
     }
 }
+
+const PORT_HOVER: Hover = Hover::new(
+    "The serial port to use.\n\n\
+     The list shows the ports the system has now, and is read again each time it is \
+     opened or the refresh button beside it is clicked. A port the system does not \
+     list, such as a virtual one, can be typed by name at the bottom of the list.\n\n\
+     A saved port that is not there now shows as not found.",
+);
+const BAUD_HOVER: Hover = Hover::new(
+    "The speed of the line, in bits per second.\n\n\
+     Both ends must use the same rate. The list holds the usual rates; any other can \
+     be typed at the bottom of the list.",
+);
+const DATA_BITS_HOVER: Hover = Hover::new(
+    "How many data bits each character has.\n\n\
+     Both ends must use the same number. 8 is usual, and 7 is often used with Even \
+     or Odd parity. Some ports cannot open with 5 or 6.",
+);
+const PARITY_HOVER: Hover = Hover::new(
+    "An extra bit sent with each character, so the receiving end can detect some \
+     errors.\n\n\
+     Both ends must use the same parity. None is usual.",
+);
+const STOP_BITS_HOVER: Hover = Hover::new(
+    "The idle time that ends each character, in bit lengths.\n\n\
+     Both ends must use the same number. 1 is usual.",
+);
+const FLOW_HOVER: Hover = Hover::new(
+    "How the two ends pause each other when one cannot keep up.\n\n\
+     None: nothing pauses the sender.\n\n\
+     XON/XOFF: the bytes 0x13 and 0x11 in the data pause and resume sending, so \
+     those two bytes cannot also be data.\n\n\
+     RTS/CTS: the RTS and CTS wires pause and resume sending, which needs a cable \
+     that connects them.",
+);
 
 /// What the second line says while the port is not open.
 const LINES_CLOSED: &str = "Control lines show while the port is open.";
@@ -391,7 +431,7 @@ fn baud_combo(ui: &mut egui::Ui, id: egui::Id, baud: &mut u32) {
     // widens the box and moves the rest of the line.
     let widest = "9".repeat(BAUD_DIGITS);
     let width = combo_width(ui, [widest.as_str(), "custom"]);
-    label_for_combo(ui, "Baud", width);
+    label_for_combo(ui, "Baud", &BAUD_HOVER, width);
     egui::ComboBox::from_id_salt(id.with("baud"))
         .selected_text(baud.to_string())
         .width(width)
@@ -418,15 +458,17 @@ fn baud_combo(ui: &mut egui::Ui, id: egui::Id, baud: &mut u32) {
             if chosen || !field.has_focus() {
                 typed.clear();
             }
-        });
+        })
+        .response
+        .on_hover(&BAUD_HOVER);
     ui.data_mut(|d| d.insert_temp(text_id, typed));
 }
 
 /// A label and a drop-down over (value, text) options, as wide as its longest
-/// option.
+/// option. The label and the drop-down share the hover.
 fn option_combo<T: PartialEq + Copy>(
     ui: &mut egui::Ui,
-    label: &str,
+    (label, hover): (&str, &Hover),
     id: egui::Id,
     value: &mut T,
     options: &[(T, &str)],
@@ -436,7 +478,7 @@ fn option_combo<T: PartialEq + Copy>(
         .find(|(v, _)| v == value)
         .map_or("", |(_, text)| *text);
     let width = combo_width(ui, options.iter().map(|(_, text)| *text));
-    label_for_combo(ui, label, width);
+    label_for_combo(ui, label, hover, width);
     egui::ComboBox::from_id_salt(id)
         .selected_text(shown)
         .width(width)
@@ -444,14 +486,17 @@ fn option_combo<T: PartialEq + Copy>(
             for (option, text) in options {
                 ui.selectable_value(value, *option, *text);
             }
-        });
+        })
+        .response
+        .on_hover(hover);
 }
 
 /// A label and a drop-down over offered options that may hold an unsupported
-/// value, shown as itself until another is chosen.
+/// value, shown as itself until another is chosen. The label and the drop-down
+/// share the hover.
 fn choice_combo<T: PartialEq + Copy>(
     ui: &mut egui::Ui,
-    label: &str,
+    (label, hover): (&str, &Hover),
     id: egui::Id,
     value: &mut Choice<T>,
     options: &[(T, &str)],
@@ -464,7 +509,7 @@ fn choice_combo<T: PartialEq + Copy>(
             .map(|(_, text)| *text)
             .chain(std::iter::once(shown.as_str())),
     );
-    label_for_combo(ui, label, width);
+    label_for_combo(ui, label, hover, width);
     egui::ComboBox::from_id_salt(id)
         .selected_text(shown)
         .width(width)
@@ -472,7 +517,9 @@ fn choice_combo<T: PartialEq + Copy>(
             for (option, text) in options {
                 ui.selectable_value(value, Choice::Offered(*option), *text);
             }
-        });
+        })
+        .response
+        .on_hover(hover);
 }
 
 /// The text a [`Choice`] shows in its closed drop-down.
@@ -522,10 +569,10 @@ fn keep_together(ui: &mut egui::Ui, width: f32) {
 }
 
 /// A label, kept on one row with the `combo`-wide drop-down that follows it.
-fn label_for_combo(ui: &mut egui::Ui, label: &str, combo: f32) {
+fn label_for_combo(ui: &mut egui::Ui, label: &str, hover: &Hover, combo: f32) {
     let width = text_width(ui, label, egui::TextStyle::Body) + ui.spacing().item_spacing.x + combo;
     keep_together(ui, width);
-    ui.label(label);
+    ui.label(label).on_hover(hover);
 }
 
 /// The words for RTS under RTS/CTS flow control, and their hover.
@@ -641,10 +688,7 @@ mod tests {
         assert_eq!(texts(PARITY), ["None", "Even", "Odd"]);
         assert_eq!(texts(STOP_BITS), ["1", "2"]);
         assert_eq!(texts(FLOW_CONTROL), ["None", "XON/XOFF", "RTS/CTS"]);
-        assert_eq!(
-            BAUD_RATES,
-            [4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
-        );
+        assert_eq!(BAUD_RATES, [4800, 9600, 19200, 38400, 57600, 115200]);
     }
 
     #[test]

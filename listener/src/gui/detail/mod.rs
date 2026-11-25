@@ -25,6 +25,18 @@ use wiredata_ui::format::{compact_duration, human_byte_rate};
 use wiredata_ui::hover::{Hover, ShowHover};
 use wiredata_ui::palette::active as palette;
 
+/// The hover of the line under a channel's name that gives its interface.
+const INTERFACE_LINE_HOVER: Hover = Hover::new(
+    "This channel's interface, as it was last applied.\n\n\
+     For UDP: the mode, then the local address the channel listens on and its port. \
+     0.0.0.0 listens on every network adapter, so other computers can reach it; \
+     127.0.0.1 is this computer only; any other address is the one adapter that has \
+     it. Configure interface names the adapter each address belongs to.\n\n\
+     For serial: the port, then the baud rate, data bits, parity and stop bits, as in \
+     9600,8,N,1, and the flow control.\n\n\
+     A change in Configure interface shows here once Start channel or Apply & \n     Restart applies it.",
+);
+
 /// Uniform size for the lifecycle / recording control buttons. Text wider than the
 /// min grows the button (so "Apply & Restart" doesn't clip).
 const CONTROL_BUTTON_SIZE: egui::Vec2 = egui::vec2(96.0, 32.0);
@@ -218,20 +230,10 @@ impl ListenerApp {
         if let Some(text) = text {
             ui.add(egui::Label::new(egui::RichText::new(text).color(palette(ui).fault)).wrap());
         }
-        if let Some(view) = self.state.channel(id) {
-            ui.add_space(6.0);
-            diagnostics::show_receive_diagnostics_card(ui, id, status, view);
-        }
-        if let Some(summary) = self
-            .state
-            .channel(id)
-            .and_then(|view| view.snapshot.as_ref())
-            .and_then(|snapshot| snapshot.last_run_summary.as_ref())
-        {
-            ui.add_space(4.0);
-            show_last_run_summary(ui, summary);
-        }
-
+        // Configure sits right under Start and Stop (and the start error, which
+        // says why the button above failed), as in talker, so what a Start
+        // applies is beside the button that applies it.
+        //
         // Configure: edit the full interface config on a working copy, then commit
         // with one click — "Apply & Restart" installs it and brings the channel up
         // (no separate Apply-then-Start step).
@@ -296,6 +298,20 @@ impl ListenerApp {
             Some(LineClick::Rts(on)) => self.send(UiCommand::SetRts(id, on)),
             Some(LineClick::Dtr(on)) => self.send(UiCommand::SetDtr(id, on)),
             None => {}
+        }
+
+        if let Some(view) = self.state.channel(id) {
+            ui.add_space(6.0);
+            diagnostics::show_receive_diagnostics_card(ui, id, status, view);
+        }
+        if let Some(summary) = self
+            .state
+            .channel(id)
+            .and_then(|view| view.snapshot.as_ref())
+            .and_then(|snapshot| snapshot.last_run_summary.as_ref())
+        {
+            ui.add_space(4.0);
+            show_last_run_summary(ui, summary);
         }
 
         ui.separator();
@@ -551,10 +567,10 @@ impl ListenerApp {
         let reconnect = self.state.channel(id).and_then(|v| v.reconnect);
         // The status on one line and the interface's settings on the next, so a
         // long status such as a reconnect's countdown never pushes the settings
-        // around. The settings wrap: with the bind scope they are wider than
-        // this column.
+        // around. The settings wrap, should a long address or port name need it.
         ui.label(status_words(status, reconnect));
-        ui.add(egui::Label::new(egui::RichText::new(details).weak()).wrap());
+        ui.add(egui::Label::new(egui::RichText::new(details).weak()).wrap())
+            .on_hover(&INTERFACE_LINE_HOVER);
         // Byte-based liveness (§18): total received + rolling throughput.
         ui.label(format!(
             "Received: {}    Throughput: {}",
