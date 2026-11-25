@@ -322,19 +322,6 @@ const SHARED_HINT: Hover = Hover::new(
      datagram to only one of the programs sharing a port.",
 );
 
-const KERNEL_TIMESTAMP_HINT: Hover = Hover::new(
-    "Asks the operating system to take each UDP datagram's arrival time itself, \
-     instead of Listener taking it after the read.\n\n\
-     This works on Linux only. Windows and macOS report the request as unavailable \
-     and take the time after the read, as they do when this is off.\n\n\
-     The arrival times used by timestamp marks and written to the timestamp sidecar \
-     then leave out the delay between a datagram reaching this computer and Listener \
-     reading it. The Handoff and Read gap figures in Diagnostics do not change.\n\n\
-     The time is software time. It is not the device's clock, not hardware time, \
-     and not the arrival time of any single byte on the wire. Linux supplies it in \
-     nanosecond fields, which does not mean it is accurate to a nanosecond.",
-);
-
 /// A list the interface editor asks to have listed again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Refresh {
@@ -432,15 +419,6 @@ fn edit_udp(
                 .horizontal_wrapped(|ui| udp_mode_and_sharing(ui, udp))
                 .response
                 .rect;
-            ui.end_row();
-
-            ui.label("Arrival timing").on_hover_text(
-                "Choose who takes the arrival time of each UDP datagram: Listener \
-                 after it reads the datagram, or the operating system when it \
-                 receives it.",
-            );
-            ui.checkbox(&mut udp.kernel_timestamps, "Kernel timestamp")
-                .on_hover(&KERNEL_TIMESTAMP_HINT);
             ui.end_row();
             (port, mode)
         })

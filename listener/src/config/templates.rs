@@ -55,7 +55,6 @@ pub fn udp_template() -> ChannelConfig {
             multicast_group: None,
             multicast_interface: None,
             recv_buffer_bytes: None,
-            kernel_timestamps: false,
             shared_port: false,
         }),
         display: DisplayConfig::default(),

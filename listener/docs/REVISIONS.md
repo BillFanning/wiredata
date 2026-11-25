@@ -12,6 +12,13 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-25) — the disk guard is removed:
+
+- **§56.2, §71, §79, §137, §168 (ADR-076).** A recording has no disk-space
+  guard: no low-disk threshold, no lasting low-disk fault, no low-disk gap and
+  no low-disk events. A profile with `disk_guard` is refused as an unknown key.
+  Status still shows each recording's size and the free space on its drive.
+
 Revision note (2026-11-24) — control characters in a new view, a shorter baud
 list, and the interface line:
 

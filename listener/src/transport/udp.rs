@@ -78,7 +78,6 @@ pub struct UdpTransport {
     multicast_group: Option<IpAddr>,
     multicast_interface: Option<Ipv4Addr>,
     recv_buffer: Option<usize>,
-    kernel_timestamps: bool,
     shared_port: bool,
 }
 
@@ -91,7 +90,6 @@ impl UdpTransport {
             multicast_group: None,
             multicast_interface: None,
             recv_buffer: None,
-            kernel_timestamps: false,
             shared_port: false,
         }
     }
@@ -113,13 +111,6 @@ impl UdpTransport {
     /// (§101). The OS may grant less; the bound transport reports what it got.
     pub fn with_recv_buffer(mut self, bytes: usize) -> Self {
         self.recv_buffer = Some(bytes);
-        self
-    }
-
-    /// Request OS receive timestamps for UDP datagrams. Unsupported systems retain
-    /// the post-read timestamp and report that fallback through transport health.
-    pub fn with_kernel_timestamps(mut self) -> Self {
-        self.kernel_timestamps = true;
         self
     }
 
@@ -168,7 +159,6 @@ impl UdpTransport {
             socket,
             notices: None,
             drop_counter_supported,
-            kernel_timestamps_requested: self.kernel_timestamps,
             kernel_timestamps_active,
             shared_port,
             receive_buffer,
@@ -201,8 +191,7 @@ fn build_udp_socket(transport: &UdpTransport) -> io::Result<BuiltSocket> {
         .recv_buffer
         .map(|requested| request_receive_buffer(&socket, requested));
     let drop_counter_supported = enable_udp_drop_counter(&socket);
-    let kernel_timestamps_active =
-        enable_udp_kernel_timestamps(&socket, transport.kernel_timestamps);
+    let kernel_timestamps_active = enable_udp_kernel_timestamps(&socket);
     let shared_port = if transport.shared_port {
         share_port(&socket)
     } else {
@@ -274,13 +263,12 @@ fn enable_udp_drop_counter(_socket: &socket2::Socket) -> bool {
     false
 }
 
+/// Ask the kernel to timestamp each datagram as it reaches the socket (§15,
+/// §26). Always asked for on Linux; whether it took is reported.
 #[cfg(target_os = "linux")]
-fn enable_udp_kernel_timestamps(socket: &socket2::Socket, requested: bool) -> bool {
+fn enable_udp_kernel_timestamps(socket: &socket2::Socket) -> bool {
     use std::os::fd::AsRawFd;
 
-    if !requested {
-        return false;
-    }
     let enabled: libc::c_int = 1;
     // SAFETY: `socket` owns a valid descriptor; `enabled` is a live integer with
     // the exact byte length passed to `setsockopt`.
@@ -295,8 +283,10 @@ fn enable_udp_kernel_timestamps(socket: &socket2::Socket, requested: bool) -> bo
     }
 }
 
+/// Windows and macOS have no per-datagram kernel receive timestamp, so
+/// Listener takes the time just after each read.
 #[cfg(not(target_os = "linux"))]
-fn enable_udp_kernel_timestamps(_socket: &socket2::Socket, _requested: bool) -> bool {
+fn enable_udp_kernel_timestamps(_socket: &socket2::Socket) -> bool {
     false
 }
 
@@ -307,7 +297,6 @@ pub struct BoundUdpTransport {
     socket: UdpSocket,
     notices: Option<Sender<TransportNotice>>,
     drop_counter_supported: bool,
-    kernel_timestamps_requested: bool,
     kernel_timestamps_active: bool,
     shared_port: SharedPortStatus,
     receive_buffer: Option<ReceiveBuffer>,
@@ -336,7 +325,6 @@ impl DataTransportRunner for BoundUdpTransport {
             socket,
             notices,
             drop_counter_supported,
-            kernel_timestamps_requested,
             kernel_timestamps_active,
             shared_port,
             receive_buffer,
@@ -350,9 +338,10 @@ impl DataTransportRunner for BoundUdpTransport {
                     channel_id,
                     dropped: drop_counter_supported.then_some(0),
                 });
+                // Linux is always asked; elsewhere there is nothing to ask.
                 let status = if kernel_timestamps_active {
                     ArrivalTimestampStatus::KernelSoftware
-                } else if kernel_timestamps_requested {
+                } else if cfg!(target_os = "linux") {
                     ArrivalTimestampStatus::KernelRequestedUnavailable
                 } else {
                     ArrivalTimestampStatus::PostRead
@@ -694,10 +683,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requested_kernel_timestamps_report_active_or_explicit_fallback() {
+    async fn udp_uses_kernel_times_on_linux_and_post_read_elsewhere() {
         let cid = ChannelId::new();
-        let transport = UdpTransport::new(cid, "127.0.0.1:0".parse().unwrap(), UdpMode::Unicast)
-            .with_kernel_timestamps();
+        let transport = UdpTransport::new(cid, "127.0.0.1:0".parse().unwrap(), UdpMode::Unicast);
         let bound = transport.bind().await.unwrap();
         let server_addr = bound.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
@@ -709,7 +697,7 @@ mod tests {
         let expected_status = if cfg!(target_os = "linux") {
             ArrivalTimestampStatus::KernelSoftware
         } else {
-            ArrivalTimestampStatus::KernelRequestedUnavailable
+            ArrivalTimestampStatus::PostRead
         };
         assert_eq!(
             notice_rx.recv().await.unwrap(),

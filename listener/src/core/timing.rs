@@ -28,12 +28,14 @@ pub enum ArrivalTimestampSource {
 /// Effective timestamping policy for a running transport.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ArrivalTimestampStatus {
-    /// Userland post-read timestamps are in use (the default for every transport).
+    /// Userland post-read timestamps are in use: serial, and UDP on Windows
+    /// and macOS.
     #[default]
     PostRead,
-    /// Kernel software receive timestamps were requested and activated.
+    /// Kernel software receive timestamps are in use: UDP on Linux.
     KernelSoftware,
-    /// Kernel timestamps were requested, but this platform/socket could not provide them.
+    /// Linux could not turn kernel timestamps on for this socket, so post-read
+    /// timestamps are used.
     KernelRequestedUnavailable,
 }
 

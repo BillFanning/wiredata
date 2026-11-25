@@ -150,11 +150,6 @@ pub struct UdpConfig {
     /// status reports what it granted.
     #[serde(default)]
     pub recv_buffer_bytes: Option<usize>,
-    /// Request a kernel software receive timestamp for each UDP datagram. Linux
-    /// activates `SO_TIMESTAMPNS`; unsupported platforms fall back explicitly to
-    /// the normal post-read timestamp. Disabled by default for profile compatibility.
-    #[serde(default)]
-    pub kernel_timestamps: bool,
     /// "Request shared port" (§15, ADR-047): set the platform's address-reuse
     /// option before binding, so another program can bind the same port.
     /// Broadcast and multicast only. Off by default.

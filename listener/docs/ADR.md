@@ -886,6 +886,8 @@ per-socket counter is available through the current transport boundary.
 
 `UdpConfig` gains additive, default-off `kernel_timestamps`. Linux requests
 `SO_TIMESTAMPNS` and parses `SCM_TIMESTAMPNS` from the same `recvmsg` ancillary data.
+(Amended 2026-11-25 by ADR-077: Linux always requests them, and the setting is
+removed.)
 When present, it replaces only `ChunkTime.wall_clock` and records
 `KernelSoftware`; monotonic ordering, handoff, gaps, and processing retain the
 post-read capture. Failed setup, unsupported platforms, or missing per-datagram
@@ -2729,6 +2731,46 @@ line but is not acted on. Once it is full, writes fail and the recording gaps
 with "writing the file failed" and retries (§56.1), which repeated faults turn
 into the lasting "recording unstable" fault. The case of a gap that lost no
 bytes, which low disk made, is now tested through a failed flush.
+
+## ADR-077 — UDP on Linux always uses kernel arrival times
+
+**Status:** Accepted 2026-11-25. Amends §15, §26, §75, §84 and ADR-029.
+
+**Context:** ADR-029 made kernel receive timestamps an opt-in UDP setting, off
+by default. It did nothing on Windows and macOS. On Linux it costs almost
+nothing: Listener already reads every datagram with `recvmsg` for the kernel's
+drop counter, and the timestamp is one more item in the same read; the kernel's
+own cost is one clock read per received packet. The user asked for the setting
+to go and for Linux to use kernel times always.
+
+**Decision:**
+
+- **UDP on Linux always asks for `SO_TIMESTAMPNS`.** When a datagram carries the
+  timestamp, it is that datagram's arrival wall time. A failed request or a
+  missing timestamp falls back to the post-read time, counted as before.
+- **Windows and macOS report post-read**, not "kernel unavailable", since
+  nothing was asked for there.
+- **The Kernel timestamp setting and the `kernel_timestamps` profile key are
+  removed.** A profile with the key is refused as unknown (ADR-048); no
+  profiles are in use.
+
+**Boundary:** The post-read monotonic time still orders chunks and drives
+Handoff, Read gap and the other timings (§26). Serial is unchanged: no
+operating system gives a serial read a kernel timestamp.
+
+**Alternatives considered:**
+
+- **Keep the setting, on by default:** still a setting that does nothing on two
+  of the three platforms.
+- **Keep it opt-in:** Linux times would be taken later by default, for no gain.
+
+**Consequences:** A UDP Channel's times are taken at different points on
+different platforms: on Linux as the datagram reaches the socket, elsewhere just
+after Listener reads it. The two are usually tens of microseconds apart, more
+when Listener falls behind. The Diagnostics line names the source for each run,
+as does the completed-run report, and the event log says it as the channel
+starts, beside any recording a reader may open later. The hovers on the
+timestamp sidecar and on timestamp marks say which time each platform uses.
 
 ## Open questions
 

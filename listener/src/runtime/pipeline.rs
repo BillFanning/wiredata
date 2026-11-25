@@ -1700,6 +1700,27 @@ impl ChannelPipeline {
                 status,
             } => {
                 self.transport_health.arrival_timestamps.status = status;
+                // Said once, as the channel starts, so the event log beside a
+                // recording says how its times were taken (ADR-077).
+                let channel = &self.channel_name;
+                self.diagnostics.record(match status {
+                    crate::core::ArrivalTimestampStatus::KernelSoftware => {
+                        Diagnostic::event(format!(
+                            "UDP arrival times on channel {channel} come from the Linux kernel, \
+                         as each datagram reaches this computer"
+                        ))
+                    }
+                    crate::core::ArrivalTimestampStatus::PostRead => Diagnostic::event(format!(
+                        "UDP arrival times on channel {channel} are taken by Listener just \
+                         after each read"
+                    )),
+                    crate::core::ArrivalTimestampStatus::KernelRequestedUnavailable => {
+                        Diagnostic::warning(format!(
+                            "Linux could not turn on kernel arrival times for channel \
+                             {channel}, so Listener takes them just after each read"
+                        ))
+                    }
+                });
             }
             TransportNotice::UdpSharedPort {
                 channel_id: _,
@@ -3650,6 +3671,48 @@ mod tests {
             }
         }
         assert!(saw_match);
+    }
+
+    /// ADR-077: where a UDP channel's arrival times come from differs by
+    /// platform, so the event log says it once as the channel starts, beside
+    /// the recording a reader may open weeks later.
+    #[test]
+    fn the_event_log_says_where_udp_arrival_times_come_from() {
+        use crate::core::ArrivalTimestampStatus;
+        let cid = ChannelId::new();
+        let said = |status| {
+            crate::diagnostics::test_support::capture(|| {
+                let mut p = pipeline(cid, PipelineCapacities::default()).with_channel_name("GPS");
+                p.record_notice(TransportNotice::UdpArrivalTimestamps {
+                    channel_id: cid,
+                    status,
+                });
+            })
+        };
+        let kernel = said(ArrivalTimestampStatus::KernelSoftware);
+        assert!(
+            kernel.contains(
+                "UDP arrival times on channel GPS come from the Linux kernel, as each \
+                 datagram reaches this computer"
+            ),
+            "{kernel}"
+        );
+        let post_read = said(ArrivalTimestampStatus::PostRead);
+        assert!(
+            post_read.contains(
+                "UDP arrival times on channel GPS are taken by Listener just after each read"
+            ),
+            "{post_read}"
+        );
+        let refused = said(ArrivalTimestampStatus::KernelRequestedUnavailable);
+        assert!(refused.contains("WARN"), "{refused}");
+        assert!(
+            refused.contains(
+                "Linux could not turn on kernel arrival times for channel GPS, so Listener \
+                 takes them just after each read"
+            ),
+            "{refused}"
+        );
     }
 
     #[test]

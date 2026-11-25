@@ -1,16 +1,18 @@
-# Listener Specification v2.6.9
+# Listener Specification v2.6.10
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-25) — the disk guard is removed:
+Revision note (2026-11-25) — kernel arrival times on Linux:
 
-- **§56.2, §71, §79, §137, §168 (ADR-076).** A recording has no disk-space
-  guard: no low-disk threshold, no lasting low-disk fault, no low-disk gap and
-  no low-disk events. A profile with `disk_guard` is refused as an unknown key.
-  Status still shows each recording's size and the free space on its drive.
+- **§15, §26, §75, §84 (ADR-077).** A UDP Channel on Linux always uses the
+  kernel's receive timestamp as each datagram's arrival time. The Kernel
+  timestamp setting and the `kernel_timestamps` profile key are gone; a profile
+  with the key is refused as unknown. Windows and macOS, which have no such
+  timestamp, use the post-read time as before. The event log says once, as a UDP
+  Channel starts, where its arrival times come from.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -645,11 +647,12 @@ each datagram to only one of the sharing sockets: the choice stays in place,
 disabled and unticked, and says in words that it is for broadcast and
 multicast only.
 
-UDP arrival wall time defaults to the portable post-read capture (§26). When the
-additive `kernel_timestamps` option is enabled, Linux requests a per-datagram software
-receive timestamp with `SO_TIMESTAMPNS`; unavailable support or missing ancillary
-metadata falls back explicitly to post-read wall time and is counted as such. This is
-not a hardware timestamp. Linux also exposes a per-socket `SO_RXQ_OVFL` drop count;
+On Linux a UDP Channel always requests a per-datagram software receive timestamp
+with `SO_TIMESTAMPNS` and uses it as the arrival wall time (§26, ADR-077). A failed
+request, or a datagram without the metadata, falls back explicitly to post-read wall
+time and is counted as such. Windows and macOS have no such timestamp and use the
+post-read wall time. This is not a hardware timestamp. The event log says once, as the
+Channel starts, where its arrival times come from (§118). Linux also exposes a per-socket `SO_RXQ_OVFL` drop count;
 unsupported platforms report that the counter is unavailable rather than reporting a
 synthetic zero (§101).
 
@@ -715,11 +718,12 @@ its monotonic member immediately after the OS read returns and before copying in
 owned payload. That post-read monotonic point drives ordering, activity, inter-read
 gaps, and elapsed-time telemetry. It is never replaced by a kernel timestamp.
 
-The wall-clock member defaults to the paired post-read `SystemTime`. A UDP Channel may
-request Linux kernel software receive timestamps (§15, §75); when one accompanies the
+The wall-clock member defaults to the paired post-read `SystemTime`. A UDP Channel on
+Linux uses kernel software receive timestamps (§15); when one accompanies the
 datagram, it replaces only the wall-clock member and records
-`KernelSoftware` as its source. Unsupported platforms, a failed request, or a datagram
-without metadata use and count the post-read fallback. The actual source and sample
+`KernelSoftware` as its source. Serial Channels and UDP Channels on Windows and macOS
+use the post-read time; on Linux, a failed request or a datagram without metadata
+uses and counts the post-read fallback. The actual source and sample
 counts are visible in Channel telemetry and the completed-run report (§91.2).
 
 This is a reception fact, not a per-Message timestamp (there are no Messages). It
@@ -1638,7 +1642,6 @@ struct UdpConfig {
     multicast_group: Option<String>,
     multicast_interface: Option<String>, // NIC to join on (multi-homed hosts)
     recv_buffer_bytes: Option<usize>,    // SO_RCVBUF; 4 MiB when unset
-    kernel_timestamps: bool,             // default false; Linux SO_TIMESTAMPNS
     shared_port: bool,                   // §15 "Request shared port"; default false;
                                          //   broadcast/multicast only
 }
@@ -1857,7 +1860,6 @@ Defaults:
 Kind: UDP
 Name: UDP Channel
 Bind Address: 0.0.0.0
-Kernel Timestamp: Disabled
 Recording: Disabled
 Display: Raw + Hex
 ```
@@ -2936,8 +2938,8 @@ pub struct ReceivedData {
     pub received_at: ChunkTime,
 }
 
-// Post-read monotonic capture per chunk. Wall clock is post-read by default and may
-// be replaced by optional Linux UDP kernel software metadata (§26). Per-byte arrival
+// Post-read monotonic capture per chunk. Wall clock is post-read by default and is
+// replaced by Linux UDP kernel software metadata when present (§26). Per-byte arrival
 // time is not represented.
 pub struct ChunkTime {
     pub monotonic: std::time::Instant,

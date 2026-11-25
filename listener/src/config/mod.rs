@@ -571,22 +571,6 @@ mod tests {
     }
 
     #[test]
-    fn udp_kernel_timestamps_are_additive_and_default_off() {
-        let old: UdpConfig =
-            toml::from_str("bind_address = '0.0.0.0'\nport = 9000\nmode = 'Unicast'\n").unwrap();
-        assert!(!old.kernel_timestamps);
-
-        let mut enabled = old;
-        enabled.kernel_timestamps = true;
-        let text = toml::to_string(&enabled).unwrap();
-        assert!(
-            toml::from_str::<UdpConfig>(&text)
-                .unwrap()
-                .kernel_timestamps
-        );
-    }
-
-    #[test]
     fn mark_timestamp_without_style_defaults_to_plain() {
         let timestamp: MarkTimestamp = toml::from_str("separator = ' '").unwrap();
         assert_eq!(timestamp.style, MarkTimestampStyle::Plain {});

@@ -153,9 +153,10 @@ const ARRIVAL_TIMESTAMP_TOOLTIP: Hover = Hover::new(
     "Where the time of day on each received block comes from.\n\n\
      Timestamped Mark annotations and the recording's metadata use this time.\n\n\
      Post-read is the computer's clock read just after the operating system's read returns. \
-     Linux kernel software time is captured earlier, as the data enters the socket. When kernel \
-     timing is in use, a post-read fallback is a datagram that arrived without a usable kernel \
-     timestamp. Kernel unavailable means kernel timing was asked for but could not be used, so \
+     Serial channels, and UDP channels on Windows and macOS, use it. Linux kernel software \
+     time is captured earlier, as the datagram enters the socket; UDP channels on Linux use \
+     it. A post-read fallback is a datagram that arrived without a usable kernel timestamp. \
+     Kernel unavailable means Linux could not turn kernel timing on for this socket, so \
      post-read is used instead.\n\n\
      The kernel's software timestamp carries digits down to the nanosecond. That does not mean it \
      is accurate to a nanosecond.\n\n\

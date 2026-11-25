@@ -162,9 +162,6 @@ pub fn build_udp(channel_id: ChannelId, config: &UdpConfig) -> Result<UdpTranspo
             .recv_buffer_bytes
             .unwrap_or(crate::config::DEFAULT_RECV_BUFFER_BYTES),
     );
-    if config.kernel_timestamps {
-        transport = transport.with_kernel_timestamps();
-    }
     if config.shared_port {
         transport = transport.with_shared_port();
     }
@@ -249,7 +246,6 @@ mod tests {
             multicast_group: None,
             multicast_interface: None,
             recv_buffer_bytes: None,
-            kernel_timestamps: false,
             shared_port: false,
         };
         assert!(build_udp(ChannelId::new(), &good).is_ok());
@@ -261,7 +257,6 @@ mod tests {
             multicast_group: None,
             multicast_interface: None,
             recv_buffer_bytes: None,
-            kernel_timestamps: false,
             shared_port: false,
         };
         assert!(matches!(

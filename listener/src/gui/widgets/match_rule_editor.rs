@@ -23,7 +23,9 @@ const MARKS_HOVER: Hover = Hover::new(
      before or after the pattern. It appears in the view and in the Display recording \
      (.disp). It is never added to the Raw recording (.raw).\n\n\
      The time is the arrival time of the block of data that held the pattern, so \
-     patterns in the same block get the same time.\n\n\
+     patterns in the same block get the same time. For a UDP channel on Linux it is \
+     the kernel's time, taken as the datagram reaches this computer; otherwise \
+     Listener takes it just after reading.\n\n\
      Changes take effect with Apply & Restart, which restarts the channel.",
 );
 const RULE_ENABLED_HOVER: Hover = Hover::new(

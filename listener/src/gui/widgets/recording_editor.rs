@@ -151,9 +151,11 @@ const TIMESTAMP_SIDECAR_TOOLTIP: Hover = Hover::new(
      (Unix time).\n\n\
      It is plain text, so any tool can read it. It is kept out of the .raw file so \
      that file stays exactly the bytes received.\n\n\
-     The time is taken once for each block, when it is received. It is not per byte, \
-     and it is not device or wire time, so a nanosecond field does not mean \
-     nanosecond accuracy.\n\n\
+     The time is taken once for each block, when it is received. For a UDP channel on \
+     Linux it is the kernel's time, taken as the datagram reaches this computer; \
+     otherwise Listener takes it just after reading. It is not per byte, and it is \
+     not device or wire time, so a nanosecond field does not mean nanosecond \
+     accuracy.\n\n\
      The positions always refer to the .raw file beside the companion file. Appending \
      to an existing recording continues from the end of that file instead of starting \
      over, and every .raw file, including each rotation period's file, has its own \
