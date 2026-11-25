@@ -67,9 +67,6 @@ Found by a survey of every retry in the workspace on 2026-11-19.
   and `cadence_tooltip` builds about 1 kB of text every repaint, hovered or not.
   The better shape is a `wiredata-ui` change so `signal_row` builds its tooltip
   only on hover. That touches shared chrome, so do it with the next chrome pass.
-- [ ] **Split `talker/src/gui/widgets.rs`** (about 2,700 lines) into a `widgets/`
-  folder mirroring listener's, re-exported flat so call sites keep
-  `widgets::<name>`. A move only: its own commit, not bundled with feature work.
 - [ ] **Do `running` and `warning` earn two colours? (ADR-050)** They look the
   same to a red-green deficiency. Everywhere they appear, a glyph and a word
   already carry the state, so this is about reinforcement one reader does not
