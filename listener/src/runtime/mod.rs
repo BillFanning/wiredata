@@ -38,6 +38,7 @@ pub use listener::{
     StartTicket, StopTicket, RUNTIME_SHUTDOWN_LIMIT,
 };
 pub use matchrule::{FiredRule, MatchRuleSet};
+pub(crate) use pipeline::transport_fault_prefix;
 pub use pipeline::{run_channel, CapacityRequest, ChannelPipeline, PipelineCapacities};
 pub use queue::DropOldestQueue;
 pub use run_summary::{ListenerRunSummary, RunEndReason, RunId};

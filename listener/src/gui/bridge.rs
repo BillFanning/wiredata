@@ -533,7 +533,7 @@ struct LinemonChannel {
 
 /// The name the hidden Channel has in the runtime. The runtime does not check
 /// names for uniqueness, so a user Channel of the same name cannot collide.
-const LINEMON_CHANNEL_NAME: &str = "Linemon";
+pub(super) const LINEMON_CHANNEL_NAME: &str = "Linemon";
 
 /// `config` as Linemon's hidden Channel runs it: named for Linemon, and with
 /// no recording, since Linemon is never a recording (spec §50.3).

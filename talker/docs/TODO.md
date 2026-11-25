@@ -57,15 +57,6 @@ Found by a survey of every retry in the workspace on 2026-11-19.
 
 ## GUI
 
-- [ ] **Say why a port refuses 5 or 6 data bits (workspace).** On 2026-11-23,
-  Linemon on an FTDI adapter with 6 data bits read "COM3 could not be opened:
-  The parameter is incorrect." FTDI chips take only 7 or 8 data bits, and the
-  Windows driver refuses the rest at open. The serial library passes on
-  Windows's words, which change with its language, and no code to test, so go
-  by the settings: when an open fails with 5 or 6 data bits, add a line such as
-  "Many USB serial adapters take only 7 or 8 data bits." Put it beside
-  `serial_port_hint` so Linemon, a Listener channel and talker say it the same
-  way.
 - [ ] **A freeze not yet explained (Windows, FTDI).** On 2026-11-22 talker
   stopped responding while flow control was changed in both talker and Linemon
   during a CTS stall, over a null-modem pair. After it was force-closed, a

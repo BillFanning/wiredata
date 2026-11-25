@@ -2180,6 +2180,79 @@ mod tests {
         id
     }
 
+    /// §94, ADR-006: a Channel whose transport faults by itself (a serial
+    /// port unplugged) keeps telling why until it is stopped. Its pipeline
+    /// records the cause and finalizes, then still answers status, so a
+    /// snapshot taken after it ended — what Linemon and the Channel view
+    /// read — carries the cause, and Stop still ends it at once.
+    #[tokio::test]
+    async fn a_faulted_channel_still_says_why_after_its_pipeline_has_finished() {
+        use crate::core::ChunkTime;
+        use crate::transport::{ReceivedData, TransportJoinHandle, TransportOutcome};
+
+        struct FaultAfterOne(ChannelId);
+        impl DataTransportRunner for FaultAfterOne {
+            fn run(
+                self,
+                out: mpsc::Sender<ReceivedData>,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) -> TransportJoinHandle {
+                TransportJoinHandle::Task(tokio::spawn(async move {
+                    let _ = out
+                        .send(ReceivedData {
+                            channel_id: self.0,
+                            payload: b"x".to_vec(),
+                            received_at: ChunkTime::now(),
+                        })
+                        .await;
+                    TransportOutcome::Faulted("the device was removed".to_string())
+                }))
+            }
+        }
+
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        let faulted = listener.channels[&id].faulted.clone();
+        let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
+        let handle = spawn_monitored_channel(
+            id,
+            FaultAfterOne(id),
+            None,
+            None,
+            MatchSetup::none(),
+            PipelineCapacities::default(),
+            listener.events_tx.clone(),
+            faulted.clone(),
+            None,
+            (notice_tx, notice_rx),
+        );
+        listener.channels.get_mut(&id).unwrap().handle = Some(handle);
+        while !faulted.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
+        // Long enough for the pipeline to record the cause, finalize and
+        // leave its loop.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let snap = listener.snapshot(id).await.expect("a known channel");
+        assert_eq!(snap.state, ChannelState::Faulted);
+        assert!(
+            snap.diagnostics
+                .errors
+                .iter()
+                .any(|d| d.message.contains("the device was removed")),
+            "the fault's cause is in the snapshot: {:?}",
+            snap.diagnostics.errors
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), listener.stop(id))
+            .await
+            .expect("Stop ends a faulted channel's pipeline at once")
+            .expect("a faulted channel can be stopped");
+        assert_eq!(listener.state(id), Some(ChannelState::Stopped));
+    }
+
     #[tokio::test]
     async fn status_does_not_wait_on_a_faulted_channel_whose_close_is_stuck() {
         // A faulted Channel keeps its handle until the user stops it. Its
@@ -2473,7 +2546,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_cached_status_says_so_and_its_age_grows_with_time() {
-        let (listener, id) = stalled_after_one_answer().await;
+        let (mut listener, id) = stalled_after_one_answer().await;
+        // The stuck close is given up at the stop grace, after which the
+        // pipeline answers again with its final status. A request queue that
+        // nothing reads keeps it silent for the whole test.
+        listener
+            .channels
+            .get_mut(&id)
+            .and_then(|channel| channel.handle.as_mut())
+            .expect("the Channel has a handle")
+            .fill_requests_for_test();
 
         let first = listener.snapshot(id).await.unwrap();
         let Provenance::Cached { age: first_age } = first.provenance else {

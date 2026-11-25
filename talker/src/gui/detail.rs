@@ -24,7 +24,8 @@ use wiredata_ui::{
     },
     fonts::bold,
     format::{
-        compact_duration, human_byte_rate, human_bytes, percent, serial_port_hint, thousands,
+        compact_duration, data_bits_hint, human_byte_rate, human_bytes, percent, serial_port_hint,
+        thousands,
     },
     glyphs,
 };
@@ -566,6 +567,13 @@ impl TalkerApp {
                 if !port.is_empty() {
                     let listed = ports.contains(port);
                     ui.colored_label(pal.warning, serial_port_hint(port, listed));
+                }
+            }
+            // A port that refuses 5 or 6 data bits says only that a parameter
+            // is wrong, so say which one it probably is.
+            if open_failure && draft_kind == ConnKind::Serial {
+                if let Some(hint) = data_bits_hint(self.conn_drafts[i].data_bits) {
+                    ui.colored_label(pal.warning, hint);
                 }
             }
         }

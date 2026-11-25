@@ -1741,8 +1741,8 @@ impl ChannelPipeline {
                 // retained snapshot). The paired `ChannelFaulted` lifecycle
                 // event (§137) is emitted by the fault monitor, not here.
                 self.diagnostics.record(Diagnostic::error(format!(
-                    "transport fault on channel {}: {cause}",
-                    self.channel_name
+                    "{}{cause}",
+                    transport_fault_prefix(&self.channel_name)
                 )));
             }
         }
@@ -2355,6 +2355,9 @@ pub async fn run_channel(
     let mut requests_open = true;
     let mut notices_open = true;
     let mut ingest_open = true;
+    // The transport ended — a fault, or a stop that closed it — rather than the
+    // pipeline being cancelled.
+    let mut transport_ended = false;
     // Periodic free-space and size check for running recordings (§56.2) — not
     // per write. Nothing is checked while no recording runs.
     let mut disk_check = tokio::time::interval(Duration::from_secs(5));
@@ -2409,6 +2412,7 @@ pub async fn run_channel(
                 None => {
                     notices_open = false;
                     if !ingest_open {
+                        transport_ended = true;
                         break;
                     }
                 }
@@ -2442,6 +2446,7 @@ pub async fn run_channel(
                 // hang).
                 None => {
                     if !notices_open {
+                        transport_ended = true;
                         break;
                     }
                     ingest_open = false;
@@ -2450,7 +2455,52 @@ pub async fn run_channel(
         }
     }
     pipeline.finish().await;
+    if transport_ended && requests_open {
+        answer_status_until_stopped(&mut requests, &mut pipeline, &cancel).await;
+    }
     pipeline
+}
+
+/// What a transport fault's diagnostic says before its cause, as in "transport
+/// fault on channel GPS: serial read failed: …". Linemon, which has no
+/// channels to name, takes it off.
+pub(crate) fn transport_fault_prefix(channel: &str) -> String {
+    format!("transport fault on channel {channel}: ")
+}
+
+/// Keep answering status after the transport has ended on its own, until the
+/// Channel is stopped (its request queue closes) or the pipeline is cancelled.
+/// A fault's cause is recorded just before the end, so without this every
+/// later snapshot was an earlier one that did not have it, and Linemon and
+/// the Channel view said the port stopped with no reason. The recordings are
+/// already finalized, so a recording command is ignored.
+async fn answer_status_until_stopped(
+    requests: &mut Receiver<PipelineRequest>,
+    pipeline: &mut ChannelPipeline,
+    cancel: &CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            req = requests.recv() => match req {
+                Some(PipelineRequest::Snapshot(tx)) => {
+                    let _ = tx.send(pipeline.snapshot());
+                }
+                Some(PipelineRequest::Stats(tx)) => {
+                    let _ = tx.send(pipeline.stats());
+                }
+                Some(PipelineRequest::StreamDelta { since, reply }) => {
+                    let _ = reply.send(pipeline.stream_delta(since));
+                }
+                Some(
+                    PipelineRequest::SetRecording { .. }
+                    | PipelineRequest::SetDisplayRecording { .. },
+                ) => {}
+                None => return,
+            },
+        }
+    }
 }
 
 /// Wait until `deadline`, or forever when there is none. The caller drops and
@@ -2945,19 +2995,41 @@ mod tests {
     async fn run_channel_drains_then_stops_when_sender_drops() {
         let cid = ChannelId::new();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let (_req_tx, req_rx) = tokio::sync::mpsc::channel(1);
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(1);
         let (notice_tx, notice_rx) = tokio::sync::mpsc::channel(1);
         let p = pipeline(cid, PipelineCapacities::default());
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_channel(rx, req_rx, notice_rx, p, cancel));
 
         tx.send(bytes_chunk(cid, b"abc")).await.unwrap();
-        // Natural end = BOTH senders gone (as in production: the transport
-        // and its fault monitor drop them after the transport ends). The loop
+        // The transport ends: BOTH its senders go (as in production: the
+        // transport and its fault monitor drop them after it ends). The loop
         // deliberately outlives the ingest close alone, so a fault-cause
         // notice can never be outrun.
         drop(tx);
         drop(notice_tx);
+        // The pipeline drains and finishes, then still answers status, so a
+        // fault's cause stays readable until the Channel is stopped.
+        let ask = || async {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            req_tx
+                .send(PipelineRequest::Snapshot(reply_tx))
+                .await
+                .unwrap();
+            reply_rx.await.expect("the pipeline answers")
+        };
+        while ask().await.activity.total_bytes < 3 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "it waits for its requesters to go");
+        assert_eq!(
+            ask().await.activity.total_bytes,
+            3,
+            "answered after the end"
+        );
+        // A stop closes the request queue, and that ends it.
+        drop(req_tx);
         let p = task.await.unwrap();
         assert_eq!(&p.stream_tail()[..], &b"abc"[..]);
     }

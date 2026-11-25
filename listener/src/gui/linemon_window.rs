@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use wiredata_ui::diagnostics::{tone_marker, SignalTone};
-use wiredata_ui::format::thousands;
+use wiredata_ui::format::{data_bits_hint, thousands};
 use wiredata_ui::hover::{Hover, ShowHover};
 
 use crate::config::{
@@ -21,7 +21,7 @@ use crate::config::{
     StopBits, UdpConfig,
 };
 use crate::core::ChannelState;
-use crate::runtime::ChannelSnapshot;
+use crate::runtime::{transport_fault_prefix, ChannelSnapshot};
 use crate::transport::serial::{open_error_prefix, RTS_HIGH_UNDER_RTS_CTS};
 use crate::transport::udp::UdpMode;
 
@@ -426,6 +426,24 @@ fn without_open_prefix<'a>(reason: &'a str, interface: &InterfaceConfig) -> &'a 
     }
 }
 
+/// A serial setting's data bits as a number.
+pub(super) fn data_bits_number(bits: crate::config::DataBits) -> u8 {
+    use crate::config::DataBits;
+    match bits {
+        DataBits::Five => 5,
+        DataBits::Six => 6,
+        DataBits::Seven => 7,
+        DataBits::Eight => 8,
+    }
+}
+
+/// A stopped port's cause without the runtime's "transport fault on channel
+/// Linemon: ", since the status line names the port already.
+fn without_fault_prefix(reason: &str) -> &str {
+    let prefix = transport_fault_prefix(super::bridge::LINEMON_CHANNEL_NAME);
+    reason.strip_prefix(prefix.as_str()).unwrap_or(reason)
+}
+
 /// Whether an output differs between two readings of the control lines. A
 /// reading follows the reader setting the line, so a marker written for it
 /// records what the port did, not a click.
@@ -462,8 +480,16 @@ fn status_line(facts: &StatusFacts) -> StatusLine {
     };
     if let Some(reason) = facts.open_error {
         let reason = without_open_prefix(reason, facts.interface);
+        // A port that refuses 5 or 6 data bits says only that a parameter is
+        // wrong, so say which one it probably is.
+        let data_bits = match facts.interface {
+            InterfaceConfig::Serial(serial) => data_bits_hint(data_bits_number(serial.data_bits))
+                .map(|hint| format!(" {hint}"))
+                .unwrap_or_default(),
+            InterfaceConfig::Udp(_) => String::new(),
+        };
         return problem(format!(
-            "{port} could not be opened: {}{gone}",
+            "{port} could not be opened: {}{data_bits}{gone}",
             with_full_stop(reason)
         ));
     }
@@ -475,6 +501,7 @@ fn status_line(facts: &StatusFacts) -> StatusLine {
             let reason = run
                 .fault
                 .as_deref()
+                .map(without_fault_prefix)
                 .map_or_else(|| "no reason was reported.".to_owned(), with_full_stop);
             problem(format!(
                 "{port} stopped: {reason}{gone} Press Start to try again."
@@ -1515,6 +1542,56 @@ mod tests {
         assert_eq!(
             line.text,
             format!("{glyph}COM4 stopped: The device was unplugged. Press Start to try again.")
+        );
+    }
+
+    /// A port that stops gives its cause without the runtime's "transport
+    /// fault on channel Linemon:" in front: Linemon has no channels to name.
+    #[test]
+    fn a_stopped_port_gives_its_cause_without_the_channel_wording() {
+        let com3 = ser("COM3");
+        let glyph = tone_marker(SignalTone::Warning);
+        let mut faulted = run(ChannelState::Faulted, 10, 0.0);
+        faulted.fault = Some(format!(
+            "{}serial read failed: The device does not recognize the command.",
+            transport_fault_prefix(super::super::bridge::LINEMON_CHANNEL_NAME)
+        ));
+        let mut f = facts(&com3);
+        f.run = Some(&faulted);
+        assert_eq!(
+            text(&f),
+            format!(
+                "{glyph}COM3 stopped: serial read failed: The device does not recognize the \
+                 command. Press Start to try again."
+            )
+        );
+    }
+
+    /// "The parameter is incorrect" is what an adapter that takes only 7 or
+    /// 8 data bits says to 6; the line says which parameter it probably is.
+    #[test]
+    fn an_open_with_6_data_bits_says_many_adapters_take_only_7_or_8() {
+        let mut com3 = ser("COM3");
+        if let InterfaceConfig::Serial(serial) = &mut com3 {
+            serial.data_bits = crate::config::DataBits::Six;
+        }
+        let glyph = tone_marker(SignalTone::Warning);
+        let mut f = facts(&com3);
+        f.open_error = Some("The parameter is incorrect.");
+        assert_eq!(
+            text(&f),
+            format!(
+                "{glyph}COM3 could not be opened: The parameter is incorrect. Many USB serial \
+                 adapters take only 7 or 8 data bits."
+            )
+        );
+        // 8 data bits, the usual, get no hint.
+        let com4 = ser("COM4");
+        let mut f = facts(&com4);
+        f.open_error = Some("The parameter is incorrect.");
+        assert_eq!(
+            text(&f),
+            format!("{glyph}COM4 could not be opened: The parameter is incorrect.")
         );
     }
 

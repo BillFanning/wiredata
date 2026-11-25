@@ -121,6 +121,19 @@ pub fn serial_port_hint(port: &str, listed: bool) -> String {
     }
 }
 
+/// A hint for a serial port that failed to open with 5 or 6 data bits, and
+/// `None` for any other number.
+///
+/// Many USB serial adapters, FTDI's among them, take only 7 or 8 data bits,
+/// and the Windows driver refuses the rest at open in words that do not say
+/// so ("The parameter is incorrect"). Those words are the system's, in the
+/// system's language, so they cannot be matched; the hint goes by the setting.
+/// Beside [`serial_port_hint`] so Linemon, a Listener channel and talker say
+/// it the same way.
+pub fn data_bits_hint(data_bits: u8) -> Option<&'static str> {
+    matches!(data_bits, 5 | 6).then_some("Many USB serial adapters take only 7 or 8 data bits.")
+}
+
 /// Format a duration compactly for timing telemetry readouts.
 pub fn compact_duration(duration: Duration) -> String {
     let nanos = duration.as_nanos();
@@ -158,6 +171,19 @@ fn scaled_duration(value: f64, unit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_5_or_6_data_bits_get_the_adapter_hint() {
+        for bits in [5, 6] {
+            assert_eq!(
+                data_bits_hint(bits),
+                Some("Many USB serial adapters take only 7 or 8 data bits.")
+            );
+        }
+        for bits in [7, 8] {
+            assert_eq!(data_bits_hint(bits), None);
+        }
+    }
 
     #[test]
     fn counts_group_by_thousands() {

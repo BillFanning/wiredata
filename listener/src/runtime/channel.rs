@@ -385,10 +385,13 @@ impl MonitoredChannel {
 
     /// Graceful stop (§110): stop reception; the transport's sender drops, the
     /// pipeline drains the accepted backlog and returns, and the monitor ends.
+    /// Closing the request queue ends a pipeline whose transport had already
+    /// ended on a fault and which was answering status since.
     /// `None` if the pipeline task panicked — its final state (diagnostics,
     /// snapshot) is unrecoverable, but the stop itself still completes rather
     /// than propagating the panic into the orchestrator.
     pub(crate) async fn stop(self) -> Option<ChannelPipeline> {
+        drop(self.requests);
         self.transport_cancel.cancel();
         let pipeline = match self.pipeline_task.await {
             Ok(pipeline) => Some(pipeline),

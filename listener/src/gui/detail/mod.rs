@@ -135,7 +135,7 @@ impl ListenerApp {
             return;
         };
         self.sync_edit_draft(id);
-        let Some((details, status, bytes_total, bps, last_error, recording, serial_port)) =
+        let Some((details, status, bytes_total, bps, last_error, recording, serial)) =
             self.state.channel(id).map(|v| {
                 (
                     v.details.clone(),
@@ -145,7 +145,9 @@ impl ListenerApp {
                     v.last_error.clone(),
                     v.recording,
                     match &v.config.interface {
-                        crate::config::InterfaceConfig::Serial(serial) => Some(serial.port.clone()),
+                        crate::config::InterfaceConfig::Serial(serial) => {
+                            Some((serial.port.clone(), serial.data_bits))
+                        }
                         _ => None,
                     },
                 )
@@ -198,7 +200,13 @@ impl ListenerApp {
         // alone hid this hint in exactly the case it was written for.
         // Nor is it said from a list not yet read, or being read again: until
         // the read ends the list may still show a port that has gone.
-        let port = serial_port.filter(|p| !p.is_empty());
+        let data_bits = serial
+            .as_ref()
+            .and_then(|(_, bits)| {
+                wiredata_ui::format::data_bits_hint(super::linemon_window::data_bits_number(*bits))
+            })
+            .filter(|_| status == ChannelStatus::Faulted || last_error.is_some());
+        let port = serial.map(|(port, _)| port).filter(|p| !p.is_empty());
         // A port can vanish and come back while Listener runs; the list is
         // otherwise only as fresh as the last read, and would say an unplugged
         // port is there, or a returned one is not found.
@@ -217,7 +225,13 @@ impl ListenerApp {
             .map(|(port, ports)| {
                 wiredata_ui::format::serial_port_hint(port, ports.iter().any(|p| p == port))
             });
-        // The error and its hint are one problem, so one paragraph in one colour.
+        // A port that refuses 5 or 6 data bits says only that a parameter is
+        // wrong, so the paragraph says which one it probably is.
+        let hint = match (hint, data_bits) {
+            (Some(port), Some(bits)) => Some(format!("{port} {bits}")),
+            (port, bits) => port.or_else(|| bits.map(str::to_owned)),
+        };
+        // The error and its hints are one problem, so one paragraph in one colour.
         let text = match (&last_error, hint) {
             (Some(err), hint) => Some(format!(
                 "⚠ {}{}",

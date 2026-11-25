@@ -12,13 +12,6 @@ again. Remove an item when it is done: the commit says what changed.
 
 ## Features
 
-- [ ] **Linemon gives no reason when its serial port is unplugged (§50.3).**
-  On 2026-11-23, unplugging COM3 while Linemon ran read "COM3 stopped: no
-  reason was reported." `RunFacts::from_snapshot` takes the reason from the
-  snapshot's newest error diagnostic, and the faulted snapshot had none. Find
-  whether the serial read's failure is not recorded as a diagnostic, or is
-  recorded after the last snapshot Linemon receives, and check what a Listener
-  Channel shows for the same unplug.
 - [ ] **Does XON/XOFF hide 0x11 and 0x13 from the stream? (§14, ADR-010)**
   Listener records the bytes as received, but with XON/XOFF on the driver may
   take the XON and XOFF bytes out of the received data. Check with the
