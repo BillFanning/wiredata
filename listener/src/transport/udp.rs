@@ -656,11 +656,23 @@ mod tests {
                 dropped: cfg!(target_os = "linux").then_some(0),
             }
         );
+        // Kernel arrival times on Linux, post-read elsewhere (ADR-077).
+        let (status, source) = if cfg!(target_os = "linux") {
+            (
+                ArrivalTimestampStatus::KernelSoftware,
+                crate::core::ArrivalTimestampSource::KernelSoftware,
+            )
+        } else {
+            (
+                ArrivalTimestampStatus::PostRead,
+                crate::core::ArrivalTimestampSource::PostRead,
+            )
+        };
         assert_eq!(
             notice_rx.recv().await.unwrap(),
             TransportNotice::UdpArrivalTimestamps {
                 channel_id: cid,
-                status: ArrivalTimestampStatus::PostRead,
+                status,
             }
         );
 
@@ -673,10 +685,7 @@ mod tests {
         let second = rx.recv().await.unwrap();
         assert_eq!(first.payload, b"$GPGGA,first");
         assert_eq!(second.payload, b"second");
-        assert_eq!(
-            first.received_at.wall_clock_source,
-            crate::core::ArrivalTimestampSource::PostRead
-        );
+        assert_eq!(first.received_at.wall_clock_source, source);
 
         cancel.cancel();
         assert!(matches!(handle.join().await, TransportOutcome::Cancelled));
