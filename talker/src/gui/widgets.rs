@@ -3,7 +3,7 @@
 //! here is either a stateless `fn(ui, …)` widget or a pure validation /
 //! formatting helper — app state stays in [`super::TalkerApp`].
 
-use std::{net::Ipv4Addr, ops::ControlFlow, sync::Arc};
+use std::{net::Ipv4Addr, ops::ControlFlow, sync::Arc, time::Instant};
 
 use egui::{Align, Layout};
 use wiredata_ui::diagnostics::{dismissible_attention_callout, SignalTone};
@@ -63,16 +63,35 @@ fn replacement_highlight_colors(ui: &egui::Ui) -> (egui::Color32, egui::Color32)
 /// both cases and the word carries the run state.
 pub(super) fn lifecycle_indicator(
     running: bool,
+    retrying: bool,
     has_error: bool,
     pal: &wiredata_ui::palette::Palette,
 ) -> (&'static str, egui::Color32, &'static str) {
     use wiredata_ui::glyphs;
     match (running, has_error) {
+        // Waiting to open, as listener shows a Channel reconnecting: on, but
+        // not sending yet (ADR-074).
+        (true, _) if retrying => (glyphs::RECONNECTING, pal.warning, "retrying"),
         (true, false) => (glyphs::RUNNING, pal.running, "running"),
         (true, true) => (glyphs::FAULT, pal.fault, "running"),
         (false, true) => (glyphs::FAULT, pal.fault, "faulted"),
         (false, false) => (glyphs::STOPPED, pal.idle, "stopped"),
     }
+}
+
+/// The detail header's words for a channel waiting to open (ADR-074): when it
+/// tries again, rounded up so it never reads "0 s" while still waiting, and
+/// "retrying now" once that time has come.
+pub(super) fn retry_status_words(next_try_at: Instant, now: Instant) -> String {
+    let left = next_try_at.saturating_duration_since(now);
+    if left.is_zero() {
+        return "retrying now".to_owned();
+    }
+    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    format!(
+        "retrying in {}",
+        wiredata_ui::format::wait(std::time::Duration::from_secs(secs))
+    )
 }
 
 /// The Start-side lifecycle button's label and enabled state — listener's
@@ -2746,19 +2765,39 @@ mod tests {
     fn lifecycle_indicator_maps_states_to_the_shared_glyph_set() {
         use wiredata_ui::glyphs;
         use wiredata_ui::palette::LIGHT;
-        let (g, c, w) = lifecycle_indicator(true, false, &LIGHT);
+        let (g, c, w) = lifecycle_indicator(true, false, false, &LIGHT);
         assert_eq!((g, w), (glyphs::RUNNING, "running"));
         assert_eq!(c, LIGHT.running);
         // Running with a live error: the ⚠ carries the alarm, the word stays
         // honest about the run state; the detail header prints the error below.
-        let (g, c, w) = lifecycle_indicator(true, true, &LIGHT);
+        let (g, c, w) = lifecycle_indicator(true, false, true, &LIGHT);
         assert_eq!((g, w), (glyphs::FAULT, "running"));
         assert_eq!(c, LIGHT.fault);
-        let (g, _, w) = lifecycle_indicator(false, true, &LIGHT);
+        // Waiting to open: listener's reconnecting glyph, and the word says so.
+        let (g, c, w) = lifecycle_indicator(true, true, true, &LIGHT);
+        assert_eq!((g, w), (glyphs::RECONNECTING, "retrying"));
+        assert_eq!(c, LIGHT.warning);
+        let (g, _, w) = lifecycle_indicator(false, false, true, &LIGHT);
         assert_eq!((g, w), (glyphs::FAULT, "faulted"));
-        let (g, c, w) = lifecycle_indicator(false, false, &LIGHT);
+        let (g, c, w) = lifecycle_indicator(false, false, false, &LIGHT);
         assert_eq!((g, w), (glyphs::STOPPED, "stopped"));
         assert_eq!(c, LIGHT.idle);
+    }
+
+    #[test]
+    fn a_channel_waiting_to_open_says_when_it_tries_again() {
+        use std::time::Duration;
+        let now = Instant::now();
+        assert_eq!(
+            retry_status_words(now + Duration::from_millis(3_200), now),
+            "retrying in 4 s",
+            "rounded up, so it never reads 0 s while waiting"
+        );
+        assert_eq!(
+            retry_status_words(now + Duration::from_secs(30), now),
+            "retrying in 30 s"
+        );
+        assert_eq!(retry_status_words(now, now), "retrying now");
     }
 
     #[test]

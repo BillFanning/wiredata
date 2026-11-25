@@ -34,9 +34,9 @@ use super::draft::{ConnKind, PayloadKind, ScheduleDraft};
 use super::widgets::{
     checksum_label, code_page_label, hex_valid, invalid_parse, lifecycle_indicator, live_lines,
     marker_aware_text_edit, message_editor_max_height, output_request, plain_text_edit_with_cursor,
-    preview_ascii_layout_job, red_bordered, rts_by_flow, serial_editor_id, show_display_pane,
-    show_insert_byte_button, show_insert_unit_button, show_interface_summary, show_serial_fields,
-    show_udp_fields, start_button, LiveUpdateQueueGauge, UppercaseHex,
+    preview_ascii_layout_job, red_bordered, retry_status_words, rts_by_flow, serial_editor_id,
+    show_display_pane, show_insert_byte_button, show_insert_unit_button, show_interface_summary,
+    show_serial_fields, show_udp_fields, start_button, LiveUpdateQueueGauge, UppercaseHex,
 };
 use super::{MessageAnalysisCache, MessageDraftAnalysis, MessagePreview, TalkerApp};
 use wiredata_ui::hover::{Hover, ShowHover};
@@ -254,7 +254,14 @@ impl TalkerApp {
         if self.views[i].open_failure_changed(open_failure) {
             self.refresh_serial_ports();
         }
-        let (glyph, glyph_color, status_word) = lifecycle_indicator(running, error.is_some(), pal);
+        let retry = telemetry.open_retry.filter(|_| running);
+        let (glyph, glyph_color, status_word) =
+            lifecycle_indicator(running, retry.is_some(), error.is_some(), pal);
+        // A channel waiting to open says when it tries again (ADR-074).
+        let status_word = retry.map_or_else(
+            || status_word.to_owned(),
+            |retry| retry_status_words(retry.next_try_at, std::time::Instant::now()),
+        );
         let draft_kind = self.conn_drafts[i].kind();
         let draft_interface = self.conn_drafts.get(i).and_then(|draft| draft.to_config());
         let (iface_drift, run_drift) = self.detect_drift(i, draft_interface.as_ref());

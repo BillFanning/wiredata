@@ -57,6 +57,14 @@ struct CommandFailure {
     message: String,
 }
 
+/// A channel waiting to open: how many opens failed in a row, and when it
+/// tries again (ADR-074).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenRetryState {
+    pub failures: u64,
+    pub next_try_at: Instant,
+}
+
 /// Per-channel observer state, updated by [`TalkerSupervisor::poll`] from the
 /// runner's ADR-018 status lanes. Everything cumulative comes straight from
 /// `TalkerStatus::Counters`, so it self-corrects across dropped updates.
@@ -120,6 +128,12 @@ pub struct ChannelTelemetry {
     /// `last_error` came from opening or reopening the interface, not from a
     /// write. Meaningless while `last_error` is `None`.
     last_error_opening: bool,
+    /// The run's interface has not opened yet and is tried again at this
+    /// point (ADR-074). `None` once it opens, or before the first failure.
+    pub open_retry: Option<OpenRetryState>,
+    /// The run's interface has opened, so a failed open reported before it,
+    /// and read only now, is out of date.
+    interface_opened: bool,
     /// A serial channel's control lines as last reported while it runs
     /// (ADR-070). `None` for any other interface, before the first reading, or
     /// while the port cannot be read.
@@ -147,6 +161,15 @@ impl ChannelTelemetry {
     /// of the interface: the one error the port list can explain.
     pub fn banner_is_open_failure(&self) -> bool {
         self.command_error.is_none() && self.last_error.is_some() && self.last_error_opening
+    }
+
+    /// The interface opened: the open's retry and error are over (ADR-074).
+    fn note_interface_opened(&mut self) {
+        self.interface_opened = true;
+        self.open_retry = None;
+        if self.last_error_opening {
+            self.set_interface_error(None);
+        }
     }
 
     fn set_interface_error(&mut self, error: Option<ActiveError>) {
@@ -561,7 +584,7 @@ impl TalkerSupervisor {
                     Some(notify) => observer.with_notify(notify),
                     None => observer,
                 };
-                runner::open_and_run(who, cfg, schedule, cmd_rx, observer);
+                runner::open_retrying_and_run(who, cfg, schedule, cmd_rx, observer);
             });
         match spawned {
             Ok(thread) => {
@@ -961,6 +984,7 @@ fn drain_control_statuses(
                 if channel != slot_id {
                     continue;
                 }
+                telemetry.note_interface_opened();
                 match pending_start.take() {
                     Some(run) if run.interface == config => *applied_run = Some(run),
                     Some(run) => {
@@ -1241,12 +1265,22 @@ fn drain_statuses(
                     reopening: false,
                 }));
             }
-            TalkerStatus::OpenFailed { message, .. } => {
-                telemetry.errors_total += 1;
+            // A failure from before the open, read only now, is out of date.
+            TalkerStatus::OpenFailed { .. } if telemetry.interface_opened => {}
+            TalkerStatus::OpenFailed { message, retry, .. } => {
+                // One error for the episode, as for send failures: the
+                // retries that follow are the same problem (ADR-074).
+                if retry.failures == 1 {
+                    telemetry.errors_total += 1;
+                }
                 telemetry.set_interface_error(Some(ActiveError {
                     message,
                     reopening: true,
                 }));
+                telemetry.open_retry = Some(OpenRetryState {
+                    failures: retry.failures,
+                    next_try_at: Instant::now() + retry.next_try_in,
+                });
             }
             TalkerStatus::SendRecovered { .. } => {
                 telemetry.set_interface_error(None);
@@ -1265,6 +1299,7 @@ mod tests {
     use super::*;
     use crate::core::channel::{Interface, SerialConfig, UdpConfig};
     use crate::core::message::{MessageConfig, PayloadConfig};
+    use crate::core::runner::OpenRetry;
 
     #[test]
     fn an_update_that_left_the_interface_closed_does_not_claim_settings_remain_in_use() {
@@ -2065,6 +2100,10 @@ mod tests {
             vec![TalkerStatus::OpenFailed {
                 channel,
                 message: "opening serial port \"COM4\": access denied".into(),
+                retry: OpenRetry {
+                    failures: 1,
+                    next_try_in: Duration::from_secs(1),
+                },
             }],
             ChannelTelemetry::default(),
         );
@@ -2123,6 +2162,82 @@ mod tests {
             ChannelTelemetry::default(),
         );
         assert!(!recovered.banner_is_open_failure(), "no banner at all");
+    }
+
+    /// ADR-074: a failed open that is tried again says when, counts as one
+    /// error however many tries fail, and ends when the interface opens. A
+    /// failure reported before the open, read only after it, does not bring
+    /// it back.
+    #[test]
+    fn a_retried_open_says_when_counts_once_and_ends_on_open() {
+        let channel = ChannelId::mint();
+        let failed = |failures, secs| TalkerStatus::OpenFailed {
+            channel,
+            message: "opening serial port \"COM4\": no device is present at COM4".into(),
+            retry: OpenRetry {
+                failures,
+                next_try_in: Duration::from_secs(secs),
+            },
+        };
+        let feed = |telemetry: &mut ChannelTelemetry, statuses: Vec<TalkerStatus>| {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            for status in statuses {
+                tx.send(status).unwrap();
+            }
+            drop(tx);
+            drain_statuses(0, &rx, telemetry, &mut Vec::new());
+        };
+
+        let mut telemetry = ChannelTelemetry::default();
+        let before = Instant::now();
+        feed(&mut telemetry, vec![failed(1, 1), failed(2, 2)]);
+        let retry = telemetry.open_retry.expect("waiting to open");
+        assert_eq!(retry.failures, 2);
+        assert!(retry.next_try_at >= before + Duration::from_secs(2));
+        assert!(retry.next_try_at <= Instant::now() + Duration::from_secs(2));
+        assert_eq!(telemetry.errors_total, 1, "one error for the episode");
+        assert!(telemetry.banner_is_open_failure());
+
+        telemetry.note_interface_opened();
+        assert_eq!(telemetry.open_retry, None);
+        assert_eq!(telemetry.banner_error(), None);
+
+        feed(&mut telemetry, vec![failed(3, 4)]);
+        assert_eq!(telemetry.open_retry, None, "a late failure is out of date");
+        assert_eq!(telemetry.banner_error(), None);
+        assert_eq!(telemetry.errors_total, 1);
+    }
+
+    /// ADR-074: a GUI start whose interface cannot open stays running and
+    /// retries at the CLI's pace, then sends once the interface opens.
+    #[test]
+    fn a_start_that_cannot_open_retries_until_the_port_is_free() {
+        let holder = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mut udp = UdpConfig::unicast("127.0.0.1:9".parse().unwrap());
+        udp.local_port = Some(holder.local_addr().unwrap().port());
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::every_send());
+        sup.push_slot();
+        let messages = vec![msg("AB", 50)];
+        let schedule = Schedule::compile(&messages, Instant::now()).unwrap();
+        sup.start(0, "1", InterfaceConfig::Udp(udp), messages, schedule);
+
+        let mut samples = Vec::new();
+        poll_until(&mut sup, &mut samples, |s| {
+            s.telemetry_ref(0).is_some_and(|t| t.open_retry.is_some())
+        });
+        assert!(sup.is_running(0), "a channel waiting to open still runs");
+        let waiting = sup.telemetry(0);
+        assert!(waiting.banner_is_open_failure());
+        assert_eq!(waiting.errors_total, 1);
+
+        drop(holder);
+        poll_until(&mut sup, &mut samples, |s| {
+            s.telemetry_ref(0)
+                .is_some_and(|t| t.open_retry.is_none() && t.total_count > 0)
+        });
+        assert_eq!(sup.telemetry(0).banner_error(), None);
+        assert_eq!(sup.stop(0), CommandOutcome::Enqueued);
+        poll_until(&mut sup, &mut samples, |s| !s.any_draining());
     }
 
     #[test]

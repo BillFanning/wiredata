@@ -1,16 +1,14 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.37
-**Date:** 2026-11-24
+**Version:** 1.38
+**Date:** 2026-11-25
 **Status:** Accepted
 
-Revision note (2026-11-24) — the TCP client is removed:
+Revision note (2026-11-25) — the GUI retries a failed open:
 
-- **ADR-073** — talker has no TCP client, as listener has no TCP receive.
-  ADR-059, the design it had, is kept as the starting point for any return.
-- **ADR-071** — the shared baud list runs from 4800 to 115200.
-- **ADR-046** — the Cadence row no longer gives the worst figure as a share of
-  the shortest interval.
+- **ADR-074** — a channel the GUI starts whose interface does not open is
+  retried at the CLI's pace, shown as waiting to open, until it opens or is
+  stopped.
 
 ---
 
@@ -2942,6 +2940,49 @@ used a TCP port nobody listened on, as a device that is not there, use a UDP
 channel whose local port another socket holds. The failed-send storm soak
 aims a unicast channel at the broadcast address, so the system refuses
 every send.
+
+## ADR-074 — The GUI retries a failed open at the CLI's pace
+
+**Status:** Accepted 2026-11-25. Amends spec §3.2 and §4.2, and extends
+ADR-060's open retry to the GUI.
+
+**Context:** A channel the GUI started whose interface did not open, such as
+a USB serial adapter not plugged in yet, reported the failure once and
+stopped; the user had to press Retry channel. The CLI retried the same
+failure, 1 s doubling to 30 s (ADR-060), and once a channel had opened, both
+front ends already recovered from a drop. The user asked for the GUI to retry
+at the CLI's pace.
+
+**Decision:**
+
+- **One way to start.** The GUI starts a channel as the CLI does, retrying a
+  failed open until it opens or Stop arrives. The one-shot open is gone.
+- **Each failed open says when it is tried again**: the failures in a row and
+  the wait before the next try travel with the failure.
+- **Shown as waiting to open.** The channel shows ◐, listener's reconnecting
+  glyph, with "retrying in N s" as its status and the open error with its port
+  and data-bits hints. Start is disabled unless there are edits, which Apply &
+  Restart applies at once; Stop ends the retrying.
+- **One error per episode.** The status bar's error count rises once for a
+  run of failed opens, as it does for a run of failed sends, not once a try.
+- **The open ends the episode.** When the interface opens, its error and the
+  retry clear at once. A failure reported before the open but read after it,
+  since the two travel on different queues, is ignored.
+
+**Boundary:** There is no setting to turn the retry off and no give-up limit,
+as there are none in the CLI. Listener's GUI is unchanged: it retries only a
+Channel whose reconnect is on (listener ADR-072).
+
+**Alternatives considered:**
+
+- **Keep the one-shot open and the Retry channel button:** the GUI and the CLI
+  would go on treating the same missing adapter differently.
+- **Retry only when a setting allows it, as listener does:** talker has no such
+  setting, and the CLI it matches always retries.
+
+**Consequences:** A channel started before its adapter is plugged in begins
+sending without a click once it is. A channel that can never open keeps
+trying every 30 s until stopped, with one error counted.
 
 ## Open questions
 

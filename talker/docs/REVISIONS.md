@@ -15,6 +15,17 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-24) — TCP is deferred:
+
+- **§4.1, §4.4, §4.5 (ADR-073)** — talker has no TCP client, as listener has
+  no TCP receive. `+ Add` offers UDP and Serial, and a profile that names a
+  TCP client is refused.
+- **§4.2** — the baud list runs from 4800 to 115200, so it opens without
+  scrolling; any other rate is typed.
+- **§3.2** — Configure interface and Configure messages sit directly under
+  Start and Stop, above the readouts that need interpretation, as Configure
+  interface does in listener.
+
 Revision note (2026-11-23) — the serial settings lines:
 
 - **§4.2 (ADR-071)** — a serial channel's settings are laid out as Linemon's
@@ -514,6 +525,14 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-11-24) — the TCP client is removed:
+
+- **ADR-073** — talker has no TCP client, as listener has no TCP receive.
+  ADR-059, the design it had, is kept as the starting point for any return.
+- **ADR-071** — the shared baud list runs from 4800 to 115200.
+- **ADR-046** — the Cadence row no longer gives the worst figure as a share of
+  the shortest interval.
 
 Revision note (2026-11-23) — jiff replaces chrono:
 

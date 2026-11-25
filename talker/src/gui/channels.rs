@@ -17,6 +17,8 @@ struct ChannelRow {
     /// One-line interface summary (may contain `?` for unfilled fields).
     summary: String,
     running: bool,
+    /// Waiting for its interface to open, which is tried again (ADR-074).
+    retrying: bool,
     /// The channel's current error, if any — shown on the row so a fault
     /// on a non-selected channel is visible without opening it.
     error: Option<String>,
@@ -131,6 +133,7 @@ impl TalkerApp {
                     name: selection::channel_title(i + 1, &self.conn_drafts[i].name),
                     summary: interface_summary(&self.conn_drafts[i]),
                     running: self.is_connection_running(i),
+                    retrying: telemetry.is_some_and(|t| t.open_retry.is_some()),
                     error: telemetry.and_then(|t| t.banner_error()).map(str::to_owned),
                     sent: telemetry.map(|t| t.total_count).unwrap_or_default(),
                     per_sec: self.views.get(i).map(|v| v.rate.per_sec).unwrap_or(0.0),
@@ -235,7 +238,7 @@ impl TalkerApp {
                     // shared symbol set as the detail header).
                     let base = egui::TextStyle::Body.resolve(ui.style()).size;
                     let (glyph, color, word) =
-                        lifecycle_indicator(row.running, row.error.is_some(), pal);
+                        lifecycle_indicator(row.running, row.retrying, row.error.is_some(), pal);
                     let emphasis = selection::channel_row_emphasis(ui, selected);
                     let mut line1 = egui::text::LayoutJob::default();
                     line1.append(
@@ -351,11 +354,10 @@ impl TalkerApp {
         let mut selected_tab_rect = None;
         for i in 0..self.conn_drafts.len() {
             let running = self.is_connection_running(i);
-            let error = self
-                .sup
-                .telemetry_ref(i)
-                .is_some_and(|t| t.banner_error().is_some());
-            let (glyph, color, _) = lifecycle_indicator(running, error, pal);
+            let telemetry = self.sup.telemetry_ref(i);
+            let error = telemetry.is_some_and(|t| t.banner_error().is_some());
+            let retrying = telemetry.is_some_and(|t| t.open_retry.is_some());
+            let (glyph, color, _) = lifecycle_indicator(running, retrying, error, pal);
             let selected = self.selected == Some(i);
             let text = egui::RichText::new(glyph)
                 .color(color)

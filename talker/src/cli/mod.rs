@@ -403,7 +403,9 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
                             }
                         }
                     }
-                    TalkerStatus::OpenFailed { channel, message } => {
+                    TalkerStatus::OpenFailed {
+                        channel, message, ..
+                    } => {
                         say(health.down(channel, &message, &open_retry, now));
                     }
                     TalkerStatus::SendFailed { channel, message } => {

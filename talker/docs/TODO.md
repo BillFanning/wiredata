@@ -28,11 +28,6 @@ found again. Remove an item when it is done: the commit says what changed.
 
 Found by a survey of every retry in the workspace on 2026-11-19.
 
-- [ ] **Talker's GUI never retries a failed open.** The supervisor calls
-  `open_and_run`, which reports the failure once; the CLI calls
-  `open_retrying_and_run` (1 s doubling to 30 s, ADR-060). Listener's GUI
-  retries when a channel's reconnect is on. Decide whether talker's GUI should
-  retry too. Once a channel is open, both talker front ends already recover.
 - [ ] **The two CLIs disagree on retrying a failed start (ADR-060).** Talker's
   retries every channel and cannot be turned off (`--require-all` stops the run
   instead). Listener's retries only a channel whose `ReconnectPolicy` is

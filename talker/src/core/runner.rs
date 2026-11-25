@@ -193,8 +193,13 @@ pub enum TalkerStatus {
         failures: u64,
         withheld: u64,
     },
-    /// Opening the interface failed; the runner exits after sending this.
-    OpenFailed { channel: ChannelId, message: String },
+    /// Opening the interface failed, and is tried again after
+    /// `retry.next_try_in` (talker ADR-060, ADR-074).
+    OpenFailed {
+        channel: ChannelId,
+        message: String,
+        retry: OpenRetry,
+    },
     /// The serial control lines (ADR-070): sent when they change and at
     /// least once a second while a serial port is open, so a dropped update
     /// repairs itself. `None` when they cannot be read, such as
@@ -225,7 +230,7 @@ pub const RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// How a runner reports to its observer (ADR-018): the named policy the owner
-/// passes to [`run`]/[`open_and_run`]. Counters and payload samples are
+/// passes to [`run`]/[`open_retrying_and_run`]. Counters and payload samples are
 /// **rate-limited lanes**; errors ([`TalkerStatus::SendFailed`] /
 /// [`TalkerStatus::SendRecovered`] / [`TalkerStatus::OpenFailed`]) are always
 /// immediate and never rate-limited.
@@ -527,12 +532,27 @@ fn open_failed_line(label: &str, error: &str, retry: Option<(Duration, Duration)
 }
 
 /// Queue [`TalkerStatus::OpenFailed`], best-effort, and wake the owner.
-fn emit_open_failed(who: &RunnerIdentity, observer: &RunnerObserver, message: String) {
+/// When a failed open is tried again (talker ADR-060, ADR-074).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenRetry {
+    /// Failed opens in a row, this one included.
+    pub failures: u64,
+    /// How long until the next try.
+    pub next_try_in: Duration,
+}
+
+fn emit_open_failed(
+    who: &RunnerIdentity,
+    observer: &RunnerObserver,
+    message: String,
+    retry: OpenRetry,
+) {
     if observer
         .status_tx
         .try_send(TalkerStatus::OpenFailed {
             channel: who.id,
             message,
+            retry,
         })
         .is_ok()
     {
@@ -593,14 +613,15 @@ pub const OPEN_RETRY_FIRST: Duration = Duration::from_secs(1);
 pub const OPEN_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// Open `cfg`'s interface, retrying a failed open — 1 s, doubling to 30 s —
-/// until it opens or Stop arrives, then run the send loop. For the unattended
-/// CLI (talker ADR-060): a channel whose port is not there yet starts once it
-/// is, while the others send.
+/// until it opens or Stop arrives, then run the send loop. The CLI and the
+/// GUI both start channels this way (talker ADR-060, ADR-074): a channel whose
+/// port is not there yet starts once it is, while the others send.
 ///
-/// Each failed attempt is reported as [`TalkerStatus::OpenFailed`], and the
-/// open as [`RunnerControlStatus::InterfaceOpened`]. Commands other than Stop
-/// have nothing to act on until the channel opens, and are ignored. Call it on
-/// the channel's own thread.
+/// Each failed attempt is reported as [`TalkerStatus::OpenFailed`] with when
+/// it is tried again, and the open as [`RunnerControlStatus::InterfaceOpened`].
+/// Commands other than Stop have nothing to act on until the channel opens,
+/// and are ignored. Call it on the channel's own thread, so the open — real
+/// I/O that can block on a slow serial driver — never runs on the window's.
 pub fn open_retrying_and_run(
     who: RunnerIdentity,
     cfg: InterfaceConfig,
@@ -662,7 +683,15 @@ fn open_retrying_and_run_with(
                         who.label
                     );
                 }
-                emit_open_failed(&who, &observer, message);
+                emit_open_failed(
+                    &who,
+                    &observer,
+                    message,
+                    OpenRetry {
+                        failures,
+                        next_try_in: wait,
+                    },
+                );
                 let deadline = Instant::now() + wait;
                 loop {
                     match cmd_rx.recv_deadline(deadline) {
@@ -673,43 +702,6 @@ fn open_retrying_and_run_with(
                 }
                 wait = (wait * 2).min(max);
             }
-        }
-    }
-}
-
-/// Open `cfg`'s interface, then run the send loop.
-///
-/// Meant to be called *on the channel's own thread* (the GUI path), so the
-/// open — real I/O that can block on a slow serial driver — never runs
-/// on the UI thread. A failed open is reported as
-/// [`TalkerStatus::OpenFailed`] and the call returns.
-pub fn open_and_run(
-    who: RunnerIdentity,
-    cfg: InterfaceConfig,
-    schedule: Schedule,
-    cmd_rx: Receiver<TalkerCommand>,
-    observer: RunnerObserver,
-) {
-    match cfg.open() {
-        Ok(interface) => {
-            emit_control(
-                &observer.control_tx,
-                &observer.notify,
-                RunnerControlStatus::InterfaceOpened {
-                    channel: who.id,
-                    config: cfg.clone(),
-                },
-            );
-            run(who, interface, Some(cfg), schedule, cmd_rx, observer);
-        }
-        Err(e) => {
-            let message = format!("{e:#}");
-            tracing::error!(
-                channel = who.id.as_u64(),
-                "{}",
-                open_failed_line(&who.label, &message, None)
-            );
-            emit_open_failed(&who, &observer, message);
         }
     }
 }
@@ -3731,11 +3723,13 @@ mod tests {
         );
     }
 
+    /// ADR-060, ADR-074: each failed open says when it is tried again, the
+    /// wait doubling to its limit, and carries the channel's stable id.
     #[test]
-    fn open_and_run_reports_open_failed() {
+    fn a_failed_open_says_when_it_is_tried_again() {
         let (cfg, _holder) = held_local_port();
         let schedule = Schedule::compile(&[msg("AB", 100)], Instant::now()).unwrap();
-        let (_cmd_tx, cmd_rx) = crossbeam_channel::bounded::<TalkerCommand>(8);
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<TalkerCommand>(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(8);
         let who = RunnerIdentity {
             id: ChannelId::mint(),
@@ -3743,23 +3737,43 @@ mod tests {
             run_id: RunId::mint(),
         };
         let id = who.id;
-        open_and_run(
-            who,
-            cfg,
-            schedule,
-            cmd_rx,
-            RunnerObserver::new(status_tx, ObserverPolicy::every_send()),
-        );
-        match status_rx.try_recv() {
-            Ok(TalkerStatus::OpenFailed { channel, message }) => {
-                assert_eq!(channel, id, "OpenFailed carries the stable id");
-                assert!(
-                    message.contains("binding UDP socket"),
-                    "message was: {message}"
-                );
+        let runner = std::thread::spawn(move || {
+            open_retrying_and_run_with(
+                who,
+                cfg,
+                schedule,
+                cmd_rx,
+                RunnerObserver::new(status_tx, ObserverPolicy::every_send()),
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+            )
+        });
+        let mut retries = Vec::new();
+        while retries.len() < 3 {
+            match status_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(TalkerStatus::OpenFailed {
+                    channel,
+                    message,
+                    retry,
+                }) => {
+                    assert_eq!(channel, id, "OpenFailed carries the stable id");
+                    assert!(
+                        message.contains("binding UDP socket"),
+                        "message was: {message}"
+                    );
+                    retries.push(retry);
+                }
+                Ok(_) => {}
+                Err(error) => panic!("no OpenFailed: {error}"),
             }
-            other => panic!("expected OpenFailed, got {:?}", other.is_ok()),
         }
+        let retry = |failures, millis| OpenRetry {
+            failures,
+            next_try_in: Duration::from_millis(millis),
+        };
+        assert_eq!(retries, [retry(1, 10), retry(2, 20), retry(3, 20)]);
+        cmd_tx.send(TalkerCommand::Stop).unwrap();
+        runner.join().unwrap();
     }
 
     /// A serial port with control lines, for the runner: it records the

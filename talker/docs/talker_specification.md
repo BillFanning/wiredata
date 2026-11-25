@@ -1,18 +1,14 @@
 # Talker — Program Specification
-**Version:** 2.6.2
+**Version:** 2.6.3
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-24) — TCP is deferred:
+Revision note (2026-11-25) — the GUI retries a failed open:
 
-- **§4.1, §4.4, §4.5 (ADR-073)** — talker has no TCP client, as listener has
-  no TCP receive. `+ Add` offers UDP and Serial, and a profile that names a
-  TCP client is refused.
-- **§4.2** — the baud list runs from 4800 to 115200, so it opens without
-  scrolling; any other rate is typed.
-- **§3.2** — Configure interface and Configure messages sit directly under
-  Start and Stop, above the readouts that need interpretation, as Configure
-  interface does in listener.
+- **§4.2, §3.2 (ADR-074)** — a channel the GUI starts whose interface does not
+  open is retried as the CLI retries it, 1 s doubling to 30 s, until it opens
+  or is stopped. It shows ◐ and "retrying in N s", and its open error counts
+  once.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -447,6 +443,12 @@ The **detail pane** (right) shows the selected channel:
   the Send outcomes and Sent lines, and the **Configure interface** and
   **Configure messages** sections (the editors) follow directly beneath them,
   above the Capacity and Cadence readouts and the rest of the diagnostics.
+- **Waiting to open** (ADR-074) — a started channel whose interface has not
+  opened yet is retried, 1 s doubling to 30 s. It shows ◐ in the channel list
+  and "retrying in N s" as its status, keeps the open error and its port and
+  data-bits hints on screen, and counts that error once for the episode. Stop
+  ends the retrying; Apply & Restart applies edited settings at once. Once the
+  interface opens, the error clears and sending starts without a click.
 - **Last completed run** — one collapsed process-local summary retained for the
   channel's newest completed runner. Its heading shows elapsed, sent, and unsent;
   expansion shows wall-clock start/finish, exact final outcomes, cumulative timing,
@@ -550,8 +552,8 @@ run resumes without user action. On Windows, an operation-aborted result still
 replaces the handle even when the operating system categorizes it as a timeout.
 
 Automatic replacement begins only after the run opened successfully. An initial
-open failure still ends that run; the GUI uses its existing **Retry channel**
-action, while CLI mode must start a new run. Recovery does not search for a
+open failure is retried instead, in the GUI as in the CLI: 1 s, doubling to 30 s,
+until the interface opens or the channel is stopped (ADR-060, ADR-074). Recovery does not search for a
 renamed port: if the replacement appears under a different name, the configured
 port must be changed. A failed write may have transferred a prefix before the
 operating system reported the error, so serial recovery cannot promise
