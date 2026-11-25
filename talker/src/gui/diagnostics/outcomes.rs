@@ -35,22 +35,6 @@ pub(in crate::gui) const LIVE_UPDATE_QUEUE_TOOLTIP: Hover = Hover::new(
      Sending never waits for this queue. Command results travel separately.",
 );
 
-pub(in crate::gui) const PEER_SENT_TOOLTIP: Hover = Hover::new(
-    "The bytes the TCP peer sent back to Talker during this run.\n\n\
-     Talker reads and discards them before each write, so the peer never stalls on a full \
-     buffer, and closing the connection does not reset it.\n\n\
-     They are counted but not shown. To see them, use Listener.",
-);
-
-/// The peer-reply readout (§4.5): "peer sent N bytes".
-pub(in crate::gui) fn peer_sent_words(bytes: u64) -> String {
-    format!(
-        "Peer sent {} byte{}",
-        thousands(bytes),
-        if bytes == 1 { "" } else { "s" }
-    )
-}
-
 /// The run's counted send outcomes as one always-visible line.
 ///
 /// Written as visible arithmetic: the schedule's own cadence points, less each
@@ -134,8 +118,8 @@ pub(in crate::gui) fn send_outcomes_tooltip(
         ),
         format!(
             "{} possibly partial: the interface reported an error after taking part of the \
-             message, or, on Windows, a TCP write timed out without saying how much it sent. \
-             The receiver may hold a fragment. It is never sent again, and the bytes taken are \
+             message, or after a write timed out without saying how much it sent. The \
+             receiver may hold a fragment. It is never sent again, and the bytes taken are \
              in the byte total.",
             thousands(possibly_partial)
         ),
@@ -238,13 +222,6 @@ mod tests {
         assert!(marked(98, 0, 1, 0, 0).starts_with("\u{26A0} Send outcomes:"));
         assert!(marked(100, 0, 0, 0, 0).starts_with("Send outcomes:"));
         assert!(marked(0, 0, 0, 0, 0).starts_with("Send outcomes:"));
-    }
-
-    #[test]
-    fn a_tcp_peer_s_replies_read_as_bytes_it_sent() {
-        assert_eq!(peer_sent_words(0), "Peer sent 0 bytes");
-        assert_eq!(peer_sent_words(1), "Peer sent 1 byte");
-        assert_eq!(peer_sent_words(12_345), "Peer sent 12,345 bytes");
     }
 
     #[test]

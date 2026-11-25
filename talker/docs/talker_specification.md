@@ -1,16 +1,13 @@
 # Talker — Program Specification
-**Version:** 2.6.1
+**Version:** 2.6.2
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-23) — the serial settings lines:
+Revision note (2026-11-24) — TCP is deferred:
 
-- **§4.2 (ADR-071)** — a serial channel's settings are laid out as Linemon's
-  and listener's: the port, baud rate and framing on one line of drop-downs,
-  then flow control and the control lines.
-- **§4.2** — the baud list runs from 4800 to 921600, and any other rate,
-  slower ones included, is typed. A port the system does not list can be
-  typed by name.
+- **§4.1, §4.4, §4.5 (ADR-073)** — talker has no TCP client, as listener has
+  no TCP receive. `+ Add` offers UDP and Serial, and a profile that names a
+  TCP client is refused.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -65,7 +62,7 @@ wiredata/                        # workspace root
 │   │   ├── cli/                 # CLI interface module
 │   │   ├── gui/                 # egui GUI module
 │   │   └── core/                # all core logic
-│   │       ├── channel/         # serial, UDP, TCP abstractions; channel collection
+│   │       ├── channel/         # serial and UDP abstractions; channel collection
 │   │       ├── message/         # message formats, encoding, timestamp, checksum
 │   │       ├── scheduler/       # priority-queue send loop
 │   │       ├── profile/         # profile management; schema v3 clean break
@@ -141,7 +138,7 @@ The GUI uses a **master–detail** layout:
   channel showing a status glyph (running / fault / stopped), the channel's display
   name (or the positional "Channel N" fallback), a one-line interface summary with
   unfilled fields flagged, the running send count with a msgs/s estimate, and the most
-  recent error. The list header holds `+ Add` (per interface kind: UDP / TCP / Serial)
+  recent error. The list header holds `+ Add` (per interface kind: UDP / Serial)
   and Start all / Stop all.
 - **Detail pane** (centre): everything about the **selected** channel — a header with
   the editable name, interface summary, drift badge, and per-channel actions (start /
@@ -499,7 +496,6 @@ Each channel has exactly one interface port. The supported interface types are:
 | UDP Unicast | Host and port configurable |
 | UDP Broadcast | Broadcast address and port configurable |
 | UDP Multicast | Group address, port, outgoing interface, and TTL configurable |
-| TCP Client | Connect to a remote host/port; reconnects after a failure (see 4.5) |
 
 The channel abstraction in `core::channel` is designed for easy addition of future interface types (e.g., WebSocket, raw socket) without changes to the interface layers or scheduler.
 
@@ -592,10 +588,7 @@ Each channel maintains and displays:
 - **Send outcomes** — cumulative scheduled, failed, possibly partial, withheld,
   missed, and sent totals for the current run; they remain visible after recovery
   and after Stop. **Possibly partial** is a write that failed after transferring
-  part of the message: the receiver may hold a fragment. On Windows a TCP write
-  that timed out counts too, though Windows reports nothing transferred (§4.5).
-  Wire bytes are counted separately from whole messages
-- **Peer replies** — for a TCP client, "peer sent N bytes" (§4.5)
+  part of the message: the receiver may hold a fragment. Wire bytes are counted separately from whole messages
 - **Log counts** — channel-attributed INFO, WARN, and ERROR entries delivered
   to the global Log pane since Start; DEBUG and TRACE remain available there
   when Detail admits them, but do not inflate INFO. While **log entries not
@@ -611,26 +604,10 @@ Event history lives in the global Log pane. There is no separate clickable
 per-channel error log. A recovered channel can therefore have no current fault
 while its current-run Send outcomes and log counts still show earlier failures.
 
-### 4.5 TCP Client (ADR-059)
+### 4.5 TCP Client
 
-- **Reconnect.** After a failed write, at each retry point the backoff allows
-  (§9.2), the client closes the failed stream and connects again with a 5 s
-  timeout. The failed message is never resent; the next due message goes out on
-  the new connection. The recovery line names the address.
-- **Replies are drained.** Talker is a sender, but a device may answer. Before
-  each write the client reads whatever the peer has sent, without blocking,
-  discards it and counts it: "peer sent N bytes". Leaving it unread would fill the
-  receive buffer, and closing a socket with unread data makes most stacks reset
-  the connection, which can discard the peer's own in-flight data. When a drain
-  finds that the peer has closed the connection, that send fails with nothing
-  written, and the next retry point reconnects.
-- **A write that times out.** A write the peer takes nothing of for 5 s fails
-  with an error that says so, and the next retry point reconnects.
-  On Windows it counts as possibly partial (§4.4): Windows reports a timed-out
-  write as sending nothing, but leaves the connection in an undetermined state,
-  so the peer may hold part of the message.
-- There is no acknowledgement protocol and no server mode. Viewing replies is
-  listener's job.
+TCP is deferred (ADR-073). This release has no TCP client, and a profile that
+names one does not load.
 
 ---
 
@@ -1083,7 +1060,7 @@ telemetry schema or runtime policy.
 
 - Draft demand is the sum, across non-dormant messages, of exact compiled wire
   length divided by interval. Incomplete or invalid messages withhold the estimate
-  instead of understating it. UDP/TCP show requested `msg/s` and `B/s`; Talker does
+  instead of understating it. UDP shows requested `msg/s` and `B/s`; Talker does
   not invent a network link capacity it cannot know.
 - For Serial, each wire byte consumes `1 + data bits + parity bits + stop bits` at
   the configured baud. Aggregate demand above the resulting bit rate cannot be
@@ -1374,7 +1351,8 @@ Coverage requirements:
 
 ### 12.1 Open Items
 
-- Additional interface types beyond TCP/UDP/serial (WebSocket, raw socket, etc.)
+- A TCP client (deferred by ADR-073; ADR-059 records the design it had)
+- Additional interface types beyond UDP and serial (WebSocket, raw socket, etc.)
 - Additional CRC/checksum algorithms beyond the initial set, and a per-message
   byte-order setting (§7.2)
 - Additional named proprietary NMEA sentences beyond `$PRDID` and `$PASHR`

@@ -196,7 +196,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use crate::core::channel::{ChannelConfig, InterfaceConfig, TcpClientConfig, UdpConfig};
+    use crate::core::channel::{ChannelConfig, InterfaceConfig, UdpConfig};
     use crate::core::message::{MessageConfig, PayloadConfig};
     use crate::core::timing::CadenceAlignment;
 
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn validate_passes_a_good_profile_and_labels_a_bad_message() {
-        let iface = InterfaceConfig::TcpClient(TcpClientConfig::new(
+        let iface = InterfaceConfig::Udp(UdpConfig::unicast(
             "127.0.0.1:4000".parse::<SocketAddr>().unwrap(),
         ));
         let mut p = Profile::new("v");
@@ -273,7 +273,7 @@ mod tests {
         let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
         let mut profile = Profile::new("full");
         let mut aligned = ChannelConfig::new(
-            InterfaceConfig::TcpClient(TcpClientConfig::new(addr)),
+            InterfaceConfig::Udp(UdpConfig::broadcast(addr)),
             vec![MessageConfig::new(PayloadConfig::raw_hex("AABB"), 500)],
         );
         aligned.cadence_alignment = CadenceAlignment::UtcPhase;
@@ -356,7 +356,7 @@ mod tests {
                 let path = path.clone();
                 std::thread::spawn(move || {
                     // Different lengths, so a torn write would not parse.
-                    let iface = InterfaceConfig::TcpClient(TcpClientConfig::new(
+                    let iface = InterfaceConfig::Udp(UdpConfig::unicast(
                         "127.0.0.1:4000".parse::<SocketAddr>().unwrap(),
                     ));
                     let channel = ChannelConfig::new(
@@ -469,10 +469,12 @@ type = "ascii"
 text = "ascii text"
 
 [[channels]]
-name = "tcp"
+name = "udp unicast"
 [channels.interface]
-type = "tcp_client"
-address = "127.0.0.1:4000"
+type = "udp"
+[channels.interface.mode]
+type = "unicast"
+destination = "127.0.0.1:4000"
 [[channels.messages]]
 interval_ms = 400
 [channels.messages.payload]
@@ -495,6 +497,22 @@ level = "info"
 directory = "logs"
 "#;
 
+    /// ADR-073: talker has no TCP client, and a profile that names one is
+    /// refused, with an error that names it, rather than loaded without it.
+    #[test]
+    fn a_profile_naming_a_tcp_client_is_refused() {
+        let path = temp_path(&format!("tcp_{}", std::process::id()));
+        std::fs::write(
+            &path,
+            "version = 3\n\n[[channels]]\nname = \"tcp\"\n[channels.interface]\n\
+             type = \"tcp_client\"\naddress = \"127.0.0.1:4000\"\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", Profile::load(&path).unwrap_err());
+        let _ = std::fs::remove_file(&path);
+        assert!(error.contains("tcp_client"), "{error}");
+    }
+
     /// ADR-062: an unknown key is refused in every profile type, and the
     /// message names it and its line. Serde's deny-unknown-fields support is
     /// partial for internally tagged enums, so each type is tried, not one.
@@ -511,7 +529,6 @@ directory = "logs"
             ("SerialConfig", "port = \"COM9\"", "baud"),
             ("UdpConfig", "local_port = 5000", "local_prot"),
             ("UdpMode", "port = 6000", "tll"),
-            ("TcpClientConfig", "address = \"127.0.0.1:4000\"", "adress"),
             ("MessageConfig", "interval_ms = 100", "interval"),
             ("PayloadConfig::Utf8", "text = \"utf8 text\"", "txt"),
             ("PayloadConfig::Utf16", "text = \"utf16 text\"", "byteorder"),

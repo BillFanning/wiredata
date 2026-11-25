@@ -5,7 +5,7 @@
 #![cfg(unix)]
 
 use std::io::Read;
-use std::net::{TcpListener, UdpSocket};
+use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -43,21 +43,20 @@ data = "41"
     )
 }
 
-/// A channel whose peer is never there: a TCP client to a port nobody
-/// listens on, standing in for a device that is not plugged in.
-fn never_opens() -> String {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+/// A channel that never opens, standing in for a device that is not plugged
+/// in: a UDP channel whose local port `holder` holds for the whole run.
+fn never_opens(holder: &UdpSocket) -> String {
+    let port = holder.local_addr().unwrap().port();
     format!(
         r#"
 [[channels]]
 name = "Missing"
 [channels.interface]
-type = "tcp_client"
-address = "127.0.0.1:{port}"
+type = "udp"
+local_port = {port}
+[channels.interface.mode]
+type = "unicast"
+destination = "127.0.0.1:9"
 [[channels.messages]]
 interval_ms = 100
 [channels.messages.payload]
@@ -106,7 +105,8 @@ fn run_then_stop(profile: &Path) -> (Option<i32>, String) {
 #[test]
 fn a_channel_that_never_opens_degrades_the_run_while_the_others_send() {
     let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let path = profile(&format!("{}{}", sending_to(&sink), never_opens()));
+    let holder = UdpSocket::bind("0.0.0.0:0").unwrap();
+    let path = profile(&format!("{}{}", sending_to(&sink), never_opens(&holder)));
     let (code, stderr) = run_then_stop(&path);
     assert!(
         stderr.contains("WARNING: [Missing] did not start"),

@@ -3,7 +3,7 @@
 Tools for testing devices that talk over serial ports and UDP.
 
 - **Talker** sends data to a device. You set up the messages, and Talker sends
-  them on a schedule over a serial port, UDP or TCP.
+  them on a schedule over a serial port or UDP.
 - **Listener** receives data from serial ports and UDP. It shows the bytes
   exactly as they arrived and can record them to files. It can watch several
   channels at once, unattended, for weeks.

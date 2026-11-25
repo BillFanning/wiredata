@@ -15,6 +15,15 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-23) — the serial settings lines:
+
+- **§4.2 (ADR-071)** — a serial channel's settings are laid out as Linemon's
+  and listener's: the port, baud rate and framing on one line of drop-downs,
+  then flow control and the control lines.
+- **§4.2** — the baud list runs from 4800 to 921600, and any other rate,
+  slower ones included, is typed. A port the system does not list can be
+  typed by name.
+
 Revision note (2026-11-22) — serial control lines and flow-control names:
 
 - **§4.2 (ADR-070)** — a serial channel sets RTS and DTR and shows CTS, DSR,
@@ -505,6 +514,11 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-11-23) — jiff replaces chrono:
+
+- **ADR-072** — dates and times are read and written with jiff, not chrono,
+  which is unmaintained. Nothing on screen, in a file or on the wire changes.
 
 Revision note (2026-11-23) — shared serial settings lines:
 

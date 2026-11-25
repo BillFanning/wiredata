@@ -60,7 +60,6 @@ impl ChannelConfig {
 pub enum InterfaceConfig {
     Serial(SerialConfig),
     Udp(UdpConfig),
-    TcpClient(TcpClientConfig),
 }
 
 impl InterfaceConfig {
@@ -280,21 +279,6 @@ pub enum UdpMode {
     },
 }
 
-// ── TCP client ────────────────────────────────────────────────────────────────
-
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TcpClientConfig {
-    pub address: SocketAddr,
-}
-
-impl TcpClientConfig {
-    pub fn new(address: SocketAddr) -> Self {
-        Self { address }
-    }
-}
-
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -445,14 +429,6 @@ mod tests {
     }
 
     #[test]
-    fn tcp_client_round_trip() {
-        let c = InterfaceConfig::TcpClient(TcpClientConfig::new("10.0.0.1:4001".parse().unwrap()));
-        let json = serde_json::to_string(&c).unwrap();
-        assert!(json.contains("\"type\":\"tcp_client\""));
-        round_trip(&c);
-    }
-
-    #[test]
     fn channel_config_round_trip() {
         let c = ChannelConfig::new(
             InterfaceConfig::Udp(UdpConfig::unicast("127.0.0.1:6000".parse().unwrap())),
@@ -463,7 +439,7 @@ mod tests {
 
     #[test]
     fn channel_config_defaults_messages_to_empty() {
-        let json = r#"{"interface":{"type":"tcp_client","address":"10.0.0.1:1"}}"#;
+        let json = r#"{"interface":{"type":"serial","port":"COM3"}}"#;
         let c: ChannelConfig = serde_json::from_str(json).unwrap();
         assert!(c.messages.is_empty());
         // Older profiles predate the name key — defaults to unnamed.
@@ -472,7 +448,7 @@ mod tests {
 
     #[test]
     fn channel_config_name_round_trips_and_empty_is_omitted() {
-        let iface = InterfaceConfig::TcpClient(TcpClientConfig::new("10.0.0.1:1".parse().unwrap()));
+        let iface = InterfaceConfig::Serial(SerialConfig::new("COM3"));
         let named = ChannelConfig::named("GPS feed", iface.clone(), vec![]);
         round_trip(&named);
         // Unnamed channels serialize without a name key at all, keeping

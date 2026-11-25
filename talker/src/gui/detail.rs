@@ -35,8 +35,7 @@ use super::widgets::{
     marker_aware_text_edit, message_editor_max_height, output_request, plain_text_edit_with_cursor,
     preview_ascii_layout_job, red_bordered, rts_by_flow, serial_editor_id, show_display_pane,
     show_insert_byte_button, show_insert_unit_button, show_interface_summary, show_serial_fields,
-    show_tcp_fields, show_udp_fields, start_button, InterfaceEdit, LiveUpdateQueueGauge,
-    UppercaseHex,
+    show_udp_fields, start_button, InterfaceEdit, LiveUpdateQueueGauge, UppercaseHex,
 };
 use super::{MessageAnalysisCache, MessageDraftAnalysis, MessagePreview, TalkerApp};
 use wiredata_ui::hover::{Hover, ShowHover};
@@ -139,9 +138,6 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
                 summary.totals.missed_sends,
             ))
             .on_hover(&SENT_MEANING_TOOLTIP);
-            if let Some(bytes) = summary.totals.peer_bytes {
-                ui.weak(peer_sent_words(bytes)).on_hover(&PEER_SENT_TOOLTIP);
-            }
             let (timer_detail, timer_hot) = timer_status_detail(summary.totals.timer);
             let timer = egui::RichText::new(format!("Timer: {timer_detail}")).weak();
             ui.label(if timer_hot {
@@ -550,10 +546,6 @@ impl TalkerApp {
             false,
             &THROUGHPUT_TOOLTIP,
         );
-        // A TCP client counts what its peer sent (§4.5).
-        if let Some(bytes) = telemetry.peer_bytes {
-            detail_line(ui, peer_sent_words(bytes), false, &PEER_SENT_TOOLTIP);
-        }
 
         // Lifecycle controls sit directly under the basic readouts, matching
         // listener's control block. Below the diagnostics they were reachable
@@ -1006,7 +998,7 @@ impl TalkerApp {
             .show(ui, |ui| {
                 let interface_result = match self.conn_drafts[i].kind() {
                     // Each kind gets its own push_id namespace so the very
-                    // different widget trees produced by Serial / UDP / TCP can't
+                    // different widget trees produced by Serial and UDP can't
                     // shift each other's auto-ids across egui's two layout passes.
                     ConnKind::Serial => {
                         ui.push_id("serial_body", |ui| {
@@ -1024,13 +1016,6 @@ impl TalkerApp {
                     ConnKind::Udp => {
                         ui.push_id("udp_body", |ui| InterfaceEdit {
                             changed: show_udp_fields(ui, &mut self.conn_drafts[i]),
-                            ..InterfaceEdit::default()
-                        })
-                        .inner
-                    }
-                    ConnKind::Tcp => {
-                        ui.push_id("tcp_body", |ui| InterfaceEdit {
-                            changed: show_tcp_fields(ui, &mut self.conn_drafts[i]),
                             ..InterfaceEdit::default()
                         })
                         .inner

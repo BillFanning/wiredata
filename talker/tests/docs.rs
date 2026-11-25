@@ -21,6 +21,11 @@ use std::path::{Path, PathBuf};
 /// absent. Checked for still being needed, below.
 const REMOVED_ON_PURPOSE: &[(&str, &str)] = &[
     (
+        "peer_sent_bytes",
+        "talker ADR-073 records that the run summary no longer writes it, since \
+         the TCP client that counted peer replies was removed",
+    ),
+    (
         "diagnostic_card_tone",
         "talker's ADR records which signals the card badge read at the time; \
          ADR-066 removed the badge and the function with it",

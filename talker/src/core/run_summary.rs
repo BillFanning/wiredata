@@ -68,9 +68,6 @@ pub struct RunTotals {
     /// Sends that failed after the interface accepted part of the message
     /// (§4.4); their accepted bytes are in `total_bytes`.
     pub possibly_partial_sends: u64,
-    /// Bytes the TCP peer sent, read and discarded (§4.5); `None` for a
-    /// transport that does not read its peer.
-    pub peer_bytes: Option<u64>,
     /// Due fires withheld by the bounded-backoff gate.
     pub withheld_sends: u64,
     /// Bounded cumulative measurements of deadline handling, payload rendering
@@ -158,14 +155,6 @@ impl RunSummary {
             self.totals.possibly_partial_sends
         );
         let _ = writeln!(out, "withheld_sends={}", self.totals.withheld_sends);
-        match self.totals.peer_bytes {
-            Some(bytes) => {
-                let _ = writeln!(out, "peer_sent_bytes={bytes}");
-            }
-            None => {
-                let _ = writeln!(out, "peer_sent_bytes=not_applicable");
-            }
-        }
         let _ = writeln!(out, "missed_sends={}", self.totals.missed_sends);
         let _ = writeln!(out, "scheduled_sends={}", self.totals.scheduled_sends());
         let counts = self
@@ -544,7 +533,6 @@ mod tests {
                 missed_sends: 3,
                 failed_sends: 1,
                 possibly_partial_sends: 1,
-                peer_bytes: Some(42),
                 withheld_sends: 2,
                 timing: SendTimingReport {
                     cumulative,
@@ -592,7 +580,6 @@ mod tests {
         assert!(report.contains("elapsed_us=12345000\n"));
         assert!(report.contains("scheduled_sends=107\n"));
         assert!(report.contains("possibly_partial_sends=1\n"));
-        assert!(report.contains("peer_sent_bytes=42\n"));
         assert!(report.contains("per_message_sent=60,40\n"));
         // Every per-message lane is positionally aligned with per_message_sent,
         // so column N of each line describes the same message.

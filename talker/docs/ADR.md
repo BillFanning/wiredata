@@ -1,13 +1,13 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.36
-**Date:** 2026-11-23
+**Version:** 1.37
+**Date:** 2026-11-24
 **Status:** Accepted
 
-Revision note (2026-11-23) — jiff replaces chrono:
+Revision note (2026-11-24) — the TCP client is removed:
 
-- **ADR-072** — dates and times are read and written with jiff, not chrono,
-  which is unmaintained. Nothing on screen, in a file or on the wire changes.
+- **ADR-073** — talker has no TCP client, as listener has no TCP receive.
+  ADR-059, the design it had, is kept as the starting point for any return.
 
 ---
 
@@ -2317,6 +2317,8 @@ check value.
 
 **Status:** Accepted 2026-09-30. Resolves the §12.1 open item on TCP reconnect.
 Amended 2026-10-01: a drain that finds the peer has closed fails that send.
+**Withdrawn 2026-11-24 by ADR-073:** talker has no TCP client. This entry is the
+design to start from if one returns.
 
 **Context:** The TCP client has no retry preparation. Once the peer closes or
 restarts, every later write fails on the dead stream until someone restarts the
@@ -2891,6 +2893,47 @@ changes. ADR-067's policy is unchanged, NMEA's own sign included.
 - `deny.toml` no longer ignores RUSTSEC-2026-0543.
 
 ---
+
+## ADR-073 — Talker has no TCP client
+
+**Status:** Accepted 2026-11-24. Amends spec §4.1, §4.4, §4.5 and §12.1, and
+withdraws ADR-059.
+
+**Context:** Listener removed TCP receive (listener ADR-047), and Linemon never
+had it, so talker's TCP client was the only TCP in the workspace and nothing in
+it could receive what it sent. It carried its own reconnect, reply draining and
+write-timeout handling (ADR-059), a peer-reply count on screen, in the CLI
+summary and in the run summary, and the 5 s timeouts that set the CLI's stop
+limit. The user asked for TCP to be sidelined in talker as it is in listener.
+
+**Decision:**
+
+- **The TCP client is removed, not hidden.** It is gone from `+ Add`, the
+  profile format and the channel code, with its reply count.
+- **A profile that names a TCP client is refused.** Loading fails with an error
+  naming the interface type. Talker's profiles are strict (ADR-062) and none
+  are in use, so it is not loaded without the channel as listener does.
+- **Re-adding TCP needs a new decision.** ADR-059 is the design it would start
+  from.
+
+**Boundary:** UDP and serial are unchanged. Possibly partial stays: a serial
+write reports it too.
+
+**Alternatives considered:**
+
+- **Hide TCP from `+ Add` and keep the code:** Rejected, as listener rejected it:
+  code for a kind that cannot be chosen still has to be kept working.
+- **Load a profile without its TCP channel and warn, as listener does:**
+  Rejected while no profiles are in use. It is a compatibility path for profiles
+  that do not exist.
+
+**Consequences:** The CLI's stop limit is the serial write timeout plus 1 s,
+2 s instead of 6 s, since a serial write is now the longest call a stop can
+wait on. The run summary no longer writes `peer_sent_bytes`. The tests that
+used a TCP port nobody listened on, as a device that is not there, use a UDP
+channel whose local port another socket holds. The failed-send storm soak
+aims a unicast channel at the broadcast address, so the system refuses
+every send.
 
 ## Open questions
 

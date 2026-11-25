@@ -3,8 +3,7 @@ use std::sync::OnceLock;
 
 use crate::core::{
     channel::{
-        DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits, TcpClientConfig,
-        UdpConfig, UdpMode,
+        DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits, UdpConfig, UdpMode,
     },
     message::{
         ByteOrder, ChecksumAlgorithm, ChecksumConfig, CodePage, MessageConfig, NmeaChecksumMode,
@@ -20,19 +19,17 @@ use wiredata_ui::serial as shared;
 pub enum ConnKind {
     Serial,
     Udp,
-    Tcp,
 }
 
 impl ConnKind {
     /// Match listener's Add menu: the transport is selected when the channel
     /// is created and is not a routine field in the detail editor.
-    pub const ADD_MENU: [Self; 3] = [Self::Udp, Self::Tcp, Self::Serial];
+    pub const ADD_MENU: [Self; 2] = [Self::Udp, Self::Serial];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Serial => "Serial",
             Self::Udp => "UDP",
-            Self::Tcp => "TCP",
         }
     }
 }
@@ -150,8 +147,6 @@ pub struct ConnDraft {
     /// buttons. Shared because only one mode is being edited at a time.
     pub udp_port_hold: Option<PortHold>,
     pub local_port: String, // optional local bind port
-    // tcp
-    pub tcp_addr: String,
 }
 
 impl Default for ConnDraft {
@@ -185,7 +180,6 @@ impl Default for ConnDraft {
             udp_multicast_ttl: None,
             udp_port_hold: None,
             local_port: String::new(),
-            tcp_addr: String::new(),
         }
     }
 }
@@ -267,11 +261,6 @@ impl From<&InterfaceConfig> for ConnDraft {
                 }
                 draft
             }
-            InterfaceConfig::TcpClient(t) => Self {
-                kind: ConnKind::Tcp,
-                tcp_addr: t.address.to_string(),
-                ..Default::default()
-            },
         }
     }
 }
@@ -416,10 +405,6 @@ impl ConnDraft {
                 };
                 udp.local_port = local_port;
                 Some(InterfaceConfig::Udp(udp))
-            }
-            ConnKind::Tcp => {
-                let addr: SocketAddr = self.tcp_addr.parse().ok()?;
-                Some(InterfaceConfig::TcpClient(TcpClientConfig::new(addr)))
             }
         }
     }
@@ -674,10 +659,7 @@ mod tests {
 
     #[test]
     fn add_menu_matches_listener_order_and_preserves_the_chosen_kind() {
-        assert_eq!(
-            ConnKind::ADD_MENU.map(ConnKind::label),
-            ["UDP", "TCP", "Serial"]
-        );
+        assert_eq!(ConnKind::ADD_MENU.map(ConnKind::label), ["UDP", "Serial"]);
         for kind in ConnKind::ADD_MENU {
             let draft = ConnDraft::new(kind);
             assert_eq!(draft.kind(), kind);
@@ -885,13 +867,6 @@ mod tests {
         let mut udp = UdpConfig::unicast("127.0.0.1:5000".parse().unwrap());
         udp.local_port = Some(6000);
         conn_round_trip(InterfaceConfig::Udp(udp));
-    }
-
-    #[test]
-    fn tcp_draft_round_trip() {
-        conn_round_trip(InterfaceConfig::TcpClient(TcpClientConfig::new(
-            "10.0.0.1:4001".parse().unwrap(),
-        )));
     }
 
     // ── ScheduleDraft round-trips ─────────────────────────────────────────────

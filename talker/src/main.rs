@@ -13,7 +13,7 @@ use talker::{cli, core, gui};
     about = "Send NMEA0183, ASCII, UTF, and binary data over serial and network connections",
     long_about = "Send NMEA0183, ASCII, UTF, and binary data over serial and network \
                   connections. Talker drives one or more send-only channels (serial, \
-                  UDP unicast/broadcast/multicast, or TCP client) on a profile-defined \
+                  UDP unicast, broadcast or multicast) on a profile-defined \
                   schedule. Run with --gui for the graphical editor, or with \
                   --profile / --profile-path on the command line to start sending \
                   immediately. Profiles are TOML files (see \

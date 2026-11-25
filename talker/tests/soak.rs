@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use talker::core::channel::{InterfaceConfig, TcpClientConfig, UdpConfig};
+use talker::core::channel::{InterfaceConfig, UdpConfig};
 use talker::core::message::{MessageConfig, PayloadConfig};
 use talker::core::runner::ObserverPolicy;
 use talker::core::scheduler::Schedule;
@@ -183,25 +183,16 @@ fn multi_channel_udp_soak_totals_exact_at_rest() {
     }
 }
 
-/// A 2 ms schedule against a peer that accepts one connection and drops it:
-/// ~500 due fires/s against a dead interface for the whole soak window. The
+/// A 2 ms schedule whose every send fails: a unicast channel aimed at the
+/// broadcast address, which the system refuses because the socket is not
+/// allowed to broadcast. ~500 due fires/s against a dead interface for the
+/// whole soak window. The
 /// bounded-backoff retry policy and edge-triggered error reporting must keep
 /// the storm silent — one SendFailed episode, a live runner, and a
 /// deliverable Stop at the end (no wedge, no per-fire error flood).
 #[test]
 #[ignore = "soak: run manually / nightly (see module docs)"]
-fn tcp_failed_send_storm_stays_bounded() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().unwrap();
-    // Accept exactly one connection and drop it immediately, then close the
-    // listener too: the talker's established stream dies (RST on the next
-    // writes) and nothing can bring it back for the rest of the soak.
-    let acceptor = std::thread::spawn(move || {
-        if let Ok((stream, _)) = listener.accept() {
-            drop(stream);
-        }
-    });
-
+fn failed_send_storm_stays_bounded() {
     let mut sup = TalkerSupervisor::new(ObserverPolicy::sampled());
     sup.push_slot();
     let messages = vec![msg("ABCD", 2)];
@@ -209,7 +200,7 @@ fn tcp_failed_send_storm_stays_bounded() {
     sup.start(
         0,
         "1",
-        InterfaceConfig::TcpClient(TcpClientConfig::new(addr)),
+        InterfaceConfig::Udp(UdpConfig::unicast("255.255.255.255:9".parse().unwrap())),
         messages,
         schedule,
     );
@@ -231,9 +222,8 @@ fn tcp_failed_send_storm_stays_bounded() {
         "the failing episode's first error must be on the banner"
     );
     // Edge-triggered: ONE SendFailed opens the episode and repeats are
-    // counted, not re-reported. Allow a little platform slack (a send can
-    // half-succeed into the OS buffer around the RST), but a per-fire storm
-    // (~500/s × the window) must be impossible.
+    // counted, not re-reported. Allow a little platform slack, but a per-fire
+    // storm (~500/s × the window) must be impossible.
     assert!(
         t.errors_total <= 3,
         "expected an edge-triggered error, not a storm: {} errors in {secs}s",
@@ -242,5 +232,4 @@ fn tcp_failed_send_storm_stays_bounded() {
 
     assert_eq!(sup.stop(0), CommandOutcome::Enqueued, "Stop must enqueue");
     poll_until(&mut sup, Duration::from_secs(15), |s| !s.any_draining());
-    acceptor.join().expect("acceptor thread");
 }

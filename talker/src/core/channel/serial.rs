@@ -19,7 +19,7 @@ type Outputs = (Option<bool>, bool);
 
 /// How long a serial write may stall, on flow control or a full driver buffer,
 /// before it fails as timed out.
-pub(super) const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Windows' `ERROR_OPERATION_ABORTED`, which Rust maps to `TimedOut` and which
 /// USB serial drivers commonly return when an unplug aborts `WriteFile`.
@@ -249,8 +249,8 @@ impl Interface for SerialInterface {
     }
 }
 
-/// A write the port took nothing of for [`WRITE_TIMEOUT`]. Said in talker's
-/// words, as the TCP interface says its own.
+/// A write the port took nothing of for [`WRITE_TIMEOUT`], said in talker's
+/// words.
 #[derive(Debug)]
 struct WriteTimedOut;
 

@@ -97,7 +97,7 @@ pub(in crate::gui) fn service_timing_source_label(
 pub(in crate::gui) fn unavailable_line_capacity_label(kind: ConnKind) -> &'static str {
     match kind {
         ConnKind::Serial => "complete Serial setup",
-        ConnKind::Udp | ConnKind::Tcp => "network line unmeasured",
+        ConnKind::Udp => "network line unmeasured",
     }
 }
 

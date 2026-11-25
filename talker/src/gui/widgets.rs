@@ -3,11 +3,7 @@
 //! here is either a stateless `fn(ui, …)` widget or a pure validation /
 //! formatting helper — app state stays in [`super::TalkerApp`].
 
-use std::{
-    net::{Ipv4Addr, SocketAddr},
-    ops::ControlFlow,
-    sync::Arc,
-};
+use std::{net::Ipv4Addr, ops::ControlFlow, sync::Arc};
 
 use egui::{Align, Layout};
 use wiredata_ui::diagnostics::{dismissible_attention_callout, SignalTone};
@@ -165,7 +161,6 @@ pub(super) fn interface_summary(conn: &ConnDraft) -> String {
     // match the disabled-Start tooltip exactly.
     let ok_ipv4 = |s: &str| s.parse::<Ipv4Addr>().is_ok();
     let ok_port = |s: &str| s.parse::<u16>().is_ok();
-    let ok_sock = |s: &str| s.parse::<SocketAddr>().is_ok();
     let ok_any = |_: &str| true;
     let lp = if conn.local_port.is_empty() {
         String::new()
@@ -211,7 +206,6 @@ pub(super) fn interface_summary(conn: &ConnDraft) -> String {
                 or_q(&pair.port, ok_port),
             )
         }
-        ConnKind::Tcp => format!("TCP {}", or_q(&conn.tcp_addr, ok_sock)),
     }
 }
 
@@ -303,13 +297,6 @@ fn channel_blockers(conn: &ConnDraft, sink: &mut BlockerSink) -> ControlFlow<()>
                 sink(&|| "Channel: local port must be 1–65535".to_string())?;
             }
         }
-        ConnKind::Tcp => {
-            if conn.tcp_addr.is_empty() {
-                sink(&|| "Channel: address is empty".to_string())?;
-            } else if conn.tcp_addr.parse::<SocketAddr>().is_err() {
-                sink(&|| "Channel: address must be host:port".to_string())?;
-            }
-        }
     }
     ControlFlow::Continue(())
 }
@@ -359,7 +346,7 @@ fn message_blockers(
     ControlFlow::Continue(())
 }
 
-// ── Interface field editors (Serial / UDP / TCP) ─────────────────────────────
+// ── Interface field editors (Serial / UDP) ───────────────────────────────────
 
 /// What an interface editor reports for one frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -729,37 +716,6 @@ fn show_addr_port_row(ui: &mut egui::Ui, p: AddrPortRow) -> bool {
     if drive_port_hold(ui, p.port_hold, p.port_field, &r_minus, &r_plus) {
         apply = true;
     }
-    apply
-}
-
-pub(super) fn show_tcp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
-    let mut apply = false;
-
-    egui::Grid::new("tcp_grid")
-        .num_columns(2)
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            let bad_tcp = invalid_parse::<SocketAddr>(&conn.tcp_addr);
-            ui.label("Address");
-            let r = red_bordered(
-                ui,
-                bad_tcp,
-                "enter host:port — e.g. 192.168.1.100:4000",
-                |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut conn.tcp_addr)
-                            .id_salt("tcp_addr")
-                            .desired_width(220.0)
-                            .hint_text("host:port  (Enter to apply)"),
-                    )
-                },
-            );
-            if enter_committed(&r, ui) {
-                apply = true;
-            }
-            ui.end_row();
-        });
-
     apply
 }
 
@@ -2643,11 +2599,16 @@ mod tests {
         // string-collecting path walk the same visitor; pin that they can't
         // drift apart across a few representative draft states.
         let valid_conn = || {
-            let mut conn = ConnDraft::new(ConnKind::Tcp);
-            conn.tcp_addr = "127.0.0.1:9000".to_string();
+            let mut conn = ConnDraft::new(ConnKind::Udp);
+            conn.udp_unicast.addr = "127.0.0.1".to_string();
+            conn.udp_unicast.port = "9000".to_string();
             conn
         };
-        let invalid_conn = || ConnDraft::new(ConnKind::Tcp); // empty address
+        let invalid_conn = || {
+            let mut conn = ConnDraft::new(ConnKind::Udp);
+            conn.udp_unicast.addr.clear(); // empty address
+            conn
+        };
         let msg = |interval: &str| ScheduleDraft {
             payload_kind: PayloadKind::Utf8,
             utf8_text: "hello".to_string(),

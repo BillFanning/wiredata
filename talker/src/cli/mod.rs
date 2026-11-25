@@ -8,7 +8,7 @@ use wiredata_cli::{doubling_retry, exit_status, HealthWatch, EXIT_CANNOT_START};
 use wiredata_ui::format::thousands;
 
 use crate::core::{
-    channel::{ChannelId, CONNECT_TIMEOUT, WRITE_TIMEOUT},
+    channel::{ChannelId, WRITE_TIMEOUT},
     logging::{self, FileLogConfig, Rotation},
     message::decode_utf8_lossy_latin1,
     profile::{self, Profile},
@@ -177,15 +177,9 @@ pub struct Args {
 /// How long the stop may take, once requested, before the CLI stops waiting
 /// for the channels' threads and exits with code 4 (ADR-060). A send blocked
 /// in the operating system cannot be interrupted, so the limit is the longest
-/// such call plus 1 s: a stop that is only waiting one out is not cut off.
-const STOP_LIMIT: Duration = {
-    let longest = if WRITE_TIMEOUT.as_nanos() > CONNECT_TIMEOUT.as_nanos() {
-        WRITE_TIMEOUT
-    } else {
-        CONNECT_TIMEOUT
-    };
-    longest.saturating_add(Duration::from_secs(1))
-};
+/// such call, a serial write, plus 1 s: a stop that is only waiting one out is
+/// not cut off.
+const STOP_LIMIT: Duration = WRITE_TIMEOUT.saturating_add(Duration::from_secs(1));
 
 /// How a channel that is down is being retried, for its WARNING line: first
 /// for an interface that did not open, then for a send that failed. The runner
@@ -431,7 +425,6 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
                                 bytes: totals.total_bytes,
                                 failed: totals.failed_sends,
                                 possibly_partial: totals.possibly_partial_sends,
-                                peer_bytes: totals.peer_bytes,
                                 dropped: totals.dropped_statuses,
                             },
                         );
@@ -574,8 +567,6 @@ struct FinalCounts {
     failed: u64,
     /// Sends that failed after part of the message was written (§4.4).
     possibly_partial: u64,
-    /// Bytes the TCP peer sent (§4.5); `None` for other transports.
-    peer_bytes: Option<u64>,
     /// Status updates dropped because the reader was full: with `--echo`,
     /// echo lines not printed (§5.8).
     dropped: u64,
@@ -601,13 +592,6 @@ fn counters_note(counts: Option<&FinalCounts>, echo: bool) -> String {
         note.push_str(&format!(
             ", {} possibly partial",
             thousands(counts.possibly_partial)
-        ));
-    }
-    if let Some(bytes) = counts.peer_bytes.filter(|&bytes| bytes > 0) {
-        note.push_str(&format!(
-            "; peer sent {} byte{}",
-            thousands(bytes),
-            if bytes == 1 { "" } else { "s" }
         ));
     }
     if echo && counts.dropped > 0 {
@@ -891,7 +875,6 @@ mod tests {
     #[test]
     fn stop_limit_outlasts_the_longest_blocking_call() {
         assert!(STOP_LIMIT > WRITE_TIMEOUT);
-        assert!(STOP_LIMIT > CONNECT_TIMEOUT);
     }
 
     fn parse(argv: &[&str]) -> Result<Args, clap::Error> {
@@ -926,7 +909,6 @@ mod tests {
             bytes: 4_800,
             failed: 1,
             possibly_partial: 0,
-            peer_bytes: None,
             dropped: 3,
         };
         assert_eq!(
@@ -943,13 +925,6 @@ mod tests {
         assert_eq!(
             counters_note(Some(&counts), false),
             "; sent 120 messages (4,800 bytes), 1 failed send, 2 possibly partial"
-        );
-        // §4.5: a TCP peer that answered.
-        counts.peer_bytes = Some(12);
-        assert_eq!(
-            counters_note(Some(&counts), false),
-            "; sent 120 messages (4,800 bytes), 1 failed send, 2 possibly partial; \
-             peer sent 12 bytes"
         );
     }
 

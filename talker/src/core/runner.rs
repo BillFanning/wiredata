@@ -216,7 +216,7 @@ const LINES_REPEAT: Duration = Duration::from_secs(1);
 /// transport may first prepare or replace its failed handle; an unavailable
 /// replacement withholds that fire too. Each unsuccessful retry doubles the wait up to
 /// [`RETRY_BACKOFF_MAX`], and the first successful send closes the episode.
-/// Without it, a 100 Hz schedule against a dead TCP/serial target would retry
+/// Without it, a 100 Hz schedule against a dead serial target would retry
 /// 100 times a second.
 pub const RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 /// Retry delay cap: a persistently dead interface is probed at most once per
@@ -680,7 +680,7 @@ fn open_retrying_and_run_with(
 /// Open `cfg`'s interface, then run the send loop.
 ///
 /// Meant to be called *on the channel's own thread* (the GUI path), so the
-/// open — real I/O that can block for seconds on a TCP connect — never runs
+/// open — real I/O that can block on a slow serial driver — never runs
 /// on the UI thread. A failed open is reported as
 /// [`TalkerStatus::OpenFailed`] and the call returns.
 pub fn open_and_run(
@@ -953,7 +953,6 @@ struct RunState<'a> {
     total_bytes: u64,
     failed_sends: u64,
     possibly_partial_sends: u64,
-    peer_bytes: u64,
     send_failure_episodes: u64,
     withheld_sends: u64,
     send_timing: SendTimingRecorder,
@@ -1037,7 +1036,6 @@ impl<'a> RunState<'a> {
             total_bytes: 0,
             failed_sends: 0,
             possibly_partial_sends: 0,
-            peer_bytes: 0,
             send_failure_episodes: 0,
             withheld_sends: 0,
             send_timing: SendTimingRecorder::default(),
@@ -1401,7 +1399,6 @@ impl<'a> RunState<'a> {
 
         let send_started = Instant::now();
         let send_result = self.interface.send(&payload);
-        self.peer_bytes += self.interface.take_peer_bytes();
         let send_finished = Instant::now();
         self.send_timing.record_send_duration(
             send_finished,
@@ -1423,14 +1420,10 @@ impl<'a> RunState<'a> {
             // "Withheld" is defined on the send-outcomes
             // line and nowhere the log reader can see, so
             // this states what happened to those sends.
-            // A replaced handle names what it reconnected
-            // to (ADR-059, §4.5).
+            // A replaced handle names what was reopened.
             let replaced = match self.current_config.as_ref() {
                 Some(InterfaceConfig::Serial(config)) if ep.handle_replaced => {
                     Some(format!("reopened serial port {}", config.port))
-                }
-                Some(InterfaceConfig::TcpClient(config)) if ep.handle_replaced => {
-                    Some(format!("reconnected to {}", config.address))
                 }
                 _ => None,
             };
@@ -1570,7 +1563,6 @@ impl<'a> RunState<'a> {
                     missed_sends: self.schedule.missed_sends(),
                     failed_sends: self.failed_sends,
                     possibly_partial_sends: self.possibly_partial_sends,
-                    peer_bytes: peer_sent(self.current_config.as_ref(), self.peer_bytes),
                     withheld_sends: self.withheld_sends,
                     timing: self.send_timing.snapshot_at(now),
                     timer: self.timer.status(),
@@ -1631,7 +1623,6 @@ impl<'a> RunState<'a> {
             missed_sends,
             failed_sends: self.failed_sends,
             possibly_partial_sends: self.possibly_partial_sends,
-            peer_bytes: peer_sent(self.current_config.as_ref(), self.peer_bytes),
             withheld_sends: self.withheld_sends,
             timing: self.send_timing.snapshot_at(finished_mono),
             timer: timer_status,
@@ -1675,8 +1666,8 @@ fn run_loop(
     cmd_rx: Receiver<TalkerCommand>,
     observer: RunnerObserver,
 ) {
-    // Cadence starts only now: any profile preflight, predecessor join, TCP
-    // connect, or serial open happened before this runner boundary and must not
+    // Cadence starts only now: any profile preflight, predecessor join, or
+    // serial open happened before this runner boundary and must not
     // inflate missed-send telemetry or shift the first-fire grid.
     let started_at = SystemTime::now();
     let started_mono = Instant::now();
@@ -1775,12 +1766,6 @@ fn run_loop(
     run.finish(end_reason);
 }
 
-/// The run's peer-reply total, for a transport that reads its peer: only the
-/// TCP client does (ADR-059, §4.5).
-fn peer_sent(config: Option<&InterfaceConfig>, bytes: u64) -> Option<u64> {
-    matches!(config, Some(InterfaceConfig::TcpClient(_))).then_some(bytes)
-}
-
 /// What a closed failure episode cost, for its recovery line: the sends that
 /// failed, those that were possibly partial, and the due sends withheld.
 fn recovery_cost(failed: u64, possibly_partial: u64, withheld: u64) -> String {
@@ -1852,7 +1837,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::core::channel::{SerialConfig, TcpClientConfig, UdpConfig};
+    use crate::core::channel::{SerialConfig, UdpConfig};
     use crate::core::message::{CodePage, MessageConfig, PayloadConfig};
 
     /// Sustained overload must log twice, not once per missed send. This is
@@ -1987,8 +1972,8 @@ mod tests {
     #[test]
     fn the_send_failed_line_states_the_retry_schedule() {
         assert_eq!(
-            send_failed_line("GPS", "writing to TCP stream: broken pipe"),
-            "channel GPS: send failed: writing to TCP stream: broken pipe; \
+            send_failed_line("GPS", "writing to serial port: device removed"),
+            "channel GPS: send failed: writing to serial port: device removed; \
              retrying in 250 ms, doubling to 5 s"
         );
     }
@@ -3432,129 +3417,6 @@ mod tests {
         );
     }
 
-    /// ADR-059, §4.5: what a TCP peer sends is counted, and only a TCP
-    /// client carries the count at all.
-    #[test]
-    fn a_tcp_peer_s_replies_are_counted_in_the_run() {
-        use std::io::Write;
-        use std::net::TcpListener;
-
-        let server = TcpListener::bind("127.0.0.1:0").unwrap();
-        let config = InterfaceConfig::TcpClient(crate::core::channel::TcpClientConfig::new(
-            server.local_addr().unwrap(),
-        ));
-        let interface = config.open().unwrap();
-        let (mut peer, _) = server.accept().unwrap();
-        let handle = spawn_interface_runner(interface, Some(config));
-        peer.write_all(b"OK\r\n").unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut counted = None;
-        while counted != Some(Some(4)) {
-            assert!(
-                Instant::now() < deadline,
-                "the reply was never counted: {counted:?}"
-            );
-            for status in handle.status_rx.try_iter() {
-                if let TalkerStatus::Counters { totals, .. } = status {
-                    counted = Some(totals.peer_bytes);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
-        join_within(handle, Duration::from_secs(2));
-
-        assert_eq!(peer_sent(None, 9), None, "no transport, no peer count");
-    }
-
-    /// ADR-059, §4.5: the receiving server is killed and restarted on the
-    /// same address. Sending resumes on a new connection without a click, and
-    /// one line closes the episode, naming the address.
-    #[test]
-    fn a_restarted_tcp_server_gets_the_next_message_on_a_new_connection() {
-        use std::io::Read;
-        use std::net::TcpListener;
-
-        fn accept_within(listener: &TcpListener, limit: Duration) -> std::net::TcpStream {
-            listener.set_nonblocking(true).unwrap();
-            let deadline = Instant::now() + limit;
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        stream.set_nonblocking(false).unwrap();
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(5)))
-                            .unwrap();
-                        return stream;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "talker never connected");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(e) => panic!("accept failed: {e}"),
-                }
-            }
-        }
-
-        let server = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = server.local_addr().unwrap();
-        let config =
-            InterfaceConfig::TcpClient(crate::core::channel::TcpClientConfig::new(address));
-        let interface = config.open().unwrap();
-        let mut first = accept_within(&server, Duration::from_secs(5));
-        let (handle, logs) = spawn_logging_interface_runner(interface, Some(config));
-        let mut buf = [0u8; 2];
-        first.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, &[0xAB, 0xAB]);
-
-        // Kill the server, and wait until talker sees a write fail.
-        drop(first);
-        drop(server);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            assert!(Instant::now() < deadline, "no write ever failed");
-            if handle
-                .status_rx
-                .try_iter()
-                .any(|s| matches!(s, TalkerStatus::SendFailed { .. }))
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        // Restart it on the same address: the next message arrives there.
-        let server = TcpListener::bind(address).expect("the port can be bound again");
-        let mut second = accept_within(&server, Duration::from_secs(20));
-        let mut buf = [0u8; 2];
-        second.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, &[0xAB, 0xAB], "whole messages on the new connection");
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !handle
-            .status_rx
-            .try_iter()
-            .any(|s| matches!(s, TalkerStatus::SendRecovered { .. }))
-        {
-            assert!(Instant::now() < deadline, "no recovery was reported");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
-        join_within(handle, Duration::from_secs(2));
-
-        let recoveries: Vec<String> = logs
-            .try_iter()
-            .map(|event| event.message)
-            .filter(|line| line.contains("sending again after"))
-            .collect();
-        assert_eq!(recoveries.len(), 1, "{recoveries:#?}");
-        assert!(
-            recoveries[0].contains(&format!("(reconnected to {address})")),
-            "{recoveries:#?}"
-        );
-    }
-
     /// Model the serial failure mode where a removed device's old handle stays
     /// unusable after a replacement appears under the same port name. Recovery
     /// must prepare a replacement handle rather than assuming every transport
@@ -3778,22 +3640,20 @@ mod tests {
         join_within(handle, Duration::from_secs(2));
     }
 
-    fn free_tcp_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+    /// A UDP interface whose local port another socket holds, so it cannot
+    /// open until `holder` is dropped: a device that is not there yet.
+    fn held_local_port() -> (InterfaceConfig, std::net::UdpSocket) {
+        let holder = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mut udp = UdpConfig::unicast("127.0.0.1:9".parse().unwrap());
+        udp.local_port = Some(holder.local_addr().unwrap().port());
+        (InterfaceConfig::Udp(udp), holder)
     }
 
     #[test]
     fn a_channel_that_cannot_open_starts_once_its_port_appears() {
-        // ADR-060: start what can start. The open is retried until the peer
-        // is there, then the channel runs.
-        let port = free_tcp_port();
-        let cfg = InterfaceConfig::TcpClient(TcpClientConfig::new(
-            format!("127.0.0.1:{port}").parse().unwrap(),
-        ));
+        // ADR-060: start what can start. The open is retried until the port
+        // is free, then the channel runs.
+        let (cfg, holder) = held_local_port();
         let schedule = Schedule::compile(&[msg("AB", 100)], Instant::now()).unwrap();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<TalkerCommand>(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(64);
@@ -3820,7 +3680,7 @@ mod tests {
             other => panic!("expected OpenFailed, got {:?}", other.is_ok()),
         }
 
-        let peer = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        drop(holder);
         let opened = loop {
             match control_rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(RunnerControlStatus::InterfaceOpened { .. }) => break true,
@@ -3830,19 +3690,15 @@ mod tests {
         };
         assert!(
             opened,
-            "the retry opened the channel once the peer was there"
+            "the retry opened the channel once the port was free"
         );
         cmd_tx.send(TalkerCommand::Stop).unwrap();
         runner.join().unwrap();
-        drop(peer);
     }
 
     #[test]
     fn stop_ends_a_channel_still_waiting_to_open() {
-        let port = free_tcp_port();
-        let cfg = InterfaceConfig::TcpClient(TcpClientConfig::new(
-            format!("127.0.0.1:{port}").parse().unwrap(),
-        ));
+        let (cfg, _holder) = held_local_port();
         let schedule = Schedule::compile(&[msg("AB", 100)], Instant::now()).unwrap();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<TalkerCommand>(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(64);
@@ -3877,8 +3733,7 @@ mod tests {
 
     #[test]
     fn open_and_run_reports_open_failed() {
-        // Port 1 on loopback refuses immediately on every platform we target.
-        let cfg = InterfaceConfig::TcpClient(TcpClientConfig::new("127.0.0.1:1".parse().unwrap()));
+        let (cfg, _holder) = held_local_port();
         let schedule = Schedule::compile(&[msg("AB", 100)], Instant::now()).unwrap();
         let (_cmd_tx, cmd_rx) = crossbeam_channel::bounded::<TalkerCommand>(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(8);
@@ -3898,7 +3753,10 @@ mod tests {
         match status_rx.try_recv() {
             Ok(TalkerStatus::OpenFailed { channel, message }) => {
                 assert_eq!(channel, id, "OpenFailed carries the stable id");
-                assert!(message.contains("127.0.0.1:1"), "message was: {message}");
+                assert!(
+                    message.contains("binding UDP socket"),
+                    "message was: {message}"
+                );
             }
             other => panic!("expected OpenFailed, got {:?}", other.is_ok()),
         }
@@ -4020,7 +3878,7 @@ mod tests {
         join_within(handle, Duration::from_secs(2));
     }
 
-    /// UDP and TCP have no control lines: no reading is reported, and a click
+    /// UDP has no control lines: no reading is reported, and a click
     /// that reaches the runner anyway is refused with a reason.
     #[test]
     fn an_interface_without_control_lines_reports_none_and_refuses_a_click() {

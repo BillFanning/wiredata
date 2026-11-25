@@ -232,7 +232,7 @@ talker/src/
 ├── cli/             # clap argument parsing; calls into core
 ├── gui/             # egui/eframe UI; calls into core
 └── core/
-    ├── channel/     # serial, UDP unicast/broadcast/multicast, TCP interfaces
+    ├── channel/     # serial and UDP unicast/broadcast/multicast interfaces
     ├── message/     # payload formats, encoding, code pages, byte markers, timestamps, checksums
     ├── scheduler/   # priority-queue schedule: per-message send intervals
     ├── profile/     # TOML load/save, schema v3 (clean break — no migration)

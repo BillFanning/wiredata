@@ -88,8 +88,6 @@ pub struct ChannelTelemetry {
     /// Interface send attempts that failed after part of the message was
     /// accepted (§4.4).
     pub possibly_partial_sends: u64,
-    /// Bytes the TCP peer sent this run (§4.5); `None` for other transports.
-    pub peer_bytes: Option<u64>,
     /// Due fires intentionally withheld while send retry backoff was active.
     pub withheld_sends: u64,
     /// Bounded cumulative send-path timing measurements from the runner.
@@ -770,7 +768,7 @@ impl TalkerSupervisor {
     /// Each runner stops at its next command check, which comes after the
     /// send it is in. A send writes until the whole message is out, and the
     /// interface's write timeout applies to each write, not to the message:
-    /// a peer that keeps taking a few bytes before each timeout keeps one
+    /// a port that keeps taking a few bytes before each timeout keeps one
     /// large send going for longer. The runners are joined one after another.
     /// So the wait is usually short, and has no fixed upper bound.
     ///
@@ -1188,7 +1186,6 @@ fn drain_statuses(
                     missed_sends,
                     failed_sends,
                     possibly_partial_sends,
-                    peer_bytes,
                     withheld_sends,
                     timing,
                     timer,
@@ -1201,7 +1198,6 @@ fn drain_statuses(
                 telemetry.missed_sends = missed_sends;
                 telemetry.failed_sends = failed_sends;
                 telemetry.possibly_partial_sends = possibly_partial_sends;
-                telemetry.peer_bytes = peer_bytes;
                 telemetry.withheld_sends = withheld_sends;
                 // Immediate failure/recovery edges paint quickly, but share the
                 // bounded observer queue. The cumulative count repairs every
@@ -1267,7 +1263,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
 
     use super::*;
-    use crate::core::channel::{Interface, TcpClientConfig, UdpConfig};
+    use crate::core::channel::{Interface, SerialConfig, UdpConfig};
     use crate::core::message::{MessageConfig, PayloadConfig};
 
     #[test]
@@ -1774,9 +1770,7 @@ mod tests {
             messages: vec![msg("AB", 20)],
         });
 
-        let refused = InterfaceConfig::TcpClient(TcpClientConfig::new(
-            "127.0.0.1:1".parse().expect("socket address"),
-        ));
+        let refused = InterfaceConfig::Serial(SerialConfig::new("/dev/does_not_exist_xyz"));
         let failed = sup.update_interface(0, refused);
         assert_eq!(failed.outcome, CommandOutcome::Enqueued);
         assert_eq!(

@@ -1,16 +1,15 @@
 mod config;
 mod port_list;
 mod serial;
-mod tcp;
 mod udp;
 
 pub use config::{
     ChannelConfig, DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits,
-    TcpClientConfig, UdpConfig, UdpMode,
+    UdpConfig, UdpMode,
 };
 pub(crate) use port_list::PortList;
 pub use serial::RTS_HIGH_UNDER_RTS_CTS;
-pub(crate) use tcp::{CONNECT_TIMEOUT, WRITE_TIMEOUT};
+pub(crate) use serial::WRITE_TIMEOUT;
 
 /// Stable identity of one configured channel, minted when the channel is
 /// created and unchanged for its whole life (ADR-020).
@@ -104,12 +103,6 @@ pub trait Interface: Send {
         Ok(false)
     }
 
-    /// Bytes the peer sent since the last call, read and discarded (ADR-059,
-    /// §4.5). Only a transport that reads its peer reports any.
-    fn take_peer_bytes(&mut self) -> u64 {
-        0
-    }
-
     /// Apply `next` to the existing handle when reopening would conflict with
     /// the resource it already owns. Returns `true` when applied in place;
     /// `false` asks the runner to open a replacement and swap on success.
@@ -142,8 +135,7 @@ pub trait Interface: Send {
 #[derive(Debug)]
 pub struct PartialWrite {
     /// Bytes the interface reported accepting before the error. 0 when the OS
-    /// cannot say: a Windows TCP write that timed out reports nothing sent,
-    /// though part of the message may have gone.
+    /// cannot say how much went, though part of the message may have gone.
     pub written: usize,
     /// The message's length.
     pub total: usize,
@@ -316,7 +308,6 @@ impl InterfaceConfig {
         match self {
             Self::Serial(c) => Ok(Box::new(serial::SerialInterface::open(c)?)),
             Self::Udp(c) => Ok(Box::new(udp::UdpInterface::open(c)?)),
-            Self::TcpClient(c) => Ok(Box::new(tcp::TcpClientInterface::open(c)?)),
         }
     }
 }
