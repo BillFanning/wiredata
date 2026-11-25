@@ -56,6 +56,17 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# unescaper 0.1.8, which serialport uses on Linux, writes its license as
+# "GPL-3.0/MIT", which is not a valid license expression ("/" instead of
+# "OR", and the deprecated "GPL-3.0"), so the check warned on every run. Its
+# 0.2 release writes "MIT OR GPL-3.0-only", but serialport still asks for 0.1.
+# This states the same licence for this one published version, which cannot
+# change, so it names no licence files to hash.
+[[licenses.clarify]]
+crate = "unescaper@0.1.8"
+expression = "MIT OR GPL-3.0-only"
+license-files = []
+
 [bans]
 # The Windows/GUI stack pulls many transitive duplicate versions (windows-sys,
 # socket2, thiserror, rustix, getrandom, …) that we can't dedupe ourselves —
