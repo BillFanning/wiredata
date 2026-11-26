@@ -12,12 +12,6 @@ again. Remove an item when it is done: the commit says what changed.
 
 ## Features
 
-- [ ] **Does XON/XOFF hide 0x11 and 0x13 from the stream? (§14, ADR-010)**
-  Listener records the bytes as received, but with XON/XOFF on the driver may
-  take the XON and XOFF bytes out of the received data. Check with the
-  null-modem pair: talker sends a message with `‹11›` and `‹13›` in it,
-  Listener receives with XON/XOFF on. If they vanish, say so where XON/XOFF is
-  chosen, or decide whether a receive-only tool should offer it.
 - [ ] **Check Windows logoff while a serial port is slow to open, by hand
   (ADR-049, ADR-052).** While the CLI is still opening a slow serial port, a
   Windows logoff should stop it and finalize the recordings already running.

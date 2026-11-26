@@ -1,14 +1,15 @@
-# Listener Specification v2.6.11
+# Listener Specification v2.6.12
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-25) — the recording lock files:
+Revision note (2026-11-26) — XON/XOFF and the bytes it removes:
 
-- **§121.** The recording lock is named: an empty `.raw.lock` or `.disp.lock`
-  file beside the recording, which stays in place after recording stops.
+- **§14.1, §80 (ADR-078).** With XON/XOFF, the port takes 0x11 and 0x13 out of
+  the received data, so they are not shown or recorded. `FlowControl` lists
+  `XonXoff`, which it already had.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -546,6 +547,12 @@ The editors offer only what a port opens with: parity None, Even or Odd, and 1
 or 2 stop bits (ADR-074). A profile may still hold Mark or Space parity or 1.5
 stop bits; the editor shows such a value as not supported until another is
 chosen, and the Channel cannot start with it.
+
+**XON/XOFF removes two bytes (ADR-078).** Flow Control may be None, XON/XOFF or
+RTS/CTS. With XON/XOFF, the port uses 0x11 and 0x13 to pause and resume sending
+and takes them out of the received data. A Channel receiving with it never shows
+or records those two bytes, and Linemon never shows them; every other byte is as
+received.
 
 ### 14.2 Serial Control Signals
 
@@ -1785,7 +1792,7 @@ pub enum OverwritePolicy {
 pub enum DataBits { Five, Six, Seven, Eight }
 pub enum Parity { None, Even, Odd, Mark, Space }
 pub enum StopBits { One, OnePointFive, Two }
-pub enum FlowControl { None, RtsCts }
+pub enum FlowControl { None, XonXoff, RtsCts }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StableConfigId(uuid::Uuid);

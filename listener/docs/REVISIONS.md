@@ -12,6 +12,11 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-25) — the recording lock files:
+
+- **§121.** The recording lock is named: an empty `.raw.lock` or `.disp.lock`
+  file beside the recording, which stays in place after recording stops.
+
 Revision note (2026-11-25) — kernel arrival times on Linux:
 
 - **§15, §26, §75, §84 (ADR-077).** A UDP Channel on Linux always uses the

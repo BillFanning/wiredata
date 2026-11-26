@@ -2772,6 +2772,33 @@ as does the completed-run report, and the event log says it as the channel
 starts, beside any recording a reader may open later. The hovers on the
 timestamp sidecar and on timestamp marks say which time each platform uses.
 
+## ADR-078 — XON/XOFF stays on offer, and says which bytes it removes
+
+**Status:** Accepted 2026-11-26. Amends §14.1 and §80.
+
+**Context:** Listener records what the port hands it (§53), and a TODO asked
+whether XON/XOFF hides its two control bytes. Measured by hand on 2026-11-26
+over a null-modem pair of FTDI adapters on Windows: talker sent
+`41 11 42 13 43 0D 0A` once a second; Linemon with Flow None received all seven
+bytes, and with XON/XOFF received `41 42 43 0D 0A`, steadily. The driver takes
+0x11 and 0x13 out of the received data.
+
+**Decision:** XON/XOFF stays a Flow choice, since some links need the port to
+pause a sender, and its removing those two bytes is stated where it is chosen:
+the shared Flow hover in talker, Linemon and Listener, and §14.1.
+
+**Boundary:** Nothing warns on a running Channel, and no setting keeps the two
+bytes: the driver removes them before Listener reads anything.
+
+**Alternatives considered:**
+
+- **Remove XON/XOFF from Listener and Linemon:** a recording would always be the
+  bytes on the wire, but a link that needs XON/XOFF could not be monitored
+  correctly, and a profile with it would be refused.
+
+**Consequences:** A recording made with XON/XOFF lacks every 0x11 and 0x13 the
+sender sent; every other byte is as received.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

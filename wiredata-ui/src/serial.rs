@@ -354,7 +354,8 @@ const FLOW_HOVER: Hover = Hover::new(
     "How the two ends pause each other when one cannot keep up.\n\n\
      None: nothing pauses the sender.\n\n\
      XON/XOFF: the bytes 0x13 and 0x11 in the data pause and resume sending, so \
-     those two bytes cannot also be data.\n\n\
+     those two bytes cannot also be data. A port receiving with XON/XOFF takes them \
+     out of the data, so they are never shown or recorded.\n\n\
      RTS/CTS: the RTS and CTS wires pause and resume sending, which needs a cable \
      that connects them.",
 );
