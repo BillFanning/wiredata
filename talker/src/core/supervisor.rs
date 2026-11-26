@@ -114,8 +114,10 @@ pub struct ChannelTelemetry {
     /// mark since the channel started.
     pub queue_len: usize,
     pub queue_peak: usize,
-    /// Errors observed since the channel started: connection/open errors
-    /// plus undeliverable commands.
+    /// Interface problems since the channel started, one per episode: a run
+    /// of failed sends or of failed opens counts once, and an undeliverable
+    /// command once. Not shown on screen: the status bar counts log entries,
+    /// as the channel rows do.
     pub errors_total: u64,
     /// Send-failure episodes already folded into `errors_total`. Counter
     /// snapshots advance this even when an immediate edge was dropped.

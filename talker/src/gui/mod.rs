@@ -1442,6 +1442,19 @@ impl eframe::App for TalkerApp {
 
 // ── Panel renderers ───────────────────────────────────────────────────────────
 
+/// The status bar's Errors hover: the same count as each channel row's.
+const STATUS_ERRORS_HOVER: Hover = Hover::new(
+    "Log entries at the Error level, from every channel since it last started.\n\n\
+     These are the err counts on the channel rows, added up. The Log pane lists them.",
+);
+
+/// The status bar's Warnings hover: the same count as each channel row's.
+const STATUS_WARNINGS_HOVER: Hover = Hover::new(
+    "Log entries at the Warning level, from every channel since it last started.\n\n\
+     These are the warn counts on the channel rows, added up. A send or an open that \
+     failed and is being retried is a warning. The Log pane lists them.",
+);
+
 impl TalkerApp {
     fn show_top_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("top_bar").show_inside(ui, |ui| {
@@ -1478,26 +1491,41 @@ impl TalkerApp {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 let total = self.sup.len();
-                let running = (0..total).filter(|&i| self.sup.is_running(i)).count();
-                let palette = wiredata_ui::palette::active(ui);
-                let (color, label) = if running > 0 {
-                    (
-                        palette.running,
-                        if running == total && total > 0 {
-                            "\u{2022} All running".to_string()
-                        } else {
-                            format!("\u{2022} {running}/{total} running")
-                        },
-                    )
-                } else {
-                    (palette.idle, "\u{2022} Stopped".to_string())
+                // A channel waiting for its interface to open is counted as
+                // retrying, not running (ADR-074).
+                let retrying_at = |i: usize| {
+                    self.sup.is_running(i)
+                        && self
+                            .sup
+                            .telemetry_ref(i)
+                            .is_some_and(|t| t.open_retry.is_some())
                 };
-                ui.colored_label(color, label);
+                let running = (0..total).filter(|&i| self.sup.is_running(i)).count();
+                let retrying = (0..total).filter(|&i| retrying_at(i)).count();
+                let palette = wiredata_ui::palette::active(ui);
+                let color = if retrying > 0 {
+                    palette.warning
+                } else if running > 0 {
+                    palette.running
+                } else {
+                    palette.idle
+                };
+                ui.colored_label(
+                    color,
+                    widgets::run_summary(total, running - retrying, retrying),
+                );
                 ui.separator();
-                let (total_sent, errors) = (0..self.sup.len())
+                let total_sent = (0..total)
                     .filter_map(|i| self.sup.telemetry_ref(i))
-                    .fold((0u64, 0u64), |(s, e), t| {
-                        (s + t.total_count, e + t.errors_total)
+                    .map(|t| t.total_count)
+                    .sum::<u64>();
+                // The same counts as the channel rows, added up: log entries
+                // since each channel last started.
+                let (warnings, errors) = (0..total)
+                    .filter_map(|i| self.sup.channel_id(i))
+                    .filter_map(|id| self.log_counts.get(&id))
+                    .fold((0u64, 0u64), |(w, e), c| {
+                        (w + u64::from(c.warn), e + u64::from(c.error))
                     });
                 ui.label(format!("Sent: {total_sent}"))
                     .on_hover(&Hover::new(
@@ -1505,9 +1533,11 @@ impl TalkerApp {
                      This does not confirm that anything reached the wire or a receiver.",
                     ));
                 ui.separator();
-                // Per-run errors: each channel's tally resets when it starts,
-                // like the send counts and log tallies.
-                ui.label(format!("Errors: {errors}"));
+                ui.label(format!("Errors: {errors}"))
+                    .on_hover(&STATUS_ERRORS_HOVER);
+                ui.separator();
+                ui.label(format!("Warnings: {warnings}"))
+                    .on_hover(&STATUS_WARNINGS_HOVER);
                 if let Some(path) = &self.profile_path {
                     ui.separator();
                     let display = path.display().to_string();

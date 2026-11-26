@@ -42,6 +42,21 @@ pub(in crate::gui) fn retry_status_words(next_try_at: Instant, now: Instant) -> 
     )
 }
 
+/// The status bar's run summary: how many channels are sending, and how many
+/// are waiting for their interface to open (ADR-074), counted apart so
+/// "running" never includes a channel that has not opened yet.
+pub(in crate::gui) fn run_summary(total: usize, sending: usize, retrying: usize) -> String {
+    match (sending, retrying) {
+        (0, 0) => "\u{2022} Stopped".to_owned(),
+        (sending, 0) if sending == total => "\u{2022} All running".to_owned(),
+        (sending, 0) => format!("\u{2022} {sending}/{total} running"),
+        (0, retrying) => format!("\u{2022} {retrying} retrying"),
+        (sending, retrying) => {
+            format!("\u{2022} {sending}/{total} running, {retrying} retrying")
+        }
+    }
+}
+
 /// The Start-side lifecycle button's label and enabled state — listener's
 /// `start_button` decision mapped onto talker's states, so the two detail
 /// panes carry drift and recovery the same way. Pure, unit-tested; the
@@ -123,6 +138,16 @@ mod tests {
             "retrying in 30 s"
         );
         assert_eq!(retry_status_words(now, now), "retrying now");
+    }
+
+    /// A channel waiting to open is counted as retrying, never as running.
+    #[test]
+    fn the_run_summary_counts_retrying_channels_apart() {
+        assert_eq!(run_summary(2, 0, 0), "\u{2022} Stopped");
+        assert_eq!(run_summary(2, 2, 0), "\u{2022} All running");
+        assert_eq!(run_summary(3, 2, 0), "\u{2022} 2/3 running");
+        assert_eq!(run_summary(1, 0, 1), "\u{2022} 1 retrying");
+        assert_eq!(run_summary(3, 1, 1), "\u{2022} 1/3 running, 1 retrying");
     }
 
     #[test]

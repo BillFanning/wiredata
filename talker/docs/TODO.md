@@ -24,6 +24,12 @@ found again. Remove an item when it is done: the commit says what changed.
   log disk use is wanted, decide who deletes, what limit, and how a failed
   cleanup is reported, before describing file logging as bounded.
 
+- [ ] **Word §3.2's waiting-to-open count at the next spec bump.** §3.2 says a
+  channel waiting to open "counts that error once for the episode". The status
+  bar now counts log entries, where that failure is one warning (ADR-074,
+  amended 2026-11-26). A spec change needs a version bump, so this waits for
+  the next one.
+
 ## Retry and backoff (workspace)
 
 Found by a survey of every retry in the workspace on 2026-11-19.

@@ -2944,7 +2944,8 @@ every send.
 ## ADR-074 — The GUI retries a failed open at the CLI's pace
 
 **Status:** Accepted 2026-11-25. Amends spec §3.2 and §4.2, and extends
-ADR-060's open retry to the GUI.
+ADR-060's open retry to the GUI. Amended 2026-11-26: the status bar counts log
+entries, as the channel rows do.
 
 **Context:** A channel the GUI started whose interface did not open, such as
 a USB serial adapter not plugged in yet, reported the failure once and
@@ -2963,8 +2964,13 @@ at the CLI's pace.
   glyph, with "retrying in N s" as its status and the open error with its port
   and data-bits hints. Start is disabled unless there are edits, which Apply &
   Restart applies at once; Stop ends the retrying.
-- **One error per episode.** The status bar's error count rises once for a
-  run of failed opens, as it does for a run of failed sends, not once a try.
+- **One entry per episode.** The first failed open of a run is logged once,
+  as a warning, since it is being retried; the tries that follow are not. The
+  status bar shows the channel rows' Errors and Warnings counts added up, so
+  its Warnings count rises once. (Amended 2026-11-26: the bar showed its own
+  tally as "Errors", which called a retried failure an error while the log and
+  the rows called it a warning. It also counts a channel waiting to open as
+  retrying, not running.)
 - **The open ends the episode.** When the interface opens, its error and the
   retry clear at once. A failure reported before the open but read after it,
   since the two travel on different queues, is ignored.
@@ -2982,7 +2988,7 @@ Channel whose reconnect is on (listener ADR-072).
 
 **Consequences:** A channel started before its adapter is plugged in begins
 sending without a click once it is. A channel that can never open keeps
-trying every 30 s until stopped, with one error counted.
+trying every 30 s until stopped, with one warning logged.
 
 ## Open questions
 
