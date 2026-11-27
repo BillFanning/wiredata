@@ -57,4 +57,19 @@ mod tests {
         let secs: Vec<u64> = waits.iter().map(Duration::as_secs).collect();
         assert_eq!(secs, [1, 2, 4, 8, 16, 30, 30, 30]);
     }
+
+    /// The spec states the pace once, in the numbers a user reads (talker
+    /// ADR-075), so changing a constant here fails until §9.1 agrees.
+    #[test]
+    fn the_spec_states_the_pace_once() {
+        let spec = include_str!("../docs/listener_specification.md");
+        let spec = spec.split_whitespace().collect::<Vec<_>>().join(" ");
+        let wait = wiredata_ui::format::wait;
+        let pace = format!("{}, doubling to {}", wait(RETRY_FIRST), wait(RETRY_MAX));
+        assert_eq!(
+            spec.matches(&pace).count(),
+            1,
+            "the spec should say {pace:?} once"
+        );
+    }
 }

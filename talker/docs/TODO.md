@@ -24,38 +24,6 @@ found again. Remove an item when it is done: the commit says what changed.
   log disk use is wanted, decide who deletes, what limit, and how a failed
   cleanup is reported, before describing file logging as bounded.
 
-- [ ] **Word §3.2's waiting-to-open count at the next spec bump.** §3.2 says a
-  channel waiting to open "counts that error once for the episode". The status
-  bar now counts log entries, where that failure is one warning (ADR-074,
-  amended 2026-11-26). A spec change needs a version bump, so this waits for
-  the next one.
-
-## Retry and backoff (workspace)
-
-Found by a survey of every retry in the workspace on 2026-11-19.
-
-- [ ] **The two CLIs disagree on retrying a failed start (ADR-060).** Talker's
-  retries every channel and cannot be turned off (`--require-all` stops the run
-  instead). Listener's retries only a channel whose `ReconnectPolicy` is
-  enabled, which is off by default, and warns only for recording channels.
-  Decide whether the one contract should make them agree.
-- [ ] **One answer for a device that keeps dropping.** There are three now:
-  listener's reconnect carries the count and wait forward within
-  `RECONNECT_STABLE_AFTER` (ADR-058) and never gives up; listener's
-  recorder slows to `unstable_retry` after `unstable_after` faults within
-  `unstable_window` and never gives up; talker resets to
-  `RETRY_BACKOFF_INITIAL` after every successful send, so it probes at the
-  fastest rate on each drop. Pick one, or record in an ADR why each differs.
-- [ ] **The specs repeat retry numbers, and nothing checks them.** The docs test
-  catches a renamed identifier, not a changed value: if `RETRY_MAX` changes,
-  listener's §9.1 and §56 still say 30 s and no test fails. For a value a user
-  relies on, the spec could name the constant instead of repeating the number,
-  or a test could compare the two. Decide with the next spec change.
-- [ ] **Say why talker's two retry paces differ.** Send failures retry from
-  `RETRY_BACKOFF_INITIAL` to `RETRY_BACKOFF_MAX` (250 ms to 5 s), a failed open
-  from `OPEN_RETRY_FIRST` to `OPEN_RETRY_MAX` (1 s to 30 s). The fast pace suits
-  a scheduled send stream, but no document sets the two side by side.
-
 ## GUI
 
 - [ ] **A freeze not yet explained (Windows, FTDI).** On 2026-11-22 talker

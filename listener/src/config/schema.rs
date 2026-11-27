@@ -38,7 +38,7 @@ pub struct ChannelConfig {
     pub display_recording: DisplayRecordingConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
-    /// Opt-in auto-reconnect after a fault (§9.1, §162); default disabled.
+    /// Auto-reconnect after a fault (§9.1, §162); on unless turned off.
     #[serde(default)]
     pub reconnect: ReconnectPolicy,
     /// Per-Channel Match Rules (§50.2, §165); default empty. Presentation/control
@@ -47,15 +47,22 @@ pub struct ChannelConfig {
     pub match_rules: Vec<MatchRule>,
 }
 
-/// Opt-in auto-reconnect (§9.1, §162). When `enabled`, a Channel that faults
-/// while it was meant to be Running is started again, at the pace in
-/// `crate::retry`, until it runs. Applies to Serial and UDP Channels. The pace
-/// is not a profile setting.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Auto-reconnect (§9.1, §162). When `enabled`, a Channel that faults while
+/// it was meant to be Running is started again, at the pace in
+/// `crate::retry`, until it runs. Applies to Serial and UDP Channels. On by
+/// default (ADR-081), so a long unattended log outlives an unplug; the pace is
+/// not a profile setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReconnectPolicy {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Serde default for opt-out booleans (e.g. a Match Rule is enabled unless the

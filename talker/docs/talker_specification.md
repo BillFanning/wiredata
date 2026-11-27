@@ -1,14 +1,14 @@
 # Talker — Program Specification
-**Version:** 2.6.3
+**Version:** 2.6.4
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-25) — the GUI retries a failed open:
+Revision note (2026-11-27) — the two retry paces:
 
-- **§4.2, §3.2 (ADR-074)** — a channel the GUI starts whose interface does not
-  open is retried as the CLI retries it, 1 s doubling to 30 s, until it opens
-  or is stopped. It shows ◐ and "retrying in N s", and its open error counts
-  once.
+- **§4.1 (ADR-075)** — the open and send retry paces are stated once, side by
+  side, with why they differ. §3.1, §3.2, §4.2 and §9 point to them.
+- **§3.2** — a channel waiting to open logs its failure as one warning, which
+  is what the channel row and the status bar count.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -201,7 +201,7 @@ The CLI must survive running headless, under systemd or Task Scheduler, where
 nobody watches the terminal:
 
 - **Start what can start.** A channel whose interface fails to open is retried
-  with backoff, 1 s doubling to 30 s, while the others send. `--require-all`
+  at the open pace (§4.1) while the others send. `--require-all`
   instead stops everything and exits when any channel fails to open.
 - **Check before opening.** The CLI checks every message against its channel's
   interface before opening anything, as the GUI does before Start. A message too
@@ -444,9 +444,10 @@ The **detail pane** (right) shows the selected channel:
   **Configure messages** sections (the editors) follow directly beneath them,
   above the Capacity and Cadence readouts and the rest of the diagnostics.
 - **Waiting to open** (ADR-074) — a started channel whose interface has not
-  opened yet is retried, 1 s doubling to 30 s. It shows ◐ in the channel list
-  and "retrying in N s" as its status, keeps the open error and its port and
-  data-bits hints on screen, and counts that error once for the episode. Stop
+  opened yet is retried at the open pace (§4.1). It shows ◐ in the channel list
+  and "retrying in N s" as its status, and keeps the open error and its port
+  and data-bits hints on screen. Its failure is logged as one warning for the
+  episode, which is what the channel row and the status bar count. Stop
   ends the retrying; Apply & Restart applies edited settings at once. Once the
   interface opens, the error clears and sending starts without a click.
 - **Last completed run** — one collapsed process-local summary retained for the
@@ -508,6 +509,19 @@ Each channel has exactly one interface port. The supported interface types are:
 
 The channel abstraction in `core::channel` is designed for easy addition of future interface types (e.g., WebSocket, raw socket) without changes to the interface layers or scheduler.
 
+**Two retry paces** (ADR-075):
+
+- **The open pace.** An interface that fails to open is retried at 1 s,
+  doubling to 30 s, until it opens or the channel is stopped, in the GUI as in
+  the CLI. It is the workspace's pace for a device that is not there, the one
+  listener reconnects at.
+- **The send pace.** Once a run has opened, a failed send holds back the next
+  due sends for 250 ms, doubling to 5 s, and goes back to 250 ms after any
+  send that succeeds (§9). It serves a stream already running, where a short
+  gap in what is sent matters more than how often a failing interface is tried:
+  a try is made only at a due send, and a failure is one warning however many
+  tries it takes.
+
 ### 4.2 Serial Configuration
 
 All standard RS-232 parameters are user-configurable:
@@ -552,8 +566,8 @@ run resumes without user action. On Windows, an operation-aborted result still
 replaces the handle even when the operating system categorizes it as a timeout.
 
 Automatic replacement begins only after the run opened successfully. An initial
-open failure is retried instead, in the GUI as in the CLI: 1 s, doubling to 30 s,
-until the interface opens or the channel is stopped (ADR-060, ADR-074). Recovery does not search for a
+open failure is retried instead, at the open pace (§4.1), in the GUI as in the
+CLI (ADR-060, ADR-074). Recovery does not search for a
 renamed port: if the replacement appears under a different name, the configured
 port must be changed. A failed write may have transferred a prefix before the
 operating system reported the error, so serial recovery cannot promise
@@ -1189,10 +1203,10 @@ competing with.
 | Off schedule (ADR-053) | the first skipped send, at WARN | the first cadence point reached at least five seconds after the last skip, at INFO, carrying the episode's total |
 | Display updates discarded | the first discarded update, at WARN | nothing — see below |
 
-After a failed write, additional due sends are gated by a bounded retry delay
-that starts at 250 ms and doubles to at most five seconds. A retry is considered
-only when the schedule next reaches a due send after that delay, so five seconds
-caps retry frequency rather than recovery latency; a slower schedule waits for
+After a failed write, additional due sends are gated by a delay at the send
+pace (§4.1). A retry is considered only when the schedule next reaches a due
+send after that delay, so the longest delay caps retry frequency rather than
+recovery latency; a slower schedule waits for
 its next due point. For an unusable serial handle, that point first attempts the
 replacement described in §4.2. If reopening fails, the due send is counted as
 withheld: no payload is rendered, no interface write is attempted, and no render

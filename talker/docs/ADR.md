@@ -1,14 +1,13 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.38
-**Date:** 2026-11-25
+**Version:** 1.39
+**Date:** 2026-11-27
 **Status:** Accepted
 
-Revision note (2026-11-25) — the GUI retries a failed open:
+Revision note (2026-11-27) — talker's retry paces:
 
-- **ADR-074** — a channel the GUI starts whose interface does not open is
-  retried at the CLI's pace, shown as waiting to open, until it opens or is
-  stopped.
+- **ADR-075** — talker keeps its two retry paces and its fast return after a
+  drop, and says why; each spec states each pace once, and a test checks it.
 
 ---
 
@@ -2989,6 +2988,61 @@ Channel whose reconnect is on (listener ADR-072).
 **Consequences:** A channel started before its adapter is plugged in begins
 sending without a click once it is. A channel that can never open keeps
 trying every 30 s until stopped, with one warning logged.
+
+---
+
+## ADR-075 — Talker keeps its retry paces, and the specs state each once
+
+**Status:** Accepted 2026-11-27. Records what ADR-060 left to each app.
+
+**Context:** A survey on 2026-11-19 found the workspace retrying in ways no
+document set side by side:
+
+- **Talker's send retry** waits 250 ms, doubling to 5 s, and goes back to
+  250 ms after any send that succeeds.
+- **Talker's open retry** waits 1 s, doubling to 30 s (ADR-060, ADR-074).
+- **Listener's reconnect** waits 1 s, doubling to 30 s, and carries its wait
+  forward if the device drops again within 60 s (listener ADR-058).
+- **Listener's recorder** slows to one try every 5 minutes after 3 faults in
+  10 minutes.
+
+The specs also repeated the numbers in several places, and nothing failed if a
+constant changed.
+
+**Decision:**
+
+- **Talker's send retry starts fast after every drop.** Talker is a test
+  sender: a short gap in what it sends matters more than how often a failing
+  interface is tried. A try is made only at a due send, at most four a second,
+  and a failure logs one warning however many tries it takes, so listener's
+  reason for the 60 s rule, a log filling up for weeks, does not apply.
+- **The two talker paces stay apart.** The open pace is the workspace's pace
+  for a device that is not there, shared with listener's reconnect and its
+  recording reopen, so all three wait for a missing device alike. The send pace
+  serves a stream already running.
+- **The recorder's rule stays its own.** Every reopen writes a gap into the
+  recording, so a device that keeps dropping would cut the file into pieces.
+- **Each spec states each pace once,** and the other mentions point to it. A
+  test in each app builds the sentence from the constants and fails if the
+  spec does not contain it exactly once.
+
+**Boundary:** No pace or rule changes. The specs keep the numbers rather than
+naming the constants, since the numbers are what a user relies on. The test
+checks only the sentence it builds; a number written some other way elsewhere
+is not caught.
+
+**Alternatives considered:**
+
+- **Adopt listener's 60 s rule for talker's sends:** a device that keeps
+  dropping would be tried less often, at the cost of a longer gap in a test
+  stream each time it returns.
+- **One talker pace for opens and sends:** talker's open pace would then
+  differ from listener's for the same missing device.
+- **Name the constants in the specs:** a reader would need the source to know
+  how long a retry takes.
+
+**Consequences:** Changing a retry constant fails a test until the spec says
+the new number.
 
 ## Open questions
 

@@ -1,16 +1,16 @@
-# Listener Specification v2.6.13
+# Listener Specification v2.6.14
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-27) — a UDP port that is not shared is held:
+Revision note (2026-11-27) — reconnect is on by default:
 
-- **§15 (ADR-079).** A UDP port opened without "Request shared port" is kept
-  from other programs. On Windows that takes SO_EXCLUSIVEADDRUSE, without which
-  another socket could bind one address on the port and take its unicast
-  datagrams.
+- **§9.1, §80.1, §162 (ADR-081).** A new Channel, and a profile that does not
+  say otherwise, reconnects automatically. Turning it off still leaves a Faulted
+  Channel Faulted. Linemon does not reconnect.
+- **§9.1, §56.** The retry pace is stated once, in §9.1, and §56 points to it.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -390,25 +390,27 @@ Running → Starting
 Faulted → Running
 ```
 
-### 9.1 Auto-Reconnect (opt-in)
+### 9.1 Auto-Reconnect
 
-By default a Faulted Channel stays Faulted until the user acts (§8.5). A Channel
-may opt in to **auto-reconnect**: after a fault that ended a Channel which was
-meant to be Running, the runtime automatically re-attempts Start with backoff
-instead of remaining Faulted. This adds one transition, taken **only** when
-auto-reconnect is enabled:
+A Channel with **auto-reconnect** on starts again by itself after a fault that
+ended it while it was meant to be Running, instead of remaining Faulted. With it
+off, a Faulted Channel stays Faulted until the user acts (§8.5). This adds one
+transition, taken **only** when auto-reconnect is on:
 
 ```text
 Faulted → Starting   (auto-reconnect only, after a backoff delay)
 ```
 
 Auto-reconnect is turned on or off per Channel (`ReconnectPolicy`, §80.1) and
-is **disabled by default**, preserving the manual-recovery semantics above. It
+is **on by default** (ADR-081), so a long unattended log outlives an unplug.
+Linemon does not reconnect: pressing Start is how it is used. Auto-reconnect
 applies to Serial (covering USB hot-plug, §14.4) and UDP Channels. Each attempt
-emits a reconnect event (§137). The first attempt waits 1 s; each failure
-doubles the wait up to 30 s, and attempts go on every 30 s until the Channel
-starts. Nothing gives up (ADR-072). The pace is the one a recording's reopen
-uses (§56), and is not a profile setting.
+emits a reconnect event (§137).
+
+**The retry pace** is 1 s, doubling to 30 s: each failed attempt doubles the
+wait up to the longest, and attempts go on at the longest until the Channel
+starts. Nothing gives up (ADR-072). A recording's reopen uses the same pace
+(§56), and it is not a profile setting.
 
 A successful reconnect does not end the sequence until the Channel has stayed
 up for 60 s (ADR-058). A fault within 60 s of a successful reconnect continues
@@ -1248,7 +1250,7 @@ any state → Stopping → Off
 - **During a gap,** bytes are deliberately omitted, never buffered. One gap stays
   open until a segment actually starts.
 - **Retry.** After a gap starts, the recorder tries to open the next segment
-  (§59) after 1 s, doubling to 30 s. A third fault within 10 minutes stretches the
+  (§59) at the retry pace (§9.1). A third fault within 10 minutes stretches the
   retry to 5 minutes and raises a lasting "recording unstable" fault, which stays
   until recording is stopped.
 - **The gap record** holds the stream offsets (§25) and wall-clock times at both
@@ -1586,7 +1588,7 @@ struct ChannelConfig {
     display_recording: DisplayRecordingConfig, // §79 (ADR-013) — rendered .disp
     retention: RetentionConfig,
     match_rules: Vec<MatchRule>,   // §50.2 find/triggers; default empty
-    reconnect: ReconnectPolicy,    // §9.1; default disabled
+    reconnect: ReconnectPolicy,    // §9.1; on by default (ADR-081)
 }
 ```
 
@@ -1823,7 +1825,7 @@ pub struct TimestampConfig { pub include_date: bool, pub include_millis: bool, p
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MatchRuleId(uuid::Uuid); // §50.2
 
-pub struct ReconnectPolicy {        // §9.1; enabled defaults false; the pace is fixed (ADR-072)
+pub struct ReconnectPolicy {        // §9.1; enabled defaults true; the pace is fixed (ADR-072)
     pub enabled: bool,
 }
 ```
@@ -3259,7 +3261,7 @@ by flow control" elsewhere (ADR-073).
 
 With auto-reconnect enabled on a Serial or UDP Channel, a transport fault shall
 trigger automatic re-Start with backoff (`Faulted → Starting`, §9.1) until the
-Channel starts. With it disabled (the default), a Faulted Channel stays Faulted.
+Channel starts. It is on by default; with it off, a Faulted Channel stays Faulted.
 The GUI shall show the choice
 and the attempt in words (§9.1).
 

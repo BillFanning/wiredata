@@ -3932,4 +3932,24 @@ mod tests {
         handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
         join_within(handle, Duration::from_secs(2));
     }
+
+    /// The spec states each retry pace once, in the numbers a user reads
+    /// (ADR-075), so changing a constant here fails until §4.1 agrees.
+    #[test]
+    fn the_spec_states_each_retry_pace_once() {
+        let spec = include_str!("../../docs/talker_specification.md");
+        let spec = spec.split_whitespace().collect::<Vec<_>>().join(" ");
+        let wait = wiredata_ui::format::wait;
+        for (first, longest) in [
+            (OPEN_RETRY_FIRST, OPEN_RETRY_MAX),
+            (RETRY_BACKOFF_INITIAL, RETRY_BACKOFF_MAX),
+        ] {
+            let pace = format!("{}, doubling to {}", wait(first), wait(longest));
+            assert_eq!(
+                spec.matches(&pace).count(),
+                1,
+                "the spec should say {pace:?} once"
+            );
+        }
+    }
 }

@@ -15,6 +15,13 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-25) — the GUI retries a failed open:
+
+- **§4.2, §3.2 (ADR-074)** — a channel the GUI starts whose interface does not
+  open is retried as the CLI retries it, 1 s doubling to 30 s, until it opens
+  or is stopped. It shows ◐ and "retrying in N s", and its open error counts
+  once.
+
 Revision note (2026-11-24) — TCP is deferred:
 
 - **§4.1, §4.4, §4.5 (ADR-073)** — talker has no TCP client, as listener has
@@ -525,6 +532,12 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-11-25) — the GUI retries a failed open:
+
+- **ADR-074** — a channel the GUI starts whose interface does not open is
+  retried at the CLI's pace, shown as waiting to open, until it opens or is
+  stopped.
 
 Revision note (2026-11-24) — the TCP client is removed:
 

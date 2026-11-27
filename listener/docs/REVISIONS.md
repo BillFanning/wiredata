@@ -12,6 +12,13 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-27) — a UDP port that is not shared is held:
+
+- **§15 (ADR-079).** A UDP port opened without "Request shared port" is kept
+  from other programs. On Windows that takes SO_EXCLUSIVEADDRUSE, without which
+  another socket could bind one address on the port and take its unicast
+  datagrams.
+
 Revision note (2026-11-26) — XON/XOFF and the bytes it removes:
 
 - **§14.1, §80 (ADR-078).** With XON/XOFF, the port takes 0x11 and 0x13 out of

@@ -570,6 +570,22 @@ mod tests {
         );
     }
 
+    /// Reconnect is on unless a profile turns it off (ADR-081): in a new
+    /// channel, and in a profile that leaves out the table or its key.
+    #[test]
+    fn reconnect_is_on_unless_turned_off() {
+        use crate::config::ReconnectPolicy;
+        assert!(templates::udp_template().reconnect.enabled, "a new channel");
+        assert!(
+            templates::serial_template().reconnect.enabled,
+            "a new channel"
+        );
+        assert!(ReconnectPolicy::default().enabled, "the table left out");
+        let parse = |text: &str| toml::from_str::<ReconnectPolicy>(text).unwrap().enabled;
+        assert!(parse(""), "the key left out");
+        assert!(!parse("enabled = false"), "turned off");
+    }
+
     #[test]
     fn mark_timestamp_without_style_defaults_to_plain() {
         let timestamp: MarkTimestamp = toml::from_str("separator = ' '").unwrap();

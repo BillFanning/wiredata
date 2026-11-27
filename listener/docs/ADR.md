@@ -1540,6 +1540,8 @@ old files (talker ADR-069).
 
 **Status:** Accepted 2026-09-30. Amends §9.1 presentation, §70 and §159.
 Amended 2026-11-19: nothing gives up, so the "Gave up" status is gone (ADR-072).
+Amended 2026-11-27: reconnect is on by default (ADR-081); the checkbox and the
+choice offered when recording is turned on stay.
 
 **Context:** Auto-reconnect is opt-in (§9.1) and the GUI offers no control for
 it, so a recording Channel stops for good at its first unplug. Separately, the
@@ -2879,6 +2881,37 @@ Listener. For any other target the script does nothing.
 **Consequences:** Properties → Details and Task Manager name each program and
 its version, and a version bump in the workspace Cargo.toml reaches the
 resource with no other edit.
+
+## ADR-081 — Reconnect is on by default
+
+**Status:** Accepted 2026-11-27. Amends ADR-045, §9.1, §80.1 and §162.
+
+**Context:** The workspace CLI contract (talker ADR-060) starts what can start
+and retries the rest. Talker's CLI always retries a channel that fails to open.
+Listener's retried only a Channel with reconnect on, and reconnect was off by
+default, so an unplug during a long unattended log left that Channel down until
+someone noticed: the second primary use, weeks-long logging, failed quietly by
+default.
+
+**Decision:** A new Channel, and a profile that does not say otherwise, has
+reconnect on. The "Reconnect automatically" checkbox stays, and a Channel with
+it off stays Faulted, in the CLI as in the GUI. Linemon does not reconnect.
+
+**Boundary:** The CLI still warns at start about each recording Channel with
+reconnect off, and the GUI still offers the choice when recording is turned on
+with it off (ADR-045). The pace is unchanged (ADR-072). Talker has no such
+setting and keeps retrying every channel.
+
+**Alternatives considered:**
+
+- **Keep it off and record why the CLIs differ:** the default would still
+  leave an unattended log down after its first unplug.
+- **Have the CLI retry whatever the setting says:** a profile setting that one
+  front end ignores.
+
+**Consequences:** Both CLIs retry a channel that fails to start, unless a
+Listener Channel has reconnect turned off. A profile written before this
+change without the key now reconnects; none is in use.
 
 ## Open questions
 
