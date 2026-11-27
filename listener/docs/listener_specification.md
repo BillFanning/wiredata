@@ -1,15 +1,16 @@
-# Listener Specification v2.6.12
+# Listener Specification v2.6.13
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-26) — XON/XOFF and the bytes it removes:
+Revision note (2026-11-27) — a UDP port that is not shared is held:
 
-- **§14.1, §80 (ADR-078).** With XON/XOFF, the port takes 0x11 and 0x13 out of
-  the received data, so they are not shown or recorded. `FlowControl` lists
-  `XonXoff`, which it already had.
+- **§15 (ADR-079).** A UDP port opened without "Request shared port" is kept
+  from other programs. On Windows that takes SO_EXCLUSIVEADDRUSE, without which
+  another socket could bind one address on the port and take its unicast
+  datagrams.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -649,6 +650,12 @@ the OS applied it. Sharing is not offered for unicast, where the OS delivers
 each datagram to only one of the sharing sockets: the choice stays in place,
 disabled and unticked, and says in words that it is for broadcast and
 multicast only.
+
+**A port that is not shared is held.** A UDP port opened without "Request shared
+port" is kept from other programs: on Windows the socket sets SO_EXCLUSIVEADDRUSE
+before binding, so nothing else can bind one address on a port held on all
+interfaces and take its unicast datagrams (ADR-079). Linux refuses that bind
+already; macOS has no such option.
 
 On Linux a UDP Channel always requests a per-datagram software receive timestamp
 with `SO_TIMESTAMPNS` and uses it as the arrival wall time (§26, ADR-077). A failed

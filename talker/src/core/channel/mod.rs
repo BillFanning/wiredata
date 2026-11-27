@@ -10,6 +10,7 @@ pub use config::{
 pub use serial::RTS_HIGH_UNDER_RTS_CTS;
 pub(crate) use serial::WRITE_TIMEOUT;
 pub(crate) use system_list::{AddressList, LocalAddress, PortList};
+pub(crate) use udp::UDP_BIND_CONTEXT;
 
 /// Stable identity of one configured channel, minted when the channel is
 /// created and unchanged for its whole life (ADR-020).

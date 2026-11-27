@@ -195,6 +195,7 @@ fn build_udp_socket(transport: &UdpTransport) -> io::Result<BuiltSocket> {
     let shared_port = if transport.shared_port {
         share_port(&socket)
     } else {
+        claim_port(&socket)?;
         SharedPortStatus::NotRequested
     };
     socket.bind(&addr.into())?;
@@ -238,6 +239,40 @@ fn share_port(socket: &socket2::Socket) -> SharedPortStatus {
     } else {
         SharedPortStatus::NotApplied
     }
+}
+
+/// Keep a port that is not shared from other sockets (ADR-079). Windows
+/// otherwise lets a socket bound to one address bind a port held on all
+/// interfaces, whether or not it asks to share, and then hands it the unicast
+/// datagrams sent to that address. SO_EXCLUSIVEADDRUSE refuses that bind.
+/// Linux refuses it already; macOS has no such option.
+#[cfg(windows)]
+fn claim_port(socket: &socket2::Socket) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_EXCLUSIVEADDRUSE};
+
+    let enabled: i32 = 1;
+    // SAFETY: `socket` owns a valid handle; `enabled` is a live integer with
+    // the exact byte length passed to `setsockopt`.
+    let result = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&raw const enabled).cast(),
+            std::mem::size_of_val(&enabled) as i32,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(windows))]
+fn claim_port(_socket: &socket2::Socket) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -608,6 +643,38 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
         assert_eq!(first.shared_port, SharedPortStatus::NotRequested);
+    }
+
+    /// A socket that does not share, bound to all interfaces, keeps its port
+    /// from a socket bound to one address on it, which would otherwise be
+    /// handed the unicast datagrams sent to that address (ADR-079). macOS has
+    /// no option for this and lets such a socket bind if it asks to share; the
+    /// macOS arm records that gap, so a change in it is noticed.
+    #[tokio::test]
+    async fn a_port_not_shared_refuses_a_bind_to_one_address_on_it() {
+        let first = UdpTransport::new(
+            ChannelId::new(),
+            "0.0.0.0:0".parse().unwrap(),
+            UdpMode::Unicast,
+        )
+        .bind()
+        .await
+        .unwrap();
+        let one_address =
+            SocketAddr::from((Ipv4Addr::LOCALHOST, first.local_addr().unwrap().port()));
+
+        let without_sharing = broadcast(one_address).bind().await;
+        assert!(
+            without_sharing.is_err(),
+            "a bind without sharing is refused"
+        );
+
+        let with_sharing = broadcast(one_address).with_shared_port().bind().await;
+        if cfg!(target_os = "macos") {
+            assert!(with_sharing.is_ok(), "macOS lets a socket that shares bind");
+        } else {
+            assert!(with_sharing.is_err(), "a bind with sharing is refused");
+        }
     }
 
     #[tokio::test]

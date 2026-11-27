@@ -41,12 +41,6 @@ again. Remove an item when it is done: the commit says what changed.
   sharing or needs a warning when unicast arrives on a shared port, which means
   reading each datagram's destination address (`IP_PKTINFO`, `WSARecvMsg`, or
   `IP_RECVDSTADDR` on macOS).
-- [ ] **Check whether a shared port can take another program's datagrams on
-  Windows.** A socket that sets address reuse may be able to bind a port that
-  another socket holds without it, unless that socket set exclusive use. If so,
-  Linemon in Broadcast with sharing ticked could take unicast datagrams from a
-  Listener channel on the same port, and Listener should set exclusive use on
-  sockets that do not share. Test before the item above.
 
 ## Reconnect
 

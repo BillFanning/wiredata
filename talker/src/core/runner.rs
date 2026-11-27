@@ -3758,7 +3758,7 @@ mod tests {
                 }) => {
                     assert_eq!(channel, id, "OpenFailed carries the stable id");
                     assert!(
-                        message.contains("binding UDP socket"),
+                        message.contains(crate::core::channel::UDP_BIND_CONTEXT),
                         "message was: {message}"
                     );
                     retries.push(retry);

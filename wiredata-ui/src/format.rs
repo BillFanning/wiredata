@@ -134,6 +134,15 @@ pub fn data_bits_hint(data_bits: u8) -> Option<&'static str> {
     matches!(data_bits, 5 | 6).then_some("Many USB serial adapters take only 7 or 8 data bits.")
 }
 
+/// The hint under a UDP port that could not be bound, in every program that
+/// binds one. The system gives its reason in its own words and language
+/// ("Only one usage of each socket address", or a permissions error when the
+/// binding socket asks to share), which seldom say what holds the port, and
+/// cannot be matched; so the hint names the usual causes. It names no
+/// program, since anything on the computer can hold a port.
+pub const UDP_BIND_HINT: &str =
+    "Something else may be using this port without sharing it, or the system may have reserved it.";
+
 /// Format a duration compactly for timing telemetry readouts.
 pub fn compact_duration(duration: Duration) -> String {
     let nanos = duration.as_nanos();

@@ -583,6 +583,11 @@ impl TalkerApp {
                     ui.colored_label(pal.warning, hint);
                 }
             }
+            // A refused bind of the local port seldom says what holds it, so
+            // say what may.
+            if let Some(hint) = udp_bind_hint(open_failure, draft_kind, err) {
+                ui.colored_label(pal.warning, hint);
+            }
         }
         ui.add_space(12.0); // a blank line between the readouts and the buttons
         self.show_lifecycle_buttons(ui, i, running, iface_drift || run_drift, error.is_some());
@@ -1954,9 +1959,47 @@ fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
         )
 }
 
+/// The hint under a UDP channel whose local port could not be bound, and
+/// `None` for any other failure.
+fn udp_bind_hint(open_failure: bool, kind: ConnKind, error: &str) -> Option<&'static str> {
+    (open_failure
+        && kind == ConnKind::Udp
+        && error.contains(crate::core::channel::UDP_BIND_CONTEXT))
+    .then_some(wiredata_ui::format::UDP_BIND_HINT)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::top_aligned_grid_cell;
+    use super::{top_aligned_grid_cell, udp_bind_hint};
+    use crate::gui::draft::ConnKind;
+
+    /// The hint follows a failed open whose error is the bind of the local
+    /// port, and nothing else.
+    #[test]
+    fn a_refused_bind_gets_the_hint_and_other_failures_do_not() {
+        let refused = format!(
+            "{}: Only one usage of each socket address is permitted.",
+            crate::core::channel::UDP_BIND_CONTEXT
+        );
+        assert_eq!(
+            udp_bind_hint(true, ConnKind::Udp, &refused),
+            Some(wiredata_ui::format::UDP_BIND_HINT)
+        );
+        assert_eq!(
+            udp_bind_hint(true, ConnKind::Udp, "joining the group"),
+            None
+        );
+        assert_eq!(
+            udp_bind_hint(false, ConnKind::Udp, &refused),
+            None,
+            "not an open"
+        );
+        assert_eq!(
+            udp_bind_hint(true, ConnKind::Serial, &refused),
+            None,
+            "not UDP"
+        );
+    }
 
     #[test]
     fn multiline_grid_cells_share_the_same_top_edge() {

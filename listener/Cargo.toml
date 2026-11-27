@@ -99,8 +99,9 @@ dirs = { workspace = true }                           # event log folder (§118)
 # Windows console handling for the GUI (§3): the binary stays a console-subsystem
 # app so the headless CLI works when run from a terminal, and the GUI path detaches
 # the console (FreeConsole) so a double-click doesn't leave an empty console window.
+# WinSock: SO_EXCLUSIVEADDRUSE on a UDP port that is not shared (ADR-079).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Networking_WinSock"] }
 
 # Linux ancillary receive metadata: per-socket SO_RXQ_OVFL counts and optional
 # SO_TIMESTAMPNS software arrival timestamps.

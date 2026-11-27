@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use wiredata_ui::diagnostics::{tone_marker, SignalTone};
-use wiredata_ui::format::{data_bits_hint, thousands};
+use wiredata_ui::format::{data_bits_hint, thousands, UDP_BIND_HINT};
 use wiredata_ui::hover::{Hover, ShowHover};
 
 use crate::config::{
@@ -21,7 +21,7 @@ use crate::config::{
     StopBits, UdpConfig,
 };
 use crate::core::ChannelState;
-use crate::runtime::{transport_fault_prefix, ChannelSnapshot};
+use crate::runtime::{transport_fault_prefix, ChannelSnapshot, BIND_FAILURE};
 use crate::transport::serial::{open_error_prefix, RTS_HIGH_UNDER_RTS_CTS};
 use crate::transport::udp::UdpMode;
 
@@ -481,15 +481,16 @@ fn status_line(facts: &StatusFacts) -> StatusLine {
     if let Some(reason) = facts.open_error {
         let reason = without_open_prefix(reason, facts.interface);
         // A port that refuses 5 or 6 data bits says only that a parameter is
-        // wrong, so say which one it probably is.
-        let data_bits = match facts.interface {
-            InterfaceConfig::Serial(serial) => data_bits_hint(data_bits_number(serial.data_bits))
-                .map(|hint| format!(" {hint}"))
-                .unwrap_or_default(),
-            InterfaceConfig::Udp(_) => String::new(),
-        };
+        // wrong, so say which one it probably is; a refused bind seldom says
+        // what holds the port, so say what may.
+        let hint = match facts.interface {
+            InterfaceConfig::Serial(serial) => data_bits_hint(data_bits_number(serial.data_bits)),
+            InterfaceConfig::Udp(_) => reason.starts_with(BIND_FAILURE).then_some(UDP_BIND_HINT),
+        }
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
         return problem(format!(
-            "{port} could not be opened: {}{data_bits}{gone}",
+            "{port} could not be opened: {}{hint}{gone}",
             with_full_stop(reason)
         ));
     }
@@ -1592,6 +1593,34 @@ mod tests {
         assert_eq!(
             text(&f),
             format!("{glyph}COM4 could not be opened: The parameter is incorrect.")
+        );
+    }
+
+    /// The system's reason for a refused bind seldom says what holds the
+    /// port, so the line names the usual causes; any other open error of a
+    /// UDP port gets no hint.
+    #[test]
+    fn a_refused_bind_says_what_may_hold_the_port() {
+        let u = net(5005);
+        let glyph = tone_marker(SignalTone::Warning);
+        let refused =
+            format!("{BIND_FAILURE}: Only one usage of each socket address is permitted.");
+        let mut f = facts(&u);
+        f.open_error = Some(&refused);
+        assert_eq!(
+            text(&f),
+            format!(
+                "{glyph}UDP port 5005 could not be opened: {refused} {}",
+                wiredata_ui::format::UDP_BIND_HINT
+            )
+        );
+        f.open_error = Some("the request did not reach Linemon's runtime.");
+        assert_eq!(
+            text(&f),
+            format!(
+                "{glyph}UDP port 5005 could not be opened: the request did not reach Linemon's \
+                 runtime."
+            )
         );
     }
 

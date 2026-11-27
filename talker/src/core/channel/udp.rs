@@ -5,6 +5,10 @@ use anyhow::Context;
 use super::config::{InterfaceConfig, UdpConfig, UdpMode};
 use super::{change_or_restore, Interface, MissingRetryConfiguration};
 
+/// The words a refused bind of the local port starts with, so the window can
+/// tell that failure from the others and say what may hold the port.
+pub(crate) const UDP_BIND_CONTEXT: &str = "binding UDP socket";
+
 pub(super) struct UdpInterface {
     /// `None` only after a settings change left the socket untrusted and it
     /// could not be reopened at once; a retry reopens it.
@@ -35,7 +39,7 @@ impl Bound {
             Ipv4Addr::UNSPECIFIED.into()
         };
         let local_port = config.local_port.unwrap_or(0);
-        let socket = UdpSocket::bind((any, local_port)).context("binding UDP socket")?;
+        let socket = UdpSocket::bind((any, local_port)).context(UDP_BIND_CONTEXT)?;
         let destination = apply_socket_config(&socket, config, false)?;
         Ok(Self {
             socket,

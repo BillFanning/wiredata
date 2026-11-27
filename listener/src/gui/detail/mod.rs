@@ -231,6 +231,12 @@ impl ListenerApp {
             (Some(port), Some(bits)) => Some(format!("{port} {bits}")),
             (port, bits) => port.or_else(|| bits.map(str::to_owned)),
         };
+        // A refused bind seldom says what holds the port, so say what may.
+        let udp = self
+            .state
+            .channel(id)
+            .is_some_and(|v| matches!(v.config.interface, crate::config::InterfaceConfig::Udp(_)));
+        let hint = hint.or_else(|| udp_bind_hint(udp, last_error.as_deref()).map(str::to_owned));
         // The error and its hints are one problem, so one paragraph in one colour.
         let text = match (&last_error, hint) {
             (Some(err), hint) => Some(format!(
@@ -909,6 +915,13 @@ fn problem_text(error: &str, serial_port: Option<&str>) -> String {
         .unwrap_or_else(|| error.to_owned())
 }
 
+/// The hint under a UDP channel's refused bind, and `None` for any other
+/// error or interface.
+fn udp_bind_hint(udp: bool, error: Option<&str>) -> Option<&'static str> {
+    (udp && error.is_some_and(|e| e.starts_with(crate::runtime::BIND_FAILURE)))
+        .then_some(wiredata_ui::format::UDP_BIND_HINT)
+}
+
 fn headline_phrase(message: &str) -> String {
     // First, drop a `→ target` tail (recording destinations etc.).
     let head = message.split('→').next().unwrap_or(message).trim();
@@ -1040,7 +1053,7 @@ fn port_problem_changed(seen: &mut Option<(ChannelId, bool)>, id: ChannelId, sho
 #[cfg(test)]
 mod tests {
     use super::{
-        headline_phrase, port_problem_changed, problem_text, FINAL_SNAPSHOT_TOOLTIP,
+        headline_phrase, port_problem_changed, problem_text, udp_bind_hint, FINAL_SNAPSHOT_TOOLTIP,
         THROUGHPUT_TOOLTIP,
     };
     use crate::core::ChannelId;
@@ -1084,6 +1097,23 @@ mod tests {
         assert_eq!(problem_text("read failed", Some("COM3")), "read failed");
         assert_eq!(problem_text(&error, Some("COM4")), error);
         assert_eq!(problem_text(&error, None), error);
+    }
+
+    /// The hint follows the runtime's own bind error, whatever the system's
+    /// words after it, and nothing else.
+    #[test]
+    fn a_refused_bind_gets_the_hint_and_other_errors_do_not() {
+        let refused = crate::runtime::OrchestratorError::Bind(std::io::Error::from(
+            std::io::ErrorKind::AddrInUse,
+        ))
+        .to_string();
+        assert_eq!(
+            udp_bind_hint(true, Some(&refused)),
+            Some(wiredata_ui::format::UDP_BIND_HINT)
+        );
+        assert_eq!(udp_bind_hint(true, Some("read failed")), None);
+        assert_eq!(udp_bind_hint(true, None), None);
+        assert_eq!(udp_bind_hint(false, Some(&refused)), None, "not UDP");
     }
 
     #[test]

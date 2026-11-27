@@ -2799,6 +2799,48 @@ bytes: the driver removes them before Listener reads anything.
 **Consequences:** A recording made with XON/XOFF lacks every 0x11 and 0x13 the
 sender sent; every other byte is as received.
 
+## ADR-079 — A UDP port that is not shared is claimed on Windows
+
+**Status:** Accepted 2026-11-27. Amends ADR-047 and §15.
+
+**Context:** A TODO asked whether "Request shared port" lets Linemon take a
+Listener Channel's datagrams on Windows. Tested on Windows 11 on 2026-11-27 with
+sockets built as Listener builds them: a second bind to the same address and
+port was refused, with or without sharing. But a socket bound to one address
+(127.0.0.1) could bind a port that another socket held on all interfaces,
+whether or not it asked to share, and every unicast datagram sent to that
+address went to it and none to the first. Neither program was told. Windows
+allows this unless the first socket sets SO_EXCLUSIVEADDRUSE, and with it set
+the bind was refused. Linux refuses such a bind already; macOS allows it to a
+socket that sets address reuse, as one that shares does.
+
+**Decision:** A UDP socket that does not request a shared port sets
+SO_EXCLUSIVEADDRUSE before it binds, on Windows. Listener Channels and Linemon
+both build their sockets this way. A socket that shares sets address reuse as
+before; Windows does not allow both options on one socket.
+
+**Boundary:**
+
+- A socket that shares is unchanged: it lets other programs in by design.
+- macOS has no such option, so there a program that sets address reuse can
+  still bind one address on a port that a Channel holds on all interfaces.
+- A refused bind gives the system's reason, which seldom says what holds the
+  port: for a socket that asks to share it is a permissions error (10013)
+  rather than "address in use". Talker, Linemon and a Listener Channel add one
+  shared hint under it that names the usual causes and no program, since
+  anything on the computer can hold a port.
+
+**Alternatives considered:**
+
+- **Say so in the hover and change nothing:** the datagrams are lost without a
+  word to either program, so a hover protects no one.
+- **Stop Linemon offering a shared port:** the bind succeeded without sharing
+  too, so that would not have closed the gap.
+
+**Consequences:** A program that binds one address on a port that a Channel
+holds without sharing now fails to bind, instead of quietly taking the unicast
+datagrams sent to that address.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

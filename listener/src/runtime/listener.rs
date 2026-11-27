@@ -648,6 +648,10 @@ impl ManagedChannel {
     }
 }
 
+/// The words a refused UDP bind starts with, so a window can tell that
+/// failure from the others and say what may hold the port.
+pub(crate) const BIND_FAILURE: &str = "failed to bind interface";
+
 /// Errors from orchestrating a Channel.
 #[derive(Debug, thiserror::Error)]
 pub enum OrchestratorError {
@@ -668,7 +672,7 @@ pub enum OrchestratorError {
     /// The transport's error names the port and the open already.
     #[error(transparent)]
     SerialOpen(serialport::Error),
-    #[error("failed to bind interface: {0}")]
+    #[error("{prefix}: {0}", prefix = BIND_FAILURE)]
     Bind(#[source] std::io::Error),
     #[error("serial control is not available (not a running serial channel)")]
     SerialControlUnavailable(ChannelId),

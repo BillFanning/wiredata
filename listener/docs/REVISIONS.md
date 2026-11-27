@@ -12,6 +12,12 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-26) — XON/XOFF and the bytes it removes:
+
+- **§14.1, §80 (ADR-078).** With XON/XOFF, the port takes 0x11 and 0x13 out of
+  the received data, so they are not shown or recorded. `FlowControl` lists
+  `XonXoff`, which it already had.
+
 Revision note (2026-11-25) — the recording lock files:
 
 - **§121.** The recording lock is named: an empty `.raw.lock` or `.disp.lock`

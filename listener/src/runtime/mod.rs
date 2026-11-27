@@ -33,6 +33,7 @@ pub mod telemetry;
 pub use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 pub use activity::{ActivityMeter, ChannelActivity};
 pub use build::BuildError;
+pub(crate) use listener::BIND_FAILURE;
 pub use listener::{
     DrainedStop, Listener, OpenedStart, OrchestratorError, ReconnectAttempt, ShutdownOutcome,
     StartTicket, StopTicket, RUNTIME_SHUTDOWN_LIMIT,
