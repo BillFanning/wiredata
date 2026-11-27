@@ -415,15 +415,16 @@ fn with_full_stop(reason: &str) -> String {
     }
 }
 
-/// A serial open error without the transport's `opening serial port "COM3": `,
-/// since the status line names the port already.
+/// An open error without the words that say it was an open: the serial
+/// transport's `opening serial port "COM3": `, or the runtime's `failed to
+/// bind interface: `. The status line already says the port could not be
+/// opened.
 fn without_open_prefix<'a>(reason: &'a str, interface: &InterfaceConfig) -> &'a str {
-    match interface {
-        InterfaceConfig::Serial(serial) => reason
-            .strip_prefix(open_error_prefix(&serial.port).as_str())
-            .unwrap_or(reason),
-        InterfaceConfig::Udp(_) => reason,
-    }
+    let prefix = match interface {
+        InterfaceConfig::Serial(serial) => open_error_prefix(&serial.port),
+        InterfaceConfig::Udp(_) => format!("{BIND_FAILURE}: "),
+    };
+    reason.strip_prefix(prefix.as_str()).unwrap_or(reason)
 }
 
 /// A serial setting's data bits as a number.
@@ -479,7 +480,6 @@ fn status_line(facts: &StatusFacts) -> StatusLine {
         ""
     };
     if let Some(reason) = facts.open_error {
-        let reason = without_open_prefix(reason, facts.interface);
         // A port that refuses 5 or 6 data bits says only that a parameter is
         // wrong, so say which one it probably is; a refused bind seldom says
         // what holds the port, so say what may.
@@ -489,6 +489,7 @@ fn status_line(facts: &StatusFacts) -> StatusLine {
         }
         .map(|hint| format!(" {hint}"))
         .unwrap_or_default();
+        let reason = without_open_prefix(reason, facts.interface);
         return problem(format!(
             "{port} could not be opened: {}{hint}{gone}",
             with_full_stop(reason)
@@ -1596,21 +1597,25 @@ mod tests {
         );
     }
 
-    /// The system's reason for a refused bind seldom says what holds the
-    /// port, so the line names the usual causes; any other open error of a
-    /// UDP port gets no hint.
+    /// A refused bind is said once, as the port that could not be opened,
+    /// and since the system's reason seldom says what holds the port, the
+    /// line names the usual causes; any other open error of a UDP port gets
+    /// no hint.
     #[test]
     fn a_refused_bind_says_what_may_hold_the_port() {
         let u = net(5005);
         let glyph = tone_marker(SignalTone::Warning);
-        let refused =
-            format!("{BIND_FAILURE}: Only one usage of each socket address is permitted.");
+        let refused = crate::runtime::OrchestratorError::Bind(std::io::Error::other(
+            "Only one usage of each socket address is permitted.",
+        ))
+        .to_string();
         let mut f = facts(&u);
         f.open_error = Some(&refused);
         assert_eq!(
             text(&f),
             format!(
-                "{glyph}UDP port 5005 could not be opened: {refused} {}",
+                "{glyph}UDP port 5005 could not be opened: Only one usage of each socket \
+                 address is permitted. {}",
                 wiredata_ui::format::UDP_BIND_HINT
             )
         );
