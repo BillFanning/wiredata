@@ -18,11 +18,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use talker::core::capacity::{
+    measured_service_estimate, service_sample_count, ChannelDemand, MessageDemand,
+    MIN_SERVICE_SAMPLES,
+};
 use talker::core::channel::{InterfaceConfig, UdpConfig};
 use talker::core::message::{MessageConfig, PayloadConfig};
-use talker::core::runner::ObserverPolicy;
+use talker::core::runner::{ObserverPolicy, STOP_LIMIT};
 use talker::core::scheduler::Schedule;
-use talker::core::supervisor::{CommandOutcome, TalkerSupervisor};
+use talker::core::supervisor::{CommandCompletion, CommandOutcome, TalkerSupervisor};
+use talker::core::telemetry::{recent_snapshot_state, RecentSnapshotState, RECENT_WINDOW};
 
 fn soak_secs() -> u64 {
     std::env::var("WIREDATA_SOAK_SECS")
@@ -111,6 +116,21 @@ fn poll_until(
             "condition not reached in {timeout:?}"
         );
         sup.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Poll channel 0 at the GUI-ish cadence until `until`, requiring on every
+/// poll that its retained snapshot's capture instant is still `captured_at`.
+fn hold_without_counters(sup: &mut TalkerSupervisor, captured_at: Instant, until: Instant) {
+    while Instant::now() < until {
+        sup.poll();
+        let t = sup.telemetry_ref(0).expect("slot 0");
+        assert_eq!(
+            t.recent_timing_captured_at,
+            Some(captured_at),
+            "a dormant runner delivered Counters: the snapshot was recaptured"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -232,4 +252,163 @@ fn failed_send_storm_stays_bounded() {
 
     assert_eq!(sup.stop(0), CommandOutcome::Enqueued, "Stop must enqueue");
     poll_until(&mut sup, Duration::from_secs(15), |s| !s.any_draining());
+}
+
+/// One channel runs at 5 ms until its recent window is warm, then its only
+/// message is made dormant with a live interval change of zero, and the
+/// supervisor is polled for a further `RECENT_WINDOW` and a second: the
+/// ADR-042 transition from a current snapshot to an expired one, end to end,
+/// with no heartbeat in between. The hold is fixed by the window, so
+/// `WIREDATA_SOAK_SECS` does not apply.
+///
+/// What it asserts:
+///
+/// - Warm: before the interval change, the recent window holds at least
+///   `MIN_SERVICE_SAMPLES` render and send samples, read from the supervisor's
+///   telemetry, and the retained snapshot classifies as Current.
+/// - No further `Counters`: from the poll that reports the change applied until
+///   the end of the hold, the retained snapshot's capture instant never moves.
+///   The supervisor writes it only from a `Counters` update, and every update
+///   carries its own fresh instant, so an update the dormant runner sent, on a
+///   timer or otherwise, would change it. The runner emits updates only from
+///   its send path and sends each one before it reports a later command as
+///   applied, so the first poll that sees the completion has already drained
+///   every update that preceded it. The wire corroborates this: the sink
+///   receives no byte once a short settle has passed.
+/// - Expired: after the hold the same snapshot classifies as Expired, not
+///   Current and not Final.
+/// - Headroom inputs: the stale recent window would still give a measured
+///   estimate, which is the figure expiry must keep out of headroom, and the
+///   run-wide timing alone is enough to give one to fall back on.
+///
+/// What it does not prove: the choice between those two timings and the
+/// run-wide fallback label are made in GUI code that an integration test
+/// cannot reach, so only that code's own tests cover them. Nor does it say
+/// anything about a runner that exits without its final update, or about a
+/// slow but not dormant cadence, where each send can still refresh the
+/// snapshot.
+#[test]
+#[ignore = "soak: run manually / nightly (see module docs)"]
+fn fast_then_dormant_snapshot_expires_without_further_counters() {
+    let sink = UdpSink::spawn();
+    let mut sup = TalkerSupervisor::new(ObserverPolicy::sampled());
+    sup.push_slot();
+    let messages = vec![msg("ABCD", 5)];
+    let schedule = Schedule::compile(&messages, Instant::now()).unwrap();
+    sup.start(
+        0,
+        "1",
+        InterfaceConfig::Udp(UdpConfig::unicast(sink.addr)),
+        messages,
+        schedule,
+    );
+
+    // Warm: wait on the telemetry itself, not on a guessed time.
+    poll_until(&mut sup, Duration::from_secs(15), |s| {
+        let t = s.telemetry_ref(0).expect("slot 0");
+        service_sample_count(t.recent_timing) >= MIN_SERVICE_SAMPLES
+    });
+
+    // Dormant: the live interval change a user makes in the GUI. Wait for the
+    // runner's confirmation, so the next step knows it has stopped sending.
+    let submission = sup.set_interval(0, 0, 0);
+    assert_eq!(submission.outcome, CommandOutcome::Enqueued);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut applied = false;
+    while !applied {
+        assert!(
+            Instant::now() < deadline,
+            "the interval change was not confirmed in 5 s"
+        );
+        sup.poll();
+        for completion in sup.take_command_completions() {
+            match completion {
+                CommandCompletion::Applied { id, .. } if id == submission.id => applied = true,
+                CommandCompletion::Failed { id, message, .. } if id == submission.id => {
+                    panic!("the interval change failed: {message}")
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let dormant = sup.telemetry(0);
+    let captured_at = dormant
+        .recent_timing_captured_at
+        .expect("Counters arrived while the window warmed");
+    assert!(
+        service_sample_count(dormant.recent_timing) >= MIN_SERVICE_SAMPLES,
+        "the window was warm when the channel went dormant"
+    );
+    assert!(
+        matches!(
+            recent_snapshot_state(
+                Some(captured_at),
+                Instant::now(),
+                dormant.recent_timing_is_final
+            ),
+            RecentSnapshotState::Current(_)
+        ),
+        "the snapshot is Current when the channel goes dormant"
+    );
+
+    // Let anything already on the loopback reach the sink, then hold. Age runs
+    // from the snapshot's own capture instant, so ending the hold a second
+    // after that instant plus the window is past the flip however old the
+    // snapshot was when the channel went dormant.
+    hold_without_counters(
+        &mut sup,
+        captured_at,
+        Instant::now() + Duration::from_millis(100),
+    );
+    let wire_at_dormancy = sink.bytes.load(Ordering::Relaxed);
+    hold_without_counters(
+        &mut sup,
+        captured_at,
+        captured_at + RECENT_WINDOW + Duration::from_secs(1),
+    );
+
+    let expired = sup.telemetry(0);
+    assert!(
+        matches!(
+            recent_snapshot_state(
+                expired.recent_timing_captured_at,
+                Instant::now(),
+                expired.recent_timing_is_final
+            ),
+            RecentSnapshotState::Expired(age) if age >= RECENT_WINDOW
+        ),
+        "after the hold the retained snapshot must be Expired"
+    );
+    assert_eq!(
+        sink.bytes.load(Ordering::Relaxed),
+        wire_at_dormancy,
+        "a dormant channel put bytes on the wire"
+    );
+
+    // Headroom inputs, from the same retained telemetry the GUI reads.
+    let demand = ChannelDemand::from_messages(
+        expired
+            .per_message_timing
+            .iter()
+            .map(|m| MessageDemand::new(m.wire_bytes, m.interval_ms())),
+    );
+    assert!(
+        measured_service_estimate(demand, expired.recent_timing).is_some(),
+        "the stale recent window still gives an estimate, so only expiry keeps it out"
+    );
+    assert!(
+        service_sample_count(expired.timing) >= MIN_SERVICE_SAMPLES
+            && measured_service_estimate(demand, expired.timing).is_some(),
+        "run-wide timing must be enough to fall back on"
+    );
+
+    sup.stop_all();
+    let left_behind = sup.join_all(STOP_LIMIT);
+    assert!(
+        left_behind.is_empty(),
+        "runner did not stop: {left_behind:?}"
+    );
+    sink.settle_and_stop();
 }

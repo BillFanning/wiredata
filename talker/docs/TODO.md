@@ -49,16 +49,6 @@ found again. Remove an item when it is done: the commit says what changed.
   already carry the state, so this is about reinforcement one reader does not
   receive. Revisit if a third state ever wants a colour.
 
-## Soak
-
-- [ ] **Fast-then-dormant snapshot expiry (ADR-042).** `recent_snapshot_state` is
-  unit-tested and the GUI is tested against synthetic states, but nothing runs the
-  real transition end to end. Run a channel fast enough to warm the recent window
-  past `MIN_SERVICE_SAMPLES`, make every message dormant, and hold past
-  `RECENT_WINDOW`. Then check that the supervisor's retained snapshot is Expired,
-  that headroom falls back to labelled run-wide timing, and that the dormant
-  runner sent no further `Counters`. Its home is `talker/tests/soak.rs`.
-
 ## macOS (planned)
 
 - [ ] **App Nap opt-out.** macOS timers are fine-grained, but App Nap throttles the

@@ -146,6 +146,22 @@ mod tests {
         );
     }
 
+    /// Run-wide timing chosen because the recent snapshot expired says so,
+    /// with the expired snapshot's own label. Plain run-wide timing does not.
+    #[test]
+    fn run_wide_timing_after_expiry_is_labelled_a_fallback() {
+        let expired = RecentSnapshotState::Expired(Duration::from_secs(12));
+        let label = service_timing_source_label(ServiceTimingSource::Run, expired);
+        assert_eq!(
+            label,
+            format!("run-wide fallback; {}", recent_snapshot_label(expired))
+        );
+        assert_eq!(
+            service_timing_source_label(ServiceTimingSource::Run, RecentSnapshotState::Pending),
+            "run-wide"
+        );
+    }
+
     #[test]
     fn incomplete_serial_setup_is_not_described_as_network_capacity() {
         assert_eq!(
