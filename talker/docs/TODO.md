@@ -111,16 +111,6 @@ Found by a survey of every retry in the workspace on 2026-11-19.
     double the size, which the code halves.
   - Run a soak. `run-soak.sh` reads memory from `/proc`, which macOS lacks.
 
-## Releases (workspace)
-
-- [ ] **Version in the Windows .exe properties.** The window titles and
-  `--version` show the Cargo.toml version, but Properties → Details on each
-  .exe has no File version or Product version. Embed a Windows version
-  resource in the five release programs from a build script in talker and
-  listener (the winresource crate is one way, and the same resource could carry
-  an icon). It adds a build dependency, so record an ADR and run
-  `cargo deny check`.
-
 ## Project README
 
 The README covers downloading, the Linux build packages (ADR-003) and building

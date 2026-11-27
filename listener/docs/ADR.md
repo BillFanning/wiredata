@@ -2841,6 +2841,45 @@ before; Windows does not allow both options on one socket.
 holds without sharing now fails to bind, instead of quietly taking the unicast
 datagrams sent to that address.
 
+## ADR-080 — Each Windows program carries a version resource
+
+**Status:** Accepted 2026-11-27. Covers talker's two programs as well as
+Listener's and Linemon.
+
+**Context:** The window titles and `--version` showed the Cargo.toml version,
+but Properties → Details on each .exe had no File version, Product version or
+name, and Task Manager names a program by its file description.
+
+**Decision:** A build script in talker and in listener embeds a version
+resource in each of the five programs, through the winresource crate.
+FileVersion and ProductVersion are the workspace version; ProductName and
+FileDescription are the program's name as its window title gives it (Talker,
+Listener, Linemon); OriginalFilename is its file name. talker.exe and
+talker-gui.exe are both Talker, as listener.exe and listener-gui.exe are both
+Listener. For any other target the script does nothing.
+
+**Boundary:**
+
+- No icon. The resource could carry one, but there is no icon to carry.
+- No company name or copyright line.
+- A resource compiler that cannot be found or that fails stops the build,
+  rather than letting a program ship without its version. It is the Windows
+  SDK's rc.exe, which comes with the libraries the MSVC linker needs anyway.
+- winresource is built without its default `toml` feature, so it reads nothing
+  from Cargo.toml and brings in only version_check, already in the tree.
+
+**Alternatives considered:**
+
+- **embed-resource:** also runs rc.exe, but brings in cc, rustc_version, toml
+  and, with MSVC, vswhom, which compiles C++ to find Visual Studio.
+- **Writing the compiled resource in the build script:** no dependency and no
+  rc.exe, but a hand-written encoder of a fiddly binary format, kept for five
+  strings.
+
+**Consequences:** Properties → Details and Task Manager name each program and
+its version, and a version bump in the workspace Cargo.toml reaches the
+resource with no other edit.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

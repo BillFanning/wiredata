@@ -108,6 +108,10 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Net
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 
+# The Windows version resource in each program (build.rs, ADR-080).
+[build-dependencies]
+winresource = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 # Cross-app loopback tests drive Talker's real UDP interface into Listener's

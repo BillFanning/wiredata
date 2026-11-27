@@ -82,6 +82,10 @@ jiff = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
+# The Windows version resource in each program (build.rs, listener ADR-080).
+[build-dependencies]
+winresource = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 # Integration tests live in /tests per Rust convention

@@ -2014,6 +2014,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows-sys 0.59.0",
+ "winresource",
  "wiredata-cli",
  "wiredata-log",
  "wiredata-stop",
@@ -3483,6 +3484,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows-sys 0.59.0",
+ "winresource",
  "wiredata-cli",
  "wiredata-log",
  "wiredata-stop",
@@ -4523,6 +4525,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b"
+dependencies = [
+ "version_check",
 ]
 
 [[package]]

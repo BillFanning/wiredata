@@ -116,5 +116,10 @@ tokio = { version = "1", features = [
 tokio-util = "0.7"        # CancellationToken for cooperative shutdown (§111)
 async-trait = "0.1"       # async methods in the recorder traits (§142)
 
+# ── Windows version resource (build-only; listener ADR-080) ──────────────────
+# Without its default `toml` feature it reads nothing from Cargo.toml and adds
+# only version_check, already in the tree.
+winresource = { version = "0.1.34", default-features = false }
+
 # ── Benchmarks (dev-only; talker + listener `benches/`) ──────────────────────
 criterion = "0.8"
