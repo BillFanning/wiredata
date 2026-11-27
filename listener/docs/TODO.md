@@ -53,16 +53,6 @@ The retry questions shared with talker are in
 
 ## Soak
 
-- [ ] **The Serial stall cell under sustained backpressure (ADR-034).**
-  `SerialStallState` and `retry_stalled_send` have unit tests for their edges,
-  poison recovery and unwind guard, but no run holds the Transport→Pipeline
-  queue full for a whole window. The soak harness (ADR-051) sends UDP only, so
-  this needs its own test in `listener/tests/soak.rs`: hold a bounded ingest
-  receiver without draining it, run the `BlockingReader` seam at rate, and check
-  that `completed_episodes` only grows, `completed_total` never exceeds wall
-  time, `active_for` is set while stalled and clear within one snapshot of
-  resuming, and the final snapshot has no episode open. A missed edge shows up
-  as a stall that grows forever, so a long window is the point.
 - [ ] **Slow-disk recording with rotation.** Needs an injectable slow writer
   rather than a real disk; do it with whatever next touches the recorder's
   writer seam.

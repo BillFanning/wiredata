@@ -1616,4 +1616,192 @@ mod tests {
         ));
         assert!(notice_rx.try_recv().is_err());
     }
+
+    /// The soak window, from `WIREDATA_SOAK_SECS` as listener's other soak
+    /// tests read it (default 10 s).
+    fn soak_secs() -> u64 {
+        std::env::var("WIREDATA_SOAK_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10)
+    }
+
+    /// A reader at rate: an 8-byte block about every millisecond, each
+    /// carrying the next sequence number, so loss or reordering shows.
+    struct RateReader {
+        next: u64,
+    }
+
+    impl BlockingReader for RateReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(1));
+            buf[..8].copy_from_slice(&self.next.to_be_bytes());
+            self.next += 1;
+            Ok(8)
+        }
+    }
+
+    /// Take everything queued, checking each block is the next in sequence.
+    fn take_in_order(rx: &mut mpsc::Receiver<ReceivedData>, expected: &mut u64) {
+        while let Ok(data) = rx.try_recv() {
+            assert_eq!(data.payload, expected.to_be_bytes(), "a block was lost");
+            *expected += 1;
+        }
+    }
+
+    /// The checks every snapshot must pass, whatever the reader is doing.
+    struct StallWatch {
+        started: Instant,
+        episodes: u64,
+    }
+
+    impl StallWatch {
+        fn check(&mut self, snapshot: SerialStallStateSnapshot) -> SerialStallStateSnapshot {
+            let now = Instant::now();
+            assert!(
+                snapshot.completed_episodes >= self.episodes,
+                "the episode count went down: {snapshot:?}"
+            );
+            self.episodes = snapshot.completed_episodes;
+            let active = snapshot
+                .active_since
+                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+            assert!(
+                snapshot.completed_total + active <= now.saturating_duration_since(self.started),
+                "more stalled time than has passed: {snapshot:?}"
+            );
+            assert!(snapshot.completed_max <= snapshot.completed_total);
+            snapshot
+        }
+    }
+
+    /// Wait, with a deadline, until the reader has an episode open.
+    fn wait_until_stalled(state: &SerialStallState) -> Instant {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(since) = state.snapshot().active_since {
+                return since;
+            }
+            assert!(Instant::now() < deadline, "the reader never stalled");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The stall cell under sustained backpressure (ADR-034). A reader at
+    /// rate fills a queue that nothing drains for the whole soak window. The
+    /// queue is then drained for a while, filled again, and the run cancelled
+    /// mid-stall, so an episode ends both ways: by a send that goes through
+    /// and by cancellation.
+    ///
+    /// Read at the GUI's snapshot pace, the cell must show one episode for
+    /// the whole hold, never split or reopened, and never more stalled time
+    /// than has passed. It must close that episode within one snapshot of
+    /// the queue draining, and leave no episode open at the end. Every
+    /// block that arrives must be the next in sequence.
+    ///
+    /// It reads the cell directly. The pipeline derives `active_for` from
+    /// `active_since`, and that derivation has its own test. A missed edge
+    /// shows up as a stall that grows forever, so the window's length is the
+    /// point.
+    #[test]
+    #[ignore = "soak: run manually; WIREDATA_SOAK_SECS sets the window (default 10 s)"]
+    fn the_stall_cell_stays_exact_under_sustained_backpressure() {
+        const SNAPSHOT_EVERY: Duration = Duration::from_millis(200);
+        let window = Duration::from_secs(soak_secs());
+        let (tx, mut rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let stall_state = SerialStallState::default();
+        let mut watch = StallWatch {
+            started: Instant::now(),
+            episodes: 0,
+        };
+        let reader = {
+            let cancel = cancel.clone();
+            let stall_state = stall_state.clone();
+            std::thread::spawn(move || {
+                run_blocking_receive_loop(
+                    ChannelId::new(),
+                    RateReader { next: 0 },
+                    tx,
+                    cancel,
+                    STALL_WARNING,
+                    SerialReceiveHooks {
+                        stall_state,
+                        ..SerialReceiveHooks::default()
+                    },
+                )
+            })
+        };
+        let mut expected = 0;
+
+        // Hold: nothing drains for the whole window.
+        let held_since = wait_until_stalled(&stall_state);
+        let hold_ends = Instant::now() + window;
+        while Instant::now() < hold_ends {
+            std::thread::sleep(SNAPSHOT_EVERY);
+            let snapshot = watch.check(stall_state.snapshot());
+            assert_eq!(
+                snapshot.active_since,
+                Some(held_since),
+                "the hold is one episode"
+            );
+            assert_eq!(
+                snapshot.completed_episodes, 0,
+                "nothing completes while nothing drains"
+            );
+        }
+
+        // Resume: the hold's episode is complete by the next snapshot. The
+        // reader refills the queue at once, so a newer episode may be open.
+        let resumed_at = Instant::now();
+        take_in_order(&mut rx, &mut expected);
+        std::thread::sleep(SNAPSHOT_EVERY);
+        let snapshot = watch.check(stall_state.snapshot());
+        assert!(
+            snapshot.completed_episodes >= 1,
+            "the hold did not end: {snapshot:?}"
+        );
+        assert!(
+            snapshot
+                .active_since
+                .is_none_or(|since| since >= resumed_at),
+            "the hold's episode is still open: {snapshot:?}"
+        );
+        assert!(
+            snapshot.completed_max >= window,
+            "the hold was not counted as one episode: {snapshot:?}"
+        );
+
+        // Keep up for a while: short episodes come and go.
+        let catch_up_ends = Instant::now() + Duration::from_secs(1);
+        let mut next_snapshot = Instant::now() + SNAPSHOT_EVERY;
+        while Instant::now() < catch_up_ends {
+            take_in_order(&mut rx, &mut expected);
+            if Instant::now() >= next_snapshot {
+                watch.check(stall_state.snapshot());
+                next_snapshot += SNAPSHOT_EVERY;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Fill again, and cancel mid-stall.
+        take_in_order(&mut rx, &mut expected);
+        wait_until_stalled(&stall_state);
+        let before_cancel = watch.check(stall_state.snapshot()).completed_episodes;
+        cancel.cancel();
+        let outcome = reader.join().expect("the reader thread did not panic");
+        assert!(
+            matches!(outcome, TransportOutcome::Cancelled),
+            "{outcome:?}"
+        );
+        take_in_order(&mut rx, &mut expected);
+
+        let last = watch.check(stall_state.snapshot());
+        assert_eq!(last.active_since, None, "an episode was left open");
+        assert!(
+            last.completed_episodes > before_cancel,
+            "cancelling did not complete the episode: {last:?}"
+        );
+        assert!(expected > 0, "nothing was received");
+    }
 }
