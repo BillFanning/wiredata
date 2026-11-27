@@ -62,9 +62,46 @@ command-line versions share the same profiles.
 
 Listener only receives. It never sends anything to the port.
 
+## Sending fast with Talker
+
+Talker keeps each message on its schedule. A few things limit how fast that
+can be.
+
+**Windows timers.** Windows normally wakes a waiting program on a 15.6 ms tick,
+which is too coarse for a fast schedule. While any message is scheduled more
+often than every 32 ms, Talker asks Windows for a 1 ms timer. This needs no
+administrator rights. Talker gives it back when the last fast channel stops,
+and Windows takes it back anyway if Talker is closed some other way. Talker
+and Listener also ask Windows 11 not to slow their timers while the window is
+minimized, so a long run left minimized keeps its pace.
+
+**How fast in practice.** About 100 messages a second on a channel runs
+cleanly. Faster than that, the 1 ms timer starts to show. On one Windows 11
+computer, sending over UDP to itself, 500 messages a second missed about 1.5%
+of their scheduled times, and 1,000 a second missed about a third, so about 667
+went out each second. That is the limit of the timer, not a fault. Talker could
+get closer by keeping a processor core busy instead of sleeping, but that would
+use up a whole core for each fast channel, so it does not.
+
+**Serial line speed.** With the common 8N1 setting, each byte takes 10 bits on
+the line, so a message takes its length in bytes × 10 ÷ the baud rate, and that
+has to fit in its interval. A 40-byte sentence at 115,200 baud takes about
+3.5 ms, so sending it 1,000 times a second is impossible whatever the timers do.
+
+**Missed sends.** When a message falls more than one interval behind its
+schedule, Talker sends it once, late, and skips the scheduled times it has
+already passed instead of sending them in a burst to catch up. Each skipped
+time is one missed send, counted on the channel's Send outcomes line, so what
+should have gone out is the number sent plus the number missed. A missed send
+means the timing on the wire broke. The Output pane can also drop updates when
+it cannot keep up, but that only changes what the window shows: the sends
+themselves are never held back for it.
+
 ## Build from source
 
-You need Rust 1.99 or newer ([rustup.rs](https://rustup.rs)).
+You need the current stable Rust ([rustup.rs](https://rustup.rs)). The project
+raises its minimum Rust version to each new stable release, so if a build says
+your Rust is too old, run `rustup update stable` and build again.
 
 ```sh
 cargo build --release -p talker -p listener

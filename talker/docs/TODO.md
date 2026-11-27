@@ -35,8 +35,11 @@ found again. Remove an item when it is done: the commit says what changed.
   orders, and an unplug did not freeze it again. The window thread waits on
   other threads only when talker closes, joining every runner (`join_all`); it
   read the port list itself until that moved to a helper thread (`PortList`),
-  which may have been the freeze. If it happens again, leave the window open
-  and record its thread states before closing it.
+  which may have been the freeze. A check on 2026-11-27 found nothing else on
+  the window thread that can wait on a driver: commands reach the runners with
+  `try_send`, the port list's lock is not held while the system lists ports, and
+  the join at close is the one wait (ADR-019). If it happens again, leave the
+  window open and record its thread states before closing it.
 - [ ] **Cache the Cadence grouping and its tooltip.** `cadence_groups` allocates
   and `cadence_tooltip` builds about 1 kB of text every repaint, hovered or not.
   The better shape is a `wiredata-ui` change so `signal_row` builds its tooltip
@@ -78,36 +81,6 @@ found again. Remove an item when it is done: the commit says what changed.
   - Check what `request_receive_buffer` reads back. Only Linux reports
     double the size, which the code halves.
   - Run a soak. `run-soak.sh` reads memory from `/proc`, which macOS lacks.
-
-## Project README
-
-The README covers downloading, the Linux build packages (ADR-003) and building
-from source. It does not yet cover:
-
-- [ ] The MSRV policy and `rustup update stable`, per ADR-008.
-- [ ] **High-rate timing, for users** (ADR-017 has the rationale):
-  - Windows wakes sleeps on a 15.625 ms tick. Talker requests 1 ms resolution
-    while any schedule has an interval under 32 ms (`wiredata-timing`). It needs
-    no elevation, is released when the last fast channel stops, and is cleaned
-    up by the OS even on a kill.
-  - **Missed sends:** one missed send is one transmission skipped under the stall
-    policy ("fire once, skip the backlog, stay on the grid"). What should have
-    gone out is sent plus missed, per channel across its messages.
-  - Dropped status and display updates affect only what the Output pane shows;
-    sends are never delayed. Missed sends mean the wire cadence itself broke.
-  - Practical ceilings: about 100 Hz clean out of the box, and 500 Hz to 1 kHz is
-    wake-quantization territory. Measured 2026-07-13 on one Windows 11 machine,
-    release build, UDP loopback: 500 Hz missed about 1.5% of grid points, and
-    1 kHz missed about a third (about 667 Hz effective), because a 1 ms grid sits
-    on the timer's granularity. That is the documented ceiling, not a regression.
-    A spin-wait would move it and was considered and not built: one pegged core
-    per fast channel.
-  - Serial line rate: `payload_bytes × 10 / baud` must fit in the interval. A
-    40-byte sentence at 115,200 baud takes about 3.5 ms, so 1 kHz is physically
-    impossible whatever the timers do.
-  - Minimized windows: both apps opt out of Windows 11's timer throttling at
-    startup, so minimized long runs keep cadence. macOS needs App Nap's
-    counterpart (above).
 
 ## Ideas that need a spec amendment first
 
