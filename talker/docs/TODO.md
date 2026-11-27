@@ -38,8 +38,8 @@ found again. Remove an item when it is done: the commit says what changed.
   which may have been the freeze. A check on 2026-11-27 found nothing else on
   the window thread that can wait on a driver: commands reach the runners with
   `try_send`, the port list's lock is not held while the system lists ports, and
-  the join at close is the one wait (ADR-019). If it happens again, leave the
-  window open and record its thread states before closing it.
+  the join at close, the one wait, gives up after 2 s (ADR-076). If it happens
+  again, leave the window open and record its thread states before closing it.
 - [ ] **Cache the Cadence grouping and its tooltip.** `cadence_groups` allocates
   and `cadence_tooltip` builds about 1 kB of text every repaint, hovered or not.
   The better shape is a `wiredata-ui` change so `signal_row` builds its tooltip

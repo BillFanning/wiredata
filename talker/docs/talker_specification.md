@@ -1,14 +1,13 @@
 # Talker — Program Specification
-**Version:** 2.6.4
+**Version:** 2.6.5
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-27) — the two retry paces:
+Revision note (2026-11-27) — closing the window:
 
-- **§4.1 (ADR-075)** — the open and send retry paces are stated once, side by
-  side, with why they differ. §3.1, §3.2, §4.2 and §9 point to them.
-- **§3.2** — a channel waiting to open logs its failure as one warning, which
-  is what the channel row and the status bar count.
+- **§3.2 (ADR-076)** — closing the window stops waiting for the channels after
+  the CLI's stop limit, so a call stuck in a driver cannot hold it open. The
+  log names any channel left behind.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -488,7 +487,7 @@ GUI state and profile data are stored separately and serve different purposes:
   returns to INFO, all five pane visibility switches return on, and Log file
   returns off whenever Talker starts.
 
-On exit, the GUI saves its state automatically. On next launch, the GUI reopens the last active profile and restores zoom and theme. Window geometry is deliberately **not** persisted: eframe restores it only after the window is first shown, which produced a visible double frame/title-bar flash on every launch (and could resurrect a broken tiny geometry) — the window always opens at its default size instead.
+On exit, the GUI saves its state automatically. It stops every channel and waits for each to close its port or socket, for no longer than 2 s: the serial write timeout plus 1 s, the same limit as the CLI's stop. A channel whose call into the operating system has not returned by then is left to end with the program, and a warning in the log names it; the log file keeps it when Log file is on. On next launch, the GUI reopens the last active profile and restores zoom and theme. Window geometry is deliberately **not** persisted: eframe restores it only after the window is first shown, which produced a visible double frame/title-bar flash on every launch (and could resurrect a broken tiny geometry) — the window always opens at its default size instead.
 
 GUI state is stored in a platform-appropriate config directory (via the `dirs` crate or `eframe`'s default storage path).
 

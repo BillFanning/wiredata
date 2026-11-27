@@ -8,11 +8,11 @@ use wiredata_cli::{doubling_retry, exit_status, HealthWatch, EXIT_CANNOT_START};
 use wiredata_ui::format::thousands;
 
 use crate::core::{
-    channel::{ChannelId, WRITE_TIMEOUT},
+    channel::ChannelId,
     logging::{self, FileLogConfig, Rotation},
     message::decode_utf8_lossy_latin1,
     profile::{self, Profile},
-    runner::{self, TalkerCommand, TalkerStatus},
+    runner::{self, TalkerCommand, TalkerStatus, STOP_LIMIT},
     scheduler::Schedule,
 };
 
@@ -173,13 +173,6 @@ pub struct Args {
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
-
-/// How long the stop may take, once requested, before the CLI stops waiting
-/// for the channels' threads and exits with code 4 (ADR-060). A send blocked
-/// in the operating system cannot be interrupted, so the limit is the longest
-/// such call, a serial write, plus 1 s: a stop that is only waiting one out is
-/// not cut off.
-const STOP_LIMIT: Duration = WRITE_TIMEOUT.saturating_add(Duration::from_secs(1));
 
 /// How a channel that is down is being retried, for its WARNING line: first
 /// for an interface that did not open, then for a send that failed. The runner
@@ -872,11 +865,6 @@ mod tests {
         let (open, send) = retry_words();
         assert_eq!(open, "retrying in 1 s, doubling to 30 s");
         assert_eq!(send, "retrying in 250 ms, doubling to 5 s");
-    }
-
-    #[test]
-    fn stop_limit_outlasts_the_longest_blocking_call() {
-        assert!(STOP_LIMIT > WRITE_TIMEOUT);
     }
 
     fn parse(argv: &[&str]) -> Result<Args, clap::Error> {

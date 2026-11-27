@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, TrySendError};
 
@@ -50,6 +50,11 @@ const CMD_QUEUE_CAP: usize = 32;
 /// queued at once, and the final run summary. Keeping this separate from sampled
 /// telemetry prevents observer pressure from erasing control truth.
 const CONTROL_QUEUE_CAP: usize = CMD_QUEUE_CAP + 2;
+
+/// How often [`TalkerSupervisor::join_all`] looks again for runners that have
+/// ended. Short, since a close that is not waiting on a stuck call should be
+/// over at once.
+const JOIN_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Debug)]
 struct CommandFailure {
@@ -307,6 +312,9 @@ struct PendingCommand {
 /// A stopped runner still winding down: its thread, plus its status receiver
 /// so the final `Counters` (ADR-018) is still drained into the telemetry.
 struct DrainingRunner {
+    /// The channel's label when it stopped, for a close that cannot wait for
+    /// it; the slot itself may have been removed since.
+    label: String,
     thread: std::thread::JoinHandle<()>,
     control_rx: Receiver<RunnerControlStatus>,
     status_rx: Receiver<TalkerStatus>,
@@ -642,6 +650,7 @@ impl TalkerSupervisor {
         };
         // Keep the receiver: the final Counters (ADR-018) still lands.
         slot.draining.push(DrainingRunner {
+            label: slot.display_label(),
             thread: handle.thread,
             control_rx: handle.control_rx,
             status_rx: handle.status_rx,
@@ -786,48 +795,74 @@ impl TalkerSupervisor {
         }
     }
 
-    /// Join every runner thread — running, draining, and orphaned.
-    /// **Blocks**; exit path only, so serial ports and sockets close cleanly
-    /// before the process dies instead of being killed mid-write.
+    /// Wait for every runner thread, running, draining and orphaned, to end,
+    /// so serial ports and sockets close cleanly before the process dies
+    /// instead of being cut off mid-write. Exit path only: it **blocks** the
+    /// caller, for at most `limit`.
     ///
     /// Each runner stops at its next command check, which comes after the
-    /// send it is in. A send writes until the whole message is out, and the
-    /// interface's write timeout applies to each write, not to the message:
-    /// a port that keeps taking a few bytes before each timeout keeps one
-    /// large send going for longer. The runners are joined one after another.
-    /// So the wait is usually short, and has no fixed upper bound.
+    /// call it is in. A call blocked in the operating system cannot be
+    /// interrupted, and a send writes until the whole message is out, the
+    /// write timeout applying to each write rather than to the message. So
+    /// the runners are waited for together, and any still running at the
+    /// limit is left to end with the process (ADR-076). Each one left behind
+    /// is logged as a warning, and the labels of their channels are returned.
     ///
-    /// Safe on live handles: the command sender is dropped *before* the join,
-    /// so a runner that never received Stop still exits on the disconnect
-    /// (joining with the sender alive would deadlock — the runner would keep
-    /// waiting for commands forever). Status receivers are drained first so a
+    /// Safe on live handles: the command sender is dropped first, so a runner
+    /// that never received Stop still exits on the disconnect (with the
+    /// sender alive it would keep waiting for commands, and the wait would
+    /// always reach the limit). Status receivers are drained throughout, so a
     /// runner block-sending its final `Counters` can always complete.
-    pub fn join_all(&mut self) {
+    pub fn join_all(&mut self, limit: Duration) -> Vec<String> {
+        let deadline = Instant::now() + limit;
+        let mut waiting = Vec::new();
         for slot in &mut self.slots {
-            if let Some(h) = slot.handle.take() {
+            if let Some(handle) = slot.handle.take() {
                 let TalkerHandle {
                     cmd_tx,
                     control_rx,
                     status_rx,
                     thread,
-                } = h;
+                } = handle;
                 drop(cmd_tx);
-                for _ in control_rx.try_iter() {}
-                for _ in status_rx.try_iter() {}
-                let _ = thread.join();
+                waiting.push(DrainingRunner {
+                    label: slot.display_label(),
+                    thread,
+                    control_rx,
+                    status_rx,
+                });
             }
-            for d in slot.draining.drain(..) {
-                for _ in d.control_rx.try_iter() {}
-                for _ in d.status_rx.try_iter() {}
-                let _ = d.thread.join();
+            waiting.append(&mut slot.draining);
+        }
+        waiting.append(&mut self.orphans);
+        loop {
+            for runner in &waiting {
+                for _ in runner.control_rx.try_iter() {}
+                for _ in runner.status_rx.try_iter() {}
             }
+            for finished in waiting.extract_if(.., |runner| runner.thread.is_finished()) {
+                let _ = finished.thread.join();
+            }
+            if waiting.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(JOIN_POLL);
+        }
+        for slot in &mut self.slots {
             slot.retired_control.clear();
         }
-        for d in self.orphans.drain(..) {
-            for _ in d.control_rx.try_iter() {}
-            for _ in d.status_rx.try_iter() {}
-            let _ = d.thread.join();
-        }
+        waiting
+            .into_iter()
+            .map(|runner| {
+                tracing::warn!(
+                    "channel {} did not stop within {}, so talker closed without waiting \
+                     for it: a call to its interface has not returned from the operating system",
+                    runner.label,
+                    wiredata_ui::format::wait(limit)
+                );
+                runner.label
+            })
+            .collect()
     }
 
     /// Drain every runner's status queue into the telemetry, reap finished
@@ -1450,6 +1485,117 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// An interface whose send never returns until released, as a serial
+    /// write stuck in a driver does. It says when the send has begun.
+    struct StuckInterface {
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    }
+
+    impl Interface for StuckInterface {
+        fn send(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+            let _ = self.entered.try_send(());
+            let _ = self.release.recv();
+            Ok(())
+        }
+    }
+
+    /// An interface that records whether it was closed (dropped).
+    struct ClosingInterface {
+        closed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Interface for ClosingInterface {
+        fn send(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for ClosingInterface {
+        fn drop(&mut self) {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A close waits for every runner, so each interface is closed before
+    /// it returns, and reports nothing left behind. It proves the wait
+    /// covers running and stopped runners alike, not how long a stop takes.
+    #[test]
+    fn a_close_waits_for_every_runner_to_close_its_interface() {
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::default());
+        sup.resize_slots(2);
+        let closed = [
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ];
+        for (i, closed) in closed.iter().enumerate() {
+            start_with_interface(
+                &mut sup,
+                i,
+                Box::new(ClosingInterface {
+                    closed: Arc::clone(closed),
+                }),
+                schedule(&[msg("01", 10)]),
+            );
+        }
+        // One already stopped and draining, one still running.
+        let _ = sup.stop(0);
+
+        let left_behind = sup.join_all(Duration::from_secs(30));
+
+        assert!(left_behind.is_empty(), "{left_behind:?}");
+        for closed in &closed {
+            assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    /// A call blocked in the operating system cannot be interrupted, so a
+    /// close stops waiting for it at the limit and names its channel, while
+    /// still waiting for the others. The upper bound is loose on purpose: it
+    /// proves the close does not wait for the stuck send, not how promptly
+    /// it returns.
+    #[test]
+    fn a_close_stops_waiting_for_a_stuck_send_at_the_limit() {
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::default());
+        sup.resize_slots(2);
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+        start_with_interface(
+            &mut sup,
+            0,
+            Box::new(StuckInterface {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+            schedule(&[msg("01", 10)]),
+        );
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        start_with_interface(
+            &mut sup,
+            1,
+            Box::new(ClosingInterface {
+                closed: Arc::clone(&closed),
+            }),
+            schedule(&[msg("01", 10)]),
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the stuck send began");
+        let stuck_label = sup.slots[0].display_label();
+        sup.stop_all();
+
+        let limit = Duration::from_millis(200);
+        let started = Instant::now();
+        let left_behind = sup.join_all(limit);
+        let waited = started.elapsed();
+
+        assert_eq!(left_behind, vec![stuck_label]);
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(waited >= limit, "returned after {waited:?}");
+        assert!(waited < Duration::from_secs(10), "waited {waited:?}");
+        drop(release_tx);
     }
 
     /// A runner that panics is a bug in talker, not a fault of the link. Reaping

@@ -1429,14 +1429,14 @@ impl eframe::App for TalkerApp {
     }
 
     /// On window close (the X button) or any app exit: orderly shutdown.
-    /// Every runner gets Stop and is then joined, so serial ports and sockets
-    /// close cleanly before the process dies instead of being killed
-    /// mid-write. The join has no limit of its own; see
-    /// [`TalkerSupervisor::join_all`](crate::core::supervisor::TalkerSupervisor::join_all)
-    /// for how long it can take.
+    /// Every runner gets Stop and is then waited for, so serial ports and
+    /// sockets close cleanly before the process dies instead of being killed
+    /// mid-write. The wait is the CLI's stop limit, so a call stuck in a
+    /// driver cannot hold the window open (ADR-076); see
+    /// [`TalkerSupervisor::join_all`](crate::core::supervisor::TalkerSupervisor::join_all).
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_all();
-        self.sup.join_all();
+        self.sup.join_all(crate::core::runner::STOP_LIMIT);
     }
 }
 
@@ -2481,7 +2481,7 @@ mod tests {
         assert_eq!(supervisor.applied_run_config(0), Some(&applied));
 
         supervisor.stop_all();
-        supervisor.join_all();
+        supervisor.join_all(crate::core::runner::STOP_LIMIT);
     }
 
     /// The flush is all-or-none and index-preserving: one bad entry aborts

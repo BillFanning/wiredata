@@ -15,6 +15,13 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-27) — the two retry paces:
+
+- **§4.1 (ADR-075)** — the open and send retry paces are stated once, side by
+  side, with why they differ. §3.1, §3.2, §4.2 and §9 point to them.
+- **§3.2** — a channel waiting to open logs its failure as one warning, which
+  is what the channel row and the status bar count.
+
 Revision note (2026-11-25) — the GUI retries a failed open:
 
 - **§4.2, §3.2 (ADR-074)** — a channel the GUI starts whose interface does not
@@ -532,6 +539,11 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-11-27) — talker's retry paces:
+
+- **ADR-075** — talker keeps its two retry paces and its fast return after a
+  drop, and says why; each spec states each pace once, and a test checks it.
 
 Revision note (2026-11-25) — the GUI retries a failed open:
 

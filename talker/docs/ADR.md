@@ -1,13 +1,13 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.39
+**Version:** 1.40
 **Date:** 2026-11-27
 **Status:** Accepted
 
-Revision note (2026-11-27) — talker's retry paces:
+Revision note (2026-11-27) — closing the window:
 
-- **ADR-075** — talker keeps its two retry paces and its fast return after a
-  drop, and says why; each spec states each pace once, and a test checks it.
+- **ADR-076** — the window's close waits for the channels at most the CLI's
+  stop limit, then closes, so ADR-019's one blocking call has a limit.
 
 ---
 
@@ -527,6 +527,7 @@ that genuinely wants every payload keeps it, explicitly.
 Implementation deliberately **sequenced after ADR-018** — the telemetry lanes change
 the same status plumbing the supervisor will own, and moving them once is cheaper.
 The open points below are settled at implementation time, not re-litigated.
+Amended 2026-11-27: the exit-path join waits at most the stop limit (ADR-076).
 
 **Context:** The spec places channel collection and management in `core`
 (`core::channel` manages a collection from day one), but in practice channel
@@ -3043,6 +3044,49 @@ is not caught.
 
 **Consequences:** Changing a retry constant fails a test until the spec says
 the new number.
+
+## ADR-076 — The window's close waits at most the CLI's stop limit
+
+**Status:** Accepted 2026-11-27. Amends ADR-019.
+
+**Context:** Closing the window stopped every channel and then joined each
+runner thread in turn, with no limit: ADR-019's one deliberate blocking call. A
+runner stops at its next command check, after the call it is in, and a call
+stuck in the operating system does not return. On 2026-11-22 a talker process
+was left that could not be ended, with one thread waiting in the system, which
+points at a serial call that never returned in the driver (talker TODO). Had
+the window been closed while such a call was stuck, the close would have waited
+for it with the window frozen. The CLI already bounds its stop with
+`STOP_LIMIT` (ADR-060, ADR-073).
+
+**Decision:**
+
+- **The close waits at most `STOP_LIMIT`**, the serial write timeout plus 1 s,
+  2 s today. It is one constant in `core::runner`, used by the CLI's stop and
+  the window's close.
+- **The runners are waited for together**, not one after another, so the limit
+  is for the whole close, not for each channel.
+- **A runner still running at the limit is left to end with the process.** A
+  warning in the log names its channel, and the log file keeps it when Log file
+  is on. The window is closing, so nothing on screen can show it.
+
+**Boundary:** This does not make a stuck call return, and a process with a
+thread stuck in a driver may still linger after the window has gone, as one did
+on 2026-11-22. It changes only how long the window waits. Stopping one channel
+was never a wait and is unchanged: its runner winds down in the background.
+
+**Alternatives considered:**
+
+- **Keep the wait without a limit:** a call stuck in a driver freezes the
+  window as it closes, and the only way out is to end the process.
+- **Wait for each runner in turn, each with the limit:** with several stuck
+  channels the close would take the limit once for each of them.
+- **Do not wait at all:** a port or socket could then be cut off mid-write by
+  the process ending, which is what the wait exists to prevent.
+
+**Consequences:** A close that is not waiting on a stuck call ends as soon as
+the runners do. The spec states the limit in seconds, and a test checks that
+number against `STOP_LIMIT`.
 
 ## Open questions
 

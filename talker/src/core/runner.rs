@@ -612,6 +612,14 @@ pub const OPEN_RETRY_FIRST: Duration = Duration::from_secs(1);
 /// The longest wait between retries of a failed open.
 pub const OPEN_RETRY_MAX: Duration = Duration::from_secs(30);
 
+/// How long a stop may take before the caller stops waiting for the runner
+/// threads: the CLI's stop (ADR-060) and the window's close (ADR-076). A call
+/// blocked in the operating system cannot be interrupted, so the limit is the
+/// longest such call, a serial write, plus 1 s: a stop that is only waiting
+/// one out is not cut off.
+pub const STOP_LIMIT: Duration =
+    crate::core::channel::WRITE_TIMEOUT.saturating_add(Duration::from_secs(1));
+
 /// Open `cfg`'s interface, retrying a failed open — 1 s, doubling to 30 s —
 /// until it opens or Stop arrives, then run the send loop. The CLI and the
 /// GUI both start channels this way (talker ADR-060, ADR-074): a channel whose
@@ -3951,5 +3959,24 @@ mod tests {
                 "the spec should say {pace:?} once"
             );
         }
+    }
+
+    #[test]
+    fn the_stop_limit_outlasts_the_longest_blocking_call() {
+        assert!(STOP_LIMIT > crate::core::channel::WRITE_TIMEOUT);
+    }
+
+    /// The spec states the window's close limit in the number a user reads
+    /// (ADR-076), so changing the limit fails until §3.2 agrees.
+    #[test]
+    fn the_spec_states_the_close_limit_once() {
+        let spec = include_str!("../../docs/talker_specification.md");
+        let spec = spec.split_whitespace().collect::<Vec<_>>().join(" ");
+        let limit = format!("no longer than {}", wiredata_ui::format::wait(STOP_LIMIT));
+        assert_eq!(
+            spec.matches(&limit).count(),
+            1,
+            "the spec should say {limit:?} once"
+        );
     }
 }
