@@ -20,6 +20,7 @@ pub fn run() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("Linemon v{}", env!("CARGO_PKG_VERSION")))
+            .with_icon(super::icon::linemon())
             .with_inner_size(DEFAULT_SIZE)
             .with_min_inner_size(MIN_SIZE),
         // As Listener: a restored geometry is applied after the window shows,

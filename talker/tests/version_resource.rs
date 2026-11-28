@@ -2,6 +2,9 @@
 //! test finds the resource section in the .exe and checks that the strings
 //! Properties → Details reads are in it, as UTF-16. It does not check how
 //! Windows lays them out, which is the resource compiler's to get right.
+//! Each also carries its own icon (listener ADR-085): the test looks for the
+//! icon file's 256 px image among the resources, which shows the right icon
+//! was embedded, not how Windows picks a size from it.
 #![cfg(windows)]
 
 /// The `.rsrc` section of a PE file, found through its section table.
@@ -24,6 +27,44 @@ fn resource_section(exe: &[u8]) -> &[u8] {
 
 fn utf16(text: &str) -> Vec<u8> {
     text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// The 256 px image in an `.ico` file: the entry whose width byte is 0.
+fn largest_icon_image(ico: &[u8]) -> &[u8] {
+    let word = |at: usize| u16::from_le_bytes([ico[at], ico[at + 1]]) as usize;
+    let dword = |at: usize| u32::from_le_bytes(ico[at..at + 4].try_into().unwrap()) as usize;
+    (0..word(4))
+        .map(|i| 6 + i * 16)
+        .find(|&entry| ico[entry] == 0)
+        .map(|entry| {
+            let (size, start) = (dword(entry + 8), dword(entry + 12));
+            &ico[start..start + size]
+        })
+        .expect("the .ico has a 256 px image")
+}
+
+#[test]
+fn each_program_carries_its_own_icon() {
+    for (exe, icon_path) in [
+        (
+            env!("CARGO_BIN_EXE_talker"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/icons/talker.ico"),
+        ),
+        (
+            env!("CARGO_BIN_EXE_talker-gui"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/icons/talker.ico"),
+        ),
+    ] {
+        let program = std::fs::read(exe).unwrap();
+        let icon = std::fs::read(icon_path).unwrap();
+        let image = largest_icon_image(&icon);
+        assert!(
+            resource_section(&program)
+                .windows(image.len())
+                .any(|w| w == image),
+            "{exe} does not carry the 256 px image in {icon_path}"
+        );
+    }
 }
 
 #[test]

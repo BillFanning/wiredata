@@ -12,6 +12,7 @@ pub mod bind_scope;
 pub mod bridge;
 mod channels;
 mod detail;
+mod icon;
 mod linemon;
 mod linemon_app;
 mod linemon_window;
@@ -89,6 +90,7 @@ pub fn run() -> anyhow::Result<()> {
             // name below stays the bare "Listener" — eframe keys its storage
             // location on it, so changing it would orphan persisted settings.
             .with_title(format!("Listener v{}", env!("CARGO_PKG_VERSION")))
+            .with_icon(icon::listener())
             .with_inner_size(DEFAULT_WINDOW_SIZE)
             .with_min_inner_size(MIN_WINDOW_SIZE),
         // Don't persist/restore window geometry. eframe restores the saved window state

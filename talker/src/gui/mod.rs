@@ -86,6 +86,7 @@ pub fn run(initial_profile: Option<PathBuf>, profile_dir: Option<PathBuf>) -> an
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(window_icon())
             .with_inner_size([1100.0, 740.0])
             .with_min_inner_size([640.0, 480.0]),
         // Don't persist/restore window geometry (listener's lesson, ADR-016):
@@ -123,6 +124,18 @@ pub fn run(initial_profile: Option<PathBuf>, profile_dir: Option<PathBuf>) -> an
 // The status-queue bound moved into core with the supervisor (ADR-019); the
 // detail header's performance readouts still reference it via this path.
 pub(crate) use crate::core::supervisor::STATUS_QUEUE_CAP;
+
+/// Talker's window icon (listener ADR-085), drawn by
+/// `assets/icons/make_icons.py`; `build.rs` embeds the same image in each
+/// `.exe`.
+const ICON_PNG: &[u8] = include_bytes!("../../../assets/icons/talker.png");
+
+/// The window icon. An image that does not decode leaves the window without
+/// an icon rather than with egui's: eframe shows none for an empty
+/// `IconData`. A test decodes it, so this is only a guard.
+fn window_icon() -> std::sync::Arc<egui::IconData> {
+    std::sync::Arc::new(eframe::icon_data::from_png_bytes(ICON_PNG).unwrap_or_default())
+}
 
 /// eframe-storage key for the newline-joined recent-profiles list.
 const RECENT_PROFILES_KEY: &str = "recent_profiles";
@@ -2522,6 +2535,13 @@ mod tests {
 
         supervisor.stop_all();
         supervisor.join_all(crate::core::runner::STOP_LIMIT);
+    }
+
+    #[test]
+    fn the_window_icon_is_a_256_pixel_image() {
+        let icon = eframe::icon_data::from_png_bytes(ICON_PNG).expect("the icon decodes");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(*window_icon(), icon);
     }
 
     /// The dialogs open beside the open profile, else in the profile folder,

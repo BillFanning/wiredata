@@ -2846,7 +2846,8 @@ datagrams sent to that address.
 ## ADR-080 — Each Windows program carries a version resource
 
 **Status:** Accepted 2026-11-27. Covers talker's two programs as well as
-Listener's and Linemon.
+Listener's and Linemon. Amended 2026-11-28: the resource carries each
+program's icon (ADR-085).
 
 **Context:** The window titles and `--version` showed the Cargo.toml version,
 but Properties → Details on each .exe had no File version, Product version or
@@ -3032,6 +3033,49 @@ ADR-064's overlap check, and a set as a Begin never conflicts.
 
 **Consequences:** One rule can watch a line for unexpected bytes. A profile
 written with this condition does not load in a build without it.
+
+## ADR-085 — Each program has its own icon, from one family
+
+**Status:** Accepted 2026-11-28. Covers talker's programs as well as
+Listener's and Linemon. Amends ADR-080, which had no icon to carry.
+
+**Context:** Every window showed egui's default icon, and Explorer showed a
+generic one for each `.exe`, so the three programs could not be told apart in
+a taskbar. The user chose a design from four families of concepts: a navy
+tile crossed by a wire, with each program's own sign.
+
+**Decision:**
+
+- **One family, three signs.** Talker's wire ends in an arrowhead (it sends),
+  Listener's runs into a bracket (it receives), and Linemon has a magnifier
+  over the wire (it watches). The signs differ in shape, never in colour
+  alone.
+- **Each program has its own lightness of blue.** Talker's tile is the
+  darkest, Listener's the middle one and Linemon's the lightest, so the three
+  are told apart at a glance in a taskbar, by lightness rather than hue.
+- **The `.exe` carries an `.ico`** with 16, 24, 32, 48 and 256 px images, put
+  in by the same build script as the version resource (ADR-080), for every
+  program, the command-line ones included. At 24 px and below the drawing
+  drops the dot at the wire's end and thickens its lines.
+- **Each window shows the 256 px image as its icon**, Listener's pop-out
+  windows included; eframe scales it to the sizes the system asks for.
+- **A Pillow script draws them.** `assets/icons/make_icons.py` holds the
+  shapes and colours and writes every file; the generated files are kept in
+  the repository, so a build needs no Python.
+
+**Boundary:** No icon for a Linux desktop entry or a macOS bundle: nothing
+installs one yet. The window icon is set on every platform.
+
+**Alternatives considered:**
+
+- **SVG sources rendered by a converter:** no converter is installed, and one
+  more tool to install for three simple drawings is not worth it.
+- **The window icon from the `.exe`'s resource on Windows:** eframe takes an
+  image, not a resource, and shows its own icon when given none.
+
+**Consequences:** Changing an icon means changing the script and running it.
+A test in each app checks that every `.exe` carries its own icon's 256 px
+image, and another that each window icon decodes.
 
 ## Open questions
 

@@ -224,6 +224,9 @@ Ten crates in a Cargo workspace:
   (listener ADR-051): `soak-gen` sends sequence-numbered 64-byte datagrams, and
   `soak-verify` checks the `.raw` files and event log listener wrote against what
   was sent. Test tooling only; neither app uses it.
+- **`assets/icons/`** — not a crate: the three programs' icons and
+  `make_icons.py`, the Pillow script that draws them (listener ADR-085).
+  Change an icon in the script and run it; the build only reads its output.
 
 ```
 talker/src/

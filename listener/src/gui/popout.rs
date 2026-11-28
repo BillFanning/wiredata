@@ -346,6 +346,7 @@ impl ListenerApp {
                 "Listener pop-out display for channel {}",
                 view.name
             ))
+            .with_icon(super::icon::listener())
             .with_inner_size(DEFAULT_SIZE)
             .with_min_inner_size(MIN_SIZE)
             .with_resizable(true);
