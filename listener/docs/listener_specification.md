@@ -1,16 +1,15 @@
-# Listener Specification v2.6.16
+# Listener Specification v2.6.17
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-27) — one editor for every match rule:
+Revision note (2026-11-27) — a trigger on any byte from a set:
 
-- **§50.2 (ADR-083).** The GUI edits every rule under Configure triggers and
-  actions: its trigger, Pattern or Quiet for, and any of the five actions. It
-  replaces Timestamp marks in Configure display.
-- **§50.2.** A Notify line names the rule that fired.
+- **§50.2 (ADR-084).** A rule can trigger on any one byte from a set, once at
+  the first byte of each unbroken run of them. The GUI offers it as Any byte
+  of, typed as hex bytes and ranges, with presets.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -971,10 +970,13 @@ A **Match Rule** scans the received **byte stream** with a predicate; on a match
 enum MatchCondition {
     BytePattern { pattern: Vec<u8> },   // a byte/hex/text sequence, scanned across the stream
     Idle { timeout: Duration },         // no data received for `timeout` (timer-based)
+    AnyByte { bytes: Vec<u8> },         // any one byte from the set, at the start of each run of them
 }
 ```
 
 `BytePattern` scans the live stream and matches **across receive-chunk boundaries**, however many reads a pattern spans: the runtime retains the newest bytes of the stream (the longest enabled pattern minus one byte, which may span several short reads) and scans them joined to each new chunk, reporting matches once. A match that only completes because of that carry — its first byte lay in an earlier chunk — is a **boundary split**: it is recovered (not lost), its firing anchors on the match's true start offset, and it is **measured** so an operator can see read boundaries splitting their patterns. Every boundary split increments a monotonic `match_boundary_saves` counter exposed in the Channel's stats and snapshot (*how often*). The first split of a run also records an event Diagnostic naming *where* (the stream offset) and *why* (the chunk-boundary split); later splits in that run are counted but not noted, so a pattern that straddles reads constantly cannot flood the log. `Idle` uses the per-Channel activity monitor (§166): it waits on the earliest exact monotonic deadline, fires once when the stream has been quiet for `timeout`, and re-arms when data resumes. The wait is an ordinary deadline wait on every platform, so on Windows a rule can fire up to about 16 ms late (ADR-030, amended). New data or cancellation abandons the pending wait without recording a firing. (The former `DecodedField` and `MessageSize` conditions are removed with the decoder/message infrastructure.)
+
+`AnyByte` fires on any one byte from its set, once at the **first byte of each unbroken run** of set bytes, so a burst of line noise fires once (ADR-084). Each firing is a one-byte match at that byte, so a Timestamp, a Begin or a Stop is placed at it. Whether the previous read ended inside a run is kept, so a run that crosses reads fires once and the firings depend only on the stream. A set can never split across reads, so it has no boundary splits. An empty set is refused (§71), and a set lists at most 256 entries, one per byte value. As a Record trigger, an `AnyByte` Stop is refused with a Begin pattern that holds a set byte before its last byte, since a run starts inside that pattern (ADR-064); an `AnyByte` Begin has no inside and never conflicts.
 
 **Actions:**
 
@@ -1008,7 +1010,7 @@ struct TimestampConfig { include_date: bool, include_millis: bool, include_timez
 - `Before` attaches immediately before the match's first byte; `After` attaches immediately after its final byte. A Mark anchored on any byte of a multi-byte character (UTF-8, or UTF-16 including a surrogate pair) is placed against the whole character: Before goes before it and After goes after it. Hex view places it at the byte. `separator` is appended after either style and may contain CR/LF. Rendering honors those controls and resets Raw wrap state, Rendered tab columns, and Hex continuation before subsequent data. The style-generated ZDA has no trailing CR/LF of its own. All styles are text insertions in every view mode, not on-screen byte-range styling (contrast removed `Highlight`, ADR-015).
 - **Notify** raises a diagnostic event/warning (§92–94) that names its rule, as `match rule '<name>' fired on channel <channel>`, so two Notify rules on one Channel can be told apart; a rule with no name reads `match rule fired …`. **PauseDisplay** freezes the display view (§50); reception and recording continue.
 
-**Editing** (ADR-083). The GUI edits a Channel's rules under **Configure triggers and actions**, below Configure interface, whose header counts the rules. Each rule, a trigger and the actions it initiates, shows its on/off checkbox, its name, its trigger (Pattern, typed as text with `<XX>` for a control byte, or Quiet for, in seconds from 0.1 to 86,400) and its actions (Timestamp, Marker line, Record, Notify, Pause display), each with its own settings. Every condition and action above can be made there, so every rule a profile holds is shown and editable. A Timestamp on a Quiet for rule is flagged, since it has no pattern to sit beside. Changes take effect with Apply & Restart.
+**Editing** (ADR-083). The GUI edits a Channel's rules under **Configure triggers and actions**, below Configure interface, whose header counts the rules. Each rule, a trigger and the actions it initiates, shows its on/off checkbox, its name, its trigger (Pattern, typed as text with `<XX>` for a control byte; Any byte of, typed as hex bytes and ranges such as `00-08 0B 0C 0E-1F 7F`, with presets for the control bytes except tab, CR and LF, all control bytes, and the bytes above 7F; or Quiet for, in seconds from 0.1 to 86,400) and its actions (Timestamp, Marker line, Record, Notify, Pause display), each with its own settings. Every condition and action above can be made there, so every rule a profile holds is shown and editable. A Timestamp on a Quiet for rule is flagged, since it has no pattern to sit beside. Changes take effect with Apply & Restart.
 
 **Configuration** (persists in profiles):
 
@@ -1023,7 +1025,7 @@ struct MatchRule {
 
 Rules are part of `ChannelConfig` (§72) as `match_rules: Vec<MatchRule>`.
 
-**Evaluation and constraints.** `BytePattern` rules evaluate as bytes arrive (the scanner keeps a carry of the newest `pattern.len() − 1` stream bytes, however many chunks they came from); `Idle` uses one recomputed earliest-deadline wait, not a periodic rule poll. Evaluation is bounded and shall not stall reception (§100). Listener is not hard real-time (§126). One condition per rule; no cross-channel rules; no pre-trigger capture — all deferred.
+**Evaluation and constraints.** `BytePattern` rules evaluate as bytes arrive (the scanner keeps a carry of the newest `pattern.len() − 1` stream bytes, however many chunks they came from); `AnyByte` rules evaluate as bytes arrive too, keeping only whether the last byte was in the set; `Idle` uses one recomputed earliest-deadline wait, not a periodic rule poll. Evaluation is bounded and shall not stall reception (§100). Listener is not hard real-time (§126). One condition per rule; no cross-channel rules; no pre-trigger capture — all deferred.
 
 ## 50.3 Linemon
 

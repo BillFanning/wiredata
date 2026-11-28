@@ -19,7 +19,8 @@ use wiredata_ui::hover::{Hover, ShowHover};
 
 const RULES_HOVER: Hover = Hover::new(
     "A rule is a trigger and the actions it initiates.\n\n\
-     The trigger is a byte pattern arriving, or nothing arriving for a set time. When \
+     The trigger is a byte pattern arriving, any byte from a set arriving, or nothing \
+     arriving for a set time. When \
      it happens, the rule does each of its actions in turn: put a timestamp or a \
      marker line next to the pattern, begin or stop a recording, add a line to the \
      Diagnostics, or pause the view.\n\n\
@@ -37,6 +38,8 @@ const CONDITION_HOVER: Hover = Hover::new(
     "The trigger: what makes the rule act.\n\n\
      Pattern acts each time the bytes typed beside it arrive, even when they are \
      split across two reads.\n\n\
+     Any byte of acts when a byte from the set beside it arrives: once at the \
+     first of each unbroken run of them, so a burst of line noise acts once.\n\n\
      Quiet for acts once when nothing has arrived for the time beside it, and again \
      after data has arrived and stopped again.",
 );
@@ -47,6 +50,14 @@ const PATTERN_HOVER: Hover = Hover::new(
      This is the same notation the view shows when View is Raw and ctrl-chars is \
      <0A>.\n\n\
      A rule with an empty pattern never acts.",
+);
+const BYTE_SET_HOVER: Hover = Hover::new(
+    "The bytes that trigger the rule, as hex.\n\n\
+     Type each byte as two hex digits, and three or more in a row as a range, \
+     separated by spaces: 00-08 0B 0C 0E-1F 7F is every control byte except tab, CR \
+     and LF. Presets fills in a common choice.\n\n\
+     The rule acts at the first byte of each unbroken run of these bytes, and a \
+     timestamp or a recording begins or ends at that one byte.",
 );
 const IDLE_HOVER: Hover = Hover::new(
     "How long the channel must receive nothing before the rule acts, in seconds.\n\n\
@@ -89,13 +100,17 @@ const SEPARATOR_HOVER: Hover = Hover::new(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConditionKind {
     Pattern,
+    AnyByte,
     Quiet,
 }
 
 impl ConditionKind {
+    const ALL: [Self; 3] = [Self::Pattern, Self::AnyByte, Self::Quiet];
+
     fn of(condition: &MatchCondition) -> Self {
         match condition {
             MatchCondition::BytePattern { .. } => Self::Pattern,
+            MatchCondition::AnyByte { .. } => Self::AnyByte,
             MatchCondition::Idle { .. } => Self::Quiet,
         }
     }
@@ -103,22 +118,101 @@ impl ConditionKind {
     fn label(self) -> &'static str {
         match self {
             Self::Pattern => "Pattern",
+            Self::AnyByte => "Any byte of",
             Self::Quiet => "Quiet for",
         }
     }
 
-    /// A new condition of this kind: an empty pattern, to be typed, or 5 s
-    /// of quiet.
+    /// A new condition of this kind: an empty pattern, to be typed; the
+    /// control bytes other than tab, CR and LF; or 5 s of quiet.
     fn new_condition(self) -> MatchCondition {
         match self {
             Self::Pattern => MatchCondition::BytePattern {
                 pattern: Vec::new(),
+            },
+            Self::AnyByte => MatchCondition::AnyByte {
+                bytes: CONTROL_EXCEPT_LINE_ENDS.bytes(),
             },
             Self::Quiet => MatchCondition::Idle {
                 timeout_ms: DEFAULT_QUIET_MS,
             },
         }
     }
+}
+
+/// A byte set the Presets menu fills in, as inclusive ranges of values.
+#[derive(Clone, Copy, Debug)]
+struct BytePreset {
+    label: &'static str,
+    ranges: &'static [(u8, u8)],
+}
+
+impl BytePreset {
+    fn bytes(self) -> Vec<u8> {
+        self.ranges
+            .iter()
+            .flat_map(|&(first, last)| first..=last)
+            .collect()
+    }
+}
+
+/// The control bytes a text line does not normally hold: all but tab, CR
+/// and LF. What a new Any byte of trigger starts with.
+const CONTROL_EXCEPT_LINE_ENDS: BytePreset = BytePreset {
+    label: "Control bytes except tab, CR and LF",
+    ranges: &[(0x00, 0x08), (0x0B, 0x0C), (0x0E, 0x1F), (0x7F, 0x7F)],
+};
+const ALL_CONTROL: BytePreset = BytePreset {
+    label: "All control bytes",
+    ranges: &[(0x00, 0x1F), (0x7F, 0x7F)],
+};
+const ABOVE_7F: BytePreset = BytePreset {
+    label: "Bytes above 7F",
+    ranges: &[(0x80, 0xFF)],
+};
+
+/// A byte set as the box shows it: hex bytes in order, three or more in a
+/// row as a range, such as `00-08 0B 0C 0E-1F 7F`.
+fn byte_set_text(bytes: &[u8]) -> String {
+    let set: std::collections::BTreeSet<u8> = bytes.iter().copied().collect();
+    let mut runs: Vec<(u8, u8)> = Vec::new();
+    for byte in set {
+        match runs.last_mut() {
+            Some((_, last)) if u16::from(*last) + 1 == u16::from(byte) => *last = byte,
+            _ => runs.push((byte, byte)),
+        }
+    }
+    let mut parts = Vec::new();
+    for (first, last) in runs {
+        if last - first >= 2 {
+            parts.push(format!("{first:02X}-{last:02X}"));
+        } else {
+            parts.extend((first..=last).map(|byte| format!("{byte:02X}")));
+        }
+    }
+    parts.join(" ")
+}
+
+/// Typed hex bytes and ranges, split by spaces or commas, as a sorted set;
+/// `None` unless every part is two hex digits or a rising range of them.
+fn parse_byte_set(text: &str) -> Option<Vec<u8>> {
+    let hex = |part: &str| {
+        (part.len() == 2)
+            .then(|| u8::from_str_radix(part, 16).ok())
+            .flatten()
+    };
+    let mut set = std::collections::BTreeSet::new();
+    for part in text.split([' ', ',']).filter(|part| !part.is_empty()) {
+        let (first, last) = match part.split_once('-') {
+            Some((first, last)) => (hex(first)?, hex(last)?),
+            None => (hex(part)?, hex(part)?),
+        };
+        if first > last {
+            return None;
+        }
+        set.extend(first..=last);
+    }
+    (!set.is_empty()).then(|| set.into_iter().collect())
 }
 
 /// The quiet time a new Quiet for condition starts with.
@@ -304,7 +398,7 @@ fn edit_condition(ui: &mut egui::Ui, condition: &mut MatchCondition) {
             .selected_text(kind.label())
             .width(90.0)
             .show_ui(ui, |ui| {
-                for option in [ConditionKind::Pattern, ConditionKind::Quiet] {
+                for option in ConditionKind::ALL {
                     ui.selectable_value(&mut kind, option, option.label());
                 }
             })
@@ -315,9 +409,54 @@ fn edit_condition(ui: &mut egui::Ui, condition: &mut MatchCondition) {
         }
         match condition {
             MatchCondition::BytePattern { pattern } => pattern_field(ui, pattern),
+            MatchCondition::AnyByte { bytes } => byte_set_field(ui, bytes),
             MatchCondition::Idle { timeout_ms } => quiet_field(ui, timeout_ms),
         }
     });
+}
+
+/// The byte set as hex bytes and ranges in a box, with a Presets menu. Like
+/// the quiet time, the box keeps the text as typed while it has focus, and
+/// text that is not a set is flagged and changes nothing.
+fn byte_set_field(ui: &mut egui::Ui, bytes: &mut Vec<u8>) {
+    let typed = ui.make_persistent_id("set_typed");
+    let mut text = ui
+        .data(|d| d.get_temp::<String>(typed))
+        .unwrap_or_else(|| byte_set_text(bytes));
+    let response = ui
+        .add(
+            egui::TextEdit::singleline(&mut text)
+                .id_salt("byte_set")
+                .desired_width(160.0)
+                .hint_text("00-08 0B 0C 0E-1F 7F"),
+        )
+        .on_hover(&BYTE_SET_HOVER);
+    if response.changed() {
+        if let Some(set) = parse_byte_set(&text) {
+            *bytes = set;
+        }
+    }
+    let refused = response.has_focus() && parse_byte_set(&text).is_none();
+    if response.has_focus() {
+        ui.data_mut(|d| d.insert_temp(typed, text));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(typed));
+    }
+    ui.menu_button("Presets", |ui| {
+        for preset in [CONTROL_EXCEPT_LINE_ENDS, ALL_CONTROL, ABOVE_7F] {
+            if ui.button(preset.label).clicked() {
+                *bytes = preset.bytes();
+                ui.close();
+            }
+        }
+    })
+    .response
+    .on_hover_text("Fills the set with a common choice. You can change it afterwards.");
+    if refused {
+        ui.label(egui::RichText::new("⚠ hex bytes such as 1B or 00-1F").weak());
+    } else if bytes.is_empty() {
+        ui.label(egui::RichText::new("⚠ empty").weak());
+    }
 }
 
 /// The quiet time as `[−] [seconds] [+] s`, like the port field: a box to type
@@ -714,9 +853,56 @@ mod tests {
             ConditionKind::Quiet.new_condition(),
             MatchCondition::Idle { timeout_ms: 5_000 }
         );
-        for kind in [ConditionKind::Pattern, ConditionKind::Quiet] {
+        assert_eq!(
+            ConditionKind::AnyByte.new_condition(),
+            MatchCondition::AnyByte {
+                bytes: CONTROL_EXCEPT_LINE_ENDS.bytes()
+            }
+        );
+        for kind in ConditionKind::ALL {
             assert_eq!(ConditionKind::of(&kind.new_condition()), kind);
         }
+    }
+
+    /// A set shows as hex bytes, three or more in a row as a range.
+    #[test]
+    fn a_byte_set_shows_as_hex_bytes_and_ranges() {
+        assert_eq!(byte_set_text(&[]), "");
+        assert_eq!(byte_set_text(&[0x7F, 0x1B, 0x1B]), "1B 7F");
+        assert_eq!(byte_set_text(&[0x0B, 0x0C]), "0B 0C");
+        assert_eq!(
+            byte_set_text(&CONTROL_EXCEPT_LINE_ENDS.bytes()),
+            "00-08 0B 0C 0E-1F 7F"
+        );
+        assert_eq!(byte_set_text(&ABOVE_7F.bytes()), "80-FF");
+    }
+
+    /// Typed text is hex bytes and ranges, split by spaces or commas; text
+    /// that is not changes nothing.
+    #[test]
+    fn typed_hex_bytes_and_ranges_make_the_set() {
+        assert_eq!(parse_byte_set("1b, 7F"), Some(vec![0x1B, 0x7F]));
+        assert_eq!(parse_byte_set(" 00-02 "), Some(vec![0x00, 0x01, 0x02]));
+        assert_eq!(parse_byte_set("7F 00 7F"), Some(vec![0x00, 0x7F]));
+        for refused in ["", "G0", "123", "1F-00", "00-", "-1F", "0x1B"] {
+            assert_eq!(parse_byte_set(refused), None, "{refused:?}");
+        }
+        for preset in [CONTROL_EXCEPT_LINE_ENDS, ALL_CONTROL, ABOVE_7F] {
+            let bytes = preset.bytes();
+            assert_eq!(parse_byte_set(&byte_set_text(&bytes)), Some(bytes));
+        }
+    }
+
+    #[test]
+    fn the_presets_hold_the_bytes_they_name() {
+        let control_except = CONTROL_EXCEPT_LINE_ENDS.bytes();
+        assert!(!control_except.contains(&b'\t'));
+        assert!(!control_except.contains(&b'\r'));
+        assert!(!control_except.contains(&b'\n'));
+        assert!(control_except.contains(&0x00) && control_except.contains(&0x7F));
+        assert_eq!(control_except.len(), 30);
+        assert_eq!(ALL_CONTROL.bytes().len(), 33);
+        assert_eq!(ABOVE_7F.bytes(), (0x80..=0xFF).collect::<Vec<u8>>());
     }
 
     /// A new rule is what the old Add timestamp mark button made, and is

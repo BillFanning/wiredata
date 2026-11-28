@@ -410,6 +410,10 @@ pub enum MatchCondition {
     /// §91.1): fires once when quiet and re-arms when data resumes. (The spec
     /// shows a `Duration`; config carries milliseconds, like `ReconnectPolicy`.)
     Idle { timeout_ms: u64 },
+    /// Any one byte from `bytes` (§50.2): fires once at the first byte of each
+    /// unbroken run of them, so a burst of line noise is one firing. Each
+    /// firing is a one-byte match. Order and repeats in `bytes` mean nothing.
+    AnyByte { bytes: Vec<u8> },
 }
 
 /// What a matched rule does (§50.2). Presentation/control only.

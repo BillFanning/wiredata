@@ -273,10 +273,15 @@ pub fn validate_channel(
     // Match Rules (§50.2, §165). A `BytePattern` with an empty pattern would match
     // everywhere (an empty needle is always found) — reject it.
     for rule in &channel.match_rules {
-        if let MatchCondition::BytePattern { pattern } = &rule.condition {
-            if pattern.is_empty() {
+        match &rule.condition {
+            MatchCondition::BytePattern { pattern } if pattern.is_empty() => {
                 errors.push(ChannelConfigError::EmptyMatchPattern);
             }
+            // An empty set can never fire: a rule that does nothing is a mistake.
+            MatchCondition::AnyByte { bytes } if bytes.is_empty() => {
+                errors.push(ChannelConfigError::EmptyByteSet);
+            }
+            _ => {}
         }
         for action in &rule.actions {
             if let MatchAction::Mark {
@@ -409,6 +414,8 @@ pub enum ChannelConfigError {
     DuplicateChannelName,
     #[error("a match rule's byte pattern is empty; it would match at every byte")]
     EmptyMatchPattern,
+    #[error("a match rule's byte set is empty; it would never match")]
+    EmptyByteSet,
     #[error("invalid NMEA ZDA Mark talker ID: {0}")]
     InvalidZdaTalkerId(crate::core::ZdaTalkerIdError),
     /// A setting outside its limit (ADR-048, §71).
@@ -494,6 +501,24 @@ mod tests {
         assert!(validate_channel(&channel, &DefaultConfig::default()).is_ok());
     }
 
+    /// An empty byte set can never fire, so a profile holding one is refused
+    /// as an empty pattern is.
+    #[test]
+    fn an_empty_byte_set_is_refused() {
+        let mut channel = templates::udp_template();
+        channel.match_rules = vec![MatchRule {
+            name: "nothing".to_string(),
+            condition: MatchCondition::AnyByte { bytes: vec![] },
+            actions: vec![MatchAction::Mark { timestamp: None }],
+            enabled: true,
+        }];
+        let errs = validate_channel(&channel, &DefaultConfig::default()).unwrap_err();
+        assert!(errs.contains(&ChannelConfigError::EmptyByteSet));
+
+        channel.match_rules[0].condition = MatchCondition::AnyByte { bytes: vec![0x1B] };
+        assert!(validate_channel(&channel, &DefaultConfig::default()).is_ok());
+    }
+
     #[test]
     fn match_rules_round_trip_through_toml() {
         let mut profile = Profile::new("rules");
@@ -534,6 +559,16 @@ mod tests {
                     MatchAction::PauseDisplay {},
                 ],
                 enabled: false,
+            },
+            MatchRule {
+                name: "noise".to_string(),
+                condition: MatchCondition::AnyByte {
+                    bytes: vec![0x00, 0x1B, 0x7F],
+                },
+                actions: vec![MatchAction::Notify {
+                    severity: crate::diagnostics::DiagnosticSeverity::Warning,
+                }],
+                enabled: true,
             },
         ];
         profile.channels = vec![channel];

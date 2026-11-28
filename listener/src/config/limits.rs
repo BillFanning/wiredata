@@ -23,6 +23,9 @@ pub const MAX_MATCH_RULES: usize = 64;
 pub const MAX_MATCH_ACTIONS: usize = 16;
 /// The text a timestamped Mark adds after its timestamp (§71).
 pub const MAX_MARK_SEPARATOR_BYTES: usize = 256;
+/// Entries in one rule's byte set: one per byte value. A set needs no more,
+/// and the bound keeps a hand-written profile from holding a huge list.
+pub const MAX_BYTE_SET_ENTRIES: usize = 256;
 /// The receive queue, in chunks of up to 64 KiB: 16 MiB at most (ADR-048).
 pub const MAX_INGEST_CHUNKS: usize = 256;
 /// Each recording's queue, in bytes (ADR-043, ADR-048).
@@ -52,6 +55,11 @@ pub enum LimitError {
     MatchRules { found: usize },
     #[error("match rule \"{rule}\" has {found} actions; the limit is {MAX_MATCH_ACTIONS}")]
     MatchActions { rule: String, found: usize },
+    #[error(
+        "match rule \"{rule}\" has {found} entries in its byte set; the limit is \
+         {MAX_BYTE_SET_ENTRIES}, one per byte value"
+    )]
+    MatchByteSet { rule: String, found: usize },
     #[error(
         "match rule \"{rule}\" has a {found}-byte Mark separator; the limit is \
          {MAX_MARK_SEPARATOR_BYTES} bytes"
@@ -106,13 +114,20 @@ pub fn match_rule_errors(rules: &[MatchRule]) -> Vec<LimitError> {
         errors.push(LimitError::MatchRules { found: rules.len() });
     }
     for rule in rules {
-        if let MatchCondition::BytePattern { pattern } = &rule.condition {
-            if pattern.len() > MAX_MATCH_PATTERN_BYTES {
+        match &rule.condition {
+            MatchCondition::BytePattern { pattern } if pattern.len() > MAX_MATCH_PATTERN_BYTES => {
                 errors.push(LimitError::MatchPattern {
                     rule: rule.name.clone(),
                     found: pattern.len(),
                 });
             }
+            MatchCondition::AnyByte { bytes } if bytes.len() > MAX_BYTE_SET_ENTRIES => {
+                errors.push(LimitError::MatchByteSet {
+                    rule: rule.name.clone(),
+                    found: bytes.len(),
+                });
+            }
+            _ => {}
         }
         if rule.actions.len() > MAX_MATCH_ACTIONS {
             errors.push(LimitError::MatchActions {
@@ -150,8 +165,10 @@ pub fn match_rule_errors(rules: &[MatchRule]) -> Vec<LimitError> {
 fn trigger_overlaps(rules: &[MatchRule]) -> Vec<LimitError> {
     let triggers = |control: RecordControl| {
         rules.iter().filter_map(move |rule| {
-            let MatchCondition::BytePattern { pattern } = &rule.condition else {
-                return None;
+            let trigger = match &rule.condition {
+                MatchCondition::BytePattern { pattern } => Trigger::Pattern(pattern),
+                MatchCondition::AnyByte { bytes } => Trigger::AnyByte(bytes),
+                MatchCondition::Idle { .. } => return None,
             };
             let targets: Vec<RecordTarget> = rule
                 .actions
@@ -161,7 +178,7 @@ fn trigger_overlaps(rules: &[MatchRule]) -> Vec<LimitError> {
                     _ => None,
                 })
                 .collect();
-            (!targets.is_empty()).then_some((rule, pattern.as_slice(), targets))
+            (!targets.is_empty()).then_some((rule, trigger, targets))
         })
     };
     let shares_a_recording = |a: RecordTarget, b: RecordTarget| {
@@ -186,21 +203,43 @@ fn trigger_overlaps(rules: &[MatchRule]) -> Vec<LimitError> {
     errors
 }
 
+/// What a Record rule matches, for the overlap check.
+#[derive(Clone, Copy)]
+enum Trigger<'a> {
+    Pattern(&'a [u8]),
+    /// One byte from the set: the first of each run of them.
+    AnyByte(&'a [u8]),
+}
+
 /// Whether some stream holds a match of `stop` that ends strictly inside a
 /// match of `begin`: after its first byte and before its last.
 ///
-/// Take the Stop ending `end` bytes into the Begin, for each `end` from 1 to
-/// one short of the Begin's length. The bytes the two would share are the
-/// last `min(end, stop.len())` of the Stop and the Begin's bytes just before
-/// `end`; the arrangement exists when those agree.
-fn stop_can_end_inside_begin(stop: &[u8], begin: &[u8]) -> bool {
-    if stop.is_empty() || begin.len() < 2 {
+/// For two patterns, take the Stop ending `end` bytes into the Begin, for each
+/// `end` from 1 to one short of the Begin's length. The bytes the two would
+/// share are the last `min(end, stop.len())` of the Stop and the Begin's bytes
+/// just before `end`; the arrangement exists when those agree.
+///
+/// A byte set's match is a single byte, so as a Begin it has no inside. As a
+/// Stop it fires on the first byte of a run of set bytes. If any byte of the
+/// Begin before its last is in the set, a run starts there or at an earlier
+/// set byte of the Begin, so a firing can end inside it.
+fn stop_can_end_inside_begin(stop: Trigger, begin: Trigger) -> bool {
+    let Trigger::Pattern(begin) = begin else {
+        return false;
+    };
+    if begin.len() < 2 {
         return false;
     }
-    (1..begin.len()).any(|end| {
-        let shared = end.min(stop.len());
-        begin[end - shared..end] == stop[stop.len() - shared..]
-    })
+    match stop {
+        Trigger::Pattern(stop) => {
+            !stop.is_empty()
+                && (1..begin.len()).any(|end| {
+                    let shared = end.min(stop.len());
+                    begin[end - shared..end] == stop[stop.len() - shared..]
+                })
+        }
+        Trigger::AnyByte(set) => begin[..begin.len() - 1].iter().any(|b| set.contains(b)),
+    }
 }
 
 /// A configured recording size cap under the minimum (§59). The runtime never
@@ -339,6 +378,75 @@ mod tests {
         assert!(!overlaps(b"ABCDE", b"BC", Raw, Raw));
         // Different recordings do not interact.
         assert!(!overlaps(b"BC", b"ABCDE", Raw, Display));
+    }
+
+    fn set_trigger(name: &str, bytes: &[u8], control: RecordControl) -> MatchRule {
+        MatchRule {
+            condition: MatchCondition::AnyByte {
+                bytes: bytes.to_vec(),
+            },
+            ..trigger(name, b"", RecordTarget::Raw, control)
+        }
+    }
+
+    fn set_overlaps(stop: MatchRule, begin: MatchRule) -> bool {
+        match_rule_errors(&[stop, begin])
+            .iter()
+            .any(|e| matches!(e, LimitError::TriggerOverlap { .. }))
+    }
+
+    /// A byte set's match is one byte: the first of a run of set bytes. As a
+    /// Stop it can end inside a Begin pattern when a set byte lies before the
+    /// pattern's last byte: some run then starts there or earlier inside it. As
+    /// a Begin it holds no byte for a Stop to end inside.
+    #[test]
+    fn a_byte_set_stop_overlaps_a_begin_that_holds_a_set_byte_before_its_last() {
+        use RecordControl::{Begin, Stop};
+        let begin = |p: &[u8]| trigger("begin", p, RecordTarget::Raw, Begin);
+        assert!(set_overlaps(
+            set_trigger("stop", &[0x02], Stop),
+            begin(b"\x02AB")
+        ));
+        assert!(set_overlaps(
+            set_trigger("stop", &[0x02], Stop),
+            begin(b"A\x02B")
+        ));
+        // A run that continues inside the pattern started inside it too.
+        assert!(set_overlaps(
+            set_trigger("stop", b"AB", Stop),
+            begin(b"ABC")
+        ));
+        // Not at the Begin's last byte: both complete on it, in one read.
+        assert!(!set_overlaps(
+            set_trigger("stop", &[0x02], Stop),
+            begin(b"AB\x02")
+        ));
+        assert!(!set_overlaps(
+            set_trigger("stop", b"Q", Stop),
+            begin(b"XYZ")
+        ));
+        // A byte-set Begin has nothing inside it.
+        assert!(!set_overlaps(
+            trigger("stop", b"\x02", RecordTarget::Raw, Stop),
+            set_trigger("begin", &[0x02], Begin)
+        ));
+    }
+
+    #[test]
+    fn a_byte_set_is_held_to_one_entry_per_byte_value() {
+        let mut rule = set_trigger("set", &[0; MAX_BYTE_SET_ENTRIES], RecordControl::Begin);
+        rule.actions.clear();
+        assert_eq!(match_rule_errors(std::slice::from_ref(&rule)), []);
+        rule.condition = MatchCondition::AnyByte {
+            bytes: vec![0; MAX_BYTE_SET_ENTRIES + 1],
+        };
+        assert_eq!(
+            match_rule_errors(std::slice::from_ref(&rule)),
+            [LimitError::MatchByteSet {
+                rule: "set".to_owned(),
+                found: MAX_BYTE_SET_ENTRIES + 1
+            }]
+        );
     }
 
     #[test]

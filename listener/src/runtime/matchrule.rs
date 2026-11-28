@@ -69,6 +69,11 @@ struct CompiledRule {
     /// found only because the cross-chunk carry was scanned (the pattern straddled
     /// a read boundary). The measurement of how often splitting matters (§50.2).
     boundary_saves: u64,
+    /// For an `AnyByte` rule: which byte values are in its set.
+    byte_set: Option<Box<[bool; 256]>>,
+    /// For an `AnyByte` rule: whether the last byte of the previous read was in
+    /// its set, so a run that crosses into this read does not fire again.
+    in_run: bool,
 }
 
 /// A rule that fired, with the actions the pipeline should apply. The actions
@@ -125,6 +130,11 @@ impl MatchRuleSet {
                 enabled: r.enabled,
                 idle_fired: false,
                 boundary_saves: 0,
+                byte_set: match &r.condition {
+                    MatchCondition::AnyByte { bytes } => Some(byte_table(bytes)),
+                    _ => None,
+                },
+                in_run: false,
             })
             .collect();
         let mut set = Self {
@@ -147,7 +157,7 @@ impl MatchRuleSet {
             .filter(|r| r.enabled)
             .filter_map(|r| match &r.condition {
                 MatchCondition::BytePattern { pattern } => Some(pattern.len()),
-                MatchCondition::Idle { .. } => None,
+                MatchCondition::Idle { .. } | MatchCondition::AnyByte { .. } => None,
             })
             .max()
             .unwrap_or(0);
@@ -176,7 +186,7 @@ impl MatchRuleSet {
                 MatchCondition::Idle { timeout_ms } => {
                     Some(Duration::from_millis(timeout_ms).saturating_sub(idle_for))
                 }
-                MatchCondition::BytePattern { .. } => None,
+                MatchCondition::BytePattern { .. } | MatchCondition::AnyByte { .. } => None,
             })
             .min()
     }
@@ -308,14 +318,16 @@ impl MatchRuleSet {
             .rules
             .iter()
             .enumerate()
+            .filter(|(_, rule)| rule.enabled)
             .filter_map(|(index, rule)| {
-                let MatchCondition::BytePattern { pattern } = &rule.condition else {
-                    return None;
+                let start = match (&rule.condition, &rule.byte_set) {
+                    (MatchCondition::BytePattern { pattern }, _) => find_subslice(chunk, pattern),
+                    (MatchCondition::AnyByte { .. }, Some(set)) => {
+                        next_run_start(chunk, 0, set, rule.in_run)
+                    }
+                    _ => None,
                 };
-                if !rule.enabled {
-                    return None;
-                }
-                find_subslice(chunk, pattern).map(|start| (start, index))
+                start.map(|start| (start, index))
             })
             .collect();
         // The minimum of (start, rule index): the earliest match, and among
@@ -327,19 +339,29 @@ impl MatchRuleSet {
             }
             let (match_start, index) = next[at];
             let rule = &self.rules[index];
-            let MatchCondition::BytePattern { pattern } = &rule.condition else {
-                break;
+            // A byte set's match is the one byte that starts its run; the
+            // next starts after a byte outside the set.
+            let (match_len, following) = match (&rule.condition, &rule.byte_set) {
+                (MatchCondition::BytePattern { pattern }, _) => (
+                    pattern.len(),
+                    find_subslice(&chunk[match_start + 1..], pattern)
+                        .map(|rel| match_start + 1 + rel),
+                ),
+                (MatchCondition::AnyByte { .. }, Some(set)) => {
+                    (1, next_run_start(chunk, match_start + 1, set, true))
+                }
+                _ => break,
             };
             fired.push(FiredRule {
                 id: rule.id,
                 name: Arc::clone(&rule.name),
                 actions: Arc::clone(&rule.actions),
                 match_offset: Some(chunk_offset + match_start as u64),
-                match_len: pattern.len(),
+                match_len,
                 boundary_split: false,
             });
-            match find_subslice(&chunk[match_start + 1..], pattern) {
-                Some(rel) => next[at].0 = match_start + 1 + rel,
+            match following {
+                Some(start) => next[at].0 = start,
                 None => {
                     next.swap_remove(at);
                 }
@@ -347,6 +369,15 @@ impl MatchRuleSet {
         }
         if cut_off {
             self.limit_hits += 1;
+        }
+        // Whether each byte set's run reaches the end of this read, so the
+        // next read does not fire for its continuation. From the read's last
+        // byte, so a read cut off at the limit keeps the stream's answer.
+        let last = chunk[chunk.len() - 1];
+        for rule in &mut self.rules {
+            if let Some(set) = &rule.byte_set {
+                rule.in_run = set[usize::from(last)];
+            }
         }
 
         // The next carry is the newest `max_pattern_len - 1` bytes of the stream:
@@ -415,6 +446,33 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// A byte set as a table indexed by byte value.
+fn byte_table(bytes: &[u8]) -> Box<[bool; 256]> {
+    let mut table = Box::new([false; 256]);
+    for &byte in bytes {
+        table[usize::from(byte)] = true;
+    }
+    table
+}
+
+/// Where the next run of set bytes starts, at or after `from`: a set byte
+/// whose previous byte is not in the set. `before_chunk` says whether the
+/// byte before `chunk[0]`, the last of the previous read, was in the set.
+fn next_run_start(
+    chunk: &[u8],
+    from: usize,
+    set: &[bool; 256],
+    before_chunk: bool,
+) -> Option<usize> {
+    (from..chunk.len()).find(|&i| {
+        let previous = match i {
+            0 => before_chunk,
+            _ => set[usize::from(chunk[i - 1])],
+        };
+        set[usize::from(chunk[i])] && !previous
+    })
 }
 
 #[cfg(test)]
@@ -821,5 +879,57 @@ mod tests {
         // A later read under the limit is whole again.
         assert_eq!(set.evaluate_stream(b"A", 65_507).len(), 64);
         assert_eq!(set.limit_hits(), 1);
+    }
+    fn any_byte(name: &str, bytes: &[u8]) -> MatchRule {
+        rule(
+            name,
+            MatchCondition::AnyByte {
+                bytes: bytes.to_vec(),
+            },
+        )
+    }
+
+    /// A byte set fires once at the first byte of each unbroken run of its
+    /// bytes, so a burst of line noise is one firing, each a one-byte match.
+    #[test]
+    fn a_byte_set_fires_once_at_the_start_of_each_run() {
+        let mut set = MatchRuleSet::compile(&[any_byte("ctl", &[0x00, 0x1B])]);
+        let fired = set.evaluate_stream(b"ab\x00\x00\x1Bcd\x1Be", 100);
+        let starts: Vec<_> = fired
+            .iter()
+            .map(|f| (f.match_offset, f.match_len, f.boundary_split))
+            .collect();
+        assert_eq!(starts, [(Some(102), 1, false), (Some(107), 1, false)]);
+    }
+
+    /// A run that crosses from one read into the next is still one run, so
+    /// the firings depend on the stream, not on how it was split into reads.
+    #[test]
+    fn a_run_across_two_reads_fires_once() {
+        let mut whole = MatchRuleSet::compile(&[any_byte("ctl", &[0x00])]);
+        let mut split = MatchRuleSet::compile(&[any_byte("ctl", &[0x00])]);
+        let offsets = |fired: Vec<FiredRule>| -> Vec<Option<u64>> {
+            fired.iter().map(|f| f.match_offset).collect()
+        };
+        let all = offsets(whole.evaluate_stream(b"a\x00\x00\x00b\x00", 0));
+        let mut parts = offsets(split.evaluate_stream(b"a\x00\x00", 0));
+        parts.extend(offsets(split.evaluate_stream(b"\x00b\x00", 3)));
+        assert_eq!(all, [Some(1), Some(5)]);
+        assert_eq!(parts, all);
+    }
+
+    #[test]
+    fn a_byte_set_fires_in_stream_order_with_patterns_and_obeys_enabled() {
+        let mut disabled = any_byte("off", b".");
+        disabled.enabled = false;
+        let mut set =
+            MatchRuleSet::compile(&[pattern("gga", b"GGA"), any_byte("ctl", &[0x02]), disabled]);
+        let ids = set.ids();
+        let fired = set.evaluate_stream(b"\x02GGA.\x02", 0);
+        let order: Vec<_> = fired.iter().map(|f| (f.match_offset, f.id)).collect();
+        assert_eq!(
+            order,
+            [(Some(0), ids[1]), (Some(1), ids[0]), (Some(5), ids[1])]
+        );
     }
 }

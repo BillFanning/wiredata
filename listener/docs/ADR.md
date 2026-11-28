@@ -2991,6 +2991,48 @@ ADR-012).
 **Consequences:** Every rule §50.2 describes can be made in the GUI, and the
 editor shows every rule a profile holds, so none is hidden or dropped.
 
+## ADR-084 — A rule can trigger on any byte from a set
+
+**Status:** Accepted 2026-11-27. Adds a condition to §50.2.
+
+**Context:** A pattern triggers on one exact sequence. Spotting bytes that
+should not be on a line, such as a stray control byte in an NMEA stream or a
+byte above 7F in ASCII text, took one rule per byte, each repeating its
+actions. The user asked for a way to trigger on non-printing bytes.
+
+**Decision:**
+
+- **`AnyByte { bytes }` fires on any one byte from its set.** It is a single
+  condition, not compound logic, so §50.2's deferral of AND, OR and sequence
+  triggers stands.
+- **It fires once at the first byte of each unbroken run of set bytes.** A
+  burst of line noise is one firing, not one per byte, so a Notify or a log
+  line does not flood. The match is that one byte, so its place does not
+  depend on how long the run turns out to be.
+- **Runs are tracked across reads.** Each rule keeps whether the last byte of
+  the previous read was in its set, so a run that crosses reads fires once and
+  the firings depend only on the stream (ADR-064's rule for where an action
+  takes effect).
+- **The GUI types a set as hex bytes and ranges**, such as
+  `00-08 0B 0C 0E-1F 7F`, with presets for the control bytes except tab, CR and
+  LF (what a new trigger starts with), all control bytes, and the bytes above
+  7F.
+
+**Boundary:** An empty set is refused, and a set lists at most 256 entries. As
+a Record Stop, a set is refused with a Begin pattern that holds a set byte
+before its last byte, since a run then starts inside the Begin; this extends
+ADR-064's overlap check, and a set as a Begin never conflicts.
+
+**Alternatives considered:**
+
+- **Fire on every byte of the set:** simplest, but a burst of noise would write
+  one diagnostic line per byte into the event log.
+- **An "any of" list of patterns:** more general, but it is compound OR logic,
+  and the user chose the byte set for this need.
+
+**Consequences:** One rule can watch a line for unexpected bytes. A profile
+written with this condition does not load in a build without it.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

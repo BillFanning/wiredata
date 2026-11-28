@@ -12,6 +12,13 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-27) — one editor for every match rule:
+
+- **§50.2 (ADR-083).** The GUI edits every rule under Configure triggers and
+  actions: its trigger, Pattern or Quiet for, and any of the five actions. It
+  replaces Timestamp marks in Configure display.
+- **§50.2.** A Notify line names the rule that fired.
+
 Revision note (2026-11-27) — the profile folder:
 
 - **§159 (ADR-082).** The GUI's profile dialogs, with no profile open, start in
