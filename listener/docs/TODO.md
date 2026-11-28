@@ -17,9 +17,6 @@ again. Remove an item when it is done: the commit says what changed.
   Windows logoff should stop it and finalize the recordings already running.
   An automated test covers the code path; this checks the real OS. Optional:
   do it when convenient.
-- [ ] **A general match-rule editor (§50.2).** `edit_mark_rules` edits only a
-  `BytePattern` rule with a `Mark` action (ADR-016). `Idle` conditions and the
-  `Record`, `Notify` and `PauseDisplay` actions arrive only through profiles.
 - [ ] **A glyph for a bare `Mark` (optional).** A `Mark` with no timestamp writes
   its `‹MARK …›` line into the `.disp`, but the live view draws nothing for it.
   Low priority: kept simple on purpose.

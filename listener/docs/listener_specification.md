@@ -1,15 +1,16 @@
-# Listener Specification v2.6.15
+# Listener Specification v2.6.16
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-27) — the profile folder:
+Revision note (2026-11-27) — one editor for every match rule:
 
-- **§159 (ADR-082).** The GUI's profile dialogs, with no profile open, start in
-  `listener/profiles` in the OS config folder, as talker's do, rather than
-  beside the program.
+- **§50.2 (ADR-083).** The GUI edits every rule under Configure triggers and
+  actions: its trigger, Pattern or Quiet for, and any of the five actions. It
+  replaces Timestamp marks in Configure display.
+- **§50.2.** A Notify line names the rule that fired.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -1005,7 +1006,9 @@ struct TimestampConfig { include_date: bool, include_millis: bool, include_timez
 - **Order and limit** (ADR-065). Matches fire in stream order of their first byte, and matches starting on the same byte fire in rule order. One read fires at most 4,096 matches (`MAX_FIRINGS_PER_READ`); later matches in that read do not fire and are not acted on. The first time this happens in a run a warning is recorded, and later ones are only counted. A read cut off this way is the one case where what a rule set does depends on read boundaries.
 - **Mark** correlates the match into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53). A bare `Mark` (`timestamp = None`) writes a `‹MARK …›` marker line into the view's `.disp`, placed just before its match, so it goes into whatever recording span the match's bytes go into (ADR-064). For a match that began in an earlier read, the line is placed at the start of the read where it completed. A bare `Mark` from an `Idle` rule is written between reads. When `timestamp` is `Some`, `Plain` splices the matched chunk's local arrival time, formatted per `TimestampConfig` (time-of-day always shown; date, milliseconds, and local UTC offset independently toggleable). `NmeaZda` instead splices `$<talker>ZDA,<hhmmss[.sss]>,<dd>,<mm>,<yyyy>,<zone-hours>,<zone-minutes>*XX`: time/date are UTC, and the zone fields are NMEA 0183's local zone: the hours and minutes added to local time to get UTC, which is the opposite sign to an ISO 8601 offset, so a zone east of Greenwich is negative and the minutes take the hours' sign (UTC−5 is `+05,00`; UTC+5:30 is `-05,-30`). An offset outside minute precision or the supported ±13:59 range leaves both zone fields empty. Standard two-character talker IDs and custom 1–32-character printable ASCII IDs are accepted; whitespace/control characters and NMEA framing characters `$ ! , *` are invalid. IDs longer than two produce explicitly custom ZDA-shaped output.
 - `Before` attaches immediately before the match's first byte; `After` attaches immediately after its final byte. A Mark anchored on any byte of a multi-byte character (UTF-8, or UTF-16 including a surrogate pair) is placed against the whole character: Before goes before it and After goes after it. Hex view places it at the byte. `separator` is appended after either style and may contain CR/LF. Rendering honors those controls and resets Raw wrap state, Rendered tab columns, and Hex continuation before subsequent data. The style-generated ZDA has no trailing CR/LF of its own. All styles are text insertions in every view mode, not on-screen byte-range styling (contrast removed `Highlight`, ADR-015).
-- **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes the display view (§50); reception and recording continue.
+- **Notify** raises a diagnostic event/warning (§92–94) that names its rule, as `match rule '<name>' fired on channel <channel>`, so two Notify rules on one Channel can be told apart; a rule with no name reads `match rule fired …`. **PauseDisplay** freezes the display view (§50); reception and recording continue.
+
+**Editing** (ADR-083). The GUI edits a Channel's rules under **Configure triggers and actions**, below Configure interface, whose header counts the rules. Each rule, a trigger and the actions it initiates, shows its on/off checkbox, its name, its trigger (Pattern, typed as text with `<XX>` for a control byte, or Quiet for, in seconds from 0.1 to 86,400) and its actions (Timestamp, Marker line, Record, Notify, Pause display), each with its own settings. Every condition and action above can be made there, so every rule a profile holds is shown and editable. A Timestamp on a Quiet for rule is flagged, since it has no pattern to sit beside. Changes take effect with Apply & Restart.
 
 **Configuration** (persists in profiles):
 

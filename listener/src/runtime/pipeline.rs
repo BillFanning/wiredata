@@ -98,6 +98,17 @@ fn render_annotations_for_chunk(
         .collect()
 }
 
+/// How a diagnostic names a match rule: by its configured name, in quotes, so
+/// two rules on one channel can be told apart; a rule with no name is just a
+/// match rule.
+fn rule_label(name: &str) -> String {
+    if name.is_empty() {
+        "match rule".to_owned()
+    } else {
+        format!("match rule '{name}'")
+    }
+}
+
 /// The marker line a bare `Mark` writes into the Display Recording (§50.2).
 /// Framed with explicit newlines: the recorder appends verbatim (ADR-018), so
 /// the marker provides its own line breaks.
@@ -1016,10 +1027,11 @@ impl ChannelPipeline {
                     .map(|n| format!(" at stream offset {n}"))
                     .unwrap_or_default();
                 self.diagnostics.record(Diagnostic::event(format!(
-                    "match rule {} on channel {} spanned a read-chunk boundary{at} \
+                    "{} on channel {} spanned a read-chunk boundary{at} \
                      (recovered by cross-chunk carry); later splits this run are \
                      counted, not listed",
-                    rule.id, self.channel_name
+                    rule_label(&rule.name),
+                    self.channel_name
                 )));
             }
             for action in rule.actions.iter() {
@@ -1030,7 +1042,11 @@ impl ChannelPipeline {
                             .unwrap_or_default();
                         self.diagnostics.record(Diagnostic::new(
                             *severity,
-                            format!("match rule fired on channel {}{where_}", self.channel_name),
+                            format!(
+                                "{} fired on channel {}{where_}",
+                                rule_label(&rule.name),
+                                self.channel_name
+                            ),
                         ));
                     }
                     // A timestamped Mark splices either compact local time or a ZDA
@@ -3671,6 +3687,39 @@ mod tests {
             }
         }
         assert!(saw_match);
+    }
+
+    /// A Notify line names the rule that fired, so two Notify rules on one
+    /// channel can be told apart. A rule with no name is still a match rule.
+    #[test]
+    fn a_notify_line_names_its_rule() {
+        let cid = ChannelId::new();
+        let notify = || {
+            vec![MatchAction::Notify {
+                severity: crate::diagnostics::DiagnosticSeverity::Warning,
+            }]
+        };
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_channel_name("GPS")
+            .with_match_rules(&[
+                byte_rule("fix lost", b"LOST", notify()),
+                byte_rule("", b"GGA", notify()),
+            ]);
+
+        p.ingest(bytes_chunk(cid, b"LOST,GGA"));
+
+        let lines: Vec<String> = p
+            .diagnostics()
+            .warnings()
+            .map(|w| w.message.clone())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "match rule 'fix lost' fired on channel GPS (stream offset 0)",
+                "match rule fired on channel GPS (stream offset 5)",
+            ]
+        );
     }
 
     /// ADR-077: where a UDP channel's arrival times come from differs by

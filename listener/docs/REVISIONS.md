@@ -12,6 +12,12 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-27) — the profile folder:
+
+- **§159 (ADR-082).** The GUI's profile dialogs, with no profile open, start in
+  `listener/profiles` in the OS config folder, as talker's do, rather than
+  beside the program.
+
 Revision note (2026-11-27) — reconnect is on by default:
 
 - **§9.1, §80.1, §162 (ADR-081).** A new Channel, and a profile that does not

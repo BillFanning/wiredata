@@ -1,37 +1,44 @@
-//! A minimal in-app editor for **Mark timestamp** rules (§50.2): create a
-//! `BytePattern → Mark(+timestamp)` rule so a matched pattern gets an inline local
-//! time or NMEA ZDA annotation in the display and Display Recording. This is deliberately small
-//! — it edits only single-pattern Mark rules; the general match-rule editor
-//! (Idle/Record/Notify/PauseDisplay, compound conditions) is a separate TODO. Rules
-//! it doesn't understand are listed read-only and never modified.
+//! The match rule editor (§50.2): every rule a channel has, each a condition
+//! and the actions it fires, edited on the channel's draft. Every condition and
+//! action the runtime supports can be made here, so the editor shows every rule
+//! a profile holds and drops none.
 //!
 //! Edits go straight into `ChannelConfig.match_rules`; because `config_needs_restart`
 //! counts `match_rules`, committing flips the lifecycle button to **Apply & Restart**,
 //! which rebuilds the pipeline with the new rules (no dedicated runtime command).
 
+use crate::config::limits::{MAX_MATCH_ACTIONS, MAX_MATCH_RULES};
 use crate::config::{
     ChannelConfig, MarkPosition, MarkTimestamp, MarkTimestampStyle, MatchAction, MatchCondition,
-    MatchRule,
+    MatchRule, RecordControl, RecordTarget,
 };
 use crate::core::{validate_zda_talker_id, TimestampConfig, MAX_ZDA_TALKER_ID_BYTES};
+use crate::diagnostics::DiagnosticSeverity;
 use crate::display::valid_utf8_prefix;
 use wiredata_ui::hover::{Hover, ShowHover};
 
-const MARKS_HOVER: Hover = Hover::new(
-    "Puts a timestamp next to a byte pattern each time that pattern is received.\n\n\
-     The timestamp is either the local arrival time or an NMEA ZDA sentence, placed \
-     before or after the pattern. It appears in the view and in the Display recording \
-     (.disp). It is never added to the Raw recording (.raw).\n\n\
-     The time is the arrival time of the block of data that held the pattern, so \
-     patterns in the same block get the same time. For a UDP channel on Linux it is \
-     the kernel's time, taken as the datagram reaches this computer; otherwise \
-     Listener takes it just after reading.\n\n\
-     Changes take effect with Apply & Restart, which restarts the channel.",
+const RULES_HOVER: Hover = Hover::new(
+    "A rule is a trigger and the actions it initiates.\n\n\
+     The trigger is a byte pattern arriving, or nothing arriving for a set time. When \
+     it happens, the rule does each of its actions in turn: put a timestamp or a \
+     marker line next to the pattern, begin or stop a recording, add a line to the \
+     Diagnostics, or pause the view.\n\n\
+     Rules never change the received data or the Raw recording. Changes take effect \
+     with Apply & Restart, which restarts the channel.",
 );
 const RULE_ENABLED_HOVER: Hover = Hover::new(
-    "Turns this timestamp mark on or off.\n\n\
-     When unchecked, the rule stays in the list but adds no timestamps. The change \
-     takes effect with Apply & Restart.",
+    "Turns this rule on or off.\n\n\
+     When unchecked, the rule stays in the list but does nothing. The change takes \
+     effect with Apply & Restart.",
+);
+const RULE_NAME_HOVER: Hover =
+    Hover::new("A name to tell this rule apart from the others. It is saved with the profile.");
+const CONDITION_HOVER: Hover = Hover::new(
+    "The trigger: what makes the rule act.\n\n\
+     Pattern acts each time the bytes typed beside it arrive, even when they are \
+     split across two reads.\n\n\
+     Quiet for acts once when nothing has arrived for the time beside it, and again \
+     after data has arrived and stopped again.",
 );
 const PATTERN_HOVER: Hover = Hover::new(
     "The bytes to look for in the received data.\n\n\
@@ -39,7 +46,31 @@ const PATTERN_HOVER: Hover = Hover::new(
      brackets: GGA<0D><0A> is GGA followed by a carriage return and a line feed. \
      This is the same notation the view shows when View is Raw and ctrl-chars is \
      <0A>.\n\n\
-     A rule with an empty pattern never adds a timestamp.",
+     A rule with an empty pattern never acts.",
+);
+const IDLE_HOVER: Hover = Hover::new(
+    "How long the channel must receive nothing before the rule acts, in seconds.\n\n\
+     Type a number from 0.1 to 86400, such as 5 or 1.5, or use − and + to change it \
+     by 1 s. On Windows the rule can act up to about 16 ms after this time.",
+);
+const ACTION_HOVER: Hover = Hover::new(
+    "What the rule does when its trigger happens.\n\n\
+     Timestamp puts the arrival time, or an NMEA ZDA sentence, next to the pattern \
+     in the view and the Display recording.\n\n\
+     Marker line writes a ‹MARK› line into the Display recording. The view does not \
+     show it.\n\n\
+     Record begins or stops the Raw recording, the Display recording or both, \
+     using the settings under Record Raw Data and Record Display. The pattern \
+     itself is recorded either way.\n\n\
+     Notify adds a line to the channel's Diagnostics and to listener's event log \
+     file.\n\n\
+     Pause display freezes the view. Reception and recording carry on, and Resume \
+     brings the view back.",
+);
+const TIMESTAMP_NEEDS_PATTERN_HOVER: Hover = Hover::new(
+    "A timestamp goes next to the pattern that was received. A Quiet for rule has no \
+     pattern to put it beside, so this action adds nothing. Use Marker line or \
+     Notify to see when the channel went quiet.",
 );
 const TALKER_HOVER: Hover = Hover::new(
     "The talker ID at the start of the ZDA sentence, such as GP in $GPZDA.\n\n\
@@ -54,108 +85,451 @@ const SEPARATOR_HOVER: Hover = Hover::new(
      nothing.",
 );
 
-/// Is this rule one the Mark editor owns — a single `BytePattern` condition whose only
-/// action is a timestamped `Mark`? Other rules (Idle, Record, bare Mark, multi-action)
-/// are shown read-only so the editor never silently drops profile-authored rules.
-fn is_mark_timestamp_rule(rule: &MatchRule) -> bool {
-    matches!(rule.condition, MatchCondition::BytePattern { .. })
-        && matches!(
-            rule.actions.as_slice(),
-            [MatchAction::Mark { timestamp: Some(_) }]
-        )
+/// The two kinds of condition, as the editor offers them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConditionKind {
+    Pattern,
+    Quiet,
 }
 
-/// Edit the channel's inline **Mark timestamp** rules (§50.2). Lists the editor-owned
-/// rules with pattern / position / format toggles and a delete button, plus an
-/// add-row. Returns nothing — edits land in `config.match_rules`; the caller's
-/// Apply & Restart path picks them up.
-pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
-    ui.label("Timestamp marks").on_hover(&MARKS_HOVER);
-
-    // Edit existing editor-owned rules in place; collect indices to delete afterwards
-    // so we don't mutate the vec while iterating it.
-    let mut delete: Option<usize> = None;
-    for (i, rule) in config.match_rules.iter_mut().enumerate() {
-        if !is_mark_timestamp_rule(rule) {
-            continue;
+impl ConditionKind {
+    fn of(condition: &MatchCondition) -> Self {
+        match condition {
+            MatchCondition::BytePattern { .. } => Self::Pattern,
+            MatchCondition::Idle { .. } => Self::Quiet,
         }
-        // Both matches! guards above guarantee these destructures succeed.
-        let MatchCondition::BytePattern { pattern } = &mut rule.condition else {
-            continue;
-        };
-        let [MatchAction::Mark {
-            timestamp: Some(ts),
-        }] = rule.actions.as_mut_slice()
-        else {
-            continue;
-        };
-        ui.horizontal(|ui| {
-            // The enabled flag is honored when the channel (re)starts, so the
-            // checkbox edits it like any other rule field — committed via
-            // Apply & Restart. (A *live* toggle without a restart is the
-            // deferred ADR-012 seam; this is not that.)
-            ui.checkbox(&mut rule.enabled, "")
-                .on_hover(&RULE_ENABLED_HOVER);
-            mark_pattern_field(ui, pattern);
-            mark_position_selector(ui, &mut ts.position);
-            mark_style_selector(ui, &mut ts.style);
-            if ui
-                .button("🗑")
-                .on_hover_text("Delete this mark rule")
-                .clicked()
-            {
-                delete = Some(i);
-            }
-        });
-        ui.indent(("mark_options", i), |ui| {
-            ui.horizontal(|ui| {
-                match &mut ts.style {
-                    MarkTimestampStyle::Plain {} => mark_format_toggles(ui, &mut ts.format),
-                    MarkTimestampStyle::NmeaZda { talker } => {
-                        mark_zda_talker_field(ui, talker);
-                        ui.checkbox(&mut ts.format.include_millis, "ms")
-                            .on_hover_text(
-                                "Adds milliseconds to the UTC time field of the ZDA sentence.",
-                            );
-                    }
-                }
-                mark_separator_field(ui, &mut ts.separator);
-            });
-        });
-    }
-    if let Some(i) = delete {
-        config.match_rules.remove(i);
     }
 
-    // Add-row: an "Add" button appends a new Before/HH:MM:SS mark on an empty pattern.
-    // The empty pattern is invalid (validation rejects it) until the user types one, so
-    // it can't fire; the user fills it in on the row above after adding.
-    if ui
-        .button("+ Add timestamp mark")
-        .on_hover_text("Adds a new rule that puts a timestamp next to a byte pattern.")
-        .clicked()
-    {
-        let n = config
-            .match_rules
-            .iter()
-            .filter(|r| is_mark_timestamp_rule(r))
-            .count();
-        config.match_rules.push(MatchRule {
-            name: format!("mark {}", n + 1),
-            condition: MatchCondition::BytePattern {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pattern => "Pattern",
+            Self::Quiet => "Quiet for",
+        }
+    }
+
+    /// A new condition of this kind: an empty pattern, to be typed, or 5 s
+    /// of quiet.
+    fn new_condition(self) -> MatchCondition {
+        match self {
+            Self::Pattern => MatchCondition::BytePattern {
                 pattern: Vec::new(),
             },
-            actions: vec![MatchAction::Mark {
+            Self::Quiet => MatchCondition::Idle {
+                timeout_ms: DEFAULT_QUIET_MS,
+            },
+        }
+    }
+}
+
+/// The quiet time a new Quiet for condition starts with.
+const DEFAULT_QUIET_MS: u64 = 5_000;
+/// The shortest and longest quiet time the field accepts: a tenth of a
+/// second, and a day.
+const QUIET_MIN_MS: u64 = 100;
+const QUIET_MAX_MS: u64 = 86_400_000;
+/// How far each − and + button moves the quiet time.
+const QUIET_STEP_MS: u64 = 1_000;
+
+/// The action kinds, as the editor offers them. A `Mark` is two of them: with a
+/// timestamp, and without one (a marker line).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActionKind {
+    Timestamp,
+    MarkerLine,
+    Record,
+    Notify,
+    PauseDisplay,
+}
+
+impl ActionKind {
+    const ALL: [Self; 5] = [
+        Self::Timestamp,
+        Self::MarkerLine,
+        Self::Record,
+        Self::Notify,
+        Self::PauseDisplay,
+    ];
+
+    fn of(action: &MatchAction) -> Self {
+        match action {
+            MatchAction::Mark { timestamp: Some(_) } => Self::Timestamp,
+            MatchAction::Mark { timestamp: None } => Self::MarkerLine,
+            MatchAction::Record { .. } => Self::Record,
+            MatchAction::Notify { .. } => Self::Notify,
+            MatchAction::PauseDisplay {} => Self::PauseDisplay,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Timestamp => "Timestamp",
+            Self::MarkerLine => "Marker line",
+            Self::Record => "Record",
+            Self::Notify => "Notify",
+            Self::PauseDisplay => "Pause display",
+        }
+    }
+
+    /// A new action of this kind, with the settings it starts with.
+    fn new_action(self) -> MatchAction {
+        match self {
+            Self::Timestamp => MatchAction::Mark {
                 timestamp: Some(MarkTimestamp {
                     position: MarkPosition::Before,
                     style: Default::default(),
                     format: TimestampConfig::default(),
                     separator: String::new(),
                 }),
-            }],
-            enabled: true,
+            },
+            Self::MarkerLine => MatchAction::Mark { timestamp: None },
+            Self::Record => MatchAction::Record {
+                target: RecordTarget::Raw,
+                control: RecordControl::Begin,
+            },
+            Self::Notify => MatchAction::Notify {
+                severity: DiagnosticSeverity::Warning,
+            },
+            Self::PauseDisplay => MatchAction::PauseDisplay {},
+        }
+    }
+}
+
+/// A new rule: an empty pattern, to be typed, with one timestamp action,
+/// named after its place in the list.
+fn new_rule(existing: usize) -> MatchRule {
+    MatchRule {
+        name: format!("rule {}", existing + 1),
+        condition: ConditionKind::Pattern.new_condition(),
+        actions: vec![ActionKind::Timestamp.new_action()],
+        enabled: true,
+    }
+}
+
+/// The quiet time in seconds, as the field shows it: no trailing zeros.
+fn quiet_text(timeout_ms: u64) -> String {
+    let text = format!("{}.{:03}", timeout_ms / 1000, timeout_ms % 1000);
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// Typed seconds as milliseconds, as the profile keeps them, or `None` for
+/// text that is not a number in the field's range.
+fn parse_quiet(text: &str) -> Option<u64> {
+    let secs: f64 = text.trim().parse().ok()?;
+    if !secs.is_finite() {
+        return None;
+    }
+    let ms = (secs * 1000.0).round();
+    (QUIET_MIN_MS as f64..=QUIET_MAX_MS as f64)
+        .contains(&ms)
+        .then_some(ms as u64)
+}
+
+/// The quiet time one button press later, kept within the field's range.
+fn step_quiet(timeout_ms: u64, longer: bool) -> u64 {
+    let stepped = if longer {
+        timeout_ms.saturating_add(QUIET_STEP_MS)
+    } else {
+        timeout_ms.saturating_sub(QUIET_STEP_MS)
+    };
+    stepped.clamp(QUIET_MIN_MS, QUIET_MAX_MS)
+}
+
+/// Whether this action adds nothing on this condition: a timestamp on a Quiet
+/// for rule has no pattern to sit beside.
+fn timestamp_without_pattern(condition: &MatchCondition, action: &MatchAction) -> bool {
+    matches!(condition, MatchCondition::Idle { .. })
+        && ActionKind::of(action) == ActionKind::Timestamp
+}
+
+/// Edit the channel's match rules (§50.2): one group per rule, then a button
+/// that adds one. Edits land in `config.match_rules`; the caller's Apply &
+/// Restart path picks them up.
+pub(crate) fn edit_match_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
+    ui.label("A rule is a trigger and the actions it initiates.")
+        .on_hover(&RULES_HOVER);
+    let mut delete = None;
+    for (i, rule) in config.match_rules.iter_mut().enumerate() {
+        ui.push_id(("rule", i), |ui| {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                if edit_rule(ui, rule) {
+                    delete = Some(i);
+                }
+            });
         });
     }
+    if let Some(i) = delete {
+        config.match_rules.remove(i);
+    }
+    let room = config.match_rules.len() < MAX_MATCH_RULES;
+    let add = ui
+        .add_enabled(room, egui::Button::new("+ Add rule"))
+        .on_hover_text(
+            "Adds a rule that puts a timestamp next to a pattern. Change what it does below it.",
+        )
+        .on_disabled_hover_text(format!(
+            "A channel can have at most {MAX_MATCH_RULES} rules."
+        ));
+    if add.clicked() {
+        config.match_rules.push(new_rule(config.match_rules.len()));
+    }
+}
+
+/// One rule's group. Returns whether its delete button was clicked.
+fn edit_rule(ui: &mut egui::Ui, rule: &mut MatchRule) -> bool {
+    let mut delete = false;
+    ui.horizontal_wrapped(|ui| {
+        // The enabled flag is honored when the channel (re)starts, so the
+        // checkbox edits it like any other rule field, committed via
+        // Apply & Restart. (A *live* toggle without a restart is the
+        // deferred ADR-012 seam; this is not that.)
+        ui.checkbox(&mut rule.enabled, "")
+            .on_hover(&RULE_ENABLED_HOVER);
+        ui.add(egui::TextEdit::singleline(&mut rule.name).desired_width(140.0))
+            .on_hover(&RULE_NAME_HOVER);
+        if ui.button("🗑").on_hover_text("Deletes this rule.").clicked() {
+            delete = true;
+        }
+    });
+    edit_condition(ui, &mut rule.condition);
+    edit_actions(ui, &rule.condition, &mut rule.actions);
+    delete
+}
+
+fn edit_condition(ui: &mut egui::Ui, condition: &mut MatchCondition) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("When");
+        let current = ConditionKind::of(condition);
+        let mut kind = current;
+        egui::ComboBox::from_id_salt("condition")
+            .selected_text(kind.label())
+            .width(90.0)
+            .show_ui(ui, |ui| {
+                for option in [ConditionKind::Pattern, ConditionKind::Quiet] {
+                    ui.selectable_value(&mut kind, option, option.label());
+                }
+            })
+            .response
+            .on_hover(&CONDITION_HOVER);
+        if kind != current {
+            *condition = kind.new_condition();
+        }
+        match condition {
+            MatchCondition::BytePattern { pattern } => pattern_field(ui, pattern),
+            MatchCondition::Idle { timeout_ms } => quiet_field(ui, timeout_ms),
+        }
+    });
+}
+
+/// The quiet time as `[−] [seconds] [+] s`, like the port field: a box to type
+/// into and buttons that step by a second, with no drag. While the box has
+/// focus it keeps the text as typed, so "1." can become "1.5"; text out of
+/// range is flagged and changes nothing, and the box shows the kept time again
+/// once it loses focus.
+fn quiet_field(ui: &mut egui::Ui, timeout_ms: &mut u64) {
+    ui.horizontal(|ui| {
+        if ui
+            .small_button("\u{2212}")
+            .on_hover_text("Makes the quiet time 1 s shorter.")
+            .clicked()
+        {
+            *timeout_ms = step_quiet(*timeout_ms, false);
+        }
+        let typed = ui.make_persistent_id("quiet_typed");
+        let mut text = ui
+            .data(|d| d.get_temp::<String>(typed))
+            .unwrap_or_else(|| quiet_text(*timeout_ms));
+        let response = ui
+            .add(
+                egui::TextEdit::singleline(&mut text)
+                    .id_salt("quiet_secs")
+                    .desired_width(56.0),
+            )
+            .on_hover(&IDLE_HOVER);
+        if response.changed() {
+            if let Some(ms) = parse_quiet(&text) {
+                *timeout_ms = ms;
+            }
+        }
+        let refused = response.has_focus() && parse_quiet(&text).is_none();
+        if response.has_focus() {
+            ui.data_mut(|d| d.insert_temp(typed, text));
+        } else {
+            ui.data_mut(|d| d.remove::<String>(typed));
+        }
+        if ui
+            .small_button("+")
+            .on_hover_text("Makes the quiet time 1 s longer.")
+            .clicked()
+        {
+            *timeout_ms = step_quiet(*timeout_ms, true);
+        }
+        ui.label("s");
+        if refused {
+            ui.label(egui::RichText::new("⚠ 0.1 to 86400 s").weak());
+        }
+    });
+}
+
+fn edit_actions(ui: &mut egui::Ui, condition: &MatchCondition, actions: &mut Vec<MatchAction>) {
+    let mut remove = None;
+    for (i, action) in actions.iter_mut().enumerate() {
+        ui.push_id(("action", i), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(if i == 0 { "Then" } else { "and" });
+                action_kind_selector(ui, action);
+                edit_action_settings(ui, action);
+                if ui
+                    .button("🗑")
+                    .on_hover_text("Removes this action from the rule.")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+            });
+            if let MatchAction::Mark {
+                timestamp: Some(timestamp),
+            } = action
+            {
+                ui.indent("timestamp_options", |ui| {
+                    ui.horizontal_wrapped(|ui| edit_timestamp_options(ui, timestamp));
+                });
+            }
+            if timestamp_without_pattern(condition, action) {
+                ui.indent("timestamp_note", |ui| {
+                    ui.label(egui::RichText::new("⚠ adds nothing on a Quiet for rule").weak())
+                        .on_hover(&TIMESTAMP_NEEDS_PATTERN_HOVER);
+                });
+            }
+        });
+    }
+    if let Some(i) = remove {
+        actions.remove(i);
+    }
+    ui.horizontal_wrapped(|ui| {
+        if actions.is_empty() {
+            ui.label(egui::RichText::new("⚠ no actions: this rule does nothing").weak());
+        }
+        let room = actions.len() < MAX_MATCH_ACTIONS;
+        let add = ui
+            .add_enabled(room, egui::Button::new("+ Add action"))
+            .on_hover_text("Adds another action to this rule. It starts as a Notify.")
+            .on_disabled_hover_text(format!(
+                "A rule can have at most {MAX_MATCH_ACTIONS} actions."
+            ));
+        if add.clicked() {
+            actions.push(ActionKind::Notify.new_action());
+        }
+    });
+}
+
+fn action_kind_selector(ui: &mut egui::Ui, action: &mut MatchAction) {
+    let current = ActionKind::of(action);
+    let mut kind = current;
+    egui::ComboBox::from_id_salt("action_kind")
+        .selected_text(kind.label())
+        .width(110.0)
+        .show_ui(ui, |ui| {
+            for option in ActionKind::ALL {
+                ui.selectable_value(&mut kind, option, option.label());
+            }
+        })
+        .response
+        .on_hover(&ACTION_HOVER);
+    if kind != current {
+        *action = kind.new_action();
+    }
+}
+
+/// The settings on the action's own row; a timestamp's longer settings go on
+/// the row under it.
+fn edit_action_settings(ui: &mut egui::Ui, action: &mut MatchAction) {
+    match action {
+        MatchAction::Mark {
+            timestamp: Some(timestamp),
+        } => {
+            mark_position_selector(ui, &mut timestamp.position);
+            mark_style_selector(ui, &mut timestamp.style);
+        }
+        MatchAction::Mark { timestamp: None } | MatchAction::PauseDisplay {} => {}
+        MatchAction::Record { target, control } => {
+            egui::ComboBox::from_id_salt("record_control")
+                .selected_text(match control {
+                    RecordControl::Begin => "begin",
+                    RecordControl::Stop => "stop",
+                })
+                .width(64.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(control, RecordControl::Begin, "begin");
+                    ui.selectable_value(control, RecordControl::Stop, "stop");
+                })
+                .response
+                .on_hover_text(
+                    "Begin starts the recording at the pattern's first byte. Stop ends it \
+                     just after the pattern's last byte. Either way the pattern is recorded.",
+                );
+            egui::ComboBox::from_id_salt("record_target")
+                .selected_text(record_target_label(*target))
+                .width(80.0)
+                .show_ui(ui, |ui| {
+                    for option in [RecordTarget::Raw, RecordTarget::Display, RecordTarget::Both] {
+                        ui.selectable_value(target, option, record_target_label(option));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Which recording to begin or stop: the Raw recording (.raw), the \
+                     Display recording (.disp), or both.",
+                );
+        }
+        MatchAction::Notify { severity } => {
+            egui::ComboBox::from_id_salt("notify_severity")
+                .selected_text(severity_label(*severity))
+                .width(80.0)
+                .show_ui(ui, |ui| {
+                    for option in [
+                        DiagnosticSeverity::Event,
+                        DiagnosticSeverity::Warning,
+                        DiagnosticSeverity::Error,
+                    ] {
+                        ui.selectable_value(severity, option, severity_label(option));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "The level of the line added to the channel's Diagnostics, named as \
+                     its Info, Warn and Error filters name them.",
+                );
+        }
+    }
+}
+
+fn record_target_label(target: RecordTarget) -> &'static str {
+    match target {
+        RecordTarget::Raw => "Raw",
+        RecordTarget::Display => "Display",
+        RecordTarget::Both => "both",
+    }
+}
+
+fn severity_label(severity: DiagnosticSeverity) -> &'static str {
+    match severity {
+        DiagnosticSeverity::Event => "Info",
+        DiagnosticSeverity::Warning => "Warn",
+        DiagnosticSeverity::Error => "Error",
+    }
+}
+
+/// A timestamp's format settings and separator, on the row under its action.
+fn edit_timestamp_options(ui: &mut egui::Ui, timestamp: &mut MarkTimestamp) {
+    match &mut timestamp.style {
+        MarkTimestampStyle::Plain {} => mark_format_toggles(ui, &mut timestamp.format),
+        MarkTimestampStyle::NmeaZda { talker } => {
+            mark_zda_talker_field(ui, talker);
+            ui.checkbox(&mut timestamp.format.include_millis, "ms")
+                .on_hover_text("Adds milliseconds to the UTC time field of the ZDA sentence.");
+        }
+    }
+    mark_separator_field(ui, &mut timestamp.separator);
 }
 
 /// Parse editor text into bytes, interpreting `<XX>` (exactly two hex digits —
@@ -219,7 +593,7 @@ fn format_escaped_bytes(bytes: &[u8]) -> String {
 /// notation — so a CRLF-anchored pattern is typed as e.g. `GGA<0D><0A>`. A
 /// non-UTF-8 pattern from a profile round-trips through edits instead of being
 /// lossily replaced.
-fn mark_pattern_field(ui: &mut egui::Ui, pattern: &mut Vec<u8>) {
+fn pattern_field(ui: &mut egui::Ui, pattern: &mut Vec<u8>) {
     let mut text = format_escaped_bytes(pattern);
     let resp = ui
         .add(
@@ -320,34 +694,92 @@ fn mark_format_toggles(ui: &mut egui::Ui, format: &mut TimestampConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::templates;
 
     #[test]
-    fn recognizes_only_single_timestamped_mark_rules() {
-        let mut rule = MatchRule {
-            name: "m".into(),
-            condition: MatchCondition::BytePattern {
-                pattern: b"$".to_vec(),
-            },
-            actions: vec![MatchAction::Mark {
-                timestamp: Some(MarkTimestamp {
-                    position: MarkPosition::Before,
-                    style: Default::default(),
-                    format: TimestampConfig::default(),
-                    separator: String::new(),
-                }),
-            }],
-            enabled: true,
-        };
-        assert!(is_mark_timestamp_rule(&rule));
+    fn every_action_kind_makes_an_action_of_that_kind() {
+        for kind in ActionKind::ALL {
+            assert_eq!(ActionKind::of(&kind.new_action()), kind, "{kind:?}");
+        }
+    }
 
-        // A bare Mark (no timestamp) is not owned by this editor.
-        rule.actions = vec![MatchAction::Mark { timestamp: None }];
-        assert!(!is_mark_timestamp_rule(&rule));
+    #[test]
+    fn a_new_condition_is_an_empty_pattern_or_five_seconds_of_quiet() {
+        assert_eq!(
+            ConditionKind::Pattern.new_condition(),
+            MatchCondition::BytePattern {
+                pattern: Vec::new()
+            }
+        );
+        assert_eq!(
+            ConditionKind::Quiet.new_condition(),
+            MatchCondition::Idle { timeout_ms: 5_000 }
+        );
+        for kind in [ConditionKind::Pattern, ConditionKind::Quiet] {
+            assert_eq!(ConditionKind::of(&kind.new_condition()), kind);
+        }
+    }
 
-        // An Idle condition is not owned either.
-        rule.condition = MatchCondition::Idle { timeout_ms: 1000 };
-        assert!(!is_mark_timestamp_rule(&rule));
+    /// A new rule is what the old Add timestamp mark button made, and is
+    /// named after its place in the list.
+    #[test]
+    fn a_new_rule_timestamps_a_pattern_still_to_be_typed() {
+        let rule = new_rule(2);
+        assert_eq!(rule.name, "rule 3");
+        assert!(rule.enabled);
+        assert_eq!(ConditionKind::of(&rule.condition), ConditionKind::Pattern);
+        assert_eq!(
+            rule.actions.iter().map(ActionKind::of).collect::<Vec<_>>(),
+            [ActionKind::Timestamp]
+        );
+    }
+
+    #[test]
+    fn the_quiet_time_shows_in_seconds_without_trailing_zeros() {
+        assert_eq!(quiet_text(5_000), "5");
+        assert_eq!(quiet_text(1_500), "1.5");
+        assert_eq!(quiet_text(100), "0.1");
+        assert_eq!(quiet_text(123), "0.123");
+    }
+
+    /// Typed seconds are kept as milliseconds; text that is not a number in
+    /// the field's range changes nothing.
+    #[test]
+    fn typed_seconds_in_range_set_the_quiet_time() {
+        assert_eq!(parse_quiet(" 2 "), Some(2_000));
+        assert_eq!(parse_quiet("1.5"), Some(1_500));
+        assert_eq!(parse_quiet("0.1234"), Some(123));
+        assert_eq!(parse_quiet("86400"), Some(86_400_000));
+        for refused in ["", "abc", "0", "0.05", "86401", "-1", "NaN", "inf"] {
+            assert_eq!(parse_quiet(refused), None, "{refused:?}");
+        }
+        for ms in [100, 1_500, 5_000, 86_400_000] {
+            assert_eq!(parse_quiet(&quiet_text(ms)), Some(ms));
+        }
+    }
+
+    /// The buttons step by a second and stop at the ends of the range.
+    #[test]
+    fn the_buttons_step_the_quiet_time_by_a_second_within_its_range() {
+        assert_eq!(step_quiet(5_000, true), 6_000);
+        assert_eq!(step_quiet(5_000, false), 4_000);
+        assert_eq!(step_quiet(500, false), 100);
+        assert_eq!(step_quiet(100, false), 100);
+        assert_eq!(step_quiet(86_400_000, true), 86_400_000);
+    }
+
+    #[test]
+    fn only_a_timestamp_on_a_quiet_rule_adds_nothing() {
+        let quiet = ConditionKind::Quiet.new_condition();
+        let pattern = ConditionKind::Pattern.new_condition();
+        for kind in ActionKind::ALL {
+            let action = kind.new_action();
+            assert_eq!(
+                timestamp_without_pattern(&quiet, &action),
+                kind == ActionKind::Timestamp,
+                "{kind:?}"
+            );
+            assert!(!timestamp_without_pattern(&pattern, &action));
+        }
     }
 
     #[test]
@@ -383,12 +815,5 @@ mod tests {
                 "round trip failed for {bytes:?}"
             );
         }
-    }
-
-    #[test]
-    fn ignores_channels_with_unrelated_rules() {
-        // A channel template has no match rules; the editor treats it as empty.
-        let channel = templates::udp_template();
-        assert!(!channel.match_rules.iter().any(is_mark_timestamp_rule));
     }
 }

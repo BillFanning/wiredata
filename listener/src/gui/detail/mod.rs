@@ -14,10 +14,10 @@ use crate::transport::serial::open_error_prefix;
 use super::bridge::{self, UiCommand};
 use super::state::{ChannelStatus, ReconnectPrompt};
 use super::widgets::{
-    config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
-    paint_glyph, recording_facts, recording_glyph_size, recording_indicator, rename_problem,
-    rts_by_flow, start_button, status_color, status_glyph, status_words, stop_enabled, LineClick,
-    Refresh,
+    config_needs_restart, edit_display_recording, edit_interface, edit_match_rules,
+    edit_raw_recording, human_bytes, paint_glyph, recording_facts, recording_glyph_size,
+    recording_indicator, rename_problem, rts_by_flow, start_button, status_color, status_glyph,
+    status_words, stop_enabled, LineClick, Refresh,
 };
 use super::ListenerApp;
 use wiredata_ui::fonts::bold;
@@ -301,9 +301,25 @@ impl ListenerApp {
                     // The reconnect choice inside applies live (§9.1); see
                     // `persist_reconnect` below.
                     // Display (.disp) recording lives in the recording block on the
-                    // right, under Record Raw Data (ADR-013); the inline Mark
-                    // timestamp editor lives under Configure display (it shapes what
-                    // the view and .disp show).
+                    // right, under Record Raw Data (ADR-013).
+                });
+            // Match rules (§50.2) edit the same draft and commit with the same
+            // Apply & Restart, so they sit under the interface rather than under
+            // Configure display, whose settings apply at once. The header counts
+            // the rules, so a collapsed section still says the channel has some.
+            let rules = config.match_rules.len();
+            let title = if rules == 0 {
+                "Configure triggers and actions".to_owned()
+            } else {
+                format!("Configure triggers and actions ({rules})")
+            };
+            egui::CollapsingHeader::new(title)
+                // A stable id, as for Configure interface, so the count in the
+                // title does not make it a new header.
+                .id_salt("configure_rules")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.push_id("edit_rules", |ui| edit_match_rules(ui, config));
                 });
         }
         self.force_config_open = false;

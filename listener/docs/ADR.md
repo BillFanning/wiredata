@@ -538,7 +538,7 @@ A second, parallel command enum on top of a working method API + a GUI transport
 - The renderer gains `render_text_annotated`, and the streaming
   `StreamRenderer::render_chunk` takes annotations; `RenderedOutput.timestamp` is retained (it drives time-based Display rotation, §59) but never carries an inline mark — the inline text lives in `RenderedOutput.text`.
 - The snapshot's `TriggeredMatch` carries an optional `MarkRender { text, before }` so the live viewer splices the same timestamp the `.disp` got, rebasing the match onto the scrollback window via its view-space `view_offset` (ADR-017 — the stream-space `byte_offset` counts bytes a paused view skipped).
-- A minimal in-app editor creates `BytePattern → Mark(+timestamp)` rules; committing uses the existing Apply & Restart path (`config_needs_restart` counts `match_rules`) — no new runtime command. The general match-rule editor (Idle/Record/Notify/PauseDisplay) remains a separate TODO.
+- A minimal in-app editor creates `BytePattern → Mark(+timestamp)` rules; committing uses the existing Apply & Restart path (`config_needs_restart` counts `match_rules`) — no new runtime command. The general match-rule editor (Idle/Record/Notify/PauseDisplay) remains a separate TODO. *(Amended 2026-11-27: ADR-083 replaces this editor with one for every rule.)*
 
 ## ADR-017 — Two stream offset spaces: stream (all received bytes) vs. view (pause-gated), translated at fire time
 
@@ -2943,6 +2943,53 @@ list, which holds full paths.
 
 **Consequences:** Both apps keep profiles in their own folder under the OS
 config folder, and §159 says where.
+
+## ADR-083 — One editor for every match rule
+
+**Status:** Accepted 2026-11-27. Completes what ADR-016 left to a later editor.
+
+**Context:** The runtime runs every condition and action of §50.2, but the GUI
+could make only one kind of rule: a pattern with a timestamp, under Timestamp
+marks in Configure display (ADR-016). Quiet-time conditions and the Record,
+Notify and Pause display actions came only from a profile written by hand, so a
+rule to begin a recording on a pattern, or to warn when a device goes quiet,
+was out of reach for most users.
+
+**Decision:**
+
+- **One editor replaces Timestamp marks.** It edits every rule: on or off, a
+  name, one condition and any number of actions, each kind with its settings.
+  A timestamp is one of the actions, with the settings it had before.
+- **It sits under Configure interface, as Configure triggers and actions.**
+  Rules change the channel's draft and take effect with Apply & Restart, as the
+  interface does, while Configure display applies its settings at once. The
+  header names what a rule is made of, for a reader who has not met the word,
+  and each entry stays a rule: one trigger and the actions it initiates. The
+  header counts the rules, so a collapsed section still says the channel has
+  some.
+- **Values are typed, with step buttons.** A pattern is text with `<XX>` for a
+  control byte, the view's notation. A quiet time is seconds in a box with − and
+  + buttons, as the port is, not a drag control, which was too easy to miss.
+- **A Notify line names its rule.** With several Notify rules on one channel,
+  the line otherwise could not say which fired. The one-time line about a
+  pattern split across two reads names it too, in place of its internal id.
+
+**Boundary:** The runtime and the profile format are unchanged. The `‹MARK›`
+line a Marker line writes into the Display recording still carries the rule's
+internal id: it is a recording format, left for its own decision. Compound
+conditions and a live on/off without a restart stay deferred (Appendix A,
+ADR-012).
+
+**Alternatives considered:**
+
+- **Keep Timestamp marks and add a second editor beside it:** two places to
+  edit one list of rules, and a rule could be shown in either or both.
+- **Put the editor under Configure display, where Timestamp marks was:** most
+  actions are not about the display, and its other settings apply without a
+  restart.
+
+**Consequences:** Every rule §50.2 describes can be made in the GUI, and the
+editor shows every rule a profile holds, so none is hidden or dropped.
 
 ## Open questions
 

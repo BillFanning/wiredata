@@ -371,7 +371,7 @@ async fn udp_channel_match_rule_fires_an_action_and_is_observable() {
         .diagnostics
         .warnings
         .iter()
-        .filter(|w| w.message.starts_with("match rule fired"))
+        .filter(|w| w.message.starts_with("match rule 'alarm' fired"))
         .count();
     assert_eq!(fired, 1, "{:#?}", snap.diagnostics.warnings);
 

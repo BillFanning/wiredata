@@ -16,7 +16,7 @@ use super::super::view_prefs::{
     hex_line_label, scroll_buffer_label, ViewPrefs, HEX_GROUP_SIZES, HEX_LINE_GROUPS,
     MAX_SCROLL_BUFFER_BYTES, MIN_SCROLL_BUFFER_BYTES, SCROLL_BUFFER_PRESETS_KB,
 };
-use super::super::widgets::{edit_mark_rules, human_bytes, ColorScheme, MSG_FONT_SIZES};
+use super::super::widgets::{human_bytes, ColorScheme, MSG_FONT_SIZES};
 use super::super::ListenerApp;
 use crate::config::schema::HexGrouping;
 use wiredata_ui::fonts::MonoFont;
@@ -117,15 +117,6 @@ impl ListenerApp {
         })
         .body(|ui| {
             show_view_controls(ui, &mut prefs, Some(stream_len));
-            // Inline Mark timestamps (§50.2) live here — they shape what the view
-            // (and `.disp`) show. They edit the draft config; committing goes
-            // through Apply & Restart (config_needs_restart counts match_rules).
-            ui.separator();
-            if let Some((eid, config)) = &mut self.edit_draft {
-                if *eid == id {
-                    edit_mark_rules(ui, config);
-                }
-            }
         });
 
         // Persist any edit: update this channel's prefs + config and sync the runtime

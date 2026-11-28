@@ -55,6 +55,8 @@ pub const MAX_FIRINGS_PER_READ: usize = 4_096;
 /// per quiet episode.
 struct CompiledRule {
     id: MatchRuleId,
+    /// The configured name, for the diagnostics a firing writes.
+    name: Arc<str>,
     condition: MatchCondition,
     /// Shared with every firing of the rule, so a firing costs a pointer, not
     /// a copy of the actions.
@@ -75,6 +77,8 @@ struct CompiledRule {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FiredRule {
     pub id: MatchRuleId,
+    /// The rule's configured name, shared like its actions.
+    pub name: Arc<str>,
     pub actions: Arc<[MatchAction]>,
     /// Absolute stream offset of the **first byte** of the match that fired
     /// (§50.2: matches are anchored on byte offsets — the stream-only model has no
@@ -115,6 +119,7 @@ impl MatchRuleSet {
             .iter()
             .map(|r| CompiledRule {
                 id: MatchRuleId::new(),
+                name: r.name.as_str().into(),
                 condition: r.condition.clone(),
                 actions: r.actions.as_slice().into(),
                 enabled: r.enabled,
@@ -285,6 +290,7 @@ impl MatchRuleSet {
             rule.boundary_saves += 1;
             fired.push(FiredRule {
                 id: rule.id,
+                name: Arc::clone(&rule.name),
                 actions: Arc::clone(&rule.actions),
                 match_offset: Some(self.carry_offset + match_start as u64),
                 match_len: pattern.len(),
@@ -326,6 +332,7 @@ impl MatchRuleSet {
             };
             fired.push(FiredRule {
                 id: rule.id,
+                name: Arc::clone(&rule.name),
                 actions: Arc::clone(&rule.actions),
                 match_offset: Some(chunk_offset + match_start as u64),
                 match_len: pattern.len(),
@@ -380,6 +387,7 @@ impl MatchRuleSet {
                 rule.idle_fired = true;
                 fired.push(FiredRule {
                     id: rule.id,
+                    name: Arc::clone(&rule.name),
                     actions: Arc::clone(&rule.actions),
                     match_offset: None,
                     match_len: 0,
