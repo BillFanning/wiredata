@@ -274,8 +274,8 @@ impl ListenerApp {
     }
 
     /// Always prompt for a destination, then save there and remember it as the
-    /// current profile path. Defaults to the app's `profiles/` directory (next to the
-    /// exe) on first use.
+    /// current profile path. Defaults to the profile folder in the OS config folder
+    /// on first use.
     ///
     /// **The one intentional exception to "the UI thread never blocks / never does
     /// I/O" (AGENTS §5).** A native file picker is inherently modal and synchronous, so
@@ -287,7 +287,7 @@ impl ListenerApp {
     pub(super) fn save_profile_as(&mut self) {
         let mut dialog = rfd::FileDialog::new().add_filter("TOML profile", &["toml"]);
         // Seed the picker with the current file's name/location if we have one;
-        // otherwise default to the app profiles directory.
+        // otherwise default to the profile folder.
         dialog = match self.current_profile_path.as_ref() {
             Some(path) => {
                 if let Some(dir) = path.parent() {
@@ -314,10 +314,10 @@ impl ListenerApp {
     }
 
     /// Open a native "load profile" dialog and, if the user picks a file, load it.
-    /// Defaults to the app's `profiles/` directory.
+    /// Defaults to the profile folder.
     fn load_profile_dialog(&mut self) {
         let mut dialog = rfd::FileDialog::new().add_filter("TOML profile", &["toml"]);
-        // Open in the last-used profile's directory, else the app profiles directory.
+        // Open in the last-used profile's directory, else the profile folder.
         let start = self
             .current_profile_path
             .as_ref()
@@ -410,17 +410,41 @@ impl ListenerApp {
     }
 }
 
-/// The app's profile directory: `profiles/` beside the running executable. Created
-/// best-effort if absent (it's just the picker's starting folder). Returns `None`
-/// if the exe path can't be resolved or the directory can't be created — e.g. the
-/// app was installed somewhere read-only — in which case the picker opens at the
-/// OS default rather than failing.
+/// The default profile folder: `listener/profiles` in the OS config folder
+/// (`%APPDATA%` on Windows), as talker's is in its own (ADR-082). `None` when
+/// the platform has no config folder.
+fn default_profiles_dir() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("listener").join("profiles"))
+}
+
+/// The default profile folder, created best-effort if absent (it's just the
+/// picker's starting folder). Returns `None` if there is no config folder or the
+/// folder can't be created, in which case the picker opens at the OS default
+/// rather than failing.
 fn profiles_dir() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?.join("profiles");
+    let dir = default_profiles_dir()?;
     // Best-effort: if it exists already this is a no-op; if creation fails, fall back.
     if !dir.exists() && std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
     Some(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The window's default profile folder is listener's own, in the OS
+    /// config folder, as talker's is (listener ADR-082).
+    #[test]
+    fn the_default_profile_folder_is_in_the_config_folder() {
+        let Some(config) = dirs::config_dir() else {
+            assert_eq!(default_profiles_dir(), None);
+            return;
+        };
+        assert_eq!(
+            default_profiles_dir(),
+            Some(config.join("listener").join("profiles"))
+        );
+    }
 }

@@ -1,16 +1,15 @@
-# Listener Specification v2.6.14
+# Listener Specification v2.6.15
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-11-27) — reconnect is on by default:
+Revision note (2026-11-27) — the profile folder:
 
-- **§9.1, §80.1, §162 (ADR-081).** A new Channel, and a profile that does not
-  say otherwise, reconnects automatically. Turning it off still leaves a Faulted
-  Channel Faulted. Linemon does not reconnect.
-- **§9.1, §56.** The retry pace is stated once, in §9.1, and §56 points to it.
+- **§159 (ADR-082).** The GUI's profile dialogs, with no profile open, start in
+  `listener/profiles` in the OS config folder, as talker's do, rather than
+  beside the program.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -3227,6 +3226,11 @@ A user shall be able to:
 - Save a complete Listener workspace Profile.
 - Load a Profile.
 - Restore configured Channels and settings.
+
+The GUI's Load and Save As dialogs open beside the open profile, or, when none
+is open, in the profile folder: `listener/profiles` in the OS config folder
+(`%APPDATA%` on Windows), made on first use (ADR-082). They accept a profile in
+any folder. The CLI's `--profile` takes a file path.
 
 Profile loading shall not:
 

@@ -12,6 +12,13 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-11-27) — reconnect is on by default:
+
+- **§9.1, §80.1, §162 (ADR-081).** A new Channel, and a profile that does not
+  say otherwise, reconnects automatically. Turning it off still leaves a Faulted
+  Channel Faulted. Linemon does not reconnect.
+- **§9.1, §56.** The retry pace is stated once, in §9.1, and §56 points to it.
+
 Revision note (2026-11-27) — a UDP port that is not shared is held:
 
 - **§15 (ADR-079).** A UDP port opened without "Request shared port" is kept

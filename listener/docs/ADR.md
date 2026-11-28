@@ -2913,6 +2913,37 @@ setting and keeps retrying every channel.
 Listener Channel has reconnect turned off. A profile written before this
 change without the key now reconnects; none is in use.
 
+## ADR-082 — Profiles default to the OS config folder, as talker's do
+
+**Status:** Accepted 2026-11-27. Amends §159.
+
+**Context:** The GUI's Load and Save As dialogs open beside the open profile,
+or in a default folder they make on first use. That folder was `profiles`
+beside the program, while talker's is `talker/profiles` in the OS config folder
+(talker ADR-077), so someone using both kept profiles in two kinds of place. A
+program folder such as `Program Files` is not writable by a normal user, and
+there the folder could not be made, so the dialogs opened wherever the system
+chose. The spec did not say where the folder was.
+
+**Decision:** The default folder is `listener/profiles` in the OS config folder
+(`%APPDATA%` on Windows), the counterpart of talker's.
+
+**Boundary:** Only where the dialogs open changes. They still accept a profile
+in any folder, and the CLI's `--profile` still takes a file path, so listener
+has no `--profile-dir`: it would have nothing to act on. A profile already
+saved beside the program is still loaded by browsing to it, or from the Recent
+list, which holds full paths.
+
+**Alternatives considered:**
+
+- **Keep the folder beside the program:** easy to find in an unzipped copy,
+  but unlike talker's, and not writable where programs are usually installed.
+- **Move talker's beside the program instead:** the same objection, and it
+  would undo part of talker ADR-077.
+
+**Consequences:** Both apps keep profiles in their own folder under the OS
+config folder, and §159 says where.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_
