@@ -15,6 +15,12 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-11-27) — closing the window:
+
+- **§3.2 (ADR-076)** — closing the window stops waiting for the channels after
+  the CLI's stop limit, so a call stuck in a driver cannot hold it open. The
+  log names any channel left behind.
+
 Revision note (2026-11-27) — the two retry paces:
 
 - **§4.1 (ADR-075)** — the open and send retry paces are stated once, side by
@@ -539,6 +545,11 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-11-27) — closing the window:
+
+- **ADR-076** — the window's close waits for the channels at most the CLI's
+  stop limit, then closes, so ADR-019's one blocking call has a limit.
 
 Revision note (2026-11-27) — talker's retry paces:
 

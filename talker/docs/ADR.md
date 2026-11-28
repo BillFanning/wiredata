@@ -1,13 +1,14 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.40
+**Version:** 1.41
 **Date:** 2026-11-27
 **Status:** Accepted
 
-Revision note (2026-11-27) — closing the window:
+Revision note (2026-11-27) — choosing the profile folder:
 
-- **ADR-076** — the window's close waits for the channels at most the CLI's
-  stop limit, then closes, so ADR-019's one blocking call has a limit.
+- **ADR-077** — a `--profile-dir` flag chooses the profile folder; there is no
+  environment variable or window setting, and the window's dialogs open in the
+  folder.
 
 ---
 
@@ -3087,6 +3088,48 @@ was never a wait and is unchanged: its runner winds down in the background.
 **Consequences:** A close that is not waiting on a stuck call ends as soon as
 the runners do. The spec states the limit in seconds, and a test checks that
 number against `STOP_LIMIT`.
+
+## ADR-077 — A flag chooses the profile folder
+
+**Status:** Accepted 2026-11-27.
+
+**Context:** Profiles lived only in `talker/profiles` under the OS config
+folder (`core::profile::default_dir`), with no way to point talker elsewhere,
+such as at a shared folder or a portable copy beside the program. A check found
+that only the CLI uses that folder: `--profile <NAME>`, `--list-profiles` and
+`talker --gui --profile <NAME>`. The window loads and saves through dialogs
+that take any path, and reopens the last profile by its full path. But the
+dialogs opened wherever the system last left them, so a profile saved from a
+new window was found by name only if the user had browsed to a hidden folder.
+
+**Decision:**
+
+- **`--profile-dir <DIR>` sets the profile folder** for `--profile`,
+  `--list-profiles` and `talker --gui --profile`. A relative folder is relative
+  to the current directory. It cannot be combined with `--profile-path`, which
+  names the file itself.
+- **The window's dialogs open in the folder.** Load and Save As open beside the
+  open profile, or in the profile folder when none is open, so what the window
+  saves is what the CLI finds by name. Save As makes the folder on first use.
+
+**Boundary:** The window gains no setting for the folder: its dialogs already
+reach any folder, so a setting would only change where they open. The default
+folder is unchanged, and a portable layout is a choice made with the flag, not
+the default.
+
+**Alternatives considered:**
+
+- **A `TALKER_PROFILE_DIR` environment variable:** an unattended run states its
+  arguments in its service or task definition anyway, and a variable set once
+  and forgotten makes `--profile <NAME>` read a folder nothing on the command
+  line names.
+- **A window setting:** see the boundary.
+- **Profiles beside the program by default:** a program folder such as
+  `Program Files` is not writable by a normal user.
+
+**Consequences:** A profile saved from a new window lands where
+`talker --profile <NAME>` finds it. A launcher or service that wants another
+folder passes `--profile-dir`.
 
 ## Open questions
 

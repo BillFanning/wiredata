@@ -18,5 +18,5 @@ fn main() -> anyhow::Result<()> {
     // One call only — shared GUI startup lives in `gui::run`. The GUI opens
     // to the last-used profile via eframe storage, same as `talker --gui`
     // without a profile flag.
-    talker::gui::run(None)
+    talker::gui::run(None, None)
 }

@@ -13,11 +13,6 @@ found again. Remove an item when it is done: the commit says what changed.
 
 ## Features
 
-- [ ] **A user-chosen profile folder.** Profiles default to the OS config folder
-  (`core::profile::default_dir`), the safe, always-writable choice. Add an
-  override, such as a `--profile-dir` flag, a `TALKER_PROFILE_DIR` variable or a
-  GUI setting, so users can point talker elsewhere. That also allows a portable
-  "profiles beside the .exe" layout without making it the default.
 - [ ] **File-log retention (workspace).** Neither app deletes a log file
   (ADR-069): talker's GUI logs rotate daily, a CLI profile chooses never, hourly
   or daily (`FileLogConfig`), and listener's event log rotates daily. If bounded

@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser};
 
-use talker::{cli, core, gui};
+use talker::{cli, gui};
 
 #[derive(Parser)]
 #[command(
@@ -38,9 +38,9 @@ struct TopArgs {
         long_help = "Launch the graphical interface instead of the headless CLI \
                      runner. With `--gui` and no profile flag, the GUI opens to the \
                      last loaded profile (if any) or an empty editor. `--profile` / \
-                     `--profile-path` are honoured and the named profile is loaded on \
-                     startup. All other CLI flags (echo, log-file, quiet) only affect \
-                     the headless mode."
+                     `--profile-path` are honoured, with `--profile-dir`, and the \
+                     named profile is loaded on startup. All other CLI flags (echo, \
+                     log-file, quiet) only affect the headless mode."
     )]
     gui: bool,
 
@@ -71,14 +71,14 @@ fn main() {
     }
 
     if args.gui {
-        let initial_profile = if let Some(p) = args.cli.profile_path {
-            Some(p)
-        } else if let Some(name) = args.cli.profile {
-            core::profile::default_dir().map(|d| d.join(format!("{name}.toml")))
-        } else {
-            None
+        let initial_profile = match args.cli.profile_file() {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("\nerror: {e:#}");
+                std::process::exit(1);
+            }
         };
-        if let Err(e) = gui::run(initial_profile) {
+        if let Err(e) = gui::run(initial_profile, args.cli.profile_dir) {
             eprintln!("\nerror: {e:#}");
             std::process::exit(1);
         }

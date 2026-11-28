@@ -1,13 +1,15 @@
 # Talker — Program Specification
-**Version:** 2.6.5
+**Version:** 2.6.6
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-11-27) — closing the window:
+Revision note (2026-11-27) — choosing the profile folder:
 
-- **§3.2 (ADR-076)** — closing the window stops waiting for the channels after
-  the CLI's stop limit, so a call stuck in a driver cannot hold it open. The
-  log names any channel left behind.
+- **§8.2 (ADR-077)** — `--profile-dir <DIR>` sets the folder the CLI looks
+  `--profile` names up in and `--list-profiles` lists, in place of the OS
+  config folder.
+- **§3.2** — the GUI's Load and Save As dialogs open beside the open profile,
+  or in the profile folder when none is open.
 
 Where a requirement leads the implementation, [TODO.md](TODO.md) lists what is
 not yet built.
@@ -479,7 +481,7 @@ replacement.
 
 GUI state and profile data are stored separately and serve different purposes:
 
-- **Profiles** (channel config, message config, checksum settings) are TOML files shared between CLI and GUI. They live in the profile directory and are the primary unit of saved work.
+- **Profiles** (channel config, message config, checksum settings) are TOML files shared between CLI and GUI. They live in the profile folder (§8.2) and are the primary unit of saved work. The Load and Save As dialogs open beside the open profile, or in the profile folder when none is open, making the folder on first save; they accept a profile in any folder.
 - **GUI state** explicitly stores theme and the current/recent profile paths;
   egui's own presentation memory restores zoom. It uses `eframe`'s persistence
   mechanism, is never loaded by the CLI, and never conflicts with profile data.
@@ -1143,6 +1145,14 @@ Profiles can be:
 - Switched at runtime in the GUI
 - Specified by name at launch in the CLI (`--profile <name>`)
 - Stored in TOML so they can be inspected, edited, and version-controlled outside the program
+
+**The profile folder** is where the CLI looks a `--profile` name up, as
+`<folder>/<name>.toml`, and what `--list-profiles` lists. It is `talker/profiles`
+in the OS config folder (`%APPDATA%` on Windows), unless `--profile-dir <DIR>`
+names another, such as a folder beside the program for a portable copy. A
+relative folder is relative to the current directory. `--profile-path <FILE>`
+names a file directly and takes no folder. `talker --gui` uses the same folder
+for `--profile` and for where its dialogs open (§3.2).
 
 **Example profile:** [`talker/profiles/profile.example.toml`](../profiles/profile.example.toml)
 is a complete, working profile: a named UDP broadcast channel with UTC-phase

@@ -60,7 +60,11 @@ fn detach_console() {}
 /// `talker-gui` (windows-subsystem) binary and `talker.exe`'s `--gui` path.
 /// Put ALL GUI startup (console detach, logging, window options) in this
 /// function so the two binaries stay identical — never in either `main`.
-pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
+///
+/// `profile_dir` is the folder `--profile-dir` names; `None` uses the
+/// default profile folder.
+pub fn run(initial_profile: Option<PathBuf>, profile_dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let profile_dir = profile_dir.or_else(crate::core::profile::default_dir);
     detach_console(); // drop the double-click console before the window opens
 
     // Windows 11 would otherwise ignore the high-rate timer request while
@@ -99,7 +103,10 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
         Box::new(move |cc| {
             Ok(Box::new(TalkerApp::new(
                 log_rx,
-                initial_profile,
+                ProfileStart {
+                    file: initial_profile,
+                    folder: profile_dir,
+                },
                 &cc.egui_ctx,
                 cc.storage,
                 level_handle,
@@ -121,6 +128,24 @@ pub(crate) use crate::core::supervisor::STATUS_QUEUE_CAP;
 const RECENT_PROFILES_KEY: &str = "recent_profiles";
 /// How many entries the Profile menu's Recent section keeps.
 const MAX_RECENT_PROFILES: usize = 8;
+
+/// The window's profile at start: the file to open, if any, and the
+/// profile folder its dialogs open in.
+struct ProfileStart {
+    file: Option<PathBuf>,
+    folder: Option<PathBuf>,
+}
+
+/// Where the Load and Save As dialogs open: beside the open profile, or
+/// else in the profile folder, so a profile saved from a new window lands
+/// where `talker --profile <NAME>` finds it (spec §3.2).
+fn dialog_folder(open_profile: Option<&Path>, profile_dir: Option<&Path>) -> Option<PathBuf> {
+    open_profile
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .or(profile_dir)
+        .map(Path::to_path_buf)
+}
 /// Bounded handoff from tracing call sites to the on-screen Log pane. A full
 /// queue never blocks application work and is reported through `GuiLogHealth`.
 const GUI_LOG_QUEUE_CAP: usize = 512;
@@ -454,6 +479,10 @@ struct TalkerApp {
     repaint: std::sync::Arc<wiredata_ui::repaint::RepaintCoalescer>,
     profile: Profile,
     profile_path: Option<PathBuf>,
+    /// The profile folder the dialogs open in when no profile is open:
+    /// `--profile-dir`, else the default (spec §3.2). `None` when the
+    /// platform has no config folder.
+    profile_dir: Option<PathBuf>,
     dirty: bool,
     conn_drafts: Vec<ConnDraft>,
     sched_drafts: Vec<Vec<ScheduleDraft>>,
@@ -680,7 +709,7 @@ impl RateTracker {
 impl TalkerApp {
     fn new(
         log_rx: crossbeam_channel::Receiver<LogEvent>,
-        initial_profile: Option<PathBuf>,
+        profile_start: ProfileStart,
         ctx: &egui::Context,
         storage: Option<&dyn eframe::Storage>,
         log_level_handle: LogLevelHandle,
@@ -735,6 +764,7 @@ impl TalkerApp {
             repaint,
             profile: Profile::default(),
             profile_path: None,
+            profile_dir: profile_start.folder,
             dirty: false,
             conn_drafts: Vec::new(),
             sched_drafts: Vec::new(),
@@ -787,7 +817,7 @@ impl TalkerApp {
         // error on every launch. `profile_path` stays `None`, so
         // the next `save()` overwrites the stale storage entry
         // with an empty string and the loop self-clears.
-        let path = initial_profile.or_else(|| {
+        let path = profile_start.file.or_else(|| {
             storage
                 .and_then(|s| s.get_string("last_profile_path"))
                 .filter(|s| !s.is_empty())
@@ -1015,10 +1045,15 @@ impl TalkerApp {
         if !self.confirm_discard() {
             return;
         }
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("TOML Profile", &["toml"])
-            .pick_file()
-        else {
+        let mut dialog = rfd::FileDialog::new().add_filter("TOML Profile", &["toml"]);
+        // A folder that does not exist yet has nothing in it to load.
+        if let Some(folder) =
+            dialog_folder(self.profile_path.as_deref(), self.profile_dir.as_deref())
+                .filter(|folder| folder.is_dir())
+        {
+            dialog = dialog.set_directory(folder);
+        }
+        let Some(path) = dialog.pick_file() else {
             return;
         };
         self.load_profile_from_path(&path);
@@ -1061,10 +1096,15 @@ impl TalkerApp {
         let mut dialog = rfd::FileDialog::new()
             .add_filter("TOML Profile", &["toml"])
             .set_file_name(&name);
-        // Seed the dialog at the current profile's directory so
-        // Save As lands next to the original by default.
-        if let Some(parent) = self.profile_path.as_deref().and_then(Path::parent) {
-            dialog = dialog.set_directory(parent);
+        // Save As lands next to the original, and a new profile in the
+        // profile folder, which is made on first use. If it cannot be
+        // made, the dialog opens where the system chooses.
+        if let Some(folder) =
+            dialog_folder(self.profile_path.as_deref(), self.profile_dir.as_deref())
+        {
+            if std::fs::create_dir_all(&folder).is_ok() {
+                dialog = dialog.set_directory(folder);
+            }
         }
         dialog.save_file()
     }
@@ -2482,6 +2522,28 @@ mod tests {
 
         supervisor.stop_all();
         supervisor.join_all(crate::core::runner::STOP_LIMIT);
+    }
+
+    /// The dialogs open beside the open profile, else in the profile folder,
+    /// so a profile saved from a new window lands where the command line
+    /// finds it by name.
+    #[test]
+    fn profile_dialogs_open_beside_the_profile_or_in_the_profile_folder() {
+        let folder = Path::new("profiles");
+        assert_eq!(
+            dialog_folder(Some(Path::new("elsewhere/gps.toml")), Some(folder)),
+            Some(PathBuf::from("elsewhere"))
+        );
+        assert_eq!(
+            dialog_folder(None, Some(folder)),
+            Some(folder.to_path_buf())
+        );
+        // A bare file name has no folder of its own to open in.
+        assert_eq!(
+            dialog_folder(Some(Path::new("gps.toml")), Some(folder)),
+            Some(folder.to_path_buf())
+        );
+        assert_eq!(dialog_folder(None, None), None);
     }
 
     /// The flush is all-or-none and index-preserving: one bad entry aborts

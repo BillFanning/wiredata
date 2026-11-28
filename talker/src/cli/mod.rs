@@ -52,11 +52,12 @@ pub struct Args {
         long,
         conflicts_with = "profile_path",
         value_name = "NAME",
-        help = "Load a profile by name from the default profile directory.",
-        long_help = "Load a profile by name from the default profile directory. \
-                     The profile is looked up at `<default-dir>/<NAME>.toml`. The \
-                     default directory is `dirs::config_dir()/talker/profiles`, which \
-                     on Windows is `%APPDATA%\\talker\\profiles`, on Linux \
+        help = "Load a profile by name from the profile directory.",
+        long_help = "Load a profile by name from the profile directory. The \
+                     profile is looked up at `<dir>/<NAME>.toml`, where the directory \
+                     is the one `--profile-dir` names, or else the default: \
+                     `dirs::config_dir()/talker/profiles`, which on Windows is \
+                     `%APPDATA%\\talker\\profiles`, on Linux \
                      `$XDG_CONFIG_HOME/talker/profiles` (or \
                      `~/.config/talker/profiles`), and on macOS \
                      `~/Library/Application Support/talker/profiles`. Use \
@@ -64,6 +65,21 @@ pub struct Args {
                      with `--profile-path`."
     )]
     pub profile: Option<String>,
+
+    #[arg(
+        long,
+        conflicts_with = "profile_path",
+        value_name = "DIR",
+        help = "Use DIR as the profile directory instead of the default.",
+        long_help = "Use DIR as the profile directory instead of the default: \
+                     `--profile` looks names up in it and `--list-profiles` lists \
+                     it. A relative DIR is relative to the current directory. Use \
+                     it to keep profiles somewhere else, such as beside the program \
+                     for a portable copy. The window's Load and Save As dialogs \
+                     work with any folder and do not use it. Mutually exclusive \
+                     with `--profile-path`, which names the file itself."
+    )]
+    pub profile_dir: Option<PathBuf>,
 
     #[arg(
         short = 'P',
@@ -81,8 +97,9 @@ pub struct Args {
     #[arg(
         short = 'l',
         long,
-        help = "List profile names found in the default directory and exit.",
-        long_help = "List profile names found in the default directory and exit. \
+        help = "List profile names found in the profile directory and exit.",
+        long_help = "List profile names found in the profile directory \
+                     (`--profile-dir`, or the default) and exit. \
                      Exit code is always 0, including when the directory is missing \
                      or empty — the message on stdout explains what was found. \
                      Combines fine with `--quiet` to suppress logging without \
@@ -172,6 +189,31 @@ pub struct Args {
     pub require_all: bool,
 }
 
+impl Args {
+    /// The folder `--profile` names are looked up in and `--list-profiles`
+    /// lists: `--profile-dir`, or else the platform default.
+    pub fn profile_dir(&self) -> anyhow::Result<PathBuf> {
+        match &self.profile_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => profile::default_dir()
+                .context("cannot determine the default profile directory on this platform"),
+        }
+    }
+
+    /// The profile file the arguments name: `--profile-path` as given, or
+    /// `--profile` in [`profile_dir`](Self::profile_dir). `None` when neither
+    /// is given. The window resolves `talker --gui --profile` the same way.
+    pub fn profile_file(&self) -> anyhow::Result<Option<PathBuf>> {
+        if let Some(path) = &self.profile_path {
+            return Ok(Some(path.clone()));
+        }
+        let Some(name) = &self.profile else {
+            return Ok(None);
+        };
+        Ok(Some(self.profile_dir()?.join(format!("{name}.toml"))))
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// How a channel that is down is being retried, for its WARNING line: first
@@ -195,7 +237,7 @@ pub fn run(args: Args) -> anyhow::Result<u8> {
     // and the error formatter), so this runner doesn't add its own.
 
     if args.list_profiles {
-        list_profiles()?;
+        list_profiles(&args)?;
         return Ok(0);
     }
 
@@ -676,12 +718,7 @@ fn resolve_log_file(path: Option<&Path>) -> anyhow::Result<FileLogConfig> {
 }
 
 fn load_profile(args: &Args) -> anyhow::Result<(Profile, PathBuf)> {
-    let path = if let Some(p) = &args.profile_path {
-        p.clone()
-    } else if let Some(name) = &args.profile {
-        let dir = profile::default_dir().context("cannot determine profile directory")?;
-        dir.join(format!("{name}.toml"))
-    } else {
+    let Some(path) = args.profile_file()? else {
         // Multi-line so the suggested invocations stand out from the
         // surrounding "error:" prefix that `main.rs` adds on stderr.
         // Joined from an array — Rust string-literal line
@@ -689,9 +726,10 @@ fn load_profile(args: &Args) -> anyhow::Result<(Profile, PathBuf)> {
         // indent inline mangles the alignment.
         let msg = [
             "no profile specified — pick one of:",
-            "  -p, --profile <NAME>        load a profile by name from the default directory",
+            "  -p, --profile <NAME>        load a profile by name from the profile directory",
             "  -P, --profile-path <FILE>   load a profile from an explicit path",
-            "  -l, --list-profiles         show what's in the default directory and exit",
+            "  -l, --list-profiles         show what's in the profile directory and exit",
+            "      --profile-dir <DIR>     use DIR as the profile directory",
             "  -g, --gui                   launch the graphical interface",
             "      --help                  full option list with descriptions",
         ]
@@ -702,10 +740,10 @@ fn load_profile(args: &Args) -> anyhow::Result<(Profile, PathBuf)> {
     Ok((profile, path))
 }
 
-fn list_profiles() -> anyhow::Result<()> {
-    let dir = match profile::default_dir() {
-        Some(d) => d,
-        None => {
+fn list_profiles(args: &Args) -> anyhow::Result<()> {
+    let dir = match args.profile_dir() {
+        Ok(d) => d,
+        Err(_) => {
             println!("Cannot determine profile directory on this platform.");
             return Ok(());
         }
@@ -926,6 +964,31 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_name_is_looked_up_in_the_chosen_folder() {
+        let a = parse(&["talker", "--profile-dir", "elsewhere", "--profile", "gps"]).unwrap();
+        assert_eq!(
+            a.profile_file().unwrap(),
+            Some(Path::new("elsewhere").join("gps.toml"))
+        );
+    }
+
+    #[test]
+    fn without_a_chosen_folder_a_name_is_looked_up_in_the_default_one() {
+        let a = parse(&["talker", "--profile", "gps"]).unwrap();
+        if let Some(dir) = profile::default_dir() {
+            assert_eq!(a.profile_file().unwrap(), Some(dir.join("gps.toml")));
+        }
+    }
+
+    #[test]
+    fn an_explicit_path_is_used_as_given_and_takes_no_folder() {
+        let a = parse(&["talker", "--profile-path", "x/y.toml"]).unwrap();
+        assert_eq!(a.profile_file().unwrap(), Some(PathBuf::from("x/y.toml")));
+        assert!(parse(&["talker", "--profile-dir", "d", "--profile-path", "x/y.toml"]).is_err());
+        assert_eq!(parse(&["talker"]).unwrap().profile_file().unwrap(), None);
+    }
+
+    #[test]
     fn parse_short_flags_match_long() {
         // Each short form should reach the same field as its long
         // counterpart — proves the `short = 'X'` derive entries
@@ -1005,6 +1068,7 @@ mod tests {
         let args = Args {
             profile: None,
             profile_path: None,
+            profile_dir: None,
             list_profiles: false,
             echo: false,
             echo_format: EchoFormat::default(),
@@ -1033,6 +1097,7 @@ mod tests {
         let args = Args {
             profile: None,
             profile_path: Some(PathBuf::from("/no/such/file.toml")),
+            profile_dir: None,
             list_profiles: false,
             echo: false,
             echo_format: EchoFormat::default(),
@@ -1052,6 +1117,7 @@ mod tests {
         let args = Args {
             profile: None,
             profile_path: Some(PathBuf::from("/no/such/file.toml")),
+            profile_dir: None,
             list_profiles: false,
             echo: false,
             echo_format: EchoFormat::default(),
